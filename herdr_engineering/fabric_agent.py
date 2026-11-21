@@ -849,6 +849,10 @@ class AgentConfig:
     # long is released. The agent's own forwarder keeps the port listening after
     # the app dies, so "port vanished" alone never releases it.
     orphan_grace: float = 60.0
+    # Backstop: a watcher (auto-registered) lease older than this is released;
+    # a still-live app is re-registered by the same scan, so this refreshes
+    # rather than bans. 0 disables (``fabric.agent_lease_max_age_seconds``).
+    lease_max_age: float = 86400.0
 
     def fabric_names(self) -> frozenset[str]:
         """The host names the fabric owns: its control-plane host and this
@@ -1031,7 +1035,8 @@ class FabricAgent:
                         or port in gateway_front
                         or process in _IGNORED_PROCESSES
                         or process_denied(process, self.cfg.deny_processes)
-                        or self._origin_orphaned(port_s, entry)):
+                        or self._origin_orphaned(port_s, entry)
+                        or self._lease_expired(entry)):
                     self._release(port_s)
                     closed.append(port_s)
 
@@ -1111,6 +1116,19 @@ class FabricAgent:
         self._save_store()
         return {"registered": registered, "closed": closed,
                 "unleased": [str(p) for p in unleased]}
+
+    def _lease_expired(self, entry: dict[str, Any]) -> bool:
+        """True when a watcher lease has outlived ``lease_max_age``. The store
+        only holds agent-created leases, so manual leases are never affected.
+        Entries from before ``registered_at`` existed are stamped now, so the
+        clock starts at upgrade instead of releasing them all at once."""
+        registered = entry.get("registered_at")
+        if not isinstance(registered, (int, float)):
+            entry["registered_at"] = time.time()
+            return False
+        if self.cfg.lease_max_age <= 0:
+            return False
+        return time.time() - registered >= self.cfg.lease_max_age
 
     def _origin_orphaned(self, port_s: str, entry: dict[str, Any]) -> bool:
         """True when a forwarded service's loopback origin has been down for
@@ -1264,6 +1282,7 @@ class FabricAgent:
                 "project": None,
                 "source_port": port,
                 "last_hb": time.monotonic(),
+                "registered_at": time.time(),
             }
         log.info("auto-registered %s -> dev port %s",
                  label, lease.get("external_port"))

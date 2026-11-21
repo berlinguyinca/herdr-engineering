@@ -3763,6 +3763,7 @@ def _cmd_dev_agent(args) -> int:
             agent_binaries=agent_binaries,
             deny_processes=deny_processes,
             orphan_grace=float(fabric_cfg.get("agent_orphan_grace_seconds", 60.0)),
+            lease_max_age=float(fabric_cfg.get("agent_lease_max_age_seconds", 86400.0)),
         ))
     if args.once:
         summary = agent.scan_once()

@@ -1332,3 +1332,116 @@ def test_orphan_grace_delays_release(tmp_path, monkeypatch):
     finally:
         agent.stop()
         gw.stop()
+
+
+# -- watcher lease max age (backstop) ---------------------------------------
+
+def _seed_store(tmp_path, port: int, registered_at: float | None) -> None:
+    entry = {"lease_id": "lease_old", "label": f"x (port {port})",
+             "external_port": 18001, "url": "http://dev.lan:18001",
+             "process": "node", "last_hb": 0.0}
+    if registered_at is not None:
+        entry["registered_at"] = registered_at
+    (tmp_path / "fabric-agent.json").write_text(json.dumps({str(port): entry}))
+
+
+def test_registered_lease_records_registration_time(tmp_path, monkeypatch):
+    gw = _FakeGateway()
+    server, port = _http_target(tmp_path)
+    monkeypatch.setattr(fa, "scan_listening_ports",
+                        lambda: _listeners({port: "node"}))
+    agent = _agent(tmp_path, gw)
+    try:
+        before = time.time()
+        agent.scan_once()
+        assert before <= _store(tmp_path)[str(port)]["registered_at"] <= time.time()
+    finally:
+        server.shutdown()
+        agent.stop()
+        gw.stop()
+
+
+def test_lease_past_max_age_is_refreshed_while_app_is_live(tmp_path, monkeypatch):
+    """Backstop: an over-age watcher lease is released; a genuinely live app is
+    simply re-registered by the same scan (new lease), not banned."""
+    gw = _FakeGateway()
+    server, port = _http_target(tmp_path)
+    _seed_store(tmp_path, port, registered_at=time.time() - 7200)
+    monkeypatch.setattr(fa, "scan_listening_ports",
+                        lambda: _listeners({port: "node"}))
+    agent = _agent(tmp_path, gw, lease_max_age=3600.0)
+    try:
+        agent.scan_once()
+        assert "lease_old" in gw.closed
+        entry = _store(tmp_path)[str(port)]
+        assert entry["lease_id"] != "lease_old"
+        assert time.time() - entry["registered_at"] < 60
+    finally:
+        server.shutdown()
+        agent.stop()
+        gw.stop()
+
+
+def test_lease_past_max_age_stays_released_when_app_is_gone(tmp_path, monkeypatch):
+    gw = _FakeGateway()
+    _seed_store(tmp_path, 59999, registered_at=time.time() - 7200)
+    monkeypatch.setattr(fa, "scan_listening_ports", lambda: _listeners({}))
+    agent = _agent(tmp_path, gw, lease_max_age=3600.0)
+    try:
+        agent.scan_once()
+        assert "lease_old" in gw.closed
+        assert _store(tmp_path) == {}
+    finally:
+        agent.stop()
+        gw.stop()
+
+
+def test_lease_within_max_age_is_kept(tmp_path, monkeypatch):
+    gw = _FakeGateway()
+    server, port = _http_target(tmp_path)
+    _seed_store(tmp_path, port, registered_at=time.time() - 10)
+    monkeypatch.setattr(fa, "scan_listening_ports",
+                        lambda: _listeners({port: "node"}))
+    agent = _agent(tmp_path, gw, lease_max_age=3600.0)
+    try:
+        agent.scan_once()
+        assert "lease_old" not in gw.closed
+        assert _store(tmp_path)[str(port)]["lease_id"] == "lease_old"
+    finally:
+        server.shutdown()
+        agent.stop()
+        gw.stop()
+
+
+def test_max_age_zero_disables_the_backstop(tmp_path, monkeypatch):
+    gw = _FakeGateway()
+    server, port = _http_target(tmp_path)
+    _seed_store(tmp_path, port, registered_at=1.0)
+    monkeypatch.setattr(fa, "scan_listening_ports",
+                        lambda: _listeners({port: "node"}))
+    agent = _agent(tmp_path, gw, lease_max_age=0.0)
+    try:
+        agent.scan_once()
+        assert "lease_old" not in gw.closed
+    finally:
+        server.shutdown()
+        agent.stop()
+        gw.stop()
+
+
+def test_legacy_entry_without_registration_time_is_stamped_not_released(
+        tmp_path, monkeypatch):
+    gw = _FakeGateway()
+    server, port = _http_target(tmp_path)
+    _seed_store(tmp_path, port, registered_at=None)
+    monkeypatch.setattr(fa, "scan_listening_ports",
+                        lambda: _listeners({port: "node"}))
+    agent = _agent(tmp_path, gw, lease_max_age=3600.0)
+    try:
+        agent.scan_once()
+        assert "lease_old" not in gw.closed
+        assert _store(tmp_path)[str(port)]["registered_at"] > 0
+    finally:
+        server.shutdown()
+        agent.stop()
+        gw.stop()

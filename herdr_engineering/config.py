@@ -160,6 +160,9 @@ DEFAULTS: dict[str, Any] = {
         "agent_deny_processes": None,
         # Release a forwarded lease once its loopback app has been down this long.
         "agent_orphan_grace_seconds": 60,
+        # Backstop: release a watcher lease this old (a live app re-registers on
+        # the next scan, i.e. a refresh). 0 disables. Default 24h.
+        "agent_lease_max_age_seconds": 86400,
         "agent_web_port_min": 1024,
         "agent_ephemeral_min": 32768,
         # The auto-registration agent reports every discovered service to this
