@@ -680,7 +680,7 @@ def test_native_cargo_output_is_removed_while_dirty_source_and_cli_evidence_surv
     )
     assert result.returncode == 0, result.stderr
     report = json.loads(result.stdout)
-    assert report["removed_count"] == 1
+    assert report["removed_count"] == 1, json.dumps(report, indent=2, default=str)
     assert report["removed_bytes"] > 0
     assert not (repo / "target").exists()
     assert source.read_bytes() == expected
