@@ -11,6 +11,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from tests.e2e.pg import ThrowawayPostgres
+
 ROOT = Path(__file__).resolve().parents[1]
 PARALLEL = ROOT / "scripts" / "ci" / "pytest-parallel.sh"
 RERUN = ROOT / "scripts" / "ci" / "pytest-rerun.sh"
@@ -165,7 +167,9 @@ def test_the_gate_uses_the_concurrent_helper_with_both_passes_under_the_watchdog
     assert tail and all("python -m pytest" in ln for ln in tail), "the tail must use `python -m pytest`, never bare `pytest`"
 
 
-def test_the_slow_tests_own_database_and_tmp_dirs_cannot_collide_with_the_workers() -> None:
+def test_the_slow_tests_own_database_and_tmp_dirs_cannot_collide_with_the_workers(tmp_path: Path) -> None:
     """Why concurrency is safe: the one slow test starts its own throwaway PostgreSQL on a unix socket in a pid-named mkdtemp dir."""
     source = (ROOT / "tests" / "e2e" / "pg.py").read_text()
-    assert "mkdtemp(prefix=f\"t16pg-{os.getpid()}-\")" in source and "listen_addresses=''" in source
+    assert "mkdtemp(prefix=f\"t16pg-{os.getpid()}-\")" in source
+    options = ThrowawayPostgres(Path("/nonexistent"), tmp_path)._options()
+    assert "unix_socket_directories=" in options, options   # socket-only: no TCP port to collide with the workers' clusters

@@ -39,8 +39,15 @@ def calm_host(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.Monk
 def args_with(cpus: int | None = None, **env: str) -> list[str]:
     """The helper's arguments; `cpus` restricts the real CPU affinity (taskset) so a 4/8/16-CPU host is simulated without a fake."""
     exports = "".join(f"export {k}={v}; " for k, v in env.items())
+    pin: list[str] = []
+    if cpus:
+        # Pin to the first `cpus` of the CPUs this process may really use: a Slurm cpuset need not contain CPUs 0..N-1.
+        allowed = sorted(os.sched_getaffinity(0))
+        if len(allowed) < cpus:
+            pytest.skip(f"needs {cpus} allowed CPUs to simulate a {cpus}-CPU host; this process may use only {len(allowed)}")
+        pin = ["taskset", "-c", ",".join(str(c) for c in allowed[:cpus])]
     done = subprocess.run(
-        [*(["taskset", "-c", f"0-{cpus - 1}"] if cpus else []), "bash", "-c", f'unset HERDR_PYTEST_WORKERS HERDR_PYTEST_MAXPROCESSES; {exports}. "{HELPER}"; herdr_pytest_parallel_args'],
+        [*pin, "bash", "-c", f'unset HERDR_PYTEST_WORKERS HERDR_PYTEST_MAXPROCESSES; {exports}. "{HELPER}"; herdr_pytest_parallel_args'],
         capture_output=True, text=True, cwd=ROOT,
     )
     assert done.returncode == 0, done.stderr
@@ -830,9 +837,11 @@ def test_a_small_cgroup_quota_still_caps_workers_whatever_the_load(tmp_path: Pat
     assert args_with(16, **env, **loadavg(tmp_path, 155.0))[:2] == ["-n", "2"]
 
 
+@needs_16_cpus
 def test_the_default_cap_stays_eight_until_a_twelve_worker_run_is_measured(tmp_path: Path) -> None:
     for cpus in (4, 8, 16, 24):
-        assert "--maxprocesses=8" in args_with(cpus) or cpus > VISIBLE
+        if cpus <= VISIBLE:
+            assert "--maxprocesses=8" in args_with(cpus)
     assert "--maxprocesses=5" in args_with(16, HERDR_PYTEST_MAXPROCESSES="5")  # the override still wins
     assert "--maxprocesses=12" in args_with(16, HERDR_PYTEST_MAXPROCESSES="12")
     assert "--maxprocesses=8" in args_with(16, HERDR_PYTEST_MAXPROCESSES="")   # empty means the default again
