@@ -141,7 +141,7 @@ def names(d):
 
 
 def test_disabled_does_nothing(tmp_path):
-    out = pol.run_eviction(validate(None), tmp_path / "st", apply=True)
+    out = pol.run_eviction(validate({"enabled": False}), tmp_path / "st", apply=True)
     assert out == {"enabled": False}
     assert not (tmp_path / "st").exists()
 
@@ -362,7 +362,7 @@ def _sparse(tmp_path):
 
 
 def test_cli_disabled_is_inert(tmp_path):
-    r = _cli(tmp_path, ["build-cache-evict", "--apply", "--json"])
+    r = _cli(tmp_path, ["build-cache-evict", "--apply", "--json"], "fabric_build_cache:\n  enabled: false\n")
     assert r.returncode == 0 and json.loads(r.stdout) == {"enabled": False}
     assert not (tmp_path / "st").exists()
 
@@ -386,7 +386,7 @@ def test_cli_status_suggests_but_never_changes_slots_by_default(tmp_path):
     out = json.loads(r.stdout)
     sg = out["slot_suggestion"]
     assert sg["advisory"] is True and 1 <= sg["recommended"] <= 4
-    r2 = _cli(tmp_path, ["build-coordinate", "--status", "--json"])
+    r2 = _cli(tmp_path, ["build-coordinate", "--status", "--json"], "fabric_build_cache:\n  enabled: false\n")
     assert "slot_suggestion" not in json.loads(r2.stdout)
     assert json.loads(r2.stdout)["slots"] == out["slots"]  # effective count unchanged
 

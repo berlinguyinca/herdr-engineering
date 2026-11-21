@@ -5,13 +5,13 @@ import json
 import os
 import plistlib
 import re
-import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID
 
+from .disk_guard import measure
 from .errors import InvalidError
 
 
@@ -110,8 +110,9 @@ def _candidate(tier: StorageTier, min_free_percent: float) -> StorageCandidate:
     try:
         if not os.access(probe, os.W_OK):
             return StorageCandidate(tier.name, None, "not_writable")
-        usage = shutil.disk_usage(probe)
-        if usage.total and 100 * usage.free / usage.total < min_free_percent:
+        # The one disk figure (df: reserved blocks are neither used nor available), shared with the guard and
+        # the cleanup, so "full" means the same thing in all three.
+        if 100 - measure(probe)[0] < min_free_percent:
             return StorageCandidate(tier.name, None, "low_free_disk")
     except OSError:
         return StorageCandidate(tier.name, None, "storage_unavailable")

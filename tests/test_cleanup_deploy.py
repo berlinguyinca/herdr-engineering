@@ -44,8 +44,8 @@ def test_cleanup_is_linux_user_service_and_never_overwrites_policy():
 
 
 @pytest.mark.parametrize("policy,expected", [
-    ({}, False),
-    ({"enabled": True}, False),
+    ({}, True),
+    ({"enabled": True}, True),
     ({"enabled": False, "roots": ["/projects"]}, False),
     ({"enabled": "false", "roots": ["/projects"]}, False),
     ({"enabled": True, "roots": "/projects"}, False),
