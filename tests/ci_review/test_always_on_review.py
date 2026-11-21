@@ -1169,7 +1169,120 @@ def test_a_repo_with_no_clone_and_no_reachable_remote_is_a_failure_not_a_wrong_r
 
 
 @pytest.mark.parametrize("bad", ["clones: [{repo: nope, path: /x}]", "clones: [{repo: a/b}]", "clones: x",
-                                 "clone_url: https://github.com/fixed.git", "clone_url: ''"])
+                                 "clone_url: https://github.com/fixed.git", "clone_url: ''", "clone_url: -x{repo}"])
 def test_a_bad_clones_or_clone_url_is_refused(env, bad):
     env.config(extra=bad + "\n")
     assert env.review("tier2") == 2 and env.reviewer_calls() == []
+
+
+# ---------------- a failing advisory tier 1 never keeps Opus from running ----------------
+
+def test_review_all_tiers_still_posts_opus_when_tier_one_fails(env):
+    env.config(post=True)
+    env.reviewer("pi", exit=1)
+    rc = env.run("review", "--repo", REPO, "--pr", "7", post=True)
+    assert rc == 1                                    # the failure is reported ...
+    posted = env.statuses_posted()
+    assert any(s["context"] == "Opus agent review" and s["state"] == "success" for s in posted), posted   # ... not fatal
+
+
+# ---------------- one review at a time on a host, whoever starts it ----------------
+
+def _hold_host_slot(env):
+    cfg = env.mod.load_config(str(env.cfg_path))
+    return env.mod.ai.lock(cfg, "host-review")
+
+
+def test_a_taken_host_slot_skips_the_review_by_default(env):
+    held = _hold_host_slot(env)
+    try:
+        assert env.review("tier2") == 4
+        assert env.reviewer_calls() == []
+    finally:
+        held.close()
+    assert env.review("tier2") == 0 and len(env.reviewer_calls()) == 1
+
+
+def test_a_wait_for_the_host_slot_that_runs_out_is_a_failure(env):
+    held = _hold_host_slot(env)
+    try:
+        t = time.monotonic()
+        assert env.review("tier2", "--host-lock-wait", "1") == 1
+        assert 0.9 <= time.monotonic() - t < 15 and env.reviewer_calls() == []
+    finally:
+        held.close()
+
+
+def test_the_timer_sweep_also_takes_the_host_slot(env):
+    env.config(extra=f"repos: [{REPO}]\nbackfill: true\n")
+    held = _hold_host_slot(env)
+    try:
+        env.run("poll")
+        assert env.reviewer_calls() == []
+    finally:
+        held.close()
+    env.run("poll")
+    assert env.reviewer_calls() != []
+
+
+# ---------------- what a killed review leaves behind is cleaned at the next start ----------------
+
+def test_stale_worktrees_and_refs_of_a_killed_review_are_removed(env, tmp_path):
+    stale = tmp_path / "state" / "worktrees" / "pr9-deadbeef-abc"
+    sh("git", "worktree", "add", "--detach", "-q", str(stale), env.head, cwd=env.clone)
+    sh("git", "update-ref", "refs/herdr-review/pr-9", env.head, cwd=env.clone)
+    assert str(stale) in "\n".join(env.worktrees())
+    assert env.review("tier2") == 0
+    assert not stale.exists()
+    assert str(stale) not in "\n".join(env.worktrees())
+    assert sh("git", "for-each-ref", "refs/herdr-review", cwd=env.clone) == ""
+
+
+# ---------------- a reviewer never outlives the process that started it ----------------
+
+def _alive(pid: int) -> bool:
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
+    except OSError:
+        return False
+
+
+def test_a_killed_parent_takes_the_reviewer_with_it(tmp_path):
+    pidfile = tmp_path / "pid"
+    code = (
+        "import importlib.util, sys\n"
+        f"spec = importlib.util.spec_from_file_location('aor', {str(SCRIPT)!r})\n"
+        "m = importlib.util.module_from_spec(spec); sys.modules['aor'] = m; spec.loader.exec_module(m)\n"
+        f"m.run_reviewer(['sh', '-c', 'echo $$ > {pidfile}; exec sleep 300'], m.Path('.'), None, 600)\n")
+    parent = subprocess.Popen([sys.executable, "-c", code], cwd=tmp_path)
+    for _ in range(100):
+        if pidfile.exists() and pidfile.read_text().strip():
+            break
+        time.sleep(0.1)
+    pid = int(pidfile.read_text())
+    assert _alive(pid)
+    parent.kill()                                     # SIGKILL: no handler runs, as when a CI cancel ends the step
+    parent.wait()
+    for _ in range(80):
+        if not _alive(pid):
+            break
+        time.sleep(0.1)
+    assert not _alive(pid), "the reviewer outlived the process that started it"
+
+
+def test_a_finished_reviewer_leaves_no_watchdog_behind(env, tmp_path):
+    assert env.review("tier2") == 0
+    out = subprocess.run(["pgrep", "-fc", "os.killpg\\(group, 0\\)"], capture_output=True, text=True).stdout.strip()
+    assert out in ("0", "")
+
+
+def test_the_managed_clone_resets_inherited_credential_helpers_first(env, tmp_path):
+    origin, head, diff = _second_repo(tmp_path)
+    _name_clone_as_github(env)
+    _point_gh_at(env, head, diff)
+    env.config(extra=f"clone_url: file://{tmp_path}/{{repo}}.git\n", wait=False)
+    assert _review_gadget(env) == 0
+    managed = tmp_path / "state" / "clones" / "acme__gadget.git"
+    listed = sh("git", "config", "--local", "--list", cwd=managed).splitlines()
+    assert [x for x in listed if x.startswith("credential.helper=")] == ["credential.helper=",
+                                                                           "credential.helper=!gh auth git-credential"]

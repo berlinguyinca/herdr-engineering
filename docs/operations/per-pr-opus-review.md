@@ -4,13 +4,14 @@ The required commit status `Opus agent review` is posted for each pull request h
 PR event, instead of waiting for a polling timer. One tiny YAML per repo; the logic lives once on the review host.
 
 ```
-GitHub PR event -> Woodpecker (label review-host) -> herdr-opus-review -> always-on-review.py review --post
-                                                                      -> status "Opus agent review" on the head SHA
+GitHub PR event -> Woodpecker (label review-host) -> /usr/local/bin/herdr-opus-review -> always-on-review.py review --post
+                                                                                     -> status "Opus agent review" on the head SHA
 ```
 
 The review itself is `deploy/ci-review/always-on-review.py` (Opus read-only in a detached worktree of the PR head, the
 script and not the model decides the state). See `deploy/ci-review/README.md` and
-`docs/operations/independent-ai-review.md`.
+`docs/operations/independent-ai-review.md`. Checked against Woodpecker 3.20.1 (`woodpecker-cli lint --strict` is part of
+the tests when the CLI is installed).
 
 ## (a) The YAML other repos copy
 
@@ -18,7 +19,7 @@ Save as `.woodpecker/opus-review.yaml`, unchanged:
 
 ```yaml
 when:
-  - event: pull_request
+  - event: [pull_request, pull_request_metadata]
 labels:
   review-host: "true"
 concurrency:
@@ -32,82 +33,141 @@ steps:
       OPUS_REVIEW_GITHUB_TOKEN:
         from_secret: opus_review_github_token
     commands:
-      - '"$HOME/.local/bin/herdr-opus-review"'
+      - /usr/local/bin/herdr-opus-review
 ```
 
 Why each line:
 
-- `pull_request` fires for opened, synchronized (new push) and reopened. A new push moves the head, so the status for
-  the old head goes stale and the new event reviews the new head.
+- `pull_request` fires for opened, synchronized (new push) and reopened. `pull_request_metadata` fires for edits that
+  are not a push: a title or label change and, importantly, **a draft marked ready for review**, which does not match
+  `event: pull_request`. It is included because a draft head is skipped by the review and nothing else would trigger it
+  again. The cost is a short pipeline per metadata edit; the review exits at once when the head already has a terminal
+  status. The secret must therefore be allowed for both events (step 3).
 - `labels: review-host` pins it to the review host's agent, never the hive-heavy pool (that is for the test suites).
-- `concurrency` limit 1 queues reviews in the repo. The wrapper also takes a host-wide lock, so reviews of different
-  repos never run together either (they share one Claude login and one slot).
-- `skip_clone: true`: nothing from the PR is checked out or run by the pipeline. The reviewer reads the PR head in its own
-  read-only worktree (`Read`, `Grep`, `Glob` only, no shell).
+- `concurrency` limit 1 queues reviews in the repo. The review script also takes a host-wide lock, so reviews of
+  different repos, and the hourly sweep, never run together (they share one Claude login and one model slot).
+- `skip_clone: true`: the pipeline itself checks out nothing. The reviewer reads the PR head in its own worktree.
 - `image: bash` names an executable on the agent, as in the other `.woodpecker/*.yml` files (local backend, no container).
+- The command is an **absolute path** and does not use `$HOME`: the local backend replaces `$HOME` with a throwaway
+  directory by default (`WOODPECKER_BACKEND_LOCAL_ISOLATED_HOME=true`). The wrapper looks up the real home itself.
+  You may set that option to `false`, but nothing here depends on it.
 
 ## (b) One-time operator steps
 
 Nothing here is automated, and no secret value belongs in any file or log.
 
-1. **Install the wrapper and config on the review host** (the host with `gh`, `git`, `flock`, the `claude` login and
-   pi configured; interim host: beast):
+1. **Install the wrapper and config on the review host** (the host with `gh`, `git`, the `claude` login and pi
+   configured; interim host: beast). As the user the agent will run as:
 
    ```bash
-   ln -s <checkout>/scripts/ci/opus-review.sh ~/.local/bin/herdr-opus-review
+   sudo ln -s <checkout>/scripts/ci/opus-review.sh /usr/local/bin/herdr-opus-review
    mkdir -p ~/.config/herdr-engineering
    cp <checkout>/deploy/ci-review/always-on-review.example.yaml ~/.config/herdr-engineering/always-on-review.yaml
    # edit it: post: true, state_dir, prompt.checklist_file (absolute path), tiers.tier2 (model opus)
    ```
 
-   The agent runs as the user that owns `~/.local/bin` and the Claude login. Keep the checkout current (`git pull`):
-   the symlink runs whatever it contains. Do not point it at a checkout that runs PR branches.
-2. **Register a Woodpecker agent on that host with the label `review-host=true`** (agent config
-   `WOODPECKER_AGENT_LABELS=review-host=true`; use `WOODPECKER_MAX_WORKFLOWS=1`; backend `local`). It must not
-   carry `cluster=hive-heavy`. Restart the agent and check that it shows up in the server's agent list with the label.
-3. **Add the secret `opus_review_github_token`** in Woodpecker, at user or global scope so every enrolled repo
-   inherits it, limited to the `pull_request` event. Its value is a GitHub token that can write commit statuses and PR
-   comments on the enrolled repos (fine-grained: Commit statuses RW, Pull requests RW, Contents R; or a classic token
-   with `repo`). It is the only secret this pipeline uses: the Claude login and the pi key already live on the host.
-   Do not give the secret to `push`, `manual` or `cron` events.
-4. **Enroll a repo**: activate it in Woodpecker (webhook), copy the YAML above into `.woodpecker/opus-review.yaml`,
-   and make `Opus agent review` a required status in its ruleset when ready. Nothing else per repo: the review
-   creates its own bare clone under `state_dir/clones/` on first use (or set `clones:` in the config).
-5. **Keep the timer as a backup**: `cp deploy/ci-review/herdr-always-on-review.{service,timer} ~/.config/systemd/user/`
-   (now hourly). It only catches missed webhooks; a head that already has a terminal status is not reviewed twice.
+   The wrapper reads the config, the state directory and the `gh` and Claude logins from that user's real home (passwd
+   entry), whatever `$HOME` the step has. The symlink runs whatever the checkout contains: keep it on `main` and never
+   point it at a checkout that runs PR branches.
+2. **Register a Woodpecker agent that takes ONLY labelled work.** `WOODPECKER_AGENT_LABELS=review-host=true` only adds a
+   label: the agent would still take unlabelled workflows (structural-gates, artifact-handoff, ...) and run them next
+   to the Claude login and the token. Use the required form, a leading `!`:
+
+   ```
+   WOODPECKER_AGENT_LABELS=!review-host=true
+   WOODPECKER_MAX_WORKFLOWS=1
+   WOODPECKER_BACKEND=local
+   ```
+
+   With `!review-host=true` the server (`server/scheduler/filter.go`, `requiredLabelsMissing`, in 3.20.1) hands the agent a
+   workflow only if it carries `review-host: "true"`; a workflow without that label never reaches it. The agent must
+   not carry `cluster=hive-heavy`. Restart it, then check the agent list shows the label.
+3. **Add the secret `opus_review_github_token`** in Woodpecker at user or global scope, allowed for the events
+   `pull_request` and `pull_request_metadata` only. Its value is a GitHub token that can write commit statuses and PR
+   comments on the enrolled repos (fine-grained: Commit statuses RW, Pull requests RW, Contents R). It is the only
+   secret this pipeline uses: the Claude login and the pi key already live on the host.
+4. **Set the repo options** for every enrolled repo (see fork safety below): require approval for **all** pull
+   requests, and set the pipeline timeout (repo settings) to at least the wrapper's lock wait plus the tier time caps:
+   default 1800 s wait + `tiers.tier1.time_cap_s` 900 + `tiers.tier2.time_cap_s` 3600 = 6300 s, so **at least 110 minutes,
+   120 recommended**. Woodpecker's default timeout is shorter and would cancel a long review.
+   Lower the wrapper's `--lock-wait` (it is passed to `review --host-lock-wait`) if you lower the timeout; the wait must
+   always stay below it.
+5. **Enroll a repo**: activate it in Woodpecker (webhook), copy the YAML above into `.woodpecker/opus-review.yaml`, and
+   make `Opus agent review` a required status in its ruleset when ready. Nothing else per repo: the review creates its
+   own bare clone under `state_dir/clones/` on first use (or set `clones:` in the config).
+6. **Keep the timer as a backup**: `cp deploy/ci-review/herdr-always-on-review.{service,timer} ~/.config/systemd/user/`
+   (now hourly). It only catches missed webhooks; a head that already has a terminal status is not reviewed twice, and it
+   takes the same host-wide slot as the pipeline reviews (one review at a time per host), skipping a PR when the slot is
+   busy and trying again an hour later.
 
 ### Verify
 
+- Agent label: create a throwaway workflow without `labels:` in a test repo and confirm it is never picked up by this
+  agent (the agent log shows no task), while `opus-review` is. Also `woodpecker-cli lint --strict .woodpecker/opus-review.yaml`.
 - On the host, with a throwaway token in the environment of the command, not on any command line:
-  `CI_PIPELINE_EVENT=pull_request CI_REPO=<owner/repo> CI_COMMIT_PULL_REQUEST=<n> OPUS_REVIEW_GITHUB_TOKEN=... herdr-opus-review`
-  (with `post: false` in the config it is a dry run: it writes `reviews.jsonl` and posts nothing).
-- Open a draft-free test PR in an enrolled repo. Within a minute the `opus-review` workflow starts on the review host
-  and the PR shows `Opus agent review` as `pending`, then `success` or `failure`, on the head SHA.
+  `CI_PIPELINE_EVENT=pull_request CI_REPO=<owner/repo> CI_COMMIT_PULL_REQUEST=<n> OPUS_REVIEW_GITHUB_TOKEN=... /usr/local/bin/herdr-opus-review`
+  (with `post: false` in the config it is a dry run: it writes `reviews.jsonl` and posts nothing). Run it with
+  `HOME=/nonexistent` too: it must still find the config.
+- Open a test PR in an enrolled repo. Within a minute the `opus-review` workflow starts on the review host and the PR
+  shows `Opus agent review` as `pending`, then `success` or `failure`, on the head SHA.
 - Push another commit: the old status is replaced by a review of the new head.
-- A PR from a fork must show the workflow ending in "no opus_review_github_token was injected" or "comes from a fork",
-  exit 0, and no status.
+- Cancel a running pipeline: no `claude` process of the review is left (`pgrep -af 'claude.*--model'`) and
+  `state_dir/worktrees/` is empty after the next review starts.
 - `~/.local/state/herdr-review/reviews.jsonl` has one line per review, with cost and duration.
 
-## (c) Fork safety
+## (c) Fork safety: read this before enrolling a repo
 
-- The token is a write credential, so the review must never see attacker-controlled code with it, and no PR code runs
-  in the pipeline. The workflow does not check out anything; the reviewer runs read-only tools in a worktree and its
-  environment is scrubbed (no `GH_TOKEN`, no API keys). The diff and PR text are untrusted prompt input.
-- Fork PRs are skipped in three independent ways: the secret is limited to the `pull_request` event and Woodpecker
-  injects no secret into a fork's pipeline (so the wrapper sees no token and exits 0); the wrapper asks GitHub whether
-  the head is in a fork (`isCrossRepository`) and exits 0 if so; and a question it cannot answer is an error, never
-  a review. In Woodpecker, leave the repo's "trusted" and fork-approval settings at their defaults.
-- Do not widen the secret to other events or to `workflow` files you do not control, and do not run this step from
-  `pull_request_closed` or `push`. A PR can edit `.woodpecker/opus-review.yaml` itself: Woodpecker runs the
-  pull request's version of the file, so require approval for workflow changes from non-members, and keep the host's
-  `claude` and `gh` logins minimal for that reason.
-- The wrapper takes the token only from `opus_review_github_token`; an ambient `GH_TOKEN` or `GITHUB_TOKEN` on the agent is
-  unset and never used.
+Woodpecker 3.20.1 does **not** keep the secret from fork pull requests. A secret is filtered by event (and by plugin
+image), nothing more. A pull request from a fork gets the secret and runs **its own copy of the workflow file** on the
+review host, in the agent's user account, once it is approved to run. That is arbitrary code from the fork's author,
+next to the status token, the `gh` login and the Claude login. The pipeline does not check out the PR, but a PR can
+replace `.woodpecker/opus-review.yaml` (or any workflow) with anything. (A missing secret is a compile error, not an
+empty value, so there is no "no token for forks" fallback either.)
+
+- **The real control** is the repo setting **require approval for all pull requests** (not just first-time or fork
+  contributors), set for each enrolled repo. Nothing runs on the review host until a maintainer approves that PR's
+  pipeline.
+- **Approving a pull request's pipeline approves its code on the review host, with the token.** For a PR from a fork that
+  means arbitrary code from outside the organization. Approve a fork PR only after reading its changes to `.woodpecker/`
+  and treating it as if you had run it yourself. Prefer not to approve fork PRs on enrolled repos at all.
+- Pull requests from branches of the repo itself are trusted to the extent their authors have push access: they can
+  also rewrite the workflow. Keep the token's scope to commit statuses and PR comments, and keep this host's `claude`
+  and `gh` logins minimal for the same reason.
+- The wrapper's check is only a safety net: `gh pr view --jq .isCrossRepository` must print exactly `false`. `true` ends
+  the step without a review, anything else (an error, a different answer) fails the step. It cannot stop a malicious
+  workflow, which does not call the wrapper.
+- Inside a review the reviewer runs read-only tools: the claude tier has `Read`, `Grep` and `Glob` only (no shell); the
+  pi tier has `read,grep,find,ls` and has no file sandbox, so it needs `backends.pi.wrapper` to be sandboxed (see the
+  README). The diff and PR text are untrusted prompt input. The reviewer's environment is scrubbed: no `GH_TOKEN`, no API
+  keys. Only the wrapper, `gh` and the PR fetch see the token.
+- The wrapper uses the token only from `opus_review_github_token`; an ambient `GH_TOKEN` or `GITHUB_TOKEN` on the agent
+  is unset and never used.
+
+## Behavior to know
+
+- **Exit 4 and 3 become exit 0.** The review exits 4 when it did nothing and that is expected: the head already has a
+  terminal status, another run holds the PR, or the host's review slot is taken (with `--host-lock-wait 0`). It also
+  exits 4 for a draft PR, a failure cooldown, an exhausted daily budget, a disabled tier or, with
+  `gates.wait_for_green`, gates that are not green. The wrapper cannot tell these apart, so a green pipeline does **not**
+  prove a review happened: the status on the head is the truth. The hourly sweep retries what can be retried. Exit 3 means
+  the head moved; the push that moved it starts its own review. Exit 1 (failed or a lock wait that ran out) and 2 (refused)
+  stay red and leave the status `pending`.
+- **Tiers.** `review` runs tier 1 (advisory) and tier 2 (the required status) independently: a failing tier 1 is
+  reported in the exit code but never stops Opus.
+- **Cancelled pipelines.** Woodpecker cancels by killing the step's process group, and the reviewer runs in its own
+  session. A small watchdog process kills the reviewer's whole group when the review process disappears, however it was
+  stopped, and the next review (holding the host slot) removes leftover worktrees and `refs/herdr-review/*` in every
+  clone. The pipeline timeout must be at least the sum in step 4, otherwise Woodpecker cancels a review that was only slow.
+- **Shared clones.** The review's refs are named by PR number (`refs/herdr-review/pr-N`), so two repos must never share
+  one clone directory; the managed clones are one per repo. Managed clone names are case-sensitive on disk
+  (`Owner__Name.git`); use one spelling of the repo name in enrollment.
+- **Draft PRs** are skipped until marked ready, which arrives as `pull_request_metadata` (included in the YAML above).
 
 ## When it does not post
 
-- Pipeline red with `config not readable` or `review script not found`: step 1 is incomplete.
+- Pipeline red with `config not readable`, `review script not found` or `cannot determine the home directory`: step 1 is
+  incomplete. Exit 127 means `/usr/local/bin/herdr-opus-review` is missing.
 - Status stays `pending`: the review could not finish (time cap, bad answer, Claude not logged in). See the pipeline log
   and `reviews.jsonl`; the hourly sweep retries it once the pending status is stale, and the failure cooldown applies.
-- No pipeline at all: the agent label or the webhook (Woodpecker server log) is the problem; the timer sweep reviews
-  the head within the hour.
+- No pipeline at all: the agent label or the webhook (Woodpecker server log) is the problem; the timer sweep reviews the
+  head within the hour.

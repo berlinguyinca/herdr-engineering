@@ -1,6 +1,6 @@
 # Example user unit (not installed by anything; the operator installs it). Host-agnostic: the interim host is beast,
 # a dedicated node later. It runs as the operator: `gh`, the Claude Code login and ~/.pi/agent/models.json are theirs.
-# One review at a time (a lock), no GPU use, no change to any serving unit.
+# One review at a time per host (the same host lock the Woodpecker pipeline takes; a busy slot skips the PR until the next sweep), no GPU use, no change to any serving unit.
 #   cp deploy/ci-review/herdr-always-on-review.{service,timer} ~/.config/systemd/user/
 #   systemctl --user daemon-reload && systemctl --user enable --now herdr-always-on-review.timer
 #   loginctl enable-linger "$USER"

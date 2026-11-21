@@ -86,6 +86,8 @@ DEFAULTS: dict = {
                                         # are left alone; True restores reviewing every open PR of a newly listed repo
     "max_comments_per_hour": None,      # None = no cap; else PR comments this script posts per rolling hour
     "post": False,                      # with the --post flag, the second of the two keys that allow any posting
+    "host_lock_wait_s": 0,              # seconds a review waits for the host's one review slot (0: skip when taken);
+                                        # set per run by `review --host-lock-wait`, not a YAML key
     "clone": "",                        # a clone the claude/pi backends create read-only worktrees from (for the repo its
                                         # origin names; any other repo gets `clones` or a managed clone, see clone_for_review)
     "clones": [],                       # [{repo: OWNER/NAME, path: DIR}]: the clone to use for that repo
@@ -255,7 +257,7 @@ def _check_passes_and_replay(cfg: dict) -> None:
             or not ai.REPO_RE.fullmatch(c["repo"]) or not isinstance(c["path"], str) or not c["path"] for c in cl):
         raise Refused("config: clones must be a list of {repo: OWNER/NAME, path: DIR}")
     cu = cfg["clone_url"]
-    if not isinstance(cu, str) or cu.count("{repo}") != 1 or any(ch in cu for ch in " \t\n\r") or "@" in cu.split("{repo}")[0]:
+    if not isinstance(cu, str) or cu.count("{repo}") != 1 or any(ch in cu for ch in " \t\n\r") or "@" in cu.split("{repo}")[0] or cu.startswith("-"):
         raise Refused("config: clone_url must be a URL with exactly one {repo} and no credentials")
     rv = cfg["replay"]["reviewers"]
     if not isinstance(rv, list) or not all(isinstance(x, str) and x for x in rv):
@@ -884,6 +886,23 @@ def child_env() -> dict[str, str]:
     return {k: os.environ[k] for k in CHILD_ENV_KEYS if k in os.environ}
 
 
+# Runs next to a reviewer, in the reviewer's session: when the process that started the reviewer is gone for any reason
+# (a CI cancel that kills only the pipeline's own process group, SIGKILL, a crash) it kills the reviewer's whole group.
+WATCHDOG = (
+    "import os,signal,sys,time\n"
+    "parent, group = int(sys.argv[1]), int(sys.argv[2])\n"
+    "while os.getppid() == parent:\n"
+    "    try:\n"
+    "        os.killpg(group, 0)\n"
+    "    except ProcessLookupError:\n"
+    "        sys.exit(0)\n"
+    "    time.sleep(0.5)\n"
+    "try:\n"
+    "    os.killpg(group, signal.SIGKILL)\n"
+    "except ProcessLookupError:\n"
+    "    pass\n")
+
+
 def run_reviewer(argv: list[str], cwd: Path, stdin: str | None, time_cap_s: float) -> tuple[str, float]:
     """The one subprocess boundary: scrubbed env, own process group (killed whole on the time cap), bounded output."""
     t = time.monotonic()
@@ -893,12 +912,18 @@ def run_reviewer(argv: list[str], cwd: Path, stdin: str | None, time_cap_s: floa
                              start_new_session=True)
     except OSError as e:
         raise ReviewFailed(f"cannot start {argv[0]}: {type(e).__name__}") from None
+    dog = subprocess.Popen([sys.executable, "-c", WATCHDOG, str(os.getpid()), str(p.pid)], env=child_env(),
+                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           start_new_session=True)
     try:
         out, err = p.communicate(stdin.encode() if stdin is not None else None, timeout=time_cap_s)
     except subprocess.TimeoutExpired:
         os.killpg(p.pid, signal.SIGKILL)
         p.communicate()
         raise ReviewFailed(f"the review took longer than the time cap ({time_cap_s:.0f}s); killed") from None
+    finally:
+        dog.kill()
+        dog.wait()
     if p.returncode != 0:
         tail = ai.redact(err.decode("utf-8", "replace")[-300:]).replace("\n", " ")
         raise ReviewFailed(f"{Path(argv[0]).name} exited {p.returncode}: {tail}")
@@ -1662,9 +1687,12 @@ def managed_clone(cfg: dict, repo: str) -> Path:
         fcntl.flock(lk, fcntl.LOCK_EX)
         if not is_git_clone(path):
             shutil.rmtree(path, ignore_errors=True)
-            git(["clone", "--bare", "--quiet", "--no-tags", "-c", "credential.helper=!gh auth git-credential",
-                 cfg["clone_url"].replace("{repo}", repo), str(path)], root, auth=True)
-            git(["config", "credential.helper", "!gh auth git-credential"], path)
+            # `-c credential.helper=` first resets any helper from the user's global config, so a `store` or `cache`
+            # helper never gets to keep the token; only gh's helper is asked.
+            git(["-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential", "clone", "--bare",
+                 "--quiet", "--no-tags", "--", cfg["clone_url"].replace("{repo}", repo), str(path)], root, auth=True)
+            git(["config", "--replace-all", "credential.helper", ""], path)
+            git(["config", "--add", "credential.helper", "!gh auth git-credential"], path)
     return path
 
 
@@ -1922,6 +1950,43 @@ def upsert_comment(gh, repo: str, n: int, context: str, body: str, mk: str | Non
 
 # ---------------- one review ----------------
 
+def host_lock(cfg: dict, wait_s: float):
+    """The host-wide review slot: one review at a time per host, whoever started it (a Woodpecker step, the timer sweep,
+    a person). Waits up to `wait_s` seconds, polling; returns the held file or None if the slot stayed taken."""
+    deadline = time.monotonic() + wait_s
+    while True:
+        held = ai.lock(cfg, "host-review")
+        if held is not None or time.monotonic() >= deadline:
+            return held
+        time.sleep(min(2.0, max(0.05, deadline - time.monotonic())))
+
+
+def clean_stale(cfg: dict) -> None:
+    """Remove what a killed review left: worktrees under state_dir/worktrees and refs/herdr-review/* in the clones.
+    Called only while holding the host lock (no other review is live here); skipped while a replay runs."""
+    replay = ai.lock(cfg, "always-on-replay")
+    if replay is None:
+        return
+    try:
+        state = ai.expand(cfg["state_dir"])
+        shutil.rmtree(state / "worktrees", ignore_errors=True)
+        clones = [ai.expand(c["path"]) for c in cfg["clones"]]
+        if cfg["clone"]:
+            clones.append(ai.expand(cfg["clone"]))
+        clones += sorted((state / "clones").glob("*.git"))
+        for clone in clones:
+            if not is_git_clone(clone):
+                continue
+            subprocess.run(["git", "worktree", "prune"], cwd=clone, capture_output=True, timeout=120, env=child_env())
+            refs = subprocess.run(["git", "for-each-ref", "--format=%(refname)", "refs/herdr-review"], cwd=clone,
+                                  capture_output=True, timeout=120, env=child_env()).stdout.decode().split()
+            for r in refs:
+                subprocess.run(["git", "update-ref", "-d", r], cwd=clone, capture_output=True, timeout=60,
+                               env=child_env())
+    finally:
+        replay.close()
+
+
 def review_tier(cfg: dict, repo: str, n: int, tier_name: str, post_flag: bool, force: bool = False) -> int:
     global LAST_RESULT
     LAST_RESULT = None
@@ -1935,6 +2000,14 @@ def review_tier(cfg: dict, repo: str, n: int, tier_name: str, post_flag: bool, f
     if held is None:
         ai.say(f"{repo}#{n}: another run holds this PR; skipped")
         return SKIPPED
+    slot = host_lock(cfg, cfg["host_lock_wait_s"])
+    if slot is None:
+        held.close()
+        if cfg["host_lock_wait_s"] > 0:
+            raise ReviewFailed(f"waited {cfg['host_lock_wait_s']:.0f}s for the host's review slot; giving up")
+        ai.say(f"{repo}#{n}: another review holds this host's slot; skipped")
+        return SKIPPED
+    clean_stale(cfg)
     post_on = post_allowed(cfg, post_flag)
     gh = ai.Gh(dry_run=not post_on)
     state, key, started, sha = State(cfg), f"{repo}#{n}#{tier_name}", time.monotonic(), ""
@@ -1988,6 +2061,7 @@ def review_tier(cfg: dict, repo: str, n: int, tier_name: str, post_flag: bool, f
                  **({"usage": e.usage} if getattr(e, "usage", None) else {}))
         return MOVED
     finally:
+        slot.close()
         held.close()
 
 
@@ -2780,9 +2854,9 @@ def poll(cfg: dict, repos: list[str], post_flag: bool) -> int:
         held.close()
 
 
-def _poll_one(cfg: dict, repo: str, n: int, tier_name: str, post_flag: bool) -> int:
+def _poll_one(cfg: dict, repo: str, n: int, tier_name: str, post_flag: bool, force: bool = False) -> int:
     try:
-        return review_tier(cfg, repo, n, tier_name, post_flag)
+        return review_tier(cfg, repo, n, tier_name, post_flag, force)
     except Refused as e:
         ai.say(f"{repo}#{n} {tier_name}: refused: {e}")
         return REFUSED
@@ -2827,6 +2901,9 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--repo", required=True)
     r.add_argument("--pr", required=True, type=int)
     r.add_argument("--tier", choices=["tier1", "tier2", "all"], default="all")
+    r.add_argument("--host-lock-wait", type=float, default=0, metavar="SECONDS",
+                   help="wait this long for the host's one review slot (default 0: skip when it is taken; a wait that "
+                        "runs out fails the review)")
     r.add_argument("--force", action="store_true", help="review even a head that already has a terminal status")
     s = sub.add_parser("show-command", help="print the reviewer's command line without running it")
     s.add_argument("--tier", choices=["tier1", "tier2", "codex"], required=True)
@@ -2866,7 +2943,9 @@ def main(argv: list[str] | None = None) -> int:
         if a.cmd == "show-command":
             return show_command(cfg, a.tier)
         if a.cmd == "review":
-            rcs = [review_tier(cfg, a.repo, a.pr, t, a.post, a.force)
+            cfg["host_lock_wait_s"] = float(a.host_lock_wait)
+            # each tier on its own, as poll does: a failing advisory tier 1 never keeps tier 2 from running
+            rcs = [_poll_one(cfg, a.repo, a.pr, t, a.post, a.force)
                    for t in (["tier1", "tier2"] if a.tier == "all" else [a.tier])]
             ran = [c for c in rcs if c != SKIPPED]
             return max(ran) if ran else SKIPPED

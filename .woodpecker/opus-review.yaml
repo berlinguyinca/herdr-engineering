@@ -1,8 +1,8 @@
 # Per-PR `Opus agent review` commit status. Copy this file unchanged into any berlinguyinca repository as
 # .woodpecker/opus-review.yaml; the logic lives in `herdr-opus-review` on the review host (scripts/ci/opus-review.sh).
-# Setup and fork-safety notes: docs/operations/per-pr-opus-review.md
+# Setup, the agent label and what approving a fork PR means: docs/operations/per-pr-opus-review.md
 when:
-  - event: pull_request
+  - event: [pull_request, pull_request_metadata]
 labels:
   review-host: "true"
 concurrency:
@@ -16,4 +16,4 @@ steps:
       OPUS_REVIEW_GITHUB_TOKEN:
         from_secret: opus_review_github_token
     commands:
-      - '"$HOME/.local/bin/herdr-opus-review"'
+      - /usr/local/bin/herdr-opus-review

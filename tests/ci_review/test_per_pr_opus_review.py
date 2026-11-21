@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import pwd
 import shutil
 import stat
 import subprocess
@@ -40,7 +41,11 @@ open(os.path.join(d, "gh.log"), "a").write(json.dumps({"argv": sys.argv[1:], "gh
 cfg = json.load(open(os.path.join(d, "gh.json")))
 if cfg.get("fail"):
     sys.stderr.write("gh: boom\n"); sys.exit(1)
-print(json.dumps({"isCrossRepository": cfg.get("cross", False)}))
+val = cfg.get("cross", False)
+if "--jq" in sys.argv:
+    print(val if isinstance(val, str) else str(val).lower())
+else:
+    print(json.dumps({"isCrossRepository": val}))
 '''
 
 
@@ -83,7 +88,8 @@ class Host:
         return {k: v for k, v in e.items() if v is not None}
 
     def popen(self, *args, **over):
-        return subprocess.Popen(["bash", str(self.installed), *args], env=self.env(**over), stdout=subprocess.PIPE,
+        home = [] if "--home" in args else ["--home", str(self.home)]
+        return subprocess.Popen(["bash", str(self.installed), *home, *args], env=self.env(**over), stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True)
 
     def run(self, *args, **over):
@@ -113,7 +119,7 @@ def test_it_reviews_the_pr_of_ci_repo_and_posts(host):
     assert rc == 0, out
     [call] = host.calls()
     assert call["argv"] == ["review", "--repo", "berlinguyinca/other-repo", "--pr", "42", "--config", str(host.config),
-                            "--post"]
+                            "--host-lock-wait", "1800", "--post"]
 
 
 def test_the_secret_becomes_gh_token_for_the_review_and_nothing_else_carries_it(host):
@@ -128,6 +134,7 @@ def test_the_fork_check_uses_the_token_and_the_pr(host):
     assert host.run()[0] == 0
     gh = [json.loads(x) for x in (host.bin / "gh.log").read_text().splitlines()]
     assert gh[0]["argv"][:3] == ["pr", "view", "42"] and "--repo" in gh[0]["argv"]
+    assert gh[0]["argv"][-2:] == ["--jq", ".isCrossRepository"]
     assert "berlinguyinca/other-repo" in gh[0]["argv"] and gh[0]["gh_token"] == TOKEN
 
 
@@ -143,18 +150,29 @@ def test_when_the_fork_question_cannot_be_answered_nothing_is_reviewed(host):
     assert rc != 0 and host.calls() == []
 
 
-def test_no_token_means_a_skip_not_a_review(host):
-    """Woodpecker injects no secret into a fork's pipeline: that must end as a skip, never a review with another login."""
-    rc, out = host.run(OPUS_REVIEW_GITHUB_TOKEN=None, GH_TOKEN="ghp_AMBIENT")
-    assert rc == 0 and host.calls() == [] and "token" in out.lower()
-    assert host.run(OPUS_REVIEW_GITHUB_TOKEN="")[0] == 0 and host.calls() == []
+def test_an_empty_token_is_an_error_and_an_ambient_token_is_never_used(host):
+    rc, out = host.run(OPUS_REVIEW_GITHUB_TOKEN=None, GH_TOKEN="ghp_AMBIENT", GITHUB_TOKEN="ghp_AMBIENT2")
+    assert rc == 1 and host.calls() == [] and "empty" in out.lower()
+    assert host.run(OPUS_REVIEW_GITHUB_TOKEN="")[0] == 1 and host.calls() == []
+
+
+@pytest.mark.parametrize("answer", ["", "maybe", "True", "null", "false\ntrue", "{}"])
+def test_only_the_exact_answer_false_lets_the_review_start(host, answer):
+    host.set_gh(cross=answer)
+    rc, out = host.run()
+    assert rc != 0 and host.calls() == [], out
 
 
 @pytest.mark.parametrize("over", [{"CI_PIPELINE_EVENT": "push"}, {"CI_PIPELINE_EVENT": "manual"},
-                                  {"CI_PIPELINE_EVENT": "cron"}])
+                                  {"CI_PIPELINE_EVENT": "cron"}, {"CI_PIPELINE_EVENT": "pull_request_closed"}])
 def test_only_a_pull_request_event_is_reviewed(host, over):
     rc, out = host.run(**over)
     assert rc == 0 and host.calls() == []
+
+
+def test_a_pull_request_metadata_event_is_reviewed_too(host):
+    """A draft marked ready arrives as pull_request_metadata, not pull_request."""
+    assert host.run(CI_PIPELINE_EVENT="pull_request_metadata")[0] == 0 and len(host.calls()) == 1
 
 
 @pytest.mark.parametrize("over", [{"CI_REPO": "no-slash"}, {"CI_REPO": "a/b/c"}, {"CI_REPO": "--evil/x"},
@@ -186,15 +204,42 @@ def test_review_exit_codes(host, code, expected):
     assert host.run()[0] == expected
 
 
-def test_one_review_runs_at_a_time_on_a_host(host):
-    host.set_review(sleep=0.6)
-    a = host.popen()
-    time.sleep(0.2)
-    b = host.popen(CI_COMMIT_PULL_REQUEST="43")
-    assert a.wait(60) == 0 and b.wait(60) == 0
-    first, second = sorted(host.calls(), key=lambda c: c["start"])
-    assert second["start"] >= first["end"] - 0.05, "two reviews overlapped on one host"
-    assert {c["argv"][4] for c in host.calls()} == {"42", "43"}
+def test_the_lock_wait_is_passed_on_and_bounded(host):
+    assert host.run("--lock-wait", "90")[0] == 0
+    argv = host.calls()[0]["argv"]
+    assert argv[argv.index("--host-lock-wait") + 1] == "90"
+    assert host.run("--lock-wait", "soon")[0] == 2
+
+
+def test_a_home_replaced_by_the_local_backend_is_not_trusted(host, tmp_path):
+    """Woodpecker's local backend sets HOME to a throwaway directory: the config must still be found."""
+    isolated = tmp_path / "isolated-home"
+    isolated.mkdir()
+    rc, out = host.run(HOME=str(isolated), XDG_CONFIG_HOME=str(isolated / ".config"))   # --home stands for the passwd entry
+    assert rc == 0, out
+    [call] = host.calls()
+    assert call["argv"][call["argv"].index("--config") + 1] == str(host.config)
+
+
+def test_without_an_override_the_home_comes_from_the_passwd_entry(host, tmp_path):
+    isolated = tmp_path / "isolated-home"
+    isolated.mkdir()
+    real = pwd.getpwuid(os.getuid()).pw_dir
+    if (Path(real) / ".config/herdr-engineering/always-on-review.yaml").exists():
+        pytest.skip("this account has a real config")
+    p = subprocess.run(["bash", str(host.installed)], env=host.env(HOME=str(isolated)), capture_output=True, text=True,
+                       timeout=60)
+    assert p.returncode == 2 and f"{real}/.config/herdr-engineering/always-on-review.yaml" in p.stderr
+    assert str(isolated) not in p.stderr and host.calls() == []
+
+
+def test_the_review_runs_with_the_real_home_so_the_logins_resolve(host, tmp_path):
+    host_home_probe = host.tree / "deploy/ci-review/always-on-review.py"
+    host_home_probe.write_text(STAND_IN_REVIEW.replace('"github_token":', '"home": os.environ.get("HOME"), "github_token":'))
+    isolated = tmp_path / "isolated-home"
+    isolated.mkdir()
+    assert host.run(HOME=str(isolated))[0] == 0
+    assert host.calls()[0]["home"] == str(host.home)
 
 
 def test_the_script_is_found_next_to_the_install_not_in_the_working_directory(host, tmp_path):
@@ -214,7 +259,7 @@ def wf():
 
 
 def test_it_triggers_only_on_pull_requests(wf):
-    assert wf["when"] == [{"event": "pull_request"}]
+    assert wf["when"] == [{"event": ["pull_request", "pull_request_metadata"]}]
 
 
 def test_it_runs_on_the_review_host_never_the_hive_heavy_pool(wf):
@@ -231,7 +276,8 @@ def test_it_is_one_step_that_calls_the_installed_wrapper_and_checks_nothing_out(
     assert wf["skip_clone"] is True
     [step] = wf["steps"]
     assert step["image"] == "bash"
-    assert [c for c in step["commands"] if "herdr-opus-review" in c], step["commands"]
+    assert step["commands"] == ["/usr/local/bin/herdr-opus-review"], "absolute: the local backend replaces $HOME"
+    assert "$HOME" not in WORKFLOW.read_text().replace("replaces $HOME", "")
     assert not any("git " in c or "checkout" in c for c in step["commands"]), "never fetch or run the PR's code"
 
 
@@ -260,3 +306,12 @@ def test_the_backup_timer_is_hourly_and_the_docs_say_why():
     assert "OnUnitActiveSec=1h" in timer and "OnUnitActiveSec=5min" not in timer
     doc = (ROOT / "docs/operations/independent-ai-review.md").read_text()
     assert "missed webhook" in doc and "by hand with" not in doc.split("## Current requirement")[1].split("---")[0]
+
+
+WOODPECKER_CLI = next((c for c in (shutil.which("woodpecker-cli"), "/tmp/claude-1000/rev910/wp/wcli") if c and Path(c).is_file()), None)
+
+
+@pytest.mark.skipif(WOODPECKER_CLI is None, reason="woodpecker-cli is not installed")
+def test_woodpecker_cli_lints_the_workflow_clean():
+    p = subprocess.run([WOODPECKER_CLI, "lint", "--strict", str(WORKFLOW)], capture_output=True, text=True, timeout=60)
+    assert p.returncode == 0, p.stdout + p.stderr

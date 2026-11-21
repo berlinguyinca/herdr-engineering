@@ -7,8 +7,8 @@ automation posts it, on the exact head SHA it reviewed, and nothing else should:
 runs `claude` with the Opus model against that head and posts `pending`, then `success` or `failure`.
 
 - **Per PR, through Woodpecker (the normal path).** `.woodpecker/opus-review.yaml` runs the review for every
-  `pull_request` event (opened, synchronized, reopened) of any enrolled repo. Setup, the YAML other repos copy and
-  fork safety: `docs/operations/per-pr-opus-review.md`.
+  `pull_request` event (opened, synchronized, reopened) and `pull_request_metadata` event (draft marked ready) of any enrolled repo. Setup, the YAML other repos copy and
+  fork safety (approving a fork PR runs its code on the review host with the token): `docs/operations/per-pr-opus-review.md`.
 - **Hourly backup sweep.** `deploy/ci-review/herdr-always-on-review.{service,timer}` polls open PRs once an hour and
   reviews any head that has no terminal status. It only catches a missed webhook or a lost pipeline; it is not the
   trigger. A head with a terminal status is never reviewed twice, so the two paths do not duplicate work.

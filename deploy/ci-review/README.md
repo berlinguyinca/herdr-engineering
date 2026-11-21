@@ -133,7 +133,7 @@ another run is working or a run crashed recently. Every other head is reviewed, 
 PR's failure does not stop the others, and the exit code is 1 if any PR failed. Each PR has its own `flock`, and
 so does `poll`, so overlapping timer runs never review the same PR twice.
 
-Exit codes: 0 the review completed; 1 the review failed; 2 refused; 3 the head moved; 4 another run holds the PR.
+Exit codes: 0 the review completed; 1 the review failed; 2 refused; 3 the head moved; 4 nothing to do (another run holds the PR or the host-wide review slot, draft, cooldown, budget). `review --host-lock-wait N` waits up to N seconds for the host slot shared with the Woodpecker pipeline and fails (1) if it runs out; `poll` never waits and skips the PR. A parent-death watchdog kills an orphaned reviewer, and each review first removes stale worktrees and `refs/herdr-review/*`.
 
 ## Always-on review (two tiers, pluggable backends)
 
