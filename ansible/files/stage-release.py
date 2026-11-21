@@ -51,6 +51,19 @@ def validate_revision(revision):
         raise RuntimeError('Release staging supports Linux and macOS only')
 
 
+def _entry_bytes(path):
+    """Bytes a tracked entry contributes to the digest. A regular file (or a link to
+    one) contributes its content. A link to a directory, a dangling link, or a
+    directory entry (a gitlink/submodule) has no readable content, so it contributes
+    its link target (or a fixed marker): retargeting a tracked link still moves the
+    digest, but ``read_bytes()`` is never called on a directory."""
+    if path.is_file():
+        return path.read_bytes()
+    if path.is_symlink():
+        return b'symlink:' + os.readlink(path).encode('utf-8', 'surrogateescape')
+    return b'directory:'
+
+
 def compute_digest(release, runner):
     """sha256 over sorted ``relpath + NUL + bytes`` for every git-tracked file in
     ``release`` (``git ls-files``). The artifact a release name denotes is its
@@ -65,7 +78,7 @@ def compute_digest(release, runner):
     for relative in sorted(part for part in listing.split('\x00') if part):
         digest.update(relative.encode('utf-8'))
         digest.update(b'\x00')
-        digest.update((release / relative).read_bytes())
+        digest.update(_entry_bytes(release / relative))
     return 'sha256:' + digest.hexdigest()
 
 

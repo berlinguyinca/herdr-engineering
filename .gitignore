@@ -64,3 +64,4 @@ tests/share-fixtures/html-parquet-duckdb/vendor/extensions/
 .herdr-test/
 .venv-test/
 pytest-retried.jsonl
+.coverage-local/

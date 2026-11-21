@@ -798,7 +798,7 @@ def test_a_process_in_another_mount_namespace_keeps_the_target(root, tmp_path, k
     assert sweep(root)["removed"] == [str(target)]
 
 
-def test_a_busy_check_that_cannot_finish_in_time_fails_closed_and_frees_the_lock(root, monkeypatch):
+def test_a_busy_check_that_cannot_finish_in_time_keeps_the_target_and_frees_the_lock(root, monkeypatch):
     """The scan stats files of arbitrary processes, which a dead network mount can block: it runs in a child
     with a deadline. (A hung mount cannot be made without privileges; a deadline nothing can meet is real.)"""
     target = local_target(root)
@@ -806,8 +806,8 @@ def test_a_busy_check_that_cannot_finish_in_time_fails_closed_and_frees_the_lock
     started = time.monotonic()
     held = sweep(root)
     assert time.monotonic() - started < 30
-    assert held["removed"] == [] and target.exists() and held["aborted"], held
-    assert any("busy check timed out" in error for error in held["errors"]), held
+    assert held["removed"] == [] and target.exists() and not held["aborted"], held  # this target only is kept
+    assert any("busy check timed out" in warning for warning in held["warnings"]), held
     monkeypatch.delenv("HERDR_BUSY_CHECK_SECONDS")
     assert sweep(root)["removed"] == [str(target)]  # the lock was released, the next sweep is fine
 
@@ -916,7 +916,7 @@ def test_a_timed_out_busy_check_kills_its_whole_process_group(root, tmp_path, mo
     macOS) and then hangs. After the deadline both must be gone: killing only the direct child leaves it.
     The ``sitecustomize`` is a test seam that makes the child hang at interpreter start, so ``_busy_child``
     itself never runs: it stands in for a slow ``lsof`` and is not a substitute for any production code path."""
-    local_target(root)
+    target = local_target(root)
     hook = tmp_path / "hook"
     hook.mkdir()
     (hook / "sitecustomize.py").write_text(_GRANDCHILD_HOOK)
@@ -924,8 +924,8 @@ def test_a_timed_out_busy_check_kills_its_whole_process_group(root, tmp_path, mo
     monkeypatch.setenv("PYTHONPATH", os.pathsep.join(filter(None, [str(hook), os.environ.get("PYTHONPATH")])))
     monkeypatch.setenv("HERDR_TEST_GRANDCHILD_PIDFILE", str(pidfile))
     monkeypatch.setenv("HERDR_BUSY_CHECK_SECONDS", "4")
-    result = sweep(root)
-    assert result["aborted"] and any("timed out" in error for error in result["errors"]), result
+    with pytest.raises(TimeoutError, match="timed out"):  # the survey child would hang the same way first
+        cleanup._busy_check(target)
     assert pidfile.exists(), "the hung scan never started its grandchild"
     grandchild = int(pidfile.read_text())
     try:
@@ -1055,14 +1055,16 @@ def test_the_documented_limit_a_non_dumpable_cwd_in_the_target_is_not_seen(root)
 
 def test_a_busy_check_whose_child_dies_without_an_answer_fails_closed(root, tmp_path, monkeypatch):
     """The child exits non-zero for real (a ``sitecustomize`` that exits), the non-timeout failure path."""
-    local_target(root)
+    target = local_target(root)
     hook = tmp_path / "hook"
     hook.mkdir()
     (hook / "sitecustomize.py").write_text("import sys\nsys.exit(3)\n")
     monkeypatch.setenv("PYTHONPATH", os.pathsep.join(filter(None, [str(hook), os.environ.get("PYTHONPATH")])))
-    result = sweep(root)
-    assert result["aborted"] and any("no answer" in error for error in result["errors"]), result
-    assert result["removed"] == []
+    with pytest.raises(OSError, match="no answer"):
+        cleanup._busy_check(target)
+    result = sweep(root)  # the survey child dies the same way: the root is skipped, nothing is cleaned
+    assert result["removed"] == [] and target.exists(), result
+    assert any("skipped root" in warning for warning in result["warnings"])
 
 
 # Not tested: an ``fd/`` that cannot be stat'ed under a user-owned ``/proc/<pid>`` (it must still fail closed
