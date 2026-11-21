@@ -270,6 +270,12 @@ def test_the_cron_pipeline_triggers_on_cron_only():
     assert "main-cron-gates.sh" in CRON_YML
 
 
+def test_the_cron_pipeline_runs_on_the_heavy_pool_and_never_overlaps_itself():
+    cron, unit = yaml.safe_load(CRON_YML), yaml.safe_load(UNIT_GATES_YML)
+    assert cron["labels"] == unit["labels"] == {"cluster": "hive-heavy"}, "cron runs landed on 4-CPU nodes without the label"
+    assert cron["concurrency"]["limit"] == 1 and cron["concurrency"]["group"]
+
+
 def test_both_scripts_are_valid_bash():
     for script in (APPLICABLE, CRON):
         out = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True)

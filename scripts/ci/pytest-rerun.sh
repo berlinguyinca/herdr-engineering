@@ -34,16 +34,54 @@ herdr_pytest_run_fast() {
   case "$-" in *e*) restore=1 ;; esac
   log="$(mktemp "${TMPDIR:-/tmp}/herdr-pytest-pass.XXXXXX")"
   set +e
-  "$runner" python -m pytest -q -m "$markexpr" ${PYTEST_PARALLEL[@]+"${PYTEST_PARALLEL[@]}"} 2>&1 | tee "$log"
+  "$runner" python -m pytest -q -m "$markexpr" ${PYTEST_REPORT[@]+"${PYTEST_REPORT[@]}"} ${PYTEST_PARALLEL[@]+"${PYTEST_PARALLEL[@]}"} 2>&1 | tee "$log"
   status=${PIPESTATUS[0]}
   if [ "${#PYTEST_PARALLEL[@]}" -gt 0 ] && herdr_pytest_rerun_wanted "$status" "$log"; then
     words="$(herdr_pytest_rerun_args)" || { rm -f "$log"; [ -n "$restore" ] && set -e; return 1; }
     while IFS= read -r word; do [ -z "$word" ] || args+=("$word"); done <<<"$words"
     echo "== pytest: the parallel pass exited $status and its output shows the xdist machinery broke (worker crash or internal error, not a test failure); rerunning the parallel pytest pass once ${args[*]:+with ${args[*]}}${args[*]:-serially} =="
-    "$runner" python -m pytest -q -m "$markexpr" ${args[@]+"${args[@]}"}
+    "$runner" python -m pytest -q -m "$markexpr" ${PYTEST_REPORT[@]+"${PYTEST_REPORT[@]}"} ${args[@]+"${args[@]}"}
     status=$?
   fi
   rm -f "$log"
   [ -n "$restore" ] && set -e
   return "$status"
+}
+
+# herdr_pytest_run_gate <fast runner> <slow runner> <fast markexpr> <slow markexpr>: the fast parallel pass (herdr_pytest_run_fast, with its
+# one rerun) and the serial `slow` tail, run AT THE SAME TIME. The tail is one process (about one core, niced so it never takes a CPU from
+# the workers) whose output is streamed with a `[slow] ` prefix; it ran after the fast pass before (~5.7 min on top of ~14.7).
+# Safe alongside xdist: its one test (tests/control_plane/test_postgres_recovery.py) starts its own PostgreSQL on a unix socket in a
+# pid-named mkdtemp dir, so it shares no port, socket or path with a worker; it runs with `-p no:cacheprovider` so two pytest processes
+# never write .pytest_cache together. Each pass keeps its own watchdog (the runners). Returns the fast pass's status when it failed,
+# else the tail's: a gate fails if either fails, and the tail is always waited for (exit 5, nothing collected, fails on purpose).
+# HERDR_PYTEST_SLOW_CONCURRENT=0 runs the tail after the fast pass, as before.
+herdr_pytest_run_gate() {
+  local fast_runner="$1" slow_runner="$2" fast_expr="$3" slow_expr="$4" restore="" fast=0 slow=0 pid="" statusf
+  case "$-" in *e*) restore=1 ;; esac
+  set +e
+  # nice, and ionice -c3 (idle I/O class) where the host has it: the tail must never slow the workers' CPU or disk; no ionice = silently just nice.
+  local slow_nice="nice -n 5"
+  command -v ionice >/dev/null 2>&1 && ionice -c3 true >/dev/null 2>&1 && slow_nice="ionice -c3 nice -n 5"
+  statusf="$(mktemp "${TMPDIR:-/tmp}/herdr-pytest-slow.XXXXXX")"
+  if [ "${HERDR_PYTEST_SLOW_CONCURRENT:-1}" != 0 ]; then
+    echo "== pytest (slow tests: serial tail, running alongside the fast pass; its lines start with [slow]) =="
+    ( "$slow_runner" $slow_nice python -m pytest -q -p no:cacheprovider -m "$slow_expr" ${PYTEST_REPORT[@]+"${PYTEST_REPORT[@]}"}
+      echo $? >"$statusf" ) 2>&1 | sed -u 's/^/[slow] /' &
+    pid=$!
+  fi
+  herdr_pytest_run_fast "$fast_runner" "$fast_expr"; fast=$?
+  if [ -n "$pid" ]; then
+    wait "$pid"
+    slow="$(cat "$statusf" 2>/dev/null)"; slow="${slow:-1}"
+  else
+    echo "== pytest (slow tests, serial tail) =="
+    "$slow_runner" python -m pytest -q -m "$slow_expr" ${PYTEST_REPORT[@]+"${PYTEST_REPORT[@]}"}; slow=$?
+  fi
+  rm -f "$statusf"
+  [ "$fast" -eq 0 ] || echo "== pytest: the fast parallel pass failed (exit $fast) =="
+  [ "$slow" -eq 0 ] || echo "== pytest: the slow tail failed (exit $slow) =="
+  [ -n "$restore" ] && set -e
+  [ "$fast" -ne 0 ] && return "$fast"
+  return "$slow"
 }
