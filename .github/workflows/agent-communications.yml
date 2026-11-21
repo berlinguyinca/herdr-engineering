@@ -35,7 +35,7 @@ jobs:
           --health-cmd "pg_isready -U postgres"
           --health-interval 5s --health-timeout 5s --health-retries 12
     env:
-      HERDR_COMMUNICATION_TEST_WHEEL: ${{ github.workspace }}/dist/herdr_engineering-0.1.0-py3-none-any.whl
+      HERDR_COMMUNICATION_TEST_WHEEL: ${{ github.workspace }}/dist/herdr_engineering-0.3.0-py3-none-any.whl
       HERDR_COMMUNICATION_TEST_DSN: postgresql://postgres:ci-only-password@127.0.0.1:5432/herdr_comm_test
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
