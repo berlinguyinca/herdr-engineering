@@ -33,7 +33,12 @@ deploy/
 lock/'
     COVERED_FILES='pyproject.toml
 .woodpecker/unit-gates.yml
-.woodpecker/main-cron.yml'
+.woodpecker/main-cron.yml
+.woodpecker/unit-gates-main.yml
+.woodpecker/structural-gates.yml
+.woodpecker/artifact-handoff.yml
+scripts/ci-pipeline-freshness.sh
+scripts/ci/integrate-main.sh'
     ;;
   ui)
     # Anything that can change the browser gates' result: the old `when: path: include` list of ui-gates.yml, plus the routing
