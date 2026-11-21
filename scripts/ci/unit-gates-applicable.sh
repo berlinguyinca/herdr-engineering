@@ -33,6 +33,9 @@ deploy/
 lock/'
     COVERED_FILES='pyproject.toml
 .woodpecker/unit-gates.yml
+.woodpecker/unit-gates-shard-1.yml
+.woodpecker/unit-gates-shard-2.yml
+.woodpecker/unit-gates-shard-3.yml
 .woodpecker/main-cron.yml
 .woodpecker/unit-gates-main.yml
 .woodpecker/structural-gates.yml

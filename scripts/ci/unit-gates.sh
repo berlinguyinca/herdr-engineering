@@ -19,6 +19,8 @@
 #
 # If the xdist machinery itself breaks (workers die, pytest exit 3) the parallel pass is rerun once on HERDR_PYTEST_RERUN_WORKERS workers
 # (default 2, 0 = serial); a real test failure or a hang is never rerun. `auto` also shrinks on a loaded host (HERDR_LOADAVG_FILE).
+# Sharding: HERDR_UNIT_SHARD=<i>/<n> runs only shard i's test files (scripts/ci/unit-shard.py; one workflow per shard, see
+# .woodpecker/unit-gates-shard-N.yml); the client tests run in shard 1.
 # Tests marked `slow` are deselected from the parallel pass and run serially in a tail pass, concurrently with it (see pytest-parallel.sh).
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -33,6 +35,7 @@ need python3; need node; need git; need flock
 . scripts/ci/pytest-rerun.sh
 herdr_pytest_report_load                 # --durations=40 and the per-file/per-worker time summary on both passes
 herdr_pytest_parallel_load || exit 1     # a bad override fails loudly instead of silently running serial
+herdr_pytest_shard_load || exit 1        # HERDR_UNIT_SHARD=<i>/<n>: only this shard's test files (empty = the whole suite)
 
 # --- dependency cache ----------------------------------------------------------------
 # The exec agents get a private per-job /tmp; the shared path is the rw CI store mount /home/wohlgemuth/woodpecker/ci (host:
@@ -67,14 +70,19 @@ watched_slow() { HERDR_PYTEST_HANG_SECONDS="${HERDR_PYTEST_SLOW_HANG_SECONDS:-42
 herdr_pytest_run_gate watched watched_slow "$HERDR_PYTEST_FAST_MARKEXPR" "$HERDR_PYTEST_SLOW_MARKEXPR"
 t3=$(date +%s)
 
-echo "== client tests =="
-npm ci --no-audit --no-fund       # the component tests import playwright
-# Chromium is content-addressed under PLAYWRIGHT_BROWSERS_PATH; flock serializes concurrent first runs on the shared
-# cache so two pipelines never race the same download (a private cache has no contention). A no-op once the build is
-# present. Quobyte flock is advisory and its scope across clients is not guaranteed, so this narrows the race rather than
-# proving exclusion; the install is idempotent (content-addressed, GC disabled), so a lost race costs time, not correctness.
-flock "$cache_root/playwright-install.lock" npx playwright install chromium
-node --test --test-timeout=300000 packages/herdr-web-client/*.test.js packages/herdr-web-components/*.test.js packages/*.test.js
+# The client (node) tests are not python files, so no shard split covers them: they run in shard 1, or in an unsharded run.
+if [ -z "${HERDR_UNIT_SHARD:-}" ] || [ "${HERDR_UNIT_SHARD%%/*}" = 1 ]; then
+  echo "== client tests =="
+  npm ci --no-audit --no-fund       # the component tests import playwright
+  # Chromium is content-addressed under PLAYWRIGHT_BROWSERS_PATH; flock serializes concurrent first runs on the shared
+  # cache so two pipelines never race the same download (a private cache has no contention). A no-op once the build is
+  # present. Quobyte flock is advisory and its scope across clients is not guaranteed, so this narrows the race rather than
+  # proving exclusion; the install is idempotent (content-addressed, GC disabled), so a lost race costs time, not correctness.
+  flock "$cache_root/playwright-install.lock" npx playwright install chromium
+  node --test --test-timeout=300000 packages/herdr-web-client/*.test.js packages/herdr-web-components/*.test.js packages/*.test.js
+else
+  echo "== client tests: run in shard 1 (this is shard $HERDR_UNIT_SHARD) =="
+fi
 t4=$(date +%s)
 
 # Per-phase totals at the end of the step log: this is what the fast/full gate split (docs/operations/ui-gates.md

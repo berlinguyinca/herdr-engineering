@@ -23,7 +23,8 @@ ROOT = Path(__file__).resolve().parents[1]
 APPLICABLE = ROOT / "scripts" / "ci" / "unit-gates-applicable.sh"
 CRON = ROOT / "scripts" / "ci" / "main-cron-gates.sh"
 UI_GATES_YML = (ROOT / ".woodpecker" / "ui-gates.yml").read_text()
-UNIT_GATES_YML = (ROOT / ".woodpecker" / "unit-gates.yml").read_text()
+UNIT_GATES_YML = (ROOT / ".woodpecker" / "unit-gates-shard-1.yml").read_text()   # the aggregate unit-gates.yml has no steps of its own
+UNIT_GATES_AGGREGATE_YML = (ROOT / ".woodpecker" / "unit-gates.yml").read_text()
 CRON_YML = (ROOT / ".woodpecker" / "main-cron.yml").read_text()
 
 GIT_ENV = {
@@ -90,6 +91,9 @@ def applicability(repo: Path, sha: str, event: str = "pull_request", base: str =
     "deploy/control-plane/deploy.sh",        # the deploy scripts the suite exercises
     "pyproject.toml",                        # dependency and pytest config
     ".woodpecker/unit-gates.yml",            # the routing config
+    ".woodpecker/unit-gates-shard-2.yml",    # a shard workflow
+    "scripts/ci/unit-shard.py",              # the shard split
+    "scripts/ci/main-moved-check.sh",
     ".woodpecker/unit-gates-main.yml",
     ".woodpecker/structural-gates.yml",
     ".woodpecker/artifact-handoff.yml",
@@ -248,10 +252,11 @@ def test_a_state_dir_that_cannot_be_written_still_runs_the_gate(tree, tmp_path):
 
 def test_unit_gates_is_no_longer_path_filtered():
     """The trap this whole change exists to spring: a filtered pipeline never reports, so it can never be required."""
-    triggers = yaml.safe_load(UNIT_GATES_YML)["when"]
-    assert [t for t in triggers if t.get("event") == "pull_request"], "unit-gates must still trigger on PRs"
-    offenders = [t for t in triggers if "path" in t or "include" in t]
-    assert not offenders, f"a path filter here re-creates the never-reports problem: {offenders}"
+    for text in (UNIT_GATES_YML, UNIT_GATES_AGGREGATE_YML):
+        triggers = yaml.safe_load(text)["when"]
+        assert [t for t in triggers if t.get("event") == "pull_request"], "unit-gates must still trigger on PRs"
+        offenders = [t for t in triggers if "path" in t or "include" in t]
+        assert not offenders, f"a path filter here re-creates the never-reports problem: {offenders}"
 
 
 def test_the_skip_is_reported_rather_than_silently_absent():

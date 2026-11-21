@@ -8,10 +8,30 @@ checkout without touching CI.
 |---|---|---|---|---|
 | `structural-gates` | `.woodpecker/structural-gates.yml` | `scripts/ci/structural-gates.sh` | **always** | ~1.5 s |
 | `artifact-handoff` | `.woodpecker/artifact-handoff.yml` | `scripts/ci/artifact-handoff-gates.sh` | **always** | ~1 min |
-| `unit-gates` | `.woodpecker/unit-gates.yml` | `scripts/ci/unit-gates.sh` | **always** (`applicability` step skips in seconds when no covered path changed) | ~55 min, seconds when skipped |
+| `unit-gates` | `.woodpecker/unit-gates.yml` (aggregate; the work is in `unit-gates-shard-{1,2,3}.yml`) | `scripts/ci/unit-gates.sh` | **always** (`applicability` step skips in seconds when no covered path changed) | ~55 min, seconds when skipped |
 | `ui-gates` | `.woodpecker/ui-gates.yml` | `scripts/ci/ui-gates.sh` | **always** (`applicability` step skips in seconds when no UI path changed) | ~15 min, seconds when skipped |
 
 `structural-gates` is also the only pipeline that triggers on `event: push, branch: main`.
+
+## Sharded unit gate
+
+The pull-request unit gate is three workflows, `unit-gates-shard-1.yml` .. `unit-gates-shard-3.yml`, that run in parallel on three
+`hive-heavy` agents. Each has the full pipeline (checkout, freshness, integrate-main, applicability, `unit-gates.sh` with
+`HERDR_UNIT_SHARD=<i>/3`, `main-moved-check`). `scripts/ci/unit-shard.py` assigns every `tests/**/test_*.py` / `*_test.py` file to a
+shard by `sha256(path)`, so the split needs no shared state and a new test file is picked up by itself; the slow-marked file and the
+client (node) tests have one owner each (the slow tail follows its file, client tests run in shard 1). `tests/test_ci_unit_shards.py`
+proves the shards partition the real suite (no test dropped, none twice) and that exactly one shard owns the slow tail.
+
+`.woodpecker/unit-gates.yml` stays as the **aggregate**: it `depends_on` the three shards and has one trivial step. Woodpecker names the
+status context after the workflow file, so `ci/woodpecker/pr/unit-gates` (the required check) is unchanged and only reports success when
+every shard succeeded; with a failed shard it never runs. The shards also report their own `ci/woodpecker/pr/unit-gates-shard-N`
+contexts (informational, not required). To change the shard count, add or remove a shard file, update `depends_on` in the aggregate and
+the `/N` in each shard's `HERDR_UNIT_SHARD`, and `SHARDS` in the test. Coverage is not enforced in this gate (no `--cov` anywhere), so
+there is nothing to combine. `unit-gates-main.yml` (push to main) stays a single unsharded run.
+
+`main-moved-check` (last step of each shard) re-fetches `origin/main` after the tests: unchanged is one fetch; moved in uncovered paths
+passes; moved in covered paths with a clean merge passes with a loud WARNING (the push-to-main run proves the combination; set
+`HERDR_MAIN_MOVED_POLICY=fail` to fail instead); a merge that no longer conflicts-free fails naming the files.
 
 ## The path filter, and the trap it sets
 
