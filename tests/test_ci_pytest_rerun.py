@@ -168,7 +168,8 @@ def test_the_serial_rerun_option_runs_without_xdist(tmp_path: Path) -> None:
 
 def test_the_gate_wires_the_rerun_around_the_parallel_pass_only() -> None:
     assert "pytest-rerun.sh" in GATE
-    fast = next(line for line in GATE.splitlines() if "HERDR_PYTEST_FAST_MARKEXPR" in line and "herdr_pytest_run_fast" in line)
-    assert fast.startswith("herdr_pytest_run_fast watched ")
-    slow = next(line for line in GATE.splitlines() if "HERDR_PYTEST_SLOW_MARKEXPR" in line and "pytest" in line)
-    assert "rerun" not in slow
+    gate = next(line for line in GATE.splitlines() if line.startswith("herdr_pytest_run_gate"))
+    assert '"$HERDR_PYTEST_FAST_MARKEXPR"' in gate
+    helper = RERUN.read_text()
+    assert 'herdr_pytest_run_fast "$fast_runner" "$fast_expr"' in helper           # the fast pass keeps its one-shot rerun
+    assert all("rerun" not in ln for ln in helper.splitlines() if '"$slow_runner"' in ln)   # the slow tail never reruns
