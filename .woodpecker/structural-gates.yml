@@ -35,6 +35,12 @@ steps:
       - 'git checkout -q FETCH_HEAD'
       - 'git --no-pager log --oneline -1'
 
+  - name: integrate-main
+    image: bash
+    commands:
+      - 'set -eu'
+      - 'bash scripts/ci/integrate-main.sh'
+
   - name: structural-gates
     image: bash
     commands:
