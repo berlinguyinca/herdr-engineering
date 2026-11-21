@@ -55,7 +55,7 @@ class Local:
     min_free_disk_percent: float
     incremental_disabled_for_cacheable_builds: bool
     storage_tiers: tuple[StorageTier, ...] = ()
-    manage_targets: bool = False
+    manage_targets: bool = True
     target_retention_enabled: bool = False
     target_internal_gib: float = 32
     target_external_gib: float = 256
