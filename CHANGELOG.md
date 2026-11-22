@@ -5,6 +5,34 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: the unit gate says what it was inside, while it runs (#937)
+
+- `scripts/ci/pytest-plugins/pytest_ci_progress.py` (loaded by `herdr_pytest_report_load`, so on the fast pass, the xdist rerun and the
+  slow tail) prints one `[ci-progress]` line per `HERDR_PYTEST_PROGRESS_EVERY_SECONDS` (60) or `HERDR_PYTEST_PROGRESS_EVERY_TESTS` (200),
+  and to `$HERDR_PYTEST_PROGRESS_DIR/progress.jsonl`: shard, elapsed, counts by outcome, and per worker the test id it is inside and for
+  how long. It ticks on wall time rather than only on report arrivals, because a wedged pass sends no reports - the pass worth reading is
+  the quiet one. Lines go to a duplicate of descriptor 1 taken at plugin load, so pytest's capture cannot hold them until teardown; that
+  is the only reason this is worth writing, since `--durations=40` and `pytest_file_times` already report at teardown and reported nothing
+  for pipeline 1754 (6829 s, truncated tail) or pipeline 1978's shard 3 (`killed` at 1950 s).
+- Per-pass wall budget (`HERDR_PYTEST_PROGRESS_BUDGET_SECONDS`, defaults from measured CI walls: 900 s for a shard, 1800 s unsharded;
+  `0` = none). Exceeding it prints a `[ci-budget]` dump of what every worker is inside and keeps running - no flat cap is added
+  (`scripts/ci/unit-gates.sh` keeps "a slow but live run is never killed"; `scripts/ci/run-watched.py` still owns wedged passes).
+  `herdr_pytest_progress_defaults` in `scripts/ci/pytest-parallel.sh` sets it; a non-numeric override fails the gate instead of running
+  without evidence.
+- Workers publish the test they started to `$HERDR_PYTEST_PROGRESS_DIR/<pass-id>/worker-<id>.json` (xdist forwards no "started" event) and
+  only the pass that owns the run writes records. `<pass-id>` is the xdist test-run id, or `local-<pid>` without workers: the gate can run
+  its slow tail beside its fast pass in one progress directory, and filed together the serial pass's `main` reads as a fifth xdist worker,
+  either pass's startup cleanup erases the other's evidence mid-run, and a worker appending its own records counts every test twice.
+  A role is decided from `config.workerinput`, never from an inherited `PYTEST_XDIST_WORKER`: a pytest that a test starts in a subprocess
+  inherits that variable, and a controller that believed itself a worker would emit nothing in exactly the shape CI runs in.
+- Docs (`docs/operations/ci-gates.md`): how to read the lines, the measured numbers behind both budgets, and the disposition of #907 -
+  closed unmerged because `scripts/ci/cpu-quota.py` sizes workers from the cgroup quota and the load average now only shaves `auto` to a
+  floor of half the visible CPUs, never below 4, so the `-n 1` squeeze of pipeline 1804 cannot recur.
+- Tests: `tests/test_ci_pytest_progress.py` (13) runs real pytest passes with real xdist workers over a subprocess - no mocks - and
+  asserts progress names a test still running, that an exceedance dumps the in-flight view without changing the verdict, shard labelling,
+  the serial `main` worker, two concurrent passes sharing one directory staying separate, that results are identical with and without the
+  plugin, and the gate wiring/budget/override rules.
+
 ### Fix: Codex second-reviewer follow-ups from #820 (always-on-review.py)
 
 - Codex spend is counted when Codex fails: a non-zero exit, time cap or missing answer after it reported tokens logs a
