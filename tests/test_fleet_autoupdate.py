@@ -139,13 +139,11 @@ def test_run_update_refuses_the_sentinel_form_python_m_actually_produces(checkou
     update.assert_not_called()
 
 
-def test_entry_captures_the_path_before_fleet_rewrites_it():
-    """`herdr_engineering.fleet` inserts `<checkout>/scripts` at `sys.path[0]` when it imports.
+def test_importing_fleet_leaves_sys_path_zero_alone():
+    """`herdr_engineering.fleet` no longer inserts `<checkout>/scripts` into `sys.path`.
 
-    A guard reading `sys.path[0]` at call time therefore never sees the cwd sentinel - the mistake
-    that let bender's `python -m` invocation through (#584). `_entry` is imported before `.fleet`, so
-    its value is what the interpreter started with. Proven in a fresh interpreter: in-process the
-    order depends on which test imported the package first.
+    The shadowing guard reads `_entry.PATH_ZERO` (captured at start-up); it must still name where
+    the interpreter began after `.fleet` is imported. Proven in a fresh interpreter.
     """
     from pathlib import Path
 
@@ -155,11 +153,11 @@ def test_entry_captures_the_path_before_fleet_rewrites_it():
     probe = subprocess.run(
         [sys.executable, "-c",
          "import herdr_engineering._entry as e, herdr_engineering.fleet, sys;"
-         "print(e.PATH_ZERO or '<cwd-sentinel>'); print(sys.path[0])"],
+         "print(e.PATH_ZERO or '<cwd-sentinel>'); print(sys.path[0] or '<cwd-sentinel>')"],
         cwd=str(checkout), capture_output=True, text=True, check=True)
     captured, after = probe.stdout.split()
-    assert captured != after
-    assert after.endswith("scripts")
+    assert captured == after
+    assert not after.endswith("scripts")
 
 
 def test_every_run_records_which_code_executed_it(checkout, capsys, monkeypatch):
