@@ -68,7 +68,7 @@ def mounted_volume(identity: str) -> Path | None:
     """Resolve a mounted, writable macOS volume by identity, including renamed drives."""
     if sys.platform != "darwin":
         return None
-    try:
+    try:  # pragma: darwin-only
         result = subprocess.run(["/usr/sbin/diskutil", "info", "-plist", identity],
                                 capture_output=True, timeout=3, check=False)
         if result.returncode:
@@ -87,7 +87,7 @@ def mounted_volume(identity: str) -> Path | None:
 
 
 def _candidate(tier: StorageTier, min_free_percent: float) -> StorageCandidate:
-    if tier.volume_uuid:
+    if tier.volume_uuid:  # pragma: darwin-only
         mount = mounted_volume(tier.volume_uuid)
         if mount is None:
             return StorageCandidate(tier.name, None, "volume_unavailable")

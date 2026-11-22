@@ -203,7 +203,7 @@ def _real_cargo(home: Path) -> Path:
     return real
 
 
-def enroll_storage(volume: Path, name: str, directory: str, config_path: Path,
+def enroll_storage(volume: Path, name: str, directory: str, config_path: Path,  # pragma: darwin-only
                    priority: int = 0) -> dict[str, str]:
     """Enroll a writable volume without erasing/moving any existing data."""
     import plistlib

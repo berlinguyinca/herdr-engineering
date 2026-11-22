@@ -938,7 +938,7 @@ def test_resource_usage_projection_is_pruned_by_event_retention():
                              "occurred_at": repo._stamp()})
     clock["t"] += 40 * 86400
     assert repo.usage_analytics(mission_id="m1")["resources"]["cpu"]["count"] == 2
-    apply_retention(repo, events_ttl_days=30)
+    apply_retention(repo, events_ttl_days=30, now=repo._stamp())
     a = repo.usage_analytics(mission_id="m1")
     assert a["resources"]["cpu"]["count"] == 1
     assert a["resources"]["cpu"]["total"] == 1.0
