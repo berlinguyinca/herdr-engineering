@@ -7,6 +7,7 @@ import plistlib
 import re
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID
@@ -64,31 +65,45 @@ def parse_storage_tiers(value: object) -> tuple[StorageTier, ...]:
     return tuple(result)
 
 
-def mounted_volume(identity: str) -> Path | None:
+def volume_mount_from_plist(raw: bytes, identity: str) -> Path | None:
+    """The mount point named by a `diskutil info -plist` document, when it is this identity and writable."""
+    try:
+        info = plistlib.loads(raw)
+    except (ValueError, plistlib.InvalidFileException):
+        return None
+    if not isinstance(info, dict):
+        return None
+    mount = info.get("MountPoint")
+    if (str(info.get("VolumeUUID", "")).lower() != identity.lower()
+            or info.get("WritableVolume") is not True or not isinstance(mount, str)):
+        return None
+    return writable_mount(Path(mount))
+
+
+def writable_mount(path: Path) -> Path | None:
+    """``path`` when it is a mount point the user can write to."""
+    return path if path.is_mount() and os.access(path, os.W_OK) else None
+
+
+def mounted_volume(identity: str) -> Path | None:  # pragma: darwin-only
     """Resolve a mounted, writable macOS volume by identity, including renamed drives."""
     if sys.platform != "darwin":
         return None
-    try:  # pragma: darwin-only
+    try:
         result = subprocess.run(["/usr/sbin/diskutil", "info", "-plist", identity],
                                 capture_output=True, timeout=3, check=False)
-        if result.returncode:
-            return None
-        info = plistlib.loads(result.stdout)
-        if not isinstance(info, dict):
-            return None
-        mount = info.get("MountPoint")
-        if (str(info.get("VolumeUUID", "")).lower() != identity.lower()
-                or info.get("WritableVolume") is not True or not isinstance(mount, str)):
-            return None
-        path = Path(mount)
-        return path if path.is_mount() and os.access(path, os.W_OK) else None
-    except (OSError, ValueError, plistlib.InvalidFileException, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError):
         return None
+    return None if result.returncode else volume_mount_from_plist(result.stdout, identity)
 
 
-def _candidate(tier: StorageTier, min_free_percent: float) -> StorageCandidate:
-    if tier.volume_uuid:  # pragma: darwin-only
-        mount = mounted_volume(tier.volume_uuid)
+VolumeResolver = Callable[[str], "Path | None"]
+
+
+def _candidate(tier: StorageTier, min_free_percent: float,
+               resolve_volume: VolumeResolver = mounted_volume) -> StorageCandidate:
+    if tier.volume_uuid:
+        mount = resolve_volume(tier.volume_uuid)
         if mount is None:
             return StorageCandidate(tier.name, None, "volume_unavailable")
         path = mount / tier.directory
@@ -130,13 +145,13 @@ def choose_storage(candidates: tuple[StorageCandidate, ...]) -> StorageSelection
 
 
 def select_storage(tiers: tuple[StorageTier, ...], default: Path,
-                   min_free_percent: float) -> StorageSelection:
+                   min_free_percent: float, *, resolve_volume: VolumeResolver = mounted_volume) -> StorageSelection:
     if not tiers:
         return StorageSelection("default", default)
     # Probe lazily: an available primary does not wait for absent lower tiers.
     skipped: list[str] = []
     for tier in tiers:
-        selected = choose_storage((_candidate(tier, min_free_percent),))
+        selected = choose_storage((_candidate(tier, min_free_percent, resolve_volume),))
         if selected.directory is not None:
             return StorageSelection(selected.name, selected.directory, tuple(skipped))
         skipped.extend(selected.skipped)
