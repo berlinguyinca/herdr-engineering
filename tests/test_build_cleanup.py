@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from herdr_engineering import build_cleanup as cleanup
+from tests.real_cargo import build
 
 Usage = namedtuple("Usage", "total used free")
 
@@ -18,7 +19,6 @@ Usage = namedtuple("Usage", "total used free")
 def workspace(tmp_path, monkeypatch):
     root = tmp_path / "projects"
     root.mkdir()
-    monkeypatch.setattr(cleanup, "_process_paths", lambda: [])
     monkeypatch.setattr(cleanup.shutil, "disk_usage", lambda _: Usage(1000, 900, 100))
     return root
 
@@ -27,13 +27,12 @@ def target(root, name="project", age=48):
     project = root / name
     project.mkdir()
     subprocess.run(["git", "init", "-q", str(project)], check=True)
-    (project / "Cargo.toml").write_text('[package]\nname = "fixture"\nversion = "0.1.0"\n')
-    cache = project / "target"
-    cache.mkdir()
-    (cache / ".rustc_info.json").write_text("{}")
-    (cache / "artifact").write_bytes(b"x" * 4096)
+    (project / "Cargo.toml").write_text('[package]\nname = "fixture"\nversion = "0.1.0"\nedition = "2021"\n')
+    (project / "src").mkdir()
+    (project / "src/main.rs").write_text("fn main() {}\n")
+    cache = build(project, project / "target")  # a real build: cargo writes the tag and the fingerprints
     stamp = time.time() - age * 3600
-    for path in [*cache.iterdir(), cache]:
+    for path in [*cache.rglob("*"), cache]:
         os.utime(path, (stamp, stamp))
     return cache
 
@@ -89,8 +88,15 @@ def test_nested_recent_artifact_protects_old_directory(workspace):
     assert cache.exists()
 
 
+def _old_artifact(cache):
+    (cache / "artifact").write_text("output")
+    stamp = time.time() - 48 * 3600
+    os.utime(cache / "artifact", (stamp, stamp))
+
+
 def test_tracked_output_is_never_deleted(workspace):
     cache = target(workspace)
+    _old_artifact(cache)
     subprocess.run(["git", "-C", str(cache.parent), "add", "target/artifact"], check=True)
     assert run(workspace)["removed_count"] == 0
     assert cache.exists()
@@ -108,33 +114,18 @@ def test_symlink_target_and_symlink_inside_target_are_preserved(workspace):
     assert external.read_text() == "keep"
 
 
-def test_shared_build_lock_blocks_cleanup(workspace):
-    cache = target(workspace)
+def test_exclusive_maintenance_lock_blocks_cleanup_but_a_running_build_does_not(workspace):
+    cache = target(workspace, "idle")
     state = workspace.parent / "state"
     state.mkdir()
     with (state / "build-maintenance.lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_SH)
+        fcntl.flock(lock, fcntl.LOCK_EX)
         result = run(workspace)
     assert result["status"] == "busy"
     assert cache.exists()
-
-
-@pytest.mark.parametrize("relative", ["target/artifact", "src/main.rs", "target"])
-def test_active_project_is_preserved(workspace, monkeypatch, relative):
-    cache = target(workspace)
-    monkeypatch.setattr(cleanup, "_process_paths", lambda: [cache.parent / relative])
-    assert run(workspace)["removed_count"] == 0
-    assert cache.exists()
-
-
-def test_process_visibility_failure_is_closed(workspace, monkeypatch):
-    cache = target(workspace)
-    def denied():
-        raise PermissionError("cannot inspect process")
-    monkeypatch.setattr(cleanup, "_process_paths", denied)
-    result = run(workspace)
-    assert result["errors"]
-    assert cache.exists()
+    with (state / "build-maintenance.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_SH)  # a running build: the per-target checks protect it
+        assert run(workspace)["status"] != "busy"
 
 
 def test_scan_failure_is_closed(workspace, monkeypatch):
@@ -171,10 +162,13 @@ def test_unverifiable_non_git_project_is_preserved(workspace):
     assert cache.exists()
 
 
-def test_discovery_limit_aborts_without_removing(workspace, monkeypatch):
+def test_discovery_limit_skips_the_root_with_a_reason_without_removing(workspace, monkeypatch):
     cache = target(workspace)
     monkeypatch.setattr(cleanup, "_MAX_ENTRIES", 1)
-    assert run(workspace)["errors"]
+    result = run(workspace)
+    # discovery keeps what it found and warns; the target itself exceeds the inspection limit: reported, kept
+    assert result["status"] != "ok" and any("limit" in warning for warning in result["warnings"])
+    assert result["removed_count"] == 0 and any("limit" in error for error in result["errors"])
     assert cache.exists()
 
 
@@ -185,6 +179,11 @@ def test_nested_source_manifest_is_preserved(workspace):
     assert cache.exists()
 
 
+def _paths(proc):
+    """The files the scan says processes use (their cwd, executable, descriptors and mappings)."""
+    return [hold[3] for hold in cleanup._scan(proc) if hold[2] == "uses"]
+
+
 def test_proc_reads_cwd_executable_and_open_files(tmp_path):
     proc = tmp_path / "proc"
     pid = proc / "99999999"
@@ -192,74 +191,60 @@ def test_proc_reads_cwd_executable_and_open_files(tmp_path):
     for link, value in [("cwd", "/project"), ("exe", "/binary"),
                         ("fd/0", "/project/target/output"), ("fd/1", "socket:[123]")]:
         (pid / link).symlink_to(value)
-    paths = cleanup._process_paths(proc)
+    paths = _paths(proc)
     assert set(paths) == {Path("/project"), Path("/binary"), Path("/project/target/output")}
 
 
-def test_missing_proc_is_an_error(tmp_path):
-    with pytest.raises(FileNotFoundError):
-        cleanup._process_paths(tmp_path / "no-proc")
+def test_missing_proc_falls_back_to_lsof_or_fails_closed(tmp_path, monkeypatch):
+    empty = tmp_path / "empty-bin"
+    empty.mkdir()
+    monkeypatch.setenv("PATH", str(empty))  # a real host without lsof
+    with pytest.raises(OSError):
+        _paths(tmp_path / "no-proc")
 
 
-def test_discovery_does_not_enter_other_filesystems(workspace, monkeypatch):
-    cache = target(workspace, "mounted")
-    safe = target(workspace, "local")
-    original = cleanup.os.scandir
-
-    class ForeignEntry:
-        def __init__(self, entry):
-            self.entry = entry
-
-        def __getattr__(self, name):
-            return getattr(self.entry, name)
-
-        def stat(self, **kwargs):
-            fields = list(self.entry.stat(**kwargs))
-            fields[2] += 1  # st_dev
-            return os.stat_result(fields)
-
-    class Entries:
-        def __enter__(self):
-            self.iterator = original(workspace)
-            return iter(ForeignEntry(entry) if entry.name == "mounted" else entry
-                        for entry in self.iterator)
-
-        def __exit__(self, *_):
-            self.iterator.close()
-
-    def scandir(path):
-        return Entries() if path == workspace else original(path)
-
-    monkeypatch.setattr(cleanup.os, "scandir", scandir)
-    assert run(workspace)["removed_count"] == 1
-    assert cache.exists() and not safe.exists()
+def _other_filesystem() -> Path | None:
+    """A writable directory on a real filesystem other than the temp directory's (``/dev/shm`` on Linux)."""
+    shm = Path("/dev/shm")
+    return shm if shm.is_dir() and os.access(shm, os.W_OK) else None
 
 
-def test_mount_inside_target_is_preserved(workspace, monkeypatch):
+def test_a_target_on_another_filesystem_is_not_measured_by_the_survey(tmp_path):
+    other = _other_filesystem()
+    if other is None or other.stat().st_dev == tmp_path.stat().st_dev:
+        pytest.skip("needs a second real filesystem")
+    home = other / f"herdr-test-{os.getpid()}"
+    home.mkdir()
+    try:
+        foreign = target(home, "mounted")
+        root = tmp_path / "root"
+        root.mkdir()
+        spec = {"root": str(root), "cap": 1, "full": False, "cap_cutoff": None, "exclude": [],
+                "targets": [str(foreign)], "seconds": 60, "max_entries": 500_000, "max_depth": 6}
+        rows = cleanup._parse_survey(cleanup._run_child(cleanup._SURVEY_CHILD, [], 60, "survey",
+                                                        json.dumps(spec)))["rows"]
+        assert rows == [{"path": str(foreign), "foreign_device": True}]
+    finally:
+        cleanup.shutil.rmtree(home, ignore_errors=True)
+
+
+def test_an_entry_of_another_filesystem_inside_a_target_is_refused(workspace):
+    """``/dev`` is a real directory of another filesystem (and owner): met inside a target it is a mount."""
     cache = target(workspace)
-    original = Path.lstat
-
-    def metadata(path, **kwargs):
-        result = original(path, **kwargs)
-        if path == cache / "artifact":
-            fields = list(result)
-            fields[2] += 1  # st_dev
-            return os.stat_result(fields)
-        return result
-
-    monkeypatch.setattr(Path, "lstat", metadata)
-    result = run(workspace)
-    assert result["removed_count"] == 0
-    assert cache.exists()
-    assert any("mount" in item["reason"] for item in result["skipped"])
+    with pytest.raises(OSError, match="mount"):
+        cleanup._check_entry("dev", os.lstat("/dev"), cache.lstat().st_dev, cache)
 
 
-def test_deep_source_tree_does_not_block_shallow_cache(workspace, monkeypatch):
-    cache = target(workspace)
+def test_the_depth_limit_reaches_the_survey_and_a_deep_source_tree_does_not_block_a_shallow_cache(
+        workspace, monkeypatch):
+    shallow = target(workspace)
     (workspace / "source/one/two/three").mkdir(parents=True)
-    monkeypatch.setattr(cleanup, "_MAX_DEPTH", 2)
+    (workspace / "a/b/c/d").mkdir(parents=True)
+    deep = target(workspace / "a/b/c/d", "deep")
+    monkeypatch.setattr(cleanup, "_MAX_DEPTH", 2)  # forwarded to the child that does the discovery
     assert run(workspace)["removed_count"] == 1
-    assert not cache.exists()
+    assert not shallow.exists()
+    assert deep.exists(), "a target deeper than the limit must not be found: the limit never reached the child"
 
 
 @pytest.fixture
@@ -290,14 +275,14 @@ def test_inaccessible_managed_build_aborts_inspection(hidden_proc):
     proc, child, _, _ = hidden_proc
     assert cleanup._managed_process(child, proc)
     with pytest.raises(PermissionError):
-        cleanup._process_paths(proc)
+        _paths(proc)
 
 
 def test_inaccessible_unmanaged_daemon_does_not_block_inspection(hidden_proc):
     proc, child, parent, binary = hidden_proc
     (parent / "cmdline").write_bytes(b"systemd\0--user\0")
     assert not cleanup._managed_process(child, proc)
-    assert cleanup._process_paths(proc) == [binary]
+    assert _paths(proc) == [binary]
 
 
 def test_managed_ancestry_walks_multiple_generations(hidden_proc):
@@ -315,7 +300,7 @@ def test_unknown_ancestry_fails_closed(hidden_proc):
     (parent / "cmdline").write_bytes(b"systemd\0--user\0")
     (parent / "status").unlink()
     with pytest.raises(OSError, match="ancestry changed"):
-        cleanup._process_paths(proc)
+        _paths(proc)
 
 
 def test_unverified_herdr_executable_fails_closed(hidden_proc):
@@ -325,7 +310,7 @@ def test_unverified_herdr_executable_fails_closed(hidden_proc):
     (parent / "exe").unlink()
     (parent / "exe").symlink_to(other)
     with pytest.raises(OSError, match="Unverifiable Herdr"):
-        cleanup._process_paths(proc)
+        _paths(proc)
 
 
 def test_ancestry_cycle_fails_closed(hidden_proc):
@@ -333,7 +318,7 @@ def test_ancestry_cycle_fails_closed(hidden_proc):
     (parent / "cmdline").write_bytes(b"bash\0")
     (parent / "status").write_text(f"PPid:\t{child.name}\n")
     with pytest.raises(OSError, match="Unverifiable process ancestry"):
-        cleanup._process_paths(proc)
+        _paths(proc)
 
 
 def test_any_verified_herdr_ancestor_is_conservatively_protected(hidden_proc):
@@ -347,4 +332,4 @@ def test_herdr_global_options_do_not_hide_managed_ancestry(hidden_proc):
     (parent / "cmdline").write_bytes(os.fsencode(binary) + b"\0--session\0abc\0server\0")
     assert cleanup._managed_process(child, proc)
     with pytest.raises(PermissionError):
-        cleanup._process_paths(proc)
+        _paths(proc)

@@ -8,6 +8,7 @@ import tomllib
 from pathlib import Path
 
 import pytest
+import yaml
 
 from herdr_engineering.build_cache_config import validate
 from herdr_engineering.build_cache_env import CmdClass, _config_sets_wrapper, classify
@@ -307,3 +308,294 @@ def test_enrollment_and_live_uuid_selection_on_real_volume(tmp_path: Path):
         assert select_storage(cfg.local.storage_tiers, tmp_path / "default", 0).name == "internal"
     finally:
         shutil.rmtree(cache)
+
+
+def _real_cargo_path() -> Path:
+    """The first real Cargo on PATH, skipping any herdr-managed launcher a developer host already has installed."""
+    from herdr_engineering.cargo_host import MARKER
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        candidate = Path(directory or ".") / "cargo"
+        if not (candidate.is_file() and os.access(candidate, os.X_OK)):
+            continue
+        try:
+            head = candidate.read_bytes()[:256]
+        except OSError:
+            continue
+        if MARKER.encode() not in head:
+            return candidate
+    pytest.skip("real Cargo required")
+
+
+def test_install_into_new_home_captures_the_real_cargo_behind_an_existing_launcher(tmp_path: Path):
+    cargo = _real_cargo_path()
+    first, second = tmp_path / "first", tmp_path / "second"
+    install(first, cargo, Path(sys.executable))
+    result = install(second, first / ".local/bin/cargo", Path(sys.executable))
+    manifest = json.loads((second / ".local/share/herdr-engineering/cargo-host/install.json").read_text())
+    assert Path(manifest["real_cargo"]) == Path(os.path.abspath(cargo))
+    assert result["cargo"] == str(second / ".local/bin/cargo")
+
+
+def test_install_refuses_a_managed_chain_that_leads_back_to_the_new_launcher(tmp_path: Path):
+    cargo = _real_cargo_path()
+    first, second = tmp_path / "first", tmp_path / "second"
+    install(first, cargo, Path(sys.executable))
+    manifest = first / ".local/share/herdr-engineering/cargo-host/install.json"
+    data = json.loads(manifest.read_text())
+    data["real_cargo"] = str(second / ".local/bin/cargo")
+    manifest.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="recurse"):
+        install(second, first / ".local/bin/cargo", Path(sys.executable))
+    assert not (second / ".local/bin/cargo").exists()
+
+
+def test_install_updates_a_legacy_cargo_config_in_place(tmp_path: Path):
+    cargo = _real_cargo_path()
+    home = tmp_path / "home"
+    (home / ".cargo").mkdir(parents=True)
+    (home / ".cargo/config").write_text("[net]\nretry = 2\n")
+    result = install(home, cargo, Path(sys.executable))
+    assert result["config"] == str(home / ".cargo/config")
+    assert not (home / ".cargo/config.toml").exists()
+    assert tomllib.loads((home / ".cargo/config").read_text())["net"]["retry"] == 2
+
+
+def test_install_refuses_destinations_that_are_not_writable_regular_files(tmp_path: Path):
+    cargo = _real_cargo_path()
+    home = tmp_path / "home"
+    (home / ".zshrc").mkdir(parents=True)
+    with pytest.raises(ValueError, match="not a writable regular file"):
+        install(home, cargo, Path(sys.executable))
+    assert not (home / ".local/bin/cargo").exists()
+
+
+def test_install_rolls_back_published_files_when_a_later_write_fails(tmp_path: Path):
+    cargo = _real_cargo_path()
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".zshrc").write_text("export KEPT=1\n")
+    (home / ".cargo").mkdir()
+    (home / ".cargo/config.toml").write_text("[net]\nretry = 3\n")
+    # A stale temporary file makes the exclusive create of .bashrc's temporary fail with a real OSError
+    # after the earlier files were already published.
+    (home / ".bashrc.herdr-tmp").write_text("stale")
+    with pytest.raises(FileExistsError):
+        install(home, cargo, Path(sys.executable))
+    assert (home / ".zshrc").read_text() == "export KEPT=1\n"
+    assert (home / ".cargo/config.toml").read_text() == "[net]\nretry = 3\n"
+    root = home / ".local/share/herdr-engineering/cargo-host"
+    assert not (root / "rustc-cache").exists() and not (root / "install.json").exists()
+    assert not (home / ".local/bin/cargo").exists() and not (home / ".zshenv").exists()
+
+
+@pytest.fixture
+def isolated_host(tmp_path: Path, monkeypatch) -> Path:
+    """HOME, XDG, the config file and the state dir all inside tmp_path: an in-process sweep or load_config()
+    can never read or clean the operator's real configuration or storage tiers."""
+    home = tmp_path / "isolated-home"
+    home.mkdir()
+    cwd = tmp_path / "isolated-cwd"
+    cwd.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.setenv("HERDR_ENGINEERING_CONFIG", str(tmp_path / "absent-config.yaml"))
+    monkeypatch.setenv("HERDR_ENGINEERING_STATE", str(tmp_path / "state"))
+    monkeypatch.chdir(cwd)
+    return home
+
+
+def _tier_config(tmp_path: Path, **local: object):
+    return validate({"enabled": True, "local": {
+        "storage_tiers": [{"name": "internal", "directory": str(tmp_path / "cache")}], **local}})
+
+
+def test_disk_guard_prints_the_override_notice_and_allows_the_build(tmp_path: Path, monkeypatch, isolated_host, capsys):
+    from herdr_engineering.cargo_host import _disk_guard_refusal
+    from herdr_engineering.disk_guard import EXIT_REFUSED, OVERRIDE_ENV
+    full = {"enabled": True, "refuse_builds_percent": 0, "refuse_builds_min_free_gib": 10**9,
+            "roots": [str(tmp_path)]}
+    monkeypatch.setenv(OVERRIDE_ENV, "1")
+    assert _disk_guard_refusal(tmp_path, full) is None
+    assert f"proceeding because {OVERRIDE_ENV}=1" in capsys.readouterr().err
+    monkeypatch.delenv(OVERRIDE_ENV)
+    assert _disk_guard_refusal(tmp_path, full) == EXIT_REFUSED
+    assert "refusing to start a new build" in capsys.readouterr().err
+    assert _disk_guard_refusal(tmp_path, {"enabled": False}) is None
+    assert capsys.readouterr().err == ""
+
+
+def test_disk_guard_fault_never_blocks_a_build(tmp_path: Path, monkeypatch, isolated_host, capsys):
+    from herdr_engineering.cargo_host import _disk_guard_refusal
+    from herdr_engineering.disk_guard import OVERRIDE_ENV
+    # The conftest override would make any "allowed" result vacuous: remove it so only the fault path can allow.
+    monkeypatch.delenv(OVERRIDE_ENV, raising=False)
+    # A malformed policy makes the guard itself fail; the build proceeds and the fault is reported.
+    assert _disk_guard_refusal(tmp_path, {"refuse_builds_percent": "not-a-number"}) is None
+    err = capsys.readouterr().err
+    assert "disk guard unavailable (ValueError)" in err and "refusing to start a new build" not in err
+    # Control: a valid policy that cannot be met does refuse with the override unset, so the None above
+    # came from the fault handling and not from the guard being disabled.
+    unmeetable = {"enabled": True, "refuse_builds_percent": 0, "refuse_builds_min_free_gib": 10**9,
+                  "roots": [str(tmp_path)]}
+    assert _disk_guard_refusal(tmp_path, unmeetable) is not None
+    # Without a policy argument the (absent, isolated) configuration yields the defaults; no assertion on the
+    # real disk's fullness is made here.
+    capsys.readouterr()
+    _disk_guard_refusal(tmp_path)
+
+
+def test_reserve_selection_uses_first_tier_then_one_cleanup_then_reports(tmp_path: Path, monkeypatch, isolated_host):
+    from herdr_engineering.cargo_host import _select_with_reserve
+    (tmp_path / "cache").mkdir()
+    config = _tier_config(tmp_path)
+    selected, cleaned = _select_with_reserve(config, {"enabled": True}, 0)
+    assert selected.directory == tmp_path / "cache" and cleaned is False
+    # A reserve no disk can meet, with cleanup switched off: nothing to try.
+    selected, cleaned = _select_with_reserve(config, {"enabled": False}, 100)
+    assert selected.directory is None and cleaned is False
+    # Cleanup enabled over an empty root set removes nothing, so the refusal may not claim a cleanup.
+    empty = tmp_path / "empty-root"
+    empty.mkdir()
+    selected, cleaned = _select_with_reserve(config, {"enabled": True, "roots": [str(empty)]}, 100)
+    assert selected.directory is None and cleaned is False
+    # A cleanup that cannot run (invalid thresholds) is reported and never crashes the build.
+    selected, cleaned = _select_with_reserve(config, {"enabled": True, "roots": [str(empty)],
+                                                      "high_water_percent": "x"}, 100)
+    assert selected.directory is None and cleaned is False
+
+
+def test_reserve_refusal_message_names_the_override(capsys):
+    from herdr_engineering.cargo_host import _reserve_refusal
+    from herdr_engineering.disk_guard import EXIT_REFUSED, OVERRIDE_ENV
+    assert _reserve_refusal(12.5, False) == EXIT_REFUSED
+    plain = capsys.readouterr().err
+    assert "keeps 12.5% of its disk free: refusing" in plain and "even after" not in plain
+    assert OVERRIDE_ENV in plain
+    assert _reserve_refusal(12.5, True) == EXIT_REFUSED
+    cleaned = capsys.readouterr().err
+    assert "even after cleaning up" in cleaned and OVERRIDE_ENV in cleaned
+
+
+def _write_config(path: Path, **local: object) -> None:
+    path.write_text(yaml.safe_dump({"fabric_build_cache": {"enabled": True, "local": local}}))
+
+
+def test_enable_targets_validates_registers_and_is_repeatable(tmp_path: Path, monkeypatch, isolated_host):
+    from herdr_engineering.cargo_host import enable_targets
+    config = tmp_path / "config.yaml"
+    config.write_text("fabric_build_cache:\n  enabled: false\n")
+    with pytest.raises(ValueError, match="Enable fabric_build_cache"):
+        enable_targets(config)
+    _write_config(config, min_free_disk_percent=0,
+                  storage_tiers=[{"name": "internal", "directory": str(tmp_path / "cache")}])
+    (tmp_path / "cache").mkdir()
+    for _ in range(2):  # the second run keeps the first backup
+        result = enable_targets(config)
+        assert result["manage_targets"] is True and result["registered_existing_aliases"] == 0
+    saved = yaml.safe_load(config.read_text())
+    assert saved["fabric_build_cache"]["local"]["manage_targets"] is True
+    backup = config.with_name(config.name + ".before-herdr-target-storage")
+    assert "manage_targets" not in backup.read_text()
+
+
+def test_enable_retention_requires_managed_targets_and_keeps_first_backup(tmp_path: Path, monkeypatch, isolated_host):
+    from herdr_engineering.cargo_host import enable_retention
+    config = tmp_path / "config.yaml"
+    _write_config(config, min_free_disk_percent=0, manage_targets=False)
+    with pytest.raises(ValueError, match="managed Cargo targets"):
+        enable_retention(config, schedule=False)
+    _write_config(config, min_free_disk_percent=0, manage_targets=True)
+    first = enable_retention(config, schedule=False)
+    assert first["target_retention_enabled"] is True and first["job"] is None
+    assert yaml.safe_load(config.read_text())["fabric_build_cache"]["local"]["target_retention_enabled"] is True
+    backup = config.with_name(config.name + ".before-herdr-target-retention")
+    assert "target_retention_enabled" not in backup.read_text()
+    enable_retention(config, schedule=False)  # idempotent: backup is not overwritten
+    assert "target_retention_enabled" not in backup.read_text()
+
+
+def _launcher_env(home: Path, config: Path, state: Path, **extra: str) -> dict[str, str]:
+    env = {key: value for key, value in os.environ.items()
+           if key not in ("CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR", "RUSTC_WRAPPER",
+                          "HERDR_DISK_GUARD_OVERRIDE", "HERDR_CARGO_HOST_COORDINATED")}
+    return {**env, "HOME": str(home), "CARGO_HOME": str(home / ".cargo"),
+            "RUSTUP_HOME": os.environ.get("RUSTUP_HOME", str(Path.home() / ".rustup")),
+            "HERDR_ENGINEERING_CONFIG": str(config), "HERDR_ENGINEERING_STATE": str(state),
+            "PYTHONPATH": str(Path(__file__).resolve().parents[1]), **extra}
+
+
+def _tiny_workspace(root: Path) -> Path:
+    (root / "src").mkdir(parents=True)
+    (root / "Cargo.toml").write_text('[package]\nname="reserve-probe"\nversion="0.1.0"\nedition="2021"\n')
+    (root / "src/lib.rs").write_text("pub fn one() -> u32 { 1 }\n")
+    return root
+
+
+def test_managed_build_honours_free_space_reserve_override_and_cleanup_policy(tmp_path: Path):
+    cargo = _real_cargo_path()
+    home = tmp_path / "home"
+    install(home, cargo, Path(sys.executable))
+    workspace = _tiny_workspace(tmp_path / "project")
+    config = tmp_path / "config.yaml"
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    # A reserve of 99% free can never be met; cleanup is off, so the tiers are not retried after a sweep.
+    config.write_text(yaml.safe_dump({
+        "build_cleanup": {"enabled": False},
+        "fabric_build_cache": {"enabled": True, "local": {
+            "manage_targets": True, "min_free_disk_percent": 99,
+            "storage_tiers": [{"name": "internal", "directory": str(cache)}]}}}))
+    launcher = str(home / ".local/bin/cargo")
+    refused = subprocess.run([launcher, "build", "--offline"], cwd=workspace, text=True, capture_output=True,
+                             timeout=60, env=_launcher_env(home, config, tmp_path / "state"))
+    assert refused.returncode != 0 and "keeps 99% of its disk free" in refused.stderr
+    assert not (workspace / "target").exists()
+    allowed = subprocess.run([launcher, "build", "--offline"], cwd=workspace, text=True, capture_output=True,
+                             timeout=90, env=_launcher_env(home, config, tmp_path / "state",
+                                                           HERDR_DISK_GUARD_OVERRIDE="1"))
+    assert allowed.returncode == 0, allowed.stderr
+    assert "proceeding because HERDR_DISK_GUARD_OVERRIDE=1" in allowed.stderr
+    assert (workspace / "target").is_symlink()
+
+
+def test_cargo_clean_skips_the_disk_guard_and_other_subcommands_pass_through(tmp_path: Path):
+    cargo = _real_cargo_path()
+    home = tmp_path / "home"
+    install(home, cargo, Path(sys.executable))
+    workspace = _tiny_workspace(tmp_path / "project")
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    config = tmp_path / "config.yaml"
+    config.write_text(yaml.safe_dump({
+        "build_cleanup": {"refuse_builds_percent": 0, "refuse_builds_min_free_gib": 1000000000},
+        "fabric_build_cache": {"enabled": True, "local": {
+            "manage_targets": True, "min_free_disk_percent": 0,
+            "storage_tiers": [{"name": "internal", "directory": str(cache)}]}}}))
+    env = _launcher_env(home, config, tmp_path / "state")
+    launcher = str(home / ".local/bin/cargo")
+    cleaned = subprocess.run([launcher, "clean", "--offline"], cwd=workspace, text=True, capture_output=True,
+                             timeout=60, env=env)
+    assert cleaned.returncode == 0, cleaned.stderr
+    assert "refusing to start" not in cleaned.stderr
+    built = subprocess.run([launcher, "build", "--offline"], cwd=workspace, text=True, capture_output=True,
+                           timeout=60, env=env)
+    assert built.returncode != 0 and "refusing to start a new build" in built.stderr
+    version = subprocess.run([launcher, "--version"], cwd=workspace, text=True, capture_output=True,
+                             timeout=30, env=env)
+    assert version.returncode == 0 and version.stdout.startswith("cargo ")
+
+
+def test_managed_build_without_any_writable_tier_is_not_started(tmp_path: Path):
+    cargo = _real_cargo_path()
+    home = tmp_path / "home"
+    install(home, cargo, Path(sys.executable))
+    workspace = _tiny_workspace(tmp_path / "project")
+    config = tmp_path / "config.yaml"
+    config.write_text(yaml.safe_dump({"fabric_build_cache": {"enabled": True, "local": {
+        "manage_targets": True, "min_free_disk_percent": 0,
+        "storage_tiers": [{"name": "gone", "directory": "herdr-build/compiler-cache",
+                           "volume_uuid": "11111111-2222-4333-8444-555555555555"}]}}}))
+    result = subprocess.run([str(home / ".local/bin/cargo"), "build", "--offline"], cwd=workspace, text=True,
+                            capture_output=True, timeout=60, env=_launcher_env(home, config, tmp_path / "state"))
+    assert result.returncode == 1 and "No writable storage tier" in result.stderr
+    assert not (workspace / "target").exists()

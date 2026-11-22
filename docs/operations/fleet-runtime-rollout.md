@@ -93,11 +93,20 @@ Per-host work is serial so one rollout does not create a fleet build storm.
 Transport calls have timeouts; a stopped controller resumes from durable state.
 Requests are saved before sending and receipts are saved atomically with fsync.
 Typed failed receipts emitted with CLI exit code 1 are recorded as failures. A
-skipped `busy` outcome or `STALE_MISSION_FENCE` code proves no mutation occurred:
-its receipt is archived and the next pass can create one fresh request using the
-latest mission fences. Other skipped outcomes remain explicitly blocked until
+skipped `busy` outcome, `STALE_MISSION_FENCE` code, or `INTERACTIVE_BUSY` code
+proves no mutation occurred: the receipt is archived and the next pass can create
+one fresh request using the latest mission fences. The Pi runtime reports its
+not-yet conditions as `busy` (runtime not ready, mission planning or recovering,
+custody changed, no local resumable controller) and a busy interactive session as
+`INTERACTIVE_BUSY`; both are time, not operator attention, so they retry instead
+of blocking the rollout. Other skipped outcomes remain explicitly blocked until
 refreshed state proves operator intent or a terminal mission; they do not generate
 unbounded fresh recovery operations.
+
+A session whose runtime activated but whose stable Host still runs an older
+release records `bootstrap_required` with a durable `nextStep`: restart the stable
+Pi Host on that host so it loads the selected release, then resume the rollout.
+A hot reload never changes `hostCommit`, so no pass can fix this by itself.
 Uncertain deliveries reuse the original operation ID and payload. A replacement
 runtime instance in the same process polls the same durable receipt.
 
@@ -106,6 +115,47 @@ The default state directory is `~/.local/state/herdr-engineering/rollouts`, mode
 Do not edit it to change a revision, destination, process, or operation ID. Create
 a separate rollout for another release. There is no automatic downgrade or
 cross-rollout rollback: a rollback is a separately reviewed pinned release plan.
+
+## Unattended convergence: pin, resume, prune
+
+Plans are only as good as the revision they target and the driver that drains
+them. Three mechanisms keep the fleet on one target (#844):
+
+**Pin the target.** Write the full 40-character commit SHA you want the fleet's
+Pi runtimes on, one line, to `~/.config/herdr-engineering/pi-rollout-revision`
+(the `HERDR_PI_ROLLOUT_REVISION` environment variable overrides the file). With a
+pin, `fleet rollout plan` no longer requires `--pi-revision`; an explicit flag
+still wins. Without a pin, planning without `--pi-revision` fails closed, and the
+unattended driver does not touch rollouts at all. An invalid pin (not a full
+lowercase 40-hex SHA) is a failure, never a silent fallback.
+
+**Resume, don't re-mint.** `fleet rollout latest` prints the newest plan that has
+not settled (`complete` or `abandoned`), or `{"id": null}`. The daily controller
+(`herdr-eng-fleet-update.timer` -> `herdr_engineering.fleet_autoupdate`) runs this
+selector after each successful controller update: with a pin it resumes the newest
+unfinished rollout with a bounded pass window (`--max-passes 3`, 30-second
+interval), and mints a new plan only when nothing unfinished exists **and** the
+pinned revision has never been rolled out - once a plan for the pin settles, later
+nights report a skip instead of re-staging the converged fleet, and an abandoned
+plan for the pin is respected as the operator's decision to retire it. A plan
+whose revision does not match the pin is skipped and reported in the run record -
+the operator settles it with `fleet rollout abandon --id ROLLOUT_ID --reason ...`
+(settling a `complete` rollout is refused) or finishes it. The result of the pi
+step is recorded in the unattended run state next to the controller update, so a
+permanently skipped or blocked drain is visible without reading the journal. The
+step's own failures - a malformed pin file, an unreadable store, a rollout lock
+held by an operator command - are recorded as `pi_rollout.status: error` (or
+`prunedError` beside a completed drain) and never undo a successful controller
+update: the run's pass/fail verdict belongs to the controller update.
+
+**Bound the state.** `fleet rollout prune [--older-than-days N]` (default 30,
+bounded to 0-3650: a negative horizon would delete every settled record) deletes
+settled records - `complete` or `abandoned`, judged by their last pass or creation
+time - so the state directory reflects current intent. Unsettled records are never
+touched: a blocked rollout may still be the operator's next action, and only a
+deliberate `abandon` marks it done - and like `apply` and `run`, `retire-identityless`
+refuses an abandoned rollout rather than silently reopening it. The daily driver
+prunes after each drain.
 
 ## What completion proves
 

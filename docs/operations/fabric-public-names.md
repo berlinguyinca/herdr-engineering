@@ -69,7 +69,7 @@ logs a warning and keeps using per-port URLs; it never advertises a name nothing
 ## The bare names: `https://dev.lan` and `https://local.metabolomics.us`
 
 `--apex-upstream HOST:PORT` (config `fabric.apex_upstream`) sends the bare fleet names on the named port to the
-dashboard, e.g. `--apex-upstream 100.104.39.6:80` for the `herdr-cp-web` container. `https://local.metabolomics.us`
+dashboard, e.g. `--apex-upstream 100.64.8.6:80` for the `herdr-cp-web` container. `https://local.metabolomics.us`
 then works on any tailnet device with no enrollment. `https://dev.lan` needs a certificate for `.lan`, which no public CA
 issues, so it uses the private CA: run `devfabric ca init && devfabric ca issue`, start the gateway with the CA present, and
 install the root once per device (`devfabric ca export`, an iOS/macOS `.mobileconfig`). Until a device trusts it, its browser

@@ -119,6 +119,12 @@ path and not the upstream checkout:
   of starting a second pane, and closes the source now that git reports it clean.
 * `status: launch_unconfirmed` or `launch_failed` — the close was refused and both panes remain up;
   nothing was destroyed. Report it rather than re-running the command to force it.
+* Takeover gave up waiting (`--confirm-timeout`) — since herdr-handoff 0.5.1 the successor's later
+  `herdr-handoff confirm` closes the source through the same gate (unpushed commits, a dirty worktree or
+  another tab refuse). Its JSON reports `close` (`source_closed`, `already_closed`, `refused`,
+  `not_attempted`), `source_closed`, `reason` and `source_closed_at`, and it exits 0 whenever the
+  confirmation is recorded. It never closes after `--keep-source`, for a 0.5.0-written record, with no
+  source pane recorded, or while a takeover holds the lock.
 * `status: source_close_failed` — the handoff completed and herdr refused the close; report it.
 
 Untracked files (`.claude/`, `.venv/`, build output) do not refuse a close: they appear in almost every
@@ -127,6 +133,23 @@ that really loses work. It skips only the worktree check — never the live-succ
 and `git -C <path> status --short` plus `git -C <path> log @{u}..HEAD --oneline` show what it would drop.
 
 To keep the old pane instead of handing over, pass `--keep-source` (or use `launch` directly).
+
+### Live pane checks and `reap` (herdr-handoff 0.6.0)
+
+A close made after the takeover (`confirm`, `reap`) first looks at the live pane and refuses with
+`source_working` (the source agent is still working), `source_is_caller` (it is the pane the command runs
+in), `source_pane_reused` (the pane id now holds a different terminal than the takeover recorded, from
+`close_options.source_terminal_id`) or `successor_gone` (the successor pane no longer exists). The reason is
+recorded in the handoff's takeover block. `takeover` itself is unchanged. Successor panes are named
+`<project>: <goal summary>`.
+
+`herdr-handoff reap` closes the panes that confirmed handoffs replaced and that are still open (the backlog,
+and any handoff whose `confirm` could not close). It is a dry run: it prints `would_close`, `closed`,
+`already_closed` or `skipped` with the reason per handoff and changes nothing until `--apply` is given. Each
+close goes through the same gate as a confirm-side close. A record written before close options were stored
+is skipped. `--include-unrecorded` closes those too, and is dangerous: an old record cannot detect pane-id
+reuse and its `--keep-source` choice is unknown, so always review the dry run first. `herdr-eng doctor`
+requires a CLI that offers `reap` (0.6.0 or newer).
 
 ## Optional `memory_context`
 

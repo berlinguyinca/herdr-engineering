@@ -73,6 +73,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("arguments", nargs=argparse.REMAINDER)
     p.set_defaults(func=_cmd_cargo_host)
 
+    p = sub.add_parser("build-hygiene", help="install or inspect default disk hygiene (cleanup job, cargo wrapper)")
+    p.add_argument("arguments", nargs=argparse.REMAINDER)
+    p.set_defaults(func=_cmd_build_hygiene)
+
     from .open_client import register_parser
     register_parser(sub)
 
@@ -439,14 +443,16 @@ def _build_parser() -> argparse.ArgumentParser:
 
     pr = fsub.add_parser("rollout", help="durable Pi runtime update and mission recovery")
     rsub = pr.add_subparsers(dest="rollout_command", required=True)
-    for action in ("plan", "apply", "run", "status"):
+    for action in ("plan", "apply", "run", "status", "latest"):
         rp = rsub.add_parser(action)
         rp.add_argument("--state", default=None, help="private rollout state directory")
         if action == "plan":
-            rp.add_argument("--pi-revision", required=True, help="full immutable Pi commit SHA")
+            rp.add_argument("--pi-revision", default=None,
+                            help="full immutable Pi commit SHA; defaults to the pinned "
+                                 "revision (~/.config/herdr-engineering/pi-rollout-revision)")
             rp.add_argument("--host", default=None)
             rp.add_argument("--inventory", default=None)
-        else:
+        elif action != "latest":
             rp.add_argument("--id", required=True, help="rollout ID printed by plan")
         if action == "run":
             rp.add_argument("--interval-seconds", type=int, default=30, help="initial retry interval, 1..3600 (backoff caps at max(interval, 300))")
@@ -466,6 +472,25 @@ def _build_parser() -> argparse.ArgumentParser:
         default="operator",
         help="who is settling the registration; recorded per session in the report",
     )
+    rp.set_defaults(func=_cmd_fleet_rollout)
+
+    rp = rsub.add_parser(
+        "abandon",
+        help="settle a rollout the operator no longer wants (e.g. it targets an unpinned "
+        "revision); the record stays until pruned, and the newest unfinished selector "
+        "moves on",
+    )
+    rp.add_argument("--state", default=None, help="private rollout state directory")
+    rp.add_argument("--id", required=True, help="rollout ID printed by plan")
+    rp.add_argument("--reason", default="abandoned by operator", help="why; recorded in the plan")
+    rp.set_defaults(func=_cmd_fleet_rollout)
+
+    rp = rsub.add_parser(
+        "prune",
+        help="delete settled (complete/abandoned) rollout records older than the horizon",
+    )
+    rp.add_argument("--state", default=None, help="private rollout state directory")
+    rp.add_argument("--older-than-days", type=int, default=30, help="settle horizon (default 30)")
     rp.set_defaults(func=_cmd_fleet_rollout)
 
     # artifacts ------------------------------------------------------------
@@ -828,10 +853,10 @@ def _build_parser() -> argparse.ArgumentParser:
                          "the gateway keeps using per-port URLs)")
     p2.add_argument("--apex-upstream", default=None, metavar="HOST:PORT",
                     help="where the bare fleet names (https://dev.lan, https://<acme-domain>) go: the dashboard, e.g. "
-                         "100.104.39.6:80. Needs the named listener (--acme-domain) and a certificate for the name")
+                         "100.64.8.6:80. Needs the named listener (--acme-domain) and a certificate for the name")
     p2.add_argument("--route", action="append", default=[], metavar="HOST=UP:PORT",
                     help="send one exact host name on the named port to an upstream (repeatable), e.g. "
-                         "bender.tail0c50da.ts.net=127.0.0.1:8787 to take over a `tailscale serve` rule")
+                         "bender.<tailnet>.ts.net=127.0.0.1:8787 to take over a `tailscale serve` rule")
     p2.add_argument("--tailscale-cert", default=None, metavar="NAME",
                     help="also serve this node's ts.net NAME with the certificate `tailscale cert` provides")
     p2.add_argument("--no-named-urls", action="store_true", help="do not serve stable service-name URLs")
@@ -1159,7 +1184,7 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="Cognito Hosted UI base URL, e.g. https://<prefix>.auth.us-west-2.amazoncognito.com")
     p2.add_argument("--collab-public-url", default=None,
                     help="the https URL users open (must equal a registered callback URL), e.g. "
-                         "https://bender.tail0c50da.ts.net:9447/")
+                         "https://bender.<tailnet>.ts.net:9447/")
     p2.add_argument("--collab-cognito-group", default=None,
                     help="required cognito:groups membership (default: local.dev)")
     p2.add_argument("--collab-open-signup", action="store_true",
@@ -2317,9 +2342,13 @@ def _cmd_fleet_rollout(args) -> int:
     from .fleet import FleetError, repo_root
     from .fleet_rollout import (
         RolloutStore,
+        abandon_rollout,
         apply_rollout,
         create_rollout,
         inventory_targets,
+        latest_unfinished,
+        prune_settled,
+        resolve_plan_revision,
         retire_identityless,
         run_rollout,
     )
@@ -2327,14 +2356,22 @@ def _cmd_fleet_rollout(args) -> int:
     store = RolloutStore(Path(args.state) if args.state else None)
     try:
         if args.rollout_command == "plan":
+            revision = resolve_plan_revision(args.pi_revision)
             inventory = Path(args.inventory) if args.inventory else repo_root() / "ansible/inventory/hosts.yml"
-            report = create_rollout(store, args.pi_revision, inventory_targets(inventory, args.host), inventory=inventory)
+            report = create_rollout(store, revision, inventory_targets(inventory, args.host), inventory=inventory)
         elif args.rollout_command == "apply":
             report = apply_rollout(store, args.id)
         elif args.rollout_command == "run":
             report = run_rollout(store, args.id, interval_seconds=args.interval_seconds, max_passes=args.max_passes, max_unchanged_online_passes=args.max_unchanged_online_passes)
         elif args.rollout_command == "retire-identityless":
             report = retire_identityless(store, args.id, settled_by=args.settled_by)
+        elif args.rollout_command == "latest":
+            plan = latest_unfinished(store)
+            report = plan if plan is not None else {"status": "none", "reason": "no unfinished rollout"}
+        elif args.rollout_command == "abandon":
+            report = abandon_rollout(store, args.id, reason=args.reason)
+        elif args.rollout_command == "prune":
+            report = {"pruned": prune_settled(store, older_than_days=args.older_than_days)}
         else:
             report = store.read(args.id)
     except (OSError, ValueError, RuntimeError, FleetError) as exc:
@@ -3481,6 +3518,11 @@ def _cmd_dev_gateway(args) -> int:
     return 0
 
 
+def _cmd_build_hygiene(args) -> int:
+    from .build_hygiene import main
+    return main(args.arguments)
+
+
 def _cmd_cargo_host(args) -> int:
     from .cargo_host import main
     return main(args.arguments)
@@ -3497,7 +3539,7 @@ def _cmd_build_coordinate(args) -> int:
     from .build_coord import BuildGate, _default_slots, _default_state_dir, run_gated
     from .build_metrics import summarize
 
-    cache_cfg = _build_cache_config()
+    cache_cfg, cleanup_policy = _build_cache_config_and_policy()
     slots = args.slots if args.slots is not None else effective_slots(
         cache_cfg, _default_slots(), _default_state_dir())
     if getattr(args, "status", False):
@@ -3540,11 +3582,40 @@ def _cmd_build_coordinate(args) -> int:
     if getattr(args, "trace_session", None) and trace is None:
         print("build-coordinate: --trace-session ignored (not a plain non-secret id)",
               file=sys.stderr)
+    if cmd and _guarded_build(cmd):
+        from .cargo_host import _disk_guard_refusal
+        probe = Path.cwd()
+        if os.path.basename(cmd[0]) == "cargo":  # measure where cargo's output really lands
+            from .cargo_target_storage import target_override
+            where = target_override(cmd[1:], os.environ, probe)
+            probe = where if isinstance(where, Path) else probe
+        refused = _disk_guard_refusal(probe, cleanup_policy)
+        if refused is not None:
+            return refused
     return run_gated(cmd, slots=slots, max_load=args.max_load,
                      wait_seconds=args.wait, json_out=args.json,
                      bypass_on_timeout=args.bypass_on_timeout,
                      record=getattr(args, "record", False),
                      cache_config=cache_cfg, trace=trace)
+
+
+# Commands whose output size the disk-budget guard protects here. Cargo is guarded here only when the
+# cargo on PATH is not the managed wrapper: the wrapper guards it against the filesystem its target really
+# lands on, also under build-coordinate. Scripts are never refused.
+_GUARDED_BUILD_COMMANDS = frozenset({"rustc", "make", "cmake", "ninja", "tsc"})
+_GUARDED_GO_SUBCOMMANDS = frozenset({"build", "install", "generate"})
+
+
+def _guarded_build(cmd: list[str]) -> bool:
+    name = os.path.basename(cmd[0])
+    if name == "cargo":
+        from .cargo_host import BUILD_SUBCOMMANDS, cargo_subcommand, path_cargo_is_wrapper
+        subcommand = cargo_subcommand(cmd[1:])
+        return (subcommand in BUILD_SUBCOMMANDS and subcommand != "clean"
+                and not path_cargo_is_wrapper(cmd[0]))
+    if name == "go":
+        return len(cmd) > 1 and cmd[1] in _GUARDED_GO_SUBCOMMANDS
+    return name in _GUARDED_BUILD_COMMANDS
 
 
 def _is_gate_command(cmd: list[str]) -> bool:
@@ -3555,20 +3626,31 @@ def _is_gate_command(cmd: list[str]) -> bool:
         and cmd[1] == "build-coordinate")
 
 
-def _build_cache_config():
-    """Effective ``fabric_build_cache`` config, or None when absent/disabled/invalid.
+def _build_cache_config_and_policy():
+    """(effective ``fabric_build_cache`` config or None, ``build_cleanup`` policy), from one config load.
 
-    A config problem must never block a build: it just runs uncached.
+    A config problem must never block a build: the cache config is then None (it runs uncached) and
+    the policy falls back to the non-strict load, so the disk guard still applies.
     """
     from .build_cache_config import validate
     from .config import load_config
     try:
-        section = load_config(strict_build_cache=True).get("fabric_build_cache")
+        loaded = load_config(strict_build_cache=True)
+        section = loaded.get("fabric_build_cache")
         cfg = validate(section) if section else None
     except Exception as exc:  # noqa: BLE001
         print(f"build-coordinate: build cache config ignored: {exc}", file=sys.stderr)
-        return None
-    return cfg if cfg is not None and cfg.enabled else None
+        try:
+            loaded = load_config()
+        except Exception:  # noqa: BLE001
+            loaded = {}
+        return None, loaded.get("build_cleanup", {})
+    return (cfg if cfg is not None and cfg.enabled else None), loaded.get("build_cleanup", {})
+
+
+def _build_cache_config():
+    """Effective ``fabric_build_cache`` config, or None when absent/disabled/invalid."""
+    return _build_cache_config_and_policy()[0]
 
 
 def _cmd_build_cache_inventory(args) -> int:
@@ -3647,7 +3729,7 @@ def _cmd_dev_agent(args) -> int:
 
     from .config import InvalidError, load_config
     from .fabric import FabricClient, gateway_url_from_config, tailnet_ipv4
-    from .fabric_agent import AgentConfig, FabricAgent, parse_agent_binaries
+    from .fabric_agent import AgentConfig, FabricAgent, parse_agent_binaries, parse_deny_processes
     from .host_config import ConfigRefresher, HostConfigUnavailable, exit_unavailable, host_config
 
     logging.basicConfig(level=logging.INFO,
@@ -3688,6 +3770,7 @@ def _cmd_dev_agent(args) -> int:
         "agent_exclude_ports", []))
     try:
         agent_binaries = parse_agent_binaries(fabric_cfg.get("agent_binaries"))
+        deny_processes = parse_deny_processes(fabric_cfg.get("agent_deny_processes"))
     except ValueError as exc:
         _print_json({"code": "config", "message": str(exc)})
         return 1
@@ -3711,6 +3794,9 @@ def _cmd_dev_agent(args) -> int:
             host_report_interval=float(fabric_cfg.get("host_report_interval", 30.0)),
             host_slow_interval=float(fabric_cfg.get("host_slow_interval", 3600.0)),
             agent_binaries=agent_binaries,
+            deny_processes=deny_processes,
+            orphan_grace=float(fabric_cfg.get("agent_orphan_grace_seconds", 60.0)),
+            lease_max_age=float(fabric_cfg.get("agent_lease_max_age_seconds", 86400.0)),
         ))
     if args.once:
         summary = agent.scan_once()
@@ -6220,8 +6306,8 @@ def _parse_api_keys(single_key, pairs_str):
 
 def _seed_demo(repo):
     """Populate a fresh repo with demo missions/sessions/hosts/services."""
-    hid1 = repo.register_host("bender", "100.104.39.6")
-    hid2 = repo.register_host("beast", "100.96.156.65")
+    hid1 = repo.register_host("bender", "100.64.8.6")
+    hid2 = repo.register_host("beast", "100.64.8.65")
     repo.record_telemetry(hid1, {"cpu_pct": 12, "mem_pct": 38, "disk_pct": 54})
     repo.record_telemetry(hid2, {"cpu_pct": 3, "mem_pct": 21, "disk_pct": 30})
 

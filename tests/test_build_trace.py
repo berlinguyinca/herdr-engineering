@@ -95,8 +95,10 @@ def _cli(args, state, home, extra_env=None):
 
 def test_cli_require_cache_enabled_disabled_runs_plain_and_unrecorded(tmp_path):
     state = tmp_path / "state"
+    off = tmp_path / "off.yaml"
+    off.write_text("fabric_build_cache:\n  enabled: false\n")
     r = _cli(["--require-cache-enabled", "--record", "--trace-session", "s1", "--",
-              "sh", "-c", "echo hi; exit 3"], state, tmp_path)
+              "sh", "-c", "echo hi; exit 3"], state, tmp_path, {"HERDR_ENGINEERING_CONFIG": str(off)})
     assert r.returncode == 3 and "hi" in r.stdout
     assert not (state / "build-gates").exists()  # no gate, no lock, no events
 

@@ -27,17 +27,37 @@ GITHUB_PROJECTS_DEFAULTS = {"enabled": False, "item_limit": 2000}
 
 DEFAULTS: dict[str, Any] = {
     "version": 1,
+    # Disk hygiene is ON by default; opt out with ``build_cleanup: {enabled: false}``.
+    # Normal sweeps need ``min_age_hours`` idle; once usage reaches ``pressure_percent`` the
+    # idle floor drops to ``pressure_min_age_hours`` (live process/lease/lock guards still apply).
+    # Cargo wrapper / build-coordinate refuse new builds at ``refuse_builds_percent``
+    # when the build's filesystem also has less than ``refuse_builds_min_free_gib`` available,
+    # unless HERDR_DISK_GUARD_OVERRIDE=1 is set. ``enabled: false`` disables the guard too.
     "build_cleanup": {
-        "enabled": False,
-        "roots": [],
+        "enabled": True,
+        # Every Rust project of the user: the home directory (bounded depth; dot directories such as ~/.cargo
+        # and ~/.rustup, node_modules and symlinks are not entered), the usual project directories (swept on
+        # their own, not twice) and ~/.cache (cache-only targets there are found and reported,
+        # but never cleaned: with no manifest beside them there is no workspace to clean through).
+        "roots": ["~", "~/work", "~/IdeaProjects", "~/.cache"],
         "interval_seconds": 900,
+        "require_herdr_server": False,  # true: the watch loop only sweeps while a herdr server runs
         "high_water_percent": 85,
         "low_water_percent": 80,
         "min_age_hours": 24,
+        # A target over this size is cleaned by the sweep (every 15 minutes, whatever the disk usage) once it has
+        # been idle for size_cap_idle_hours, never from inside a build; 0: no cap.
+        "max_target_gb": 50,
+        "size_cap_idle_hours": 2,
+        "pressure_percent": 90,
+        "pressure_min_age_hours": 2,
+        "refuse_builds_percent": 90,
+        "refuse_builds_min_free_gib": 50,
     },
-    # Spec 02: default-off; validated by build_cache_config.validate (fails closed).
+    # Spec 02: on by default (local_only; shared cache/slurm stay off); validated by
+    # build_cache_config.validate (fails closed). Opt out with ``enabled: false``.
     "fabric_build_cache": {
-        "enabled": False,
+        "enabled": True,
         "mode": "local_only",
         "allowed_hosts": [],
         "shared_cache": {
@@ -56,7 +76,7 @@ DEFAULTS: dict[str, Any] = {
             "min_free_disk_percent": 20,
             "incremental_disabled_for_cacheable_builds": True,
             "storage_tiers": [],
-            "manage_targets": False,
+            "manage_targets": True,
             "target_retention_enabled": False,
             "target_internal_gib": 32,
             "target_external_gib": 256,
@@ -143,6 +163,14 @@ DEFAULTS: dict[str, Any] = {
         # services on ports in [agent_web_port_min, agent_ephemeral_min) that
         # are not in agent_exclude_ports (well-known daemons are also skipped).
         "agent_exclude_ports": [],
+        # Process-name fragments never auto-leased (null = built-in list of
+        # test/dev servers: vitest, jest, playwright, vite, next-server, ...).
+        "agent_deny_processes": None,
+        # Release a forwarded lease once its loopback app has been down this long.
+        "agent_orphan_grace_seconds": 60,
+        # Backstop: release a watcher lease this old (a live app re-registers on
+        # the next scan, i.e. a refresh). 0 disables. Default 24h.
+        "agent_lease_max_age_seconds": 86400,
         "agent_web_port_min": 1024,
         "agent_ephemeral_min": 32768,
         # The auto-registration agent reports every discovered service to this
@@ -260,6 +288,8 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
     """Recursively merge override into base, preserving unrelated base keys."""
     result = copy.deepcopy(base)
     for key, value in override.items():
+        if value is None and isinstance(result.get(key), dict):
+            continue  # an empty ``section:`` key adds nothing; it must not erase the defaults
         if isinstance(value, dict) and isinstance(result.get(key), dict):
             result[key] = _deep_merge(result[key], value)
         else:
@@ -286,36 +316,84 @@ def _expand_env(value: Any) -> Any:
     return value
 
 
-def _discover_config_paths() -> list[Path]:
-    """Default config discovery, in increasing precedence (later overrides).
+def _discover_config_sources() -> list[tuple[Path, bool]]:
+    """Default config discovery, in increasing precedence (later overrides), as ``(path, trusted)``.
 
     1. machine-local: ``~/.config/herdr-engineering/config.yaml``
        (written by ``scripts/install.sh``; per-host settings)
     2. repository:     ``./config/herdr-engineering.yaml`` or ``./herdr-engineering.yaml``
-    3. explicit env:   ``$HERDR_ENGINEERING_CONFIG`` (highest)
+       (untrusted: it is whatever checkout the command runs in)
+    3. explicit env:   ``$HERDR_ENGINEERING_CONFIG`` (highest; the operator chose it, so it is machine config
+       even when it names a file inside the current directory)
     """
     home = Path.home()
     candidates = [
-        home / ".config" / "herdr-engineering" / "config.yaml",
-        Path.cwd() / "config" / "herdr-engineering.yaml",
-        Path.cwd() / "herdr-engineering.yaml",
+        (home / ".config" / "herdr-engineering" / "config.yaml", True),
+        (Path.cwd() / "config" / "herdr-engineering.yaml", False),
+        (Path.cwd() / "herdr-engineering.yaml", False),
     ]
     env = os.environ.get("HERDR_ENGINEERING_CONFIG")
     if env:
-        candidates.append(Path(env))
-    return [c for c in candidates if c.exists()]
+        candidates.append((Path(env), True))
+    return [(c, trusted) for c, trusted in candidates if c.exists()]
 
 
-# Sections a checkout being built must never set: policy (build-cache writes,
-# namespace, credentials; automatic handoff triggers) belongs to the machine
-# config, not to the repository an agent is working on.
-_REPO_LOCAL_STRIPPED_KEYS: tuple[str, ...] = ("fabric_build_cache", "handoff_autopilot")
+def _discover_config_paths() -> list[Path]:
+    return [path for path, _ in _discover_config_sources()]
 
 
-def _repo_local_paths() -> set[Path]:
-    """Config files taken from the current directory (untrusted: the repo being built)."""
-    cwd = Path.cwd()
-    return {cwd / "config" / "herdr-engineering.yaml", cwd / "herdr-engineering.yaml"}
+# What a checkout's own config may set: only keys that are harmless coming from untrusted input. Every
+# other section and key (build_cleanup roots and thresholds, build-cache policy, credentials, endpoints
+# such as ci.base_url, listeners such as web.host, security) is machine-local only: a repo being built
+# must not choose what gets deleted, where a token is sent, or what the host listens on.
+REPO_LOCAL_ALLOWED: dict[str, frozenset[str] | None] = {
+    "version": None,  # scalar
+    "web": frozenset({"port"}),
+    "tests": frozenset({"adapters"}),
+    "ci": frozenset({"provider", "pileated_extensions"}),
+}
+_warned_repo_local: set[tuple[str, tuple[str, ...]]] = set()
+
+
+def _filter_repo_local(path: Path, data: dict[str, Any]) -> dict[str, Any]:
+    """Keep only the allowed keys of an untrusted repo-local config; warn once, naming what was ignored."""
+    kept: dict[str, Any] = {}
+    ignored: list[str] = []
+    for key, value in data.items():
+        if key not in REPO_LOCAL_ALLOWED:
+            ignored.append(key)
+        elif REPO_LOCAL_ALLOWED[key] is None:
+            kept[key] = value
+        elif isinstance(value, dict):
+            allowed = REPO_LOCAL_ALLOWED[key]
+            kept[key] = {k: v for k, v in value.items() if k in allowed}
+            ignored.extend(f"{key}.{k}" for k in value if k not in allowed)
+        else:
+            ignored.append(key)
+    names = tuple(sorted(ignored))
+    if names and (str(path), names) not in _warned_repo_local:
+        _warned_repo_local.add((str(path), names))
+        logging.getLogger(__name__).warning(
+            "%s: ignoring %s; a repository's own config may only set %s. Put the rest in "
+            "~/.config/herdr-engineering/config.yaml or $HERDR_ENGINEERING_CONFIG.",
+            path, ", ".join(names), ", ".join(sorted(
+                k if v is None else f"{k}.{{{','.join(sorted(v))}}}" for k, v in REPO_LOCAL_ALLOWED.items())))
+    return kept
+
+
+def _normalize_build_cleanup(data: dict[str, Any], path: Path) -> None:
+    """``build_cleanup`` is a mapping; the shorthand ``build_cleanup: false`` (or ``true``) means
+    ``{enabled: value}`` and is merged into what earlier sources set. Checked on each source before it is
+    merged, so no reader ever sees another type."""
+    if "build_cleanup" not in data:
+        return
+    value = data["build_cleanup"]
+    if value is None or isinstance(value, dict):
+        return
+    if isinstance(value, bool):
+        data["build_cleanup"] = {"enabled": value}
+        return
+    raise InvalidError(f"{path}: build_cleanup must be a mapping or a boolean")
 
 
 def load_config(
@@ -328,9 +406,8 @@ def load_config(
     file written by the installer is actually used.
     """
     cfg = copy.deepcopy(DEFAULTS)
-    discovered = paths is None
-    repo_local = _repo_local_paths() if discovered else set()
-    for path in paths if paths is not None else _discover_config_paths():
+    sources = ([(path, True) for path in paths] if paths is not None else _discover_config_sources())
+    for path, trusted in sources:
         if not path.exists():
             continue
         try:
@@ -350,15 +427,10 @@ def load_config(
             logging.getLogger(__name__).warning(
                 "%s: github.* is validated but not read from this file; control-plane-web reads "
                 "github.organizations and github.sync from the central fleet config (control_plane "
-                "fleet file), so this section has no effect",
-                path,
-            )
-        if path in repo_local:
-            # A checkout being built must never choose build-cache policy
-            # (writes, namespace, credentials) or handoff policy: trusted
-            # (machine-local / explicit) config only.
-            for key in _REPO_LOCAL_STRIPPED_KEYS:
-                data.pop(key, None)
+                "fleet file), so this section has no effect", path)
+        if not trusted:
+            data = _filter_repo_local(path, data)
+        _normalize_build_cleanup(data, path)
         cfg = _deep_merge(cfg, data)
     validate_github(cfg.get("github"))
     cfg = _expand_env(cfg)
@@ -375,6 +447,7 @@ def load_config(
             "fabric_build_cache config invalid, feature disabled: %s", exc
         )
         cfg["fabric_build_cache"] = copy.deepcopy(DEFAULTS["fabric_build_cache"])
+        cfg["fabric_build_cache"]["enabled"] = False
     return cfg
 
 
@@ -386,19 +459,19 @@ def declared_keys(section: str) -> set[str]:
     a default is a guess about a context window, 200000 as a declaration is a fact about one.
     """
     keys: set[str] = set()
-    untrusted = _repo_local_paths()
-    for path in _discover_config_paths():
+    for path, trusted in _discover_config_sources():
         if not path.is_file():
             continue
-        if section in _REPO_LOCAL_STRIPPED_KEYS and path in untrusted:
+        if not trusted and section not in REPO_LOCAL_ALLOWED:
             continue
+        allowed = None if trusted else REPO_LOCAL_ALLOWED[section]
         try:
             raw = _read_simple_yaml(path)
         except (OSError, ValueError):
             continue
         block = raw.get(section) if isinstance(raw, dict) else None
         if isinstance(block, dict):
-            keys.update(key for key in block if isinstance(key, str))
+            keys.update(key for key in block if isinstance(key, str) and (allowed is None or key in allowed))
     return keys
 
 

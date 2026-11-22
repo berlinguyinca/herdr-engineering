@@ -31,7 +31,7 @@ ZONES = [{"Id": "/hostedzone/ZPARENT", "Name": "example.test.", "Config": {}},
 
 
 def test_only_tailnet_ipv4_addresses_publishable():
-    assert dns.validate_ips(["100.104.39.6", "100.104.39.6"]) == ["100.104.39.6"]
+    assert dns.validate_ips(["100.64.8.6", "100.64.8.6"]) == ["100.64.8.6"]
     for bad in ("192.168.1.5", "8.8.8.8", "fd7a:115c:a1e0::8c2b:2707", "nope", "127.0.0.1"):
         with pytest.raises(dns.DnsError):
             dns.validate_ips([bad])

@@ -13,13 +13,31 @@
 # (a dev host, a docker agent, a first run) the script cannot tell, so it runs the suite - the same fail-open rule as
 # unit-gates-applicable.sh: a guard that cannot read state must not hand back a green.
 #
-# Override the memo location with HERDR_CI_STATE for a dev host or a test.
+# HERDR_CI_STATE (the memo directory) is REQUIRED: .woodpecker/main-cron.yml sets it from the runner-provided WPCI_CI_DIR, the
+# persistent shared CI store. There is deliberately no default: a writable but per-job directory would silently re-run the whole
+# suite on every cron tick, so an unset value fails loudly instead.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
-state_dir="${HERDR_CI_STATE:-/home/wohlgemuth/woodpecker/ci/state/herdr}"
+state_dir="${HERDR_CI_STATE:-}"
+if [ -z "$state_dir" ]; then
+  echo "main-cron: HERDR_CI_STATE is not set; refusing to guess a memo directory (it must be the persistent shared CI store)" >&2
+  exit 2
+fi
 memo="${state_dir}/main-unit-gates-green.txt"
 head_sha="$(git rev-parse HEAD)"
+
+# `--record-green`: .woodpecker/unit-gates-main.yml runs the full suite on every push to main and calls this after it passed, so a
+# commit proven by its push run is not proven a second time by the next cron tick. Records only; never runs the suite.
+if [ "${1:-}" = "--record-green" ]; then
+  if mkdir -p "$state_dir" 2>/dev/null && [ -w "$state_dir" ]; then
+    printf '%s\n' "$head_sha" > "${memo}.tmp" && mv -f "${memo}.tmp" "$memo"
+    echo "main-cron: recorded ${head_sha:0:12} as proven green by its push run"
+  else
+    echo "main-cron: memo path ${state_dir} is not writable; not recording (the cron will re-prove this commit)" >&2
+  fi
+  exit 0
+fi
 
 if [ -f "$memo" ] && [ "$(cat "$memo" 2>/dev/null)" = "$head_sha" ]; then
   echo "main-cron: ${head_sha:0:12} is already proven green; nothing to do"
