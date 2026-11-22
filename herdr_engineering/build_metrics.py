@@ -224,28 +224,31 @@ def _diskstats() -> dict[str, tuple[int, int, int]]:
     return out
 
 
-def host_disk_sectors(cwd: str | os.PathLike[str] | None = None) -> tuple[str, int] | None:
-    """(scope, sectors written) for the cwd's device, else host-wide sum."""
-    try:
-        stats = _diskstats()
-    except (OSError, ValueError):
-        return None
-    try:
-        dev = os.stat(cwd or ".").st_dev
-        mm = (os.major(dev), os.minor(dev))
-        for name, (maj, mnr, sec) in stats.items():
-            if (maj, mnr) == mm:
-                return (f"device:{name}", sec)
-    except OSError:
-        pass
+def disk_sectors_from(stats: dict[str, tuple[int, int, int]], dev: int,
+                      block_root: str | os.PathLike[str] = "/sys/block") -> tuple[str, int] | None:
+    """(scope, sectors written) for ``dev``'s row, else the sum over whole physical devices."""
+    mm = (os.major(dev), os.minor(dev))
+    for name, (maj, mnr, sec) in stats.items():
+        if (maj, mnr) == mm:
+            return (f"device:{name}", sec)
     total, found = 0, False
     for name, (_, _, sec) in stats.items():
         if name.startswith(("loop", "ram", "dm-", "zram", "sr", "fd")):
             continue
-        if os.path.isdir(f"/sys/block/{name}"):  # whole device, not a partition
+        if os.path.isdir(os.path.join(block_root, name)):  # whole device, not a partition
             total += sec
             found = True
     return ("host_wide_physical_ish", total) if found else None
+
+
+def host_disk_sectors(cwd: str | os.PathLike[str] | None = None) -> tuple[str, int] | None:
+    """(scope, sectors written) for the cwd's device, else host-wide sum."""
+    try:
+        stats = _diskstats()
+        dev = os.stat(cwd or ".").st_dev
+    except (OSError, ValueError):
+        return None
+    return disk_sectors_from(stats, dev)
 
 
 def sccache_snapshot(timeout: float = SCCACHE_TIMEOUT_S,
