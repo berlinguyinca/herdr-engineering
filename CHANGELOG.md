@@ -8,6 +8,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 ### Agent rules: push work branches and open PRs autonomously
 
 - `AGENTS.md` and the managed `SessionStart` reminder no longer require an explicit per-message ask before pushing herdr-engineering or opening a PR. Agents push their own work branches and open PRs themselves; pushing `main` and force-pushing or pushing someone else's branch stay forbidden (the reminder says so). The managed `PreToolUse` guard matches: a plain herdr-engineering push of a non-main branch is allowed, while force/destructive pushes (`-f`, `--force*`, `--mirror`, `--delete`/`-d`, `--prune`, `+` or `:branch` refspecs) still need the one-shot human token, including in the untokenizable-command fallback. Push to main/master stays denied.
+### Fix(ci): main push pipeline records green in the shared CI store (#931)
+
+- `.woodpecker/unit-gates-main.yml` now exports `HERDR_CI_STATE` from the runner's `WPCI_CI_DIR` before `main-cron-gates.sh --record-green`, as `main-cron.yml` does. Without it every main push failed after a fully green suite with `HERDR_CI_STATE is not set`, and the cron never learned the commit was already green.
+- `tests/test_ci_integrate_main.py` checks that every pipeline step calling `main-cron-gates.sh` exports the state dir first, and that the main push step passes it to `--record-green`.
 ### Chore(ci): drop the Woodpecker `opus-review` workflow; the always-on timer posts the status
 
 - Removed `.woodpecker/opus-review.yaml`, `scripts/ci/opus-review.sh`, `tests/ci_review/test_per_pr_opus_review.py` and `docs/operations/per-pr-opus-review.md`.

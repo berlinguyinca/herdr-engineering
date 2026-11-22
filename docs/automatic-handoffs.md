@@ -188,6 +188,21 @@ harness, the percent that triggered it, the boundary that noticed, and a hash of
 instruction. `handoff autopilot uninstall` removes the extension and the hooks but keeps this
 file — it is the audit record of when the machine took over on its own.
 
+Only `XDG_STATE_HOME` moves that file. `HERDR_ENGINEERING_STATE` sounds like the same knob and is
+not: it relocates the *other* trigger's marker directory
+(`$HERDR_ENGINEERING_STATE/handoff-context/<session>.fired`), and the ledger keeps resolving
+through `XDG_STATE_HOME`. A probe that redirects `HERDR_ENGINEERING_STATE` to a scratch directory,
+expecting to sandbox itself, spends a real trigger against a session that never happened — and
+`uninstall` deliberately keeps whatever it writes. Sandbox with `XDG_STATE_HOME`:
+
+```bash
+XDG_STATE_HOME="$PWD/.tmp/autopilot-probe" herdr-eng handoff autopilot status --json
+```
+
+`install` rewrites `~/.claude/settings.json` in place through a temp file in the same directory,
+preserving the file's existing mode, its unrelated keys and every foreign hook group, but it takes
+no backup of its own; copy the file first if it holds anything you cannot reconstruct.
+
 ## Checking the trigger itself
 
 ```bash

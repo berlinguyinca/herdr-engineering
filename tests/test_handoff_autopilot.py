@@ -983,6 +983,59 @@ def test_a_session_the_context_hook_already_warned_is_not_told_again(host: dict)
     assert check("session-c")["code"] == "context_is_full"
 
 
+def test_only_xdg_state_home_moves_the_trigger_ledger(
+    host: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`XDG_STATE_HOME` moves the ledger; `HERDR_ENGINEERING_STATE` never touches it.
+
+    The two names look interchangeable and are not. `HERDR_ENGINEERING_STATE` is the *other*
+    mechanism's root: the directory holding `handoff context-hook` markers, read by
+    `_context_hook_warned()`. A probe that redirects it expecting to sandbox the ledger writes
+    straight to the operator's real `$XDG_STATE_HOME/herdr-engineering/handoff-autopilot.json`
+    and spends a trigger for a session that never happened - and that file is the audit record
+    of when the machine took over on its own, the one artifact `uninstall` deliberately keeps.
+    The fixture deletes the inherited variable, so it is set again here: a probe's mistake has
+    to be impossible, not merely unreproduced by the test environment.
+    """
+    write_config(host["home"], "handoff_autopilot:\n  enabled: true\n")
+    scratch = host["tmp"] / "hero-state"
+    monkeypatch.setenv("HERDR_ENGINEERING_STATE", str(scratch))
+    host["env"]["HERDR_ENGINEERING_STATE"] = str(scratch)
+    expected = host["state"] / "herdr-engineering"
+
+    assert ha.state_path().parent == expected, "XDG_STATE_HOME must decide the ledger location"
+
+    ha.record_trigger(session_id="probe-session", harness="claude", percent=92.5)
+    ledger = json.loads(ha.state_path().read_text())
+    assert ledger["sessions"]["probe-session"]["count"] == 1, ledger
+
+    # The installed command resolves the same way, in its own process.
+    result = _cli(
+        [
+            "handoff",
+            "autopilot",
+            "record",
+            "--harness",
+            "claude",
+            "--session-id",
+            "probe-session",
+            "--percent",
+            "92.5",
+            "--json",
+        ],
+        host["env"],
+        host["work"],
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    ledger = json.loads(ha.state_path().read_text())
+    assert ledger["sessions"]["probe-session"]["count"] == 2, ledger
+
+    assert not scratch.exists(), (
+        "HERDR_ENGINEERING_STATE must not receive the ledger; "
+        f"found {[p.name for p in scratch.iterdir()]}"
+    )
+
+
 def test_precompact_advises_without_spending_the_trigger(host: dict) -> None:
     """PreCompact cannot reach the model, so it must not consume the per-session trigger.
 

@@ -53,4 +53,6 @@ steps:
       - 'set -eu'
       - 'if [ -f .ci-main-superseded ]; then echo "unit-gates: superseded by a newer push to main; nothing to run, nothing recorded"; exit 0; fi'
       - 'bash scripts/ci/unit-gates.sh'
+      # Persistent shared CI store, mounted and named by the runner (as in main-cron.yml). $$ escapes Woodpecker substitution.
+      - 'export HERDR_CI_STATE="$${WPCI_CI_DIR:?the runner must export WPCI_CI_DIR}/state/herdr"'
       - 'bash scripts/ci/main-cron-gates.sh --record-green'
