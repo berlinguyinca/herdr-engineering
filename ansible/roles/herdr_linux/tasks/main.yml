@@ -6,7 +6,7 @@
   ansible.builtin.apt:
     update_cache: true
     cache_valid_time: 3600
-  when: ansible_os_family == "Debian"
+  when: ansible_facts['os_family'] == "Debian"
 
 - name: "Install baseline CLI tools (vim, mc, btop)"
   ansible.builtin.package:
@@ -52,13 +52,13 @@
 - name: "Clone berlinguyinca/pi-engineering"
   ansible.builtin.git:
     repo: "https://github.com/berlinguyinca/pi-engineering.git"
-    dest: "{{ ansible_env.HOME }}/pi-engineering"
+    dest: "{{ ansible_facts['env']['HOME'] }}/pi-engineering"
     version: main
   ignore_errors: true
 
 - name: "Clone berlinguyinca/autospec"
   ansible.builtin.git:
     repo: "https://github.com/berlinguyinca/autospec.git"
-    dest: "{{ ansible_env.HOME }}/autospec"
+    dest: "{{ ansible_facts['env']['HOME'] }}/autospec"
     version: main
   ignore_errors: true
