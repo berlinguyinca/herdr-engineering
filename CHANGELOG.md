@@ -5,6 +5,13 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Feature: periodic `herdr-handoff reap --apply` timer (opt-in, off by default)
+
+- `herdr-eng handoff-reap {run,status}` and `scripts/install-handoff-reap.sh` install a systemd user timer (Linux) or LaunchAgent (macOS) that closes panes replaced by confirmed handoffs, including those whose `confirm` was refused because the source pane was still working. Wired into `scripts/install.sh` (step 7f2) and, for Linux fleet hosts, `ansible/tasks/handoff-reap.yml` (`site.yml`, `fleet-sync.yml`).
+- Policy is the `handoff_reap` section of `~/.config/herdr-engineering/config.yaml`: `enabled` (default `false`), `interval_minutes` (default 15, must divide 60), `legacy_roots` (per-project `.herdr/handoffs` directories imported into the shared store first). The unit files are always installed but the timer is only started where `enabled: true`; a malformed section fails closed to disabled. No environment variables.
+- Covers the shared handoff store (`herdr-handoff` with no `--root`); `HERDR_HANDOFF_FILE`/`HERDR_HANDOFF_DIR` are removed from the job's environment so it cannot be redirected to one project's root. It never passes `--include-unrecorded` (tests pin this in the code, the units, the installer and the Ansible task).
+- Nothing is enabled by this change: each host opts in separately.
+
 ### Chore: bump herdr-handoff to 0.6.0 (c16c2dfd), `reap` required by the capability gate
 
 - `lock/upstreams.yaml` pins herdr-handoff `c16c2dfdd86d6c0f22d8523f894718420e23d3a1` (v0.6.0; herdr-handoff#14, #16): `herdr-handoff reap [--apply] [--include-unrecorded]` (dry run by default) closes panes replaced by confirmed handoffs; `confirm` and `reap` check the live pane first and refuse with `source_is_caller`, `successor_gone`, `source_pane_reused` or `source_working`; takeover records `close_options.source_terminal_id`; successor panes are named `<project>: <goal summary>`.

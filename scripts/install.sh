@@ -415,6 +415,10 @@ else
   printf '\n  (disk-hygiene timers not installed; HERDR_INSTALL_DISK_HYGIENE=0 or --no-disk-hygiene)\n'
 fi
 
+# --- 7f2. handoff pane-reap timer: unit files always, started only where config.yaml opts in -------
+step "7f2/8 handoff pane reap (herdr-handoff reap --apply timer; off unless handoff_reap.enabled: true)"
+HERDR_ENG="$VENV/bin/herdr-eng" bash "$REPO_ROOT/scripts/install-handoff-reap.sh" install || warn "handoff-reap timer not installed (see above); the rest of the install is unaffected"
+
 # --- 7g. build hygiene (default on): build-cleanup timer + managed cargo launcher -------
 if [ "$WITH_BUILD_HYGIENE" = "1" ]; then
   step "7g/8 build hygiene (build-cleanup timer, managed cargo launcher; non-fatal)"

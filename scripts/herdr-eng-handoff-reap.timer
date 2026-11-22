@@ -1,0 +1,12 @@
+# __INTERVAL_MINUTES__ comes from handoff_reap.interval_minutes (default 15; must divide 60).
+# Calendar-based on purpose: Persistent= only applies to OnCalendar= (see herdr-gateway-monitor.timer).
+[Unit]
+Description=Close panes replaced by confirmed handoffs every __INTERVAL_MINUTES__ minutes
+
+[Timer]
+OnCalendar=*:0/__INTERVAL_MINUTES__
+RandomizedDelaySec=30
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,15 @@
+# Closes the panes that confirmed handoffs replaced (herdr-handoff reap --apply, never its unrecorded-records flag).
+# Rendered by scripts/install-handoff-reap.sh and ansible/tasks/handoff-reap.yml: __HERDR_ENG__ is the herdr-eng
+# path. Policy (enabled, interval_minutes, legacy_roots) is the handoff_reap section of
+# ~/.config/herdr-engineering/config.yaml; a host whose YAML leaves it disabled never starts the timer.
+[Unit]
+Description=HerdR Engineering close panes replaced by confirmed handoffs
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h
+ExecStart=__HERDR_ENG__ handoff-reap run
+TimeoutStartSec=600
+Nice=10
+UMask=0077
+NoNewPrivileges=true

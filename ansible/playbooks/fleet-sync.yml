@@ -50,6 +50,8 @@
       ansible.builtin.include_tasks: ../tasks/ai-sync-feed.yml
     - name: "Converge ai-sync enforcement (opt-in per host, never on the publisher)"
       ansible.builtin.include_tasks: ../tasks/ai-sync-enforce.yml
+    - name: "Converge the handoff pane-reap timer (opt-in per host via config.yaml, default off)"
+      ansible.builtin.include_tasks: ../tasks/handoff-reap.yml
     - name: "Keep the herdr-engineering deployment checkout + pointer file for the rollout rows"
       ansible.builtin.include_tasks: ../tasks/fleet-deployment-checkout.yml
 
