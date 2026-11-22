@@ -510,7 +510,7 @@ def decide(
             f"session (handoff_autopilot.max_per_session: "
             f"{active_policy.max_per_session})",
         )
-    underway = active_handoff(session_id, cwd=cwd)
+    underway = active_handoff(session_id, cwd=cwd, home=home)
     if underway is not None:
         return Decision(
             False,

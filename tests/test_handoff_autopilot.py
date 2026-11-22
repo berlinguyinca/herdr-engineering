@@ -85,6 +85,9 @@ def host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("XDG_STATE_HOME", str(state))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+    # XDG_DATA_HOME is where `herdr-handoff` keeps its envelopes, so a host (or a CI container)
+    # that relocates it would point every in-process lookup at the operator's real store.
+    monkeypatch.setenv("XDG_DATA_HOME", str(home / ".local" / "share"))
     return {"tmp": tmp_path, "home": home, "state": state, "work": work, "env": env}
 
 
@@ -1530,6 +1533,11 @@ def test_an_invalid_policy_is_a_clean_error_and_install_writes_nothing(
 # and records the session at the TOP level of the package, not under `source`.
 
 
+def _shared_store(home: Path) -> Path:
+    """Where `herdr-handoff` keeps its envelopes under a given home (the XDG data root)."""
+    return home / ".local" / "share" / "herdr-handoff" / "store"
+
+
 def _envelope(
     root: Path,
     *,
@@ -1537,9 +1545,15 @@ def _envelope(
     session_id: str,
     state: str,
     in_outbox: bool = True,
-    created_at: str = "2026-11-22T08:00:00Z",
+    created_at: str | None = None,
 ) -> Path:
-    """An envelope in the shape `herdr-handoff create` writes (session id at the top level)."""
+    """An envelope in the shape `herdr-handoff create` writes (session id at the top level).
+
+    "Now" is the default because uptake attributes a handoff to the trigger that preceded it, and
+    a fixture written this turn has to read as written this turn; a test asking about a handoff
+    from elsewhere says so with `created_at`.
+    """
+    created_at = created_at or ha._utc_now()
     directory = root / "outbox" if in_outbox else root
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{handoff_id}.json"
@@ -1624,7 +1638,7 @@ def test_the_envelope_the_real_cli_writes_is_the_one_the_autopilot_reads(host: d
 
 def test_a_handoff_in_the_shared_store_suppresses_a_second_trigger(host: dict) -> None:
     """The default store is the XDG data location, which the lookup never searched at all."""
-    store = host["home"] / ".local" / "share" / "herdr-handoff" / "store"
+    store = _shared_store(host["home"])
     _envelope(store, handoff_id="handoff_shared", session_id="s-store", state="queued")
 
     found = ha.active_handoff("s-store", cwd=host["work"], home=host["home"])
@@ -1814,3 +1828,111 @@ def test_a_handoff_that_predates_the_trigger_is_not_credited_to_it(host: dict) -
     assert ha.settle_uptake(home=host["home"]) is not None
     entry = json.loads(ha.state_path(host["home"]).read_text())["sessions"]["s-before"]
     assert entry["taken_handoff"] == "handoff_newer", entry
+
+
+def test_a_home_passed_in_outranks_the_environment_the_call_runs_in(
+    host: dict, monkeypatch
+) -> None:
+    """`decide(home=...)` must not go reading the operator's own handoff store.
+
+    `active_handoff` took a cwd but no home, so the shared store it searched came from whatever
+    XDG_DATA_HOME the calling process carried. A test, a hook or a `--home` run on a machine that
+    relocates XDG dirs then asks a real question about the wrong tree: the handoff under the
+    named home is invisible, and a stranger's handoff for the same session id can answer for it.
+    """
+    monkeypatch.setenv("XDG_DATA_HOME", str(host["tmp"] / "ambient-data"))
+    # The tree the ambient environment points at has its own answer to give, so a lookup that
+    # wandered there would report a different handoff rather than nothing.
+    ambient = host["tmp"] / "ambient-data" / "herdr-handoff" / "store"
+    _envelope(ambient, handoff_id="handoff_stranger", session_id="s-under", state="claimed")
+    _envelope(
+        _shared_store(host["home"]),
+        handoff_id="handoff_mine",
+        session_id="s-under",
+        state="queued",
+    )
+
+    decision = ha.decide(
+        session_id="s-under",
+        harness="pi",
+        percent=88.0,
+        cwd=str(host["work"]),
+        home=host["home"],
+        config={"handoff_autopilot": {"enabled": True}},
+    )
+    assert decision.code == "handoff_underway", (
+        f"a named home has to govern where the handoff is looked for: {decision.code}"
+    )
+    assert "handoff_mine" in decision.reason, decision.reason
+
+
+def test_record_settles_the_ledger_it_wrote_and_not_the_one_the_shell_points_at(host: dict) -> None:
+    """`--home` chooses which state the command touches; the uptake stamp has to obey it.
+
+    `record` popped `home` on its way to `record_trigger`, so by the time the settle step ran the
+    value was gone and the stamp went to whatever the ambient environment named - the developer's
+    real ledger - while the ledger the command actually wrote stayed unsettled forever.
+    """
+    alt = host["tmp"] / "alt"
+    (alt / "home").mkdir(parents=True)
+    env = dict(host["env"])
+    # The ambient environment names a different state tree on purpose: see the docstring.
+    for name in ("XDG_STATE_HOME", "XDG_DATA_HOME"):
+        env.pop(name, None)
+    real_state = host["home"] / ".local" / "state" / "herdr-engineering"
+
+    done = _cli(
+        [
+            "handoff",
+            "autopilot",
+            "record",
+            "--session-id",
+            "s-alt",
+            "--harness",
+            "claude",
+            "--percent",
+            "88",
+            "--home",
+            str(alt / "home"),
+            "--json",
+        ],
+        env,
+        alt,
+    )
+    assert done.returncode == 0, done.stderr
+    _envelope(
+        alt / ".herdr" / "handoffs",
+        handoff_id="handoff_alt",
+        session_id="s-alt",
+        state="queued",
+        created_at=ha._utc_now(),
+    )
+
+    again = _cli(
+        [
+            "handoff",
+            "autopilot",
+            "record",
+            "--session-id",
+            "s-alt-2",
+            "--harness",
+            "claude",
+            "--percent",
+            "88",
+            "--home",
+            str(alt / "home"),
+            "--json",
+        ],
+        env,
+        alt,
+    )
+    assert again.returncode == 0, again.stderr
+    settled = json.loads(again.stdout).get("uptake_settled") or {}
+    assert "s-alt" in settled, json.loads(again.stdout)
+
+    alt_ledger = alt / "home" / ".local" / "state" / "herdr-engineering" / "handoff-autopilot.json"
+    alt_entry = json.loads(alt_ledger.read_text())
+    assert alt_entry["sessions"]["s-alt"].get("taken_handoff") == "handoff_alt", alt_entry
+    assert not (real_state / "handoff-autopilot.json").exists(), (
+        "`--home` named a different tree; nothing may be written to the ambient one"
+    )

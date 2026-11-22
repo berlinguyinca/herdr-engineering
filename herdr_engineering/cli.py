@@ -1844,6 +1844,8 @@ def _cmd_handoff_autopilot_record(args) -> int:
             default_window=active.context_window_tokens,
             large_window=active.large_context_window_tokens,
         )
+    # `home` is the whole question for the settle step too, so read it before it is consumed.
+    autopilot_home = kwargs.get("home")
     entry = autopilot.record_trigger(
         session_id=kwargs.pop("session_id"),
         harness=kwargs.pop("harness"),
@@ -1851,7 +1853,7 @@ def _cmd_handoff_autopilot_record(args) -> int:
         boundary=kwargs.pop("boundary"),
         home=kwargs.pop("home"),
     )
-    settled = _autopilot_settle_uptake(autopilot, kwargs)
+    settled = _autopilot_settle_uptake(autopilot, {"home": autopilot_home})
     payload = {"schema_version": 1, "ok": True, "session_id": args.session_id, **entry}
     if settled:
         payload["uptake_settled"] = settled
