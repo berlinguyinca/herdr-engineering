@@ -5,6 +5,11 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix(ci): main push pipeline records green in the shared CI store (#931)
+
+- `.woodpecker/unit-gates-main.yml` now exports `HERDR_CI_STATE` from the runner's `WPCI_CI_DIR` before `main-cron-gates.sh --record-green`, as `main-cron.yml` does. Without it every main push failed after a fully green suite with `HERDR_CI_STATE is not set`, and the cron never learned the commit was already green.
+- `tests/test_ci_integrate_main.py` checks that every pipeline step calling `main-cron-gates.sh` exports the state dir first, and that the main push step passes it to `--record-green`.
+
 ### Chore: bump herdr-handoff to 0.6.0 (c16c2dfd), `reap` required by the capability gate
 
 - `lock/upstreams.yaml` pins herdr-handoff `c16c2dfdd86d6c0f22d8523f894718420e23d3a1` (v0.6.0; herdr-handoff#14, #16): `herdr-handoff reap [--apply] [--include-unrecorded]` (dry run by default) closes panes replaced by confirmed handoffs; `confirm` and `reap` check the live pane first and refuse with `source_is_caller`, `successor_gone`, `source_pane_reused` or `source_working`; takeover records `close_options.source_terminal_id`; successor panes are named `<project>: <goal summary>`.
