@@ -148,8 +148,9 @@ def _split_commands(command: str) -> list[list[str]]:
     return _tokenize(_strip_heredocs(command).replace("\\\n", ""))
 
 
+# --all/--branches push every local branch, so a stray local main rides along unseen.
 _DESTRUCTIVE_LONG = ("--force", "--force-with-lease", "--force-if-includes", "--mirror", "--delete",
-                     "--prune")
+                     "--prune", "--all", "--branches")
 _SHORT_DESTRUCTIVE = frozenset("fd")
 
 
@@ -162,8 +163,9 @@ def _destructive_flag(arg: str) -> bool:
 
 
 def _destructive_refspec(refspec: str) -> bool:
-    """``+src:dst`` forces; ``:dst`` (empty source) deletes the remote ref."""
-    return refspec.startswith(("+", ":"))
+    """``+src:dst`` forces; ``:dst`` (empty source) deletes the remote ref; a glob (``*``) can
+    match main without naming it."""
+    return refspec.startswith(("+", ":")) or "*" in refspec
 
 
 def _is_destructive(args: list[str]) -> bool:

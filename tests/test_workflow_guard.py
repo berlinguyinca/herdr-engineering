@@ -158,7 +158,10 @@ DESTRUCTIVE = ["git push --force origin feat/z", "git push -f origin feat/z", "g
                "git push --force-if-includes origin feat/z", "git push --mirror origin",
                "git push --delete origin feat/z", "git push -d origin feat/z",
                "git push --prune origin", "git push origin +feat/z", "git push origin +HEAD:feat/z",
-               "git push origin :feat/z", "git push --forc origin feat/z"]
+               "git push origin :feat/z", "git push --forc origin feat/z",
+               # pushes of every branch or a glob refspec can carry a local main
+               "git push --all origin", "git push --branches origin", "git push origin --all",
+               "git push origin 'refs/heads/*:refs/heads/*'", "git push origin 'feat/*'"]
 
 
 @pytest.mark.parametrize("url", ["git@github.com:berlinguyinca/herdr-engineering.git",
