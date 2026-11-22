@@ -102,7 +102,7 @@ if command -v cargo >/dev/null 2>&1 && command -v rustc >/dev/null 2>&1; then
   fi
   # cargo-host: real cargo tests, the e2e retention test last. Tests that need the APFS volume skip themselves on Linux.
   PATH="$cargo_host_path" cov cargo-host .coveragerc-cargo-host -m 'not e2e' \
-    tests/test_cargo_host.py tests/test_cargo_host_real.py tests/test_cargo_target_storage.py \
+    tests/test_cargo_host.py tests/test_cargo_host_real.py tests/test_build_cache_volume.py tests/test_cargo_target_storage.py \
     tests/test_cargo_managed_targets_real.py tests/test_cargo_target_retention.py
   PATH="$cargo_host_path" python3 -m pytest -m e2e -q tests/test_cargo_target_retention.py
 else
