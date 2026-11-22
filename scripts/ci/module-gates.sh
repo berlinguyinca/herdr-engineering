@@ -82,11 +82,29 @@ unset COVERAGE_RCFILE
 if command -v cargo >/dev/null 2>&1 && command -v rustc >/dev/null 2>&1; then
   # scratch-retention: `-m ''` clears the default marker deselection, so the real-cargo integration test and the e2e run.
   cov scratch .coveragerc-scratch-reaper -m '' tests/test_scratch_reaper.py
+  # cargo-host needs a real sccache for the run_rustc cache path; CI has none, so fetch a pinned official release.
+  cargo_host_path="$PATH"
+  if ! command -v sccache >/dev/null 2>&1; then
+    sccache_version=v0.19.0
+    sccache_sha256=aa73c7270c997894038c0d8f0d297865f57569e1687883322bc431713d4bb9dd   # x86_64-unknown-linux-musl tarball
+    sccache_dir="sccache-$sccache_version-x86_64-unknown-linux-musl"
+    if [ "$(uname -sm)" = "Linux x86_64" ]; then
+      mkdir -p .superpowers/bin .superpowers/sccache-dl
+      curl -fsSL -o ".superpowers/sccache-dl/$sccache_dir.tar.gz" \
+        "https://github.com/mozilla/sccache/releases/download/$sccache_version/$sccache_dir.tar.gz"
+      echo "$sccache_sha256  .superpowers/sccache-dl/$sccache_dir.tar.gz" | sha256sum -c -
+      tar -xzf ".superpowers/sccache-dl/$sccache_dir.tar.gz" -C .superpowers/sccache-dl "$sccache_dir/sccache"
+      install -m 0755 ".superpowers/sccache-dl/$sccache_dir/sccache" .superpowers/bin/sccache
+      cargo_host_path="$PWD/.superpowers/bin:$PATH"
+    else
+      echo "module gate: NOTICE no sccache and no pinned build for $(uname -sm): sccache-dependent tests skip" >&2
+    fi
+  fi
   # cargo-host: real cargo tests, the e2e retention test last. Tests that need the APFS volume skip themselves on Linux.
-  cov cargo-host .coveragerc-cargo-host -m 'not e2e' \
+  PATH="$cargo_host_path" cov cargo-host .coveragerc-cargo-host -m 'not e2e' \
     tests/test_cargo_host.py tests/test_cargo_host_real.py tests/test_cargo_target_storage.py \
     tests/test_cargo_managed_targets_real.py tests/test_cargo_target_retention.py
-  python3 -m pytest -m e2e -q tests/test_cargo_target_retention.py
+  PATH="$cargo_host_path" python3 -m pytest -m e2e -q tests/test_cargo_target_retention.py
 else
   echo "module gate: NOTICE no cargo/rustc on this host: scratch-retention and cargo-host gates SKIPPED" >&2
 fi
