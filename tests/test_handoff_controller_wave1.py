@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import stat
+import subprocess
 import sys
 from pathlib import Path
 
@@ -273,3 +274,28 @@ def test_the_over_the_ceiling_last_resort_still_needs_no_ready_pane_to_write_the
     w.clock[0] += D + 1  # the drain timeout passed without the order typed: the last resort writes the briefing
     w.tick(w.pane("p1", "working"))
     assert w.names()[-1] == "handoff.stuck" and w.events()[-1].colour is Colour.RED
+
+
+@pytest.mark.parametrize("status", ["working", "idle"])
+def test_the_last_resort_makes_no_checkpoint_commit_under_a_working_session(tmp_path: Path, status: str) -> None:
+    w = Wave(tmp_path)
+    _repo_on("feat/x", w.repo, dirty=True)
+    head = subprocess.run(["git", "-C", str(w.repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout
+    fake, _ = _fake_handoff(tmp_path)
+    w.ctl = w.controller(compact_ready_timeout_s=0.1)
+    w.ctl.handoff = fake
+    w.session("p1", 95.0)
+    start = w.clock[0] - 10
+    w.ctl.log.append(_event("handoff.triggered", start, chain="c1", session="s-p1", reason="over_ceiling"))
+    w.ctl.log.append(_event("handoff.briefing_fallback", start + 2, chain="c1", session="s-p1",
+                            handoff_id="handoff_" + "b" * 32, reason="over_ceiling"))
+    w.tick(w.pane("p1", status))
+    after = subprocess.run(["git", "-C", str(w.repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout
+    dirty = subprocess.run(["git", "-C", str(w.repo), "status", "--porcelain", "--untracked-files=no"], check=True,
+                           capture_output=True, text=True).stdout.strip()
+    wip = [e for e in w.events() if e.event == "handoff.wip_committed"]
+    if status == "working":  # nothing is staged or committed in a worktree the session still writes to
+        assert after == head and dirty == "M a.txt"
+        assert [(e.reason, e.commit) for e in wip] == [("session_working", None)]
+    else:
+        assert after != head and not dirty and wip[0].commit

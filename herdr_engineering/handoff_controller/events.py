@@ -68,6 +68,7 @@ TERMINAL = {
 }
 ATTEMPT = "attempt"  # the `reason` of a `handoff.takeover_started` written before each call to herdr-handoff: attempts are counted per chain
 NOTHING_STAGEABLE = "nothing_stageable"  # the `reason` of a `handoff.wip_committed` for tracked changes that cannot be staged
+SESSION_WORKING = "session_working"  # the `reason` of a `handoff.wip_committed` for a last resort that left the worktree uncommitted
 COMPACTING = "compacting"  # the `reason` of the second `handoff.takeover_started`: the attempts are over, compaction begins
 OVER_CEILING = "over_ceiling"  # the `reason` of the triggered / fallback-briefing event of a last-resort chain
 _REQUIRED_KEYS = frozenset({"event", "at", "chain_id", "pane_id", "harness"})  # every other key reads as None when absent

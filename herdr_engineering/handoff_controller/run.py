@@ -7,7 +7,9 @@ chain needs to continue after a restart is in `events.jsonl` and the store; the 
 cannot be told from them (the order was typed in this process, a cool-down). What each tick does is decided by the pure
 functions `open_chain`, `may_start` and `next_step`.
 
-A session that is still working is never acted on. After the order is typed the briefing timeout counts only the time
+A session that is still working is never acted on, and that includes the checkpoint commit: the last resort makes none
+(`handoff.wip_committed` with reason `session_working`; the worktree stays as it is; only a fallback briefing, which is written
+from `git status`, describes it). After the order is typed the briefing timeout counts only the time
 the session is idle (or done) with no live subagent; until then the chain waits (`handoff.waiting`, once per change),
 bounded by `drain_timeout_s` from the trigger. The takeover is entered only into a ready pane (`_finish_when_ready`);
 past `briefing_timeout_s` of waiting for that, the chain takes the last-resort path, which types only into a ready pane.
@@ -38,6 +40,7 @@ from .credit import TickClock
 from .drain import DrainResult, Look, drain, look
 from .events import (
     OVER_CEILING,
+    SESSION_WORKING,
     TERMINAL,
     Chain,
     Colour,
@@ -464,9 +467,12 @@ def _finish(ctl: Controller, ref: SessionRef, chain: Chain, rt: PaneRuntime, pct
     allowed = push_allowed(ctl.cfg, worktree, _common_dir(worktree) if ctl.cfg.push_allowed_repos else None)
     wip: WipResult | None = None
     if not chain.takeover_started:
-        wip = _checkpoint(ctl, ref, chain.chain_id, worktree, allowed, pct)
-        if wip is None:
-            return
+        if last_resort and _not_ready(ctl, ref) is not None:  # a session still working: no commit under its own files
+            _emit(ctl, ref, "handoff.wip_committed", chain.chain_id, reason=SESSION_WORKING, pct=pct)
+        else:
+            wip = _checkpoint(ctl, ref, chain.chain_id, worktree, allowed, pct)
+            if wip is None:
+                return
     unstageable = chain.unstageable or (not chain.takeover_started and wip is not None
                                         and wip.reason is WipReason.NOTHING_STAGEABLE)  # the log remembers it across a restart
     cfg = replace(ctl.cfg, max_attempts=0) if last_resort else ctl.cfg  # no attempts: straight to compaction

@@ -345,7 +345,8 @@ and nothing is created. `herdr-eng side-pane ensure --tab` is documented with pl
 5. A checkpoint commit of tracked changes on the feature branch (`wip: auto-handoff checkpoint`), `handoff.wip_committed`.
    The controller never commits on main or master, and never on a detached head, and an unknown git state ends the chain red
    rather than guessing. If the status shows tracked changes but `git add -u` stages none (a dirty submodule), nothing is
-   committed (`NOTHING_STAGEABLE`) and the takeover goes on with `--allow-dirty-source`.
+   committed (`NOTHING_STAGEABLE`) and the takeover goes on with `--allow-dirty-source`. The last resort (below) makes no
+   checkpoint commit while the session is still working: that event has reason `session_working` and no commit.
 6. `handoff.takeover_started`: `herdr-handoff takeover` launches the same harness in a pane below the source, waits for proof
    that it is live, asks the source session to exit, and closes the source pane. It is tried up to 3 times per chain (each call is counted in the log as a `handoff.takeover_started` with reason `attempt`, so
    a restart or a pane that keeps going busy never raises the number); a rerun for the
@@ -399,7 +400,7 @@ Every step is one JSON line in `events.jsonl` in the shared handoff store (below
 time, the chain id, the pane and session, the harness, the handoff id and the predecessor and successor ids, a colour on
 terminal events, a reason, the context percent, and (on events that name a successor) `successor_pane_id` and
 `successor_session_id`. `handoff.wip_committed` also carries the checkpoint `commit` (its `reason` is `committed`, or
-`push_not_allowed` or `push_failed` when the commit was not pushed). The twelve events are `handoff.triggered`, `handoff.drain_started`, `handoff.drained`,
+`push_not_allowed` or `push_failed` when the commit was not pushed; `nothing_stageable` and `session_working` carry no commit). The twelve events are `handoff.triggered`, `handoff.drain_started`, `handoff.drained`,
 `handoff.briefing_written`, `handoff.briefing_fallback`, `handoff.wip_committed`, `handoff.takeover_started`,
 `handoff.succeeded`, `handoff.failed_compacted`, `handoff.stuck`, `handoff.skipped` and `handoff.waiting`. A second
 `handoff.takeover_started` with reason `compacting` marks the start of the compaction fallback: a controller restarted after
@@ -459,7 +460,12 @@ harness's own compaction. The waits count credited time (see below), so a laptop
 Compaction is used only in the fallback path: over the ceiling once the 30-minute bound passed without the order typed (or
 a ready pane could not be typed), or after takeover failed 3 times without a confirmed successor, or when the 5-minute wait for a ready pane before the takeover ran out. The controller types the harness's compact command and then a pointer to the briefing file, each only
 into a ready pane (idle, empty input); it may do so with live subagents. This is the orange
-outcome. If the successor is confirmed live but the source would not close, the controller does not compact (two sessions on
+outcome. The controller makes no checkpoint commit while the session is still working (not idle or done, or with a live
+subagent): a commit then could capture half-written files and change what the session's own next commit holds. The
+worktree stays as it is, `handoff.wip_committed` has reason `session_working` and no `commit`, and the uncommitted and
+unpushed state is recorded only when the briefing is a fallback one (it was given `git status --short` and
+`git log -n 20`); a briefing the session wrote itself may not mention it. Check the worktree after the compaction. A last resort that finds the pane ready commits as usual.
+If the successor is confirmed live but the source would not close, the controller does not compact (two sessions on
 one task is worse than one stale pane): that is red `source_not_closed_successor_live`.
 
 A controller restarted after the compaction began, with no end recorded, does not type again: the chain ends red
