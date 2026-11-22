@@ -334,6 +334,14 @@ def test_unreadable_proc_means_alive(reg, clock, tmp_path):
     assert br.pid_alive(None) is True
 
 
+def test_reaped_child_is_dead_with_default_proc_root():
+    """Holds on Linux (/proc) and macOS (no /proc: liveness falls back to kill(pid, 0))."""
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait()
+    assert br.pid_alive(child.pid) is False
+    assert br.pid_alive(os.getpid()) is True
+
+
 def test_reused_pid_with_other_starttime_is_dead(reg, clock):
     assert br.pid_alive(os.getpid(), br.proc_starttime(os.getpid()))
     assert not br.pid_alive(os.getpid(), br.proc_starttime(os.getpid()) + 1)
