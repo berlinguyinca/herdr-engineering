@@ -473,6 +473,9 @@ def test_remove_planned_rejects_swapped_symlink_and_traversal(tmp_path):
     st = real.lstat()
     def mk(rel, size=64):
         return policy.Entry(rel, size, st.st_mtime, st.st_atime)
+    # a real file OUTSIDE the cache, addressed by absolute path (portable: /etc/hostname is Linux-only)
+    abs_outside = tmp_path / "abs-outside.txt"
+    abs_outside.write_text("do not delete either")
     # 1. file swapped for a symlink after planning
     real.unlink()
     real.symlink_to(o["victim"])
@@ -480,7 +483,7 @@ def test_remove_planned_rejects_swapped_symlink_and_traversal(tmp_path):
     # 3. relative traversal out of the cache
     plan = policy.Plan("over_hard_cap", 0, 0, 0,
                        (mk("good/swap.bin"), mk("evil-dir/inner.txt", 5),
-                        mk("../../outside/victim.txt", 13), mk("/etc/hostname"),
+                        mk("../../outside/victim.txt", 13), mk(str(abs_outside)),
                         mk("good/vanished.bin")), 0, False, ())
     removed, skipped = policy.remove_planned(cache, plan, state, now=now, min_idle_s=3600)
     assert removed == []
@@ -488,8 +491,9 @@ def test_remove_planned_rejects_swapped_symlink_and_traversal(tmp_path):
     assert reasons["good/swap.bin"] == "not_regular_file"
     assert reasons["evil-dir/inner.txt"] == "outside_cache_dir"
     assert reasons["../../outside/victim.txt"] == "outside_cache_dir"
-    assert reasons["/etc/hostname"] == "outside_cache_dir"
+    assert reasons[str(abs_outside)] == "outside_cache_dir"
     assert reasons["good/vanished.bin"] == "vanished"
+    assert abs_outside.read_text() == "do not delete either"
     assert o["victim"].read_text() == "do not delete" and o["dirvictim"].exists()
 
 

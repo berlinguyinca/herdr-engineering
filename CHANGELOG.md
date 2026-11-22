@@ -8,6 +8,11 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 ### Agent rules: push work branches and open PRs autonomously
 
 - `AGENTS.md` and the managed `SessionStart` reminder no longer require an explicit per-message ask before pushing herdr-engineering or opening a PR. Agents push their own work branches and open PRs themselves; pushing `main` and force-pushing or pushing someone else's branch stay forbidden (the reminder says so). The managed `PreToolUse` guard matches: a plain herdr-engineering push of a non-main branch is allowed, while force/destructive pushes (`-f`, `--force*`, `--mirror`, `--delete`/`-d`, `--prune`, `+` or `:branch` refspecs) still need the one-shot human token, including in the untokenizable-command fallback. Push to main/master stays denied.
+### Chore(ci): drop the Woodpecker `opus-review` workflow; the always-on timer posts the status
+
+- Removed `.woodpecker/opus-review.yaml`, `scripts/ci/opus-review.sh`, `tests/ci_review/test_per_pr_opus_review.py` and `docs/operations/per-pr-opus-review.md`.
+- Why: the workflow needed an agent labelled `review-host=true` and `/usr/local/bin/herdr-opus-review`; neither ever existed, so `ci/woodpecker/pr/opus-review` stayed pending on every PR.
+- The `herdr-always-on-review` systemd user timer is the only path and posts `Opus agent review`; docs and timer header updated to say so.
 
 ### Chore: bump herdr-handoff to 0.6.0 (c16c2dfd), `reap` required by the capability gate
 

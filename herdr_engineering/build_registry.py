@@ -29,6 +29,7 @@ import os
 import signal
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -174,6 +175,16 @@ def pid_alive(pid: int | None, starttime: int | None = None,
     if pid is None or pid <= 0:
         return True
     if not (proc_root / str(os.getpid()) / "stat").is_file():
+        if sys.platform != "linux" and proc_root == Path("/proc"):
+            # macOS/BSD have no /proc at all: kill(pid, 0) is the only liveness probe.
+            # Only ESRCH proves the owner gone; any other doubt (EPERM) means alive.
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return False
+            except OSError:
+                return True
+            return True
         return True  # /proc unreadable: fail safe
     try:
         os.kill(pid, 0)

@@ -6,18 +6,15 @@ Ruleset 25691548 on the default branch now requires a commit status named exactl
 automation posts it, on the exact head SHA it reviewed, and nothing else should: `always-on-review.py review ... --post`
 runs `claude` with the Opus model against that head and posts `pending`, then `success` or `failure`.
 
-- **Per PR, through Woodpecker (the normal path).** `.woodpecker/opus-review.yaml` runs the review for every
-  `pull_request` event (opened, synchronized, reopened) and `pull_request_metadata` event (draft marked ready) of any enrolled repo. Setup, the YAML other repos copy and
-  fork safety (approving a fork PR runs its code on the review host with the token): `docs/operations/per-pr-opus-review.md`.
-- **Hourly backup sweep.** `deploy/ci-review/herdr-always-on-review.{service,timer}` polls open PRs once an hour and
-  reviews any head that has no terminal status. It only catches a missed webhook or a lost pipeline; it is not the
-  trigger. A head with a terminal status is never reviewed twice, so the two paths do not duplicate work.
+- **The `herdr-always-on-review` systemd user timer (the only path).** `deploy/ci-review/herdr-always-on-review.{service,timer}`
+  polls open PRs and reviews any head that has no terminal status. A head with a terminal status is never reviewed twice.
+  There is no per-PR Woodpecker workflow: it needed an agent and a wrapper that were never set up, so its check stayed pending on every PR.
 
 Never post the status by hand: a hand-posted `success` is a review nobody did.
 
 - The ruleset is still named "Independent AI review" in the GitHub UI, although the context it requires is now `Opus agent review`.
 - Anyone with push access can post a commit status, so the identity of the poster is a convention, not enforced. The
-  token that the automation uses is the host token file `~/.config/herdr-engineering/opus-review.token` (see `per-pr-opus-review.md`).
+  token that the automation uses is the host token file `~/.config/herdr-engineering/opus-review.token`.
 - Any push moves the head and makes the status stale. The new `synchronize` event starts a review of the new head.
 - The `Independent AI review` check below (`deploy/ci-review/ai-review.py`, a deepseek or qwen model) is **no
   longer required**. The script and timer remain, but their status is advisory.
