@@ -20,7 +20,14 @@ CLI_COMMANDS = ("create", "launch", "takeover", "confirm")
 # `takeover --direction` arrived in herdr-handoff 0.5.0 and 0.4.0 has no other marker: it offers every
 # command above.  Checked in `takeover --help` and reported under this key beside the commands.
 TAKEOVER_DIRECTION = "takeover --direction"
-REQUIRED_CAPABILITIES = (*CLI_COMMANDS, TAKEOVER_DIRECTION)
+
+# `reap` arrived in herdr-handoff 0.6.0 together with the live pane checks (`source_working`,
+# `source_pane_reused`, `successor_gone`, `source_is_caller`) that `confirm` now applies before it closes a
+# pane.  0.5.1 has every command and flag above and none of those checks, so it could close a reused or
+# still-working pane; `reap` is the only marker the CLI's help gives for them.  The skill and the ops doc
+# tell agents and operators to run it, so it is required rather than optional.
+REAP = "reap"
+REQUIRED_CAPABILITIES = (*CLI_COMMANDS, TAKEOVER_DIRECTION, REAP)
 
 
 @dataclass(frozen=True)
@@ -74,7 +81,7 @@ def _probe_cli(path: str) -> tuple[str, dict[str, bool], str]:
     lines = shown.stdout.strip().splitlines()
     if not lines and not help_text.strip():
         return "", {}, "0"
-    capabilities = {command: _advertises(help_text, command) for command in CLI_COMMANDS}
+    capabilities = {command: _advertises(help_text, command) for command in (*CLI_COMMANDS, REAP)}
     capabilities[TAKEOVER_DIRECTION] = capabilities["takeover"] and _takeover_offers_direction(path)
     return lines[0] if lines else "", capabilities, ""
 
@@ -122,10 +129,10 @@ def check_handoff_dependency(*, skill_root: Path | None = None,
     else:
         absent = [command for command in required_commands if not capabilities.get(command)]
         if absent:
+            needs = ("0.6.0" if REAP in absent else "0.5.0" if TAKEOVER_DIRECTION in absent else "")
             problems.append(f"CLI: {resolved} ({version or 'version unknown'}) does not provide "
                             + ", ".join(absent)
-                            + (" (herdr-handoff 0.5.0 or newer is needed)"
-                               if TAKEOVER_DIRECTION in absent else "")
+                            + (f" (herdr-handoff {needs} or newer is needed)" if needs else "")
                             + " - refresh the pinned dependency with scripts/install-handoff.sh")
     if problems:
         return HandoffDependencyResult("fail", "; ".join(problems), [], resolved, version, capabilities)

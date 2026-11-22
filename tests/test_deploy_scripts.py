@@ -2,6 +2,7 @@
 on PATH (nothing real is ever built, started or contacted)."""
 import json
 import os
+import re
 import stat
 import subprocess
 from pathlib import Path
@@ -376,12 +377,20 @@ def test_compose_runs_every_app_service_on_the_deploy_tag():
     assert collab["services"]["collab-public"]["image"] == "herdr-engineering:${HERDR_CP_IMAGE_TAG:?run deploy.sh}"
 
 
+def test_deploy_rolls_the_gateway_and_herdr_web_with_the_app_services():
+    text = (ROOT / "deploy/control-plane/deploy.sh").read_text()
+    rolled = re.search(r"^APP_SERVICES=\(([^)]*)\)", text, re.M).group(1).split()
+    assert "fabric-gateway" in rolled and "herdr-web" in rolled
+    # health checks look the container up by name; the gateway's differs from its service name
+    assert "fabric-gateway) echo herdr-fabric-gateway" in text
+
+
 def test_deploy_recreates_web_worker_and_proxy_on_one_tag(env):
     env["env"]["FAIL_COMPOSE"] = "1"
     deploy(env)
     log = env["log"].read_text().splitlines()
     up = [ln for ln in log if ln.startswith("docker compose") and " up " in ln]
-    assert up and up[0].endswith("up -d --no-deps --no-build control-plane-web control-plane-worker llm-proxy")
+    assert up and up[0].endswith("up -d --no-deps --no-build control-plane-web control-plane-worker llm-proxy fabric-gateway herdr-web")
     sha = _head()
     assert any(ln.startswith("composeenv ") and f" tag={sha} " in ln for ln in log)
     assert any(ln.startswith("docker build") and f"herdr-engineering:{sha}" in ln for ln in log)
@@ -1330,7 +1339,7 @@ def test_rollback_to_a_checkout_without_the_fabric_overlay_drops_the_sidecar_ser
     after = log[log.index(files[0]):]
     assert not any(ln.startswith("docker compose") and "fabric-whois" in ln for ln in after)
     assert "docker stop herdr-collab-fabric-whois" in after                       # the orphan sidecar is stopped
-    assert "all of: control-plane-web control-plane-worker llm-proxy collab-public collab-edge)" in r.stderr
+    assert "all of: control-plane-web control-plane-worker llm-proxy fabric-gateway herdr-web collab-public collab-edge)" in r.stderr
 
 
 def test_rollback_to_a_checkout_with_the_fabric_overlay_keeps_the_sidecar(env):
@@ -1866,7 +1875,7 @@ def test_changed_slice_recreates_collab_public_exactly_once_and_reloads_the_edge
     assert len(ups) == 1 and "--force-recreate collab-public" in ups[0]
     rest = [ln for ln in env["log"].read_text().splitlines()
             if ln.startswith("docker compose") and " up " in ln and ln not in ups]
-    assert len(rest) == 1 and rest[0].endswith("control-plane-web control-plane-worker llm-proxy collab-edge")
+    assert len(rest) == 1 and rest[0].endswith("control-plane-web control-plane-worker llm-proxy fabric-gateway herdr-web collab-edge")
     assert "docker exec herdr-collab-edge nginx -s reload" in env["log"].read_text()
 
 
@@ -2225,7 +2234,7 @@ fi
     ip = bindir / 'ip'
     ip.write_text('''#!/bin/bash
 case "$*" in
-  *address*) echo '[{"addr_info":[{"local":"100.104.39.6","family":"inet"}]}]' ;;
+  *address*) echo '[{"addr_info":[{"local":"100.64.8.6","family":"inet"}]}]' ;;
   *) echo '[]' ;;
 esac
 ''')
@@ -2251,7 +2260,7 @@ exit 99
 def test_private_egress_real_deploy_dry_run_adds_overlay_without_root_or_network_changes(env):
     _egress_inspection_stubs(env)
     result = deploy(env, '--dry-run', '--memory-private-egress',
-                    '--memory-private-egress-gateway', '100.104.39.6/32')
+                    '--memory-private-egress-gateway', '100.64.8.6/32')
     assert result.returncode == 0, result.stderr
     calls = env['log'].read_text()
     assert 'compose.web-egress.yaml' in calls
@@ -2281,7 +2290,7 @@ def test_private_egress_root_preflight_refuses_before_recreate_or_profile(env, f
     _egress_inspection_stubs(env)
     env['env']['STUB_UFW_PREFLIGHT'] = failure
     result = deploy(env, '--dry-run', '--memory-private-egress',
-                    '--memory-private-egress-gateway', '100.104.39.6/32')
+                    '--memory-private-egress-gateway', '100.64.8.6/32')
     assert result.returncode != 0
     assert 'preflight' in result.stderr
     calls = env['log'].read_text()
@@ -2296,7 +2305,7 @@ def test_explicit_permission_recovery_uses_existing_lock_and_no_fleet_or_compose
     state=env['home']/'.local/state/herdr-engineering/deploys'
     state.mkdir(parents=True,mode=0o700)
     attempt=state/'attempt-recovery'
-    record=make_record('172.31.252.0/29','100.104.39.6/32','a'*32)
+    record=make_record('172.31.252.0/29','100.64.8.6/32','a'*32)
     record['network_id']='c'*64
     record['rule_may_exist']=True
     private_json(attempt/'web-egress/candidate.json',record)
@@ -2308,8 +2317,8 @@ def test_explicit_permission_recovery_uses_existing_lock_and_no_fleet_or_compose
 case "$*" in
   "-n -- /usr/sbin/ufw status") echo 'Status: inactive'; exit 0 ;;
   "-n -- /usr/sbin/ufw show added")
-    echo 'ufw allow in on br-herdr-cp-eg proto tcp from 172.31.252.0/29 to 100.104.39.6 port 443 comment herdr-cp-web-egress-v1'; exit 0 ;;
-  "-n -- /usr/sbin/ufw --force delete allow in on br-herdr-cp-eg proto tcp from 172.31.252.0/29 to 100.104.39.6/32 port 443 comment herdr-cp-web-egress-v1")
+    echo 'ufw allow in on br-herdr-cp-eg proto tcp from 172.31.252.0/29 to 100.64.8.6 port 443 comment herdr-cp-web-egress-v1'; exit 0 ;;
+  "-n -- /usr/sbin/ufw --force delete allow in on br-herdr-cp-eg proto tcp from 172.31.252.0/29 to 100.64.8.6/32 port 443 comment herdr-cp-web-egress-v1")
     echo owned-root-delete >> "{env['log']}"; exit 0 ;;
 esac
 exit 99

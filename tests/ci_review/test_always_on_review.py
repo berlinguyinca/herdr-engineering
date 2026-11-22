@@ -26,7 +26,7 @@ SCRIPT = ROOT / "deploy/ci-review/always-on-review.py"
 REPO = "acme/widget"
 GATES = ["ci/woodpecker/pr/lint", "verify", "GitGuardian Security Checks"]
 WHEN_PRESENT = "ci/woodpecker/pr/ui-gates"
-GH_TOKEN = "gho_FAKEGHAUTHTOKEN0123456789"
+GH_TOKEN = "plainfakeghauthtoken0123456789"
 SECRET = "sk-PIKEY-0123456789abcdefSECRET"
 
 
@@ -77,7 +77,7 @@ elif argv[:2] == ["pr", "list"]:
 elif argv[:2] == ["repo", "view"]:
     out(st.get("repos", {}).get(argv[2], {"isArchived": False, "isFork": False}))
 elif argv[:2] == ["auth", "token"]:
-    sys.stdout.write("gho_FAKEGHAUTHTOKEN0123456789\n")
+    sys.stdout.write("plainfakeghauthtoken0123456789\n")
 elif argv[:2] == ["api", "user"]:
     out({"login": "operator"})
 elif argv[0] == "api":
@@ -194,6 +194,10 @@ class Env:
         self.reviewer("claude", answer=APPROVE)
         self.reviewer("pi", answer=APPROVE)
         self.reviewer("codex", answer=APPROVE)
+        # hermetic: nothing from the runner's own session (Woodpecker CI_*, XDG_*, gh/git logins) may leak in
+        for name in [n for n in os.environ if n.startswith(("CI_", "XDG_", "GH_", "GITHUB_", "WOODPECKER_", "OPUS_REVIEW_"))
+                     or n in ("CI", "ANTHROPIC_API_KEY", "GIT_CONFIG_GLOBAL", "GIT_ASKPASS")]:
+            monkeypatch.delenv(name)
         monkeypatch.setenv("HOME", str(self.home))
         monkeypatch.setenv("PATH", f"{self.bin}:{os.environ['PATH']}")
         monkeypatch.setenv("GH_TOKEN", "ghp_NOTFORREVIEWERS")
@@ -569,6 +573,33 @@ def test_a_pi_reviewer_cannot_smuggle_the_provider_key_into_a_comment(env):
     body = env.gh_state()["comments"][0]["body"]
     assert SECRET not in body and SECRET not in json.dumps(env.gh_state())
     assert SECRET not in (env.tmp / "state/reviews.jsonl").read_text()
+
+
+def test_a_claude_reviewer_cannot_smuggle_the_github_token_into_a_comment(env):
+    token = os.environ["GH_TOKEN"]
+    env.mod.ai.REDACT.discard(token)                      # a fresh process: only startup registration may add it
+    env.config(post=True)
+    env.reviewer("claude", answer=block(why=f"leaked {token}"))
+    assert env.review("tier2", post=True) == 0
+    state = json.dumps(env.gh_state())
+    assert "leaked" in state and token not in state
+    assert token not in (env.tmp / "state/reviews.jsonl").read_text()
+
+
+def test_the_operators_gh_auth_token_is_redacted_on_every_backend_without_the_wrapper(env, monkeypatch):
+    gh_tok = "plainfakeghauthtoken0123456789"            # what the stand-in gh prints for `gh auth token`
+    monkeypatch.delenv("GH_TOKEN")                         # the timer sweep has no wrapper and no GH_TOKEN
+    env.mod.ai.REDACT.discard(gh_tok)
+    env.config(post=True)
+    env.reviewer("claude", answer=block(why=f"leaked {gh_tok}"))
+    assert env.review("tier2", post=True) == 0
+    state = json.dumps(env.gh_state())
+    assert "leaked" in state and gh_tok not in state
+
+
+def test_a_failed_authenticated_fetch_names_the_git_subcommand(env, tmp_path):
+    with pytest.raises(env.mod.ReviewFailed, match=r"git fetch failed"):
+        env.mod.git(["fetch", "--quiet", str(tmp_path / "does-not-exist.git")], env.clone, auth=True)
 
 
 def test_poll_survives_an_unexpected_error_in_one_review(env):
@@ -1090,3 +1121,245 @@ def test_codex_does_not_load_a_pr_added_agents_md_as_instructions(env):
 def test_the_example_config_counts_auth_directories_as_risky(env):
     cfg = env.mod.load_config(str(ROOT / "deploy/ci-review/always-on-review.example.yaml"))
     assert any(env.mod.glob_regex(g).fullmatch("pkg/auth/login.go") for g in cfg["risky"]["globs"])
+
+
+# ---------------- one installed command for every repo: the clone follows --repo ----------------
+
+def _second_repo(tmp_path, name="gadget"):
+    """A second GitHub repository (acme/<name>): its own bare origin with its own refs/pull/7/head."""
+    origin = tmp_path / "acme" / f"{name}.git"
+    origin.parent.mkdir(parents=True, exist_ok=True)
+    work = tmp_path / f"{name}-work"
+    sh("git", "init", "-q", "--bare", "-b", "main", str(origin), cwd=tmp_path)
+    sh("git", "clone", "-q", str(origin), str(work), cwd=tmp_path)
+    (work / "src").mkdir()
+    (work / "src/a.py").write_text("def g(y):\n    return y\n")
+    sh("git", "add", ".", cwd=work)
+    sh("git", "commit", "-qm", "base", cwd=work)
+    sh("git", "push", "-q", "origin", "HEAD:main", cwd=work)
+    base = sh("git", "rev-parse", "HEAD", cwd=work)
+    (work / "src/a.py").write_text("def g(y):\n    return eval(y)\n")
+    sh("git", "commit", "-qam", "change", cwd=work)
+    head = sh("git", "rev-parse", "HEAD", cwd=work)
+    sh("git", "push", "-q", "origin", f"{head}:refs/pull/7/head", cwd=work)
+    return origin, head, sh("git", "diff", f"{base}...{head}", cwd=work) + "\n"
+
+
+def _name_clone_as_github(env, repo=REPO):
+    """The configured clone's origin is the GitHub URL of `repo`; insteadOf lets git still fetch from the local origin."""
+    sh("git", "config", "remote.origin.url", f"https://github.com/{repo}.git", cwd=env.clone)
+    sh("git", "config", f"url.{env.origin}.insteadOf", f"https://github.com/{repo}.git", cwd=env.clone)
+
+
+def _point_gh_at(env, head, diff):
+    env.write_gh({"prs": {"7": {"head": head, "diff": diff}}, "statuses": {}, "check_runs": {}})
+
+
+def _review_gadget(env):
+    return env.run("review", "--repo", "acme/gadget", "--pr", "7", "--tier", "tier2")
+
+
+def test_a_clones_entry_gives_another_repo_its_own_clone(env, tmp_path):
+    origin, head, diff = _second_repo(tmp_path)
+    mine = tmp_path / "gadget-clone"
+    sh("git", "clone", "-q", str(origin), str(mine), cwd=tmp_path)
+    _name_clone_as_github(env)                       # `clone` is acme/widget's, so it must not serve acme/gadget
+    _point_gh_at(env, head, diff)
+    env.config(extra=f"clones:\n  - {{repo: acme/gadget, path: {mine}}}\n", wait=False)
+    assert _review_gadget(env) == 0
+    assert [c["head"] for c in env.reviewer_calls()] == [head]
+    assert not (tmp_path / "state" / "clones").exists()
+
+
+def test_a_repo_without_a_clone_gets_a_managed_bare_clone(env, tmp_path):
+    origin, head, diff = _second_repo(tmp_path)
+    _name_clone_as_github(env)
+    _point_gh_at(env, head, diff)
+    env.config(extra=f"clone_url: file://{tmp_path}/{{repo}}.git\n", wait=False)
+    assert _review_gadget(env) == 0
+    assert [c["head"] for c in env.reviewer_calls()] == [head]
+    managed = tmp_path / "state" / "clones" / "acme__gadget.git"
+    assert sh("git", "rev-parse", "--is-bare-repository", cwd=managed) == "true"
+    assert "gh auth git-credential" in sh("git", "config", "credential.helper", cwd=managed)
+    assert sh("git", "for-each-ref", "refs/herdr-review", cwd=managed) == ""
+    assert _review_gadget(env) == 4                  # the same head again: nothing new, the managed clone is reused
+
+
+def test_the_configured_clone_still_serves_the_repo_it_belongs_to(env, tmp_path):
+    _name_clone_as_github(env)                       # acme/widget: origin names this very repo
+    env.config(extra=f"clone_url: file://{tmp_path}/{{repo}}.git\n", wait=False)
+    assert env.review("tier2") == 0 and [c["head"] for c in env.reviewer_calls()] == [env.head]
+    assert not (tmp_path / "state" / "clones").exists()
+
+
+def test_a_repo_with_no_clone_and_no_reachable_remote_is_a_failure_not_a_wrong_review(env, tmp_path):
+    _name_clone_as_github(env)
+    _point_gh_at(env, "a" * 40, "diff --git a/x b/x\n")
+    env.config(extra=f"clone_url: file://{tmp_path}/nowhere/{{repo}}.git\n", wait=False)
+    assert _review_gadget(env) != 0 and env.reviewer_calls() == [] and env.statuses_posted() == []
+
+
+@pytest.mark.parametrize("bad", ["clones: [{repo: nope, path: /x}]", "clones: [{repo: a/b}]", "clones: x",
+                                 "clone_url: https://github.com/fixed.git", "clone_url: ''", "clone_url: -x{repo}"])
+def test_a_bad_clones_or_clone_url_is_refused(env, bad):
+    env.config(extra=bad + "\n")
+    assert env.review("tier2") == 2 and env.reviewer_calls() == []
+
+
+# ---------------- a failing advisory tier 1 never keeps Opus from running ----------------
+
+def test_review_all_tiers_still_posts_opus_when_tier_one_fails(env):
+    env.config(post=True)
+    env.reviewer("pi", exit=1)
+    rc = env.run("review", "--repo", REPO, "--pr", "7", post=True)
+    assert rc == 1                                    # the failure is reported ...
+    posted = env.statuses_posted()
+    assert any(s["context"] == "Opus agent review" and s["state"] == "success" for s in posted), posted   # ... not fatal
+
+
+# ---------------- one review at a time on a host, whoever starts it ----------------
+
+def _hold_host_slot(env):
+    cfg = env.mod.load_config(str(env.cfg_path))
+    return env.mod.ai.lock(cfg, "host-review")
+
+
+def test_a_taken_host_slot_skips_the_review_by_default(env):
+    held = _hold_host_slot(env)
+    try:
+        assert env.review("tier2") == 4
+        assert env.reviewer_calls() == []
+    finally:
+        held.close()
+    assert env.review("tier2") == 0 and len(env.reviewer_calls()) == 1
+
+
+def test_a_wait_for_the_host_slot_that_runs_out_is_a_failure(env):
+    held = _hold_host_slot(env)
+    try:
+        t = time.monotonic()
+        assert env.review("tier2", "--host-lock-wait", "1") == 1
+        assert 0.9 <= time.monotonic() - t < 15 and env.reviewer_calls() == []
+    finally:
+        held.close()
+
+
+def test_the_timer_sweep_also_takes_the_host_slot(env):
+    env.config(extra=f"repos: [{REPO}]\nbackfill: true\n")
+    held = _hold_host_slot(env)
+    try:
+        env.run("poll")
+        assert env.reviewer_calls() == []
+    finally:
+        held.close()
+    env.run("poll")
+    assert env.reviewer_calls() != []
+
+
+# ---------------- what a killed review leaves behind is cleaned at the next start ----------------
+
+def test_stale_worktrees_and_refs_of_a_killed_review_are_removed(env, tmp_path):
+    stale = tmp_path / "state" / "worktrees" / "pr9-deadbeef-abc"
+    sh("git", "worktree", "add", "--detach", "-q", str(stale), env.head, cwd=env.clone)
+    sh("git", "update-ref", "refs/herdr-review/pr-9", env.head, cwd=env.clone)
+    assert str(stale) in "\n".join(env.worktrees())
+    assert env.review("tier2") == 0
+    assert not stale.exists()
+    assert sh("git", "for-each-ref", "refs/herdr-review", cwd=env.clone) == ""
+
+
+def test_stale_cleanup_never_prunes_the_operators_own_clone(env, tmp_path):
+    mine = tmp_path / "my-own-worktree"
+    sh("git", "worktree", "add", "--detach", "-q", str(mine), env.head, cwd=env.clone)
+    shutil.rmtree(mine)                                  # the operator's record is now "prunable"
+    assert env.review("tier2") == 0
+    assert str(mine) in "\n".join(env.worktrees())       # git worktree prune must not run in `clone:`
+
+
+def test_stale_cleanup_prunes_the_managed_clones(env, tmp_path):
+    origin, head, diff = _second_repo(tmp_path)
+    _name_clone_as_github(env)
+    _point_gh_at(env, head, diff)
+    env.config(extra=f"clone_url: file://{tmp_path}/{{repo}}.git\n", wait=False)
+    assert _review_gadget(env) == 0
+    managed = tmp_path / "state" / "clones" / "acme__gadget.git"
+    gone = tmp_path / "gone-worktree"
+    sh("git", "worktree", "add", "--detach", "-q", str(gone), head, cwd=managed)
+    shutil.rmtree(gone)
+    assert env.run("review", "--repo", "acme/gadget", "--pr", "7", "--tier", "tier2", "--force") == 0
+    assert str(gone) not in sh("git", "worktree", "list", cwd=managed)
+
+
+def test_a_review_that_exits_early_does_not_clean(env, tmp_path):
+    stale = tmp_path / "state" / "worktrees" / "pr9-deadbeef-abc"
+    stale.mkdir(parents=True)
+    sh("git", "update-ref", "refs/herdr-review/pr-9", env.head, cwd=env.clone)
+    st = env.gh_state()
+    st["prs"]["7"]["draft"] = True                       # a no-op run: nothing will be reviewed
+    env.write_gh(st)
+    assert env.review("tier2") == 4
+    assert stale.exists()
+    assert sh("git", "for-each-ref", "refs/herdr-review", cwd=env.clone) != ""
+
+
+def test_fetches_into_the_operators_clone_reset_inherited_credential_helpers(env, tmp_path):
+    log = tmp_path / "git-args.log"
+    real = shutil.which("git")
+    wrapper = env.bin / "git"
+    wrapper.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> {log}\nexec {real} "$@"\n')
+    wrapper.chmod(0o755)
+    assert env.review("tier2") == 0
+    fetches = [x for x in log.read_text().splitlines() if " fetch " in f" {x} "]
+    assert fetches and all(x.startswith("-c credential.helper= -c credential.helper=!gh auth git-credential ")
+                           for x in fetches)
+
+
+
+# ---------------- a reviewer never outlives the process that started it ----------------
+
+def _alive(pid: int) -> bool:
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
+    except OSError:
+        return False
+
+
+def test_a_killed_parent_takes_the_reviewer_with_it(tmp_path):
+    pidfile = tmp_path / "pid"
+    code = (
+        "import importlib.util, sys\n"
+        f"spec = importlib.util.spec_from_file_location('aor', {str(SCRIPT)!r})\n"
+        "m = importlib.util.module_from_spec(spec); sys.modules['aor'] = m; spec.loader.exec_module(m)\n"
+        f"m.run_reviewer(['sh', '-c', 'echo $$ > {pidfile}; exec sleep 300'], m.Path('.'), None, 600)\n")
+    parent = subprocess.Popen([sys.executable, "-c", code], cwd=tmp_path)
+    for _ in range(100):
+        if pidfile.exists() and pidfile.read_text().strip():
+            break
+        time.sleep(0.1)
+    pid = int(pidfile.read_text())
+    assert _alive(pid)
+    parent.kill()                                     # SIGKILL: no handler runs, as when a CI cancel ends the step
+    parent.wait()
+    for _ in range(80):
+        if not _alive(pid):
+            break
+        time.sleep(0.1)
+    assert not _alive(pid), "the reviewer outlived the process that started it"
+
+
+def test_a_finished_reviewer_leaves_no_watchdog_behind(env, tmp_path):
+    assert env.review("tier2") == 0
+    out = subprocess.run(["pgrep", "-fc", "os.killpg\\(group, 0\\)"], capture_output=True, text=True).stdout.strip()
+    assert out in ("0", "")
+
+
+def test_the_managed_clone_resets_inherited_credential_helpers_first(env, tmp_path):
+    origin, head, diff = _second_repo(tmp_path)
+    _name_clone_as_github(env)
+    _point_gh_at(env, head, diff)
+    env.config(extra=f"clone_url: file://{tmp_path}/{{repo}}.git\n", wait=False)
+    assert _review_gadget(env) == 0
+    managed = tmp_path / "state" / "clones" / "acme__gadget.git"
+    listed = sh("git", "config", "--local", "--list", cwd=managed).splitlines()
+    assert [x for x in listed if x.startswith("credential.helper=")] == ["credential.helper=",
+                                                                           "credential.helper=!gh auth git-credential"]

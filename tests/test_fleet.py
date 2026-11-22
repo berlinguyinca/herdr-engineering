@@ -212,7 +212,10 @@ def test_update_refreshes_enabled_local_cleanup(tmp_path, monkeypatch):
     monkeypatch.setattr(fleet, 'fleet_status', lambda **kwargs: STATUS)
     result = fleet.fleet_update(pull_controller=False, reinstall_local=False)
     assert result['ok']
-    assert any(str(repo / 'scripts/build-cleanup.sh') in cmd for cmd in calls)
+    # build-hygiene alone writes the cleanup job (the old systemd script is no longer run)
+    assert not any('build-cleanup.sh' in str(part) for cmd in calls for part in cmd)
+    hygiene = next(cmd for cmd in calls if 'build-hygiene' in cmd)
+    assert '--skip-cleanup-job' not in hygiene
 
 
 def test_update_status_failure_is_not_success(tmp_path, monkeypatch):

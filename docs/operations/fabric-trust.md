@@ -42,10 +42,10 @@ control_plane:
       enabled: false           # absent = off
       kill_switch: false       # true = every Fabric request is 401 at once
       machines: [bender, beast, zapp]   # tailscale MagicDNS short names
-      tailnet_suffix: tail0c50da.ts.net # REQUIRED when enabled: a node is a machine only if its FULL name is <machine>.<suffix>
+      tailnet_suffix: <tailnet>.ts.net # REQUIRED when enabled: a node is a machine only if its FULL name is <machine>.<suffix>
       agent_ttl_seconds: 2592000        # how long the owner's "fabric" bit stays valid (default 30 d, 300..7776000)
       whois_cache_seconds: 30           # 0..3600
-      listen_host: 100.104.39.6         # the dedicated listener (section 9); tailnet range only; with listen_port, or neither
+      listen_host: 100.64.8.6         # the dedicated listener (section 9); tailnet range only; with listen_port, or neither
       listen_port: 9483
       whois_socket: /run/fabric-whois/whois.sock   # ask the whois sidecar instead of tailscaled (section 9); absolute path
       auto_join: false         # true = agents on an allow-listed machine join with no token and no owner click (section 5a)
@@ -329,9 +329,9 @@ image back (the overlay then drops out and the sidecar is stopped).
 ```yaml
 # ~/.config/herdr-engineering/config.yaml (YAML only; there is no environment variable)
 fabric_join:
-  listen_host: 100.104.39.6          # tailnet address of the fabric listener
+  listen_host: 100.64.8.6          # tailnet address of the fabric listener
   listen_port: 9483
-  # control_plane_url: http://100.104.39.6:9483   # optional explicit URL, wins over listen_host/listen_port
+  # control_plane_url: http://100.64.8.6:9483   # optional explicit URL, wins over listen_host/listen_port
   auto_join_on_session_start: false  # true: Claude Code SessionStart hook joins automatically (default false)
 ```
 

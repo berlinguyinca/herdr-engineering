@@ -38,17 +38,17 @@ def slurm_ok(**extra):
             "allowed_partitions": ["high"], **extra}
 
 
-def test_defaults_all_off_and_local_only():
+def test_defaults_on_and_local_only():
     c = validate(None)
     assert validate({}) == c
-    assert not c.enabled and c.effective_mode is Mode.LOCAL_ONLY
+    assert c.enabled and c.effective_mode is Mode.LOCAL_ONLY
     assert not c.shared_cache.enabled and not c.shared_writes_effective
     assert not c.slurm_effective and c.cleanup.dry_run and c.warnings == ()
     assert c.allowed_hosts == ()
 
 
 def test_disabled_forces_local_only_even_with_flags():
-    c = validate(sec(mode="slurm_full_build", execution=slurm_ok(),
+    c = validate(sec(enabled=False, mode="slurm_full_build", execution=slurm_ok(),
                      shared_cache={"enabled": True, "endpoint_ref": "cache", "writes_enabled": True}))
     assert c.mode is Mode.SLURM_FULL_BUILD and c.effective_mode is Mode.LOCAL_ONLY
     assert not c.slurm_effective and not c.shared_writes_effective
@@ -191,7 +191,7 @@ def _write(path, body):
 
 def test_load_config_defaults_and_invalid_fail_closed(tmp_path):
     cfg = load_config([])
-    assert cfg["fabric_build_cache"]["enabled"] is False
+    assert cfg["fabric_build_cache"]["enabled"] is True
     p = _write(tmp_path / "c.yaml", """
         fabric_build_cache:
           enabled: true
@@ -226,7 +226,7 @@ def test_legacy_config_loads_unchanged(tmp_path):
     others = {k: v for k, v in cfg.items() if k not in ("web", "build_cleanup")}
     assert others == {k: v for k, v in ref.items() if k not in ("web", "build_cleanup")}
     assert cfg["fabric_build_cache"] == ref["fabric_build_cache"]
-    assert not validate(cfg["fabric_build_cache"]).enabled
+    assert validate(cfg["fabric_build_cache"]).enabled
 
 
 def test_shipped_example_loads_with_feature_off():
@@ -278,4 +278,4 @@ def test_invalid_repo_local_section_does_not_break_commands(tmp_path, monkeypatc
     (tmp_path / "herdr-engineering.yaml").write_text(
         "fabric_build_cache: {enabled: yes-please}\n")
     monkeypatch.chdir(tmp_path)
-    assert load_config(strict_build_cache=True)["fabric_build_cache"]["enabled"] is False
+    assert load_config(strict_build_cache=True)["fabric_build_cache"]["enabled"] is True  # repo-local section is ignored; machine default applies

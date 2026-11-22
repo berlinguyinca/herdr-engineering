@@ -60,7 +60,7 @@ def validate_listen_host(host: Any, name: str = f"{_NAME}.listen_host") -> str:
 def normalize_fabric_trust(raw: Any) -> dict:
     """Validate ``control_plane.collab.fabric_trust`` (YAML only). Unknown keys and wrong types raise ValueError. Absent means
     OFF. ``machines`` are MagicDNS short names (no dots), lower-cased; enabling with no machines, or without ``tailnet_suffix``
-    (the tailnet's MagicDNS domain, e.g. ``tail0c50da.ts.net``), is an error. A node is a machine only when its FULL name equals
+    (the tailnet's MagicDNS domain, e.g. ``<tailnet>.ts.net``), is an error. A node is a machine only when its FULL name equals
     ``<machine>.<tailnet_suffix>``. ``agent_ttl_seconds`` is how long one owner "set the bit" stays valid."""
     if raw is None:
         raw = {}
@@ -87,7 +87,7 @@ def normalize_fabric_trust(raw: Any) -> dict:
                 raise ValueError(f"{name} entries must be MagicDNS short names (letters, digits, hyphens; no dots)")
         elif key == "tailnet_suffix":
             if not isinstance(value, str) or not _SUFFIX.match(value.strip().strip(".").lower()):
-                raise ValueError(f"{name} must be the tailnet MagicDNS domain, e.g. tail0c50da.ts.net")
+                raise ValueError(f"{name} must be the tailnet MagicDNS domain, e.g. <tailnet>.ts.net")
             value = value.strip().strip(".").lower()
         elif key == "listen_host":
             value = validate_listen_host(value, name)

@@ -78,8 +78,8 @@ def test_private_files_are_0600_and_yaml_loadable(tmp_path):
 
 def test_registry_file_names_endpoint_without_secrets(tmp_path):
     import yaml
-    data = yaml.safe_load(rf.registry_yaml("100.104.39.6:9000", "herdr-build-cache", False))
-    assert data == {"endpoints": {"build-cache": {"host": "100.104.39.6:9000",
+    data = yaml.safe_load(rf.registry_yaml("100.64.8.6:9000", "herdr-build-cache", False))
+    assert data == {"endpoints": {"build-cache": {"host": "100.64.8.6:9000",
                     "region": "us-east-1", "bucket": "herdr-build-cache", "use_ssl": False}}}
 
 

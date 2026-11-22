@@ -26,7 +26,8 @@ def pct(xs, p):
 
 def incremental(a):
     """Analyse REV~1 to fill the facts cache, then REV with the cache; compare to a cache-less full run of REV."""
-    import subprocess, tempfile
+    import subprocess
+    import tempfile
     parent = subprocess.run(["git", "-C", a.repo, "rev-parse", f"{a.rev}~1"], capture_output=True, text=True).stdout.strip()
     if not parent:
         return {"skipped": "no parent commit"}

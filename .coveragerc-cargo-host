@@ -11,3 +11,6 @@ include =
     */herdr_engineering/cargo_target_migration.py
     */herdr_engineering/cargo_target_retention.py
 show_missing = True
+# macOS-only code (diskutil / APFS volumes): the gate runs on Linux only, the macOS leg was dropped with GitHub Actions.
+exclude_also =
+    pragma: darwin-only

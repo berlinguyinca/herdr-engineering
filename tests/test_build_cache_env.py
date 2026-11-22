@@ -161,7 +161,7 @@ def test_never_touches_target_dir_or_idle_timeout(tmp_path):
 
 
 @pytest.mark.parametrize("cfg,cmd,env,tools_kw,reason", [
-    (None, ["cargo", "build"], {}, {}, "disabled"),
+    (validate({"enabled": False}), ["cargo", "build"], {}, {}, "disabled"),
     (_cfg(), ["cargo", "run"], {}, {}, "not_cacheable_cmd"),
     (_cfg(), ["sh", "-c", "true"], {}, {}, "not_cacheable_cmd"),
     (_cfg(), ["cargo", "build"], {}, {"with_sccache": False}, "sccache_not_found"),

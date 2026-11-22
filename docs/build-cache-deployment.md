@@ -169,7 +169,7 @@ namespace must miss; unreachable rustfs leaves the build correct with
 `shared_unavailable:endpoint_unreachable` and the same exit code (tested against
 `100.64.0.1:9` with real sccache and cargo).
 
-Known blocker for other hosts: the tailnet address `100.104.39.6:9000` currently rejects
+Known blocker for other hosts: the tailnet address `100.64.8.6:9000` currently rejects
 valid SigV4 requests (it is the fabric agent's forwarder, rustfs is published on loopback
 only). The operator must publish rustfs on the tailnet address or fix the forwarder before
 a second host can use the shared tier.

@@ -8,6 +8,7 @@ import pytest
 from herdr_engineering.control_plane.api import ControlPlaneServer
 from herdr_engineering.control_plane.redact import redact_payload, redact_text
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
+from herdr_engineering.version import __version__
 from herdr_engineering.control_plane.retention import apply_retention
 
 
@@ -198,7 +199,7 @@ def test_loopback_host_detection():
     assert _is_loopback("::1")
     assert not _is_loopback("0.0.0.0")
     assert not _is_loopback("10.0.0.5")
-    assert not _is_loopback("100.104.39.6")
+    assert not _is_loopback("100.64.8.6")
 
 
 # -------------------------------------------------------- rate limiting
@@ -247,7 +248,7 @@ def test_health_reports_postgres_when_source_present():
     svr = ControlPlaneServer(repo, source=_EmptySource())
     h = svr._health()
     assert h["source"] == "postgres"
-    assert h["version"] == "0.1.0"
+    assert h["version"] == __version__
 
 
 @pytest.fixture()
