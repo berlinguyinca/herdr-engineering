@@ -8,7 +8,7 @@ Repo-specific rules. They add to the global rules in `~/.agent-rules/AGENTS.md` 
 - If a plain `git push` would target a differently named upstream, push `HEAD:<remote-branch>` explicitly.
 
 ## CI
-- CI is Woodpecker at ci.metabolomics.us (repo id 120), plus the GitHub `verify` jobs. `unit-gates` is slow and sometimes hangs at the one-hour limit with a truncated log; retrigger with an empty commit rather than assuming a code failure, and say so when you do.
+- CI is Woodpecker only, at ci.metabolomics.us (repo id 120); GitHub Actions is not used. `unit-gates` is slow and sometimes hangs at the one-hour limit with a truncated log; retrigger with an empty commit rather than assuming a code failure, and say so when you do.
 - Never use or write Woodpecker tokens. Unauthenticated API reads work.
 
 ## Installed copy
