@@ -237,7 +237,7 @@ def steps(name: str) -> list[dict]:
     return yaml.safe_load((WOODPECKER / name).read_text())["steps"]
 
 
-@pytest.mark.parametrize("name", ["unit-gates.yml", "ui-gates.yml", "artifact-handoff.yml", "structural-gates.yml"])
+@pytest.mark.parametrize("name", ["unit-gates-shard-1.yml", "unit-gates-shard-2.yml", "unit-gates-shard-3.yml", "ui-gates.yml", "artifact-handoff.yml", "structural-gates.yml"])
 def test_pr_pipelines_integrate_main_right_after_checkout_and_freshness(name):
     steps_ = steps(name)
     names = [s["name"] for s in steps_]

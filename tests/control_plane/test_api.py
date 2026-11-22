@@ -232,7 +232,7 @@ def test_api_responses_are_never_cached(server):
 
 def test_hosts_health(server):
     c, repo = server
-    hid = repo.register_host("bender", "100.104.39.6")
+    hid = repo.register_host("bender", "100.64.8.6")
     repo.record_heartbeat(hid)
     status, _, body = c.get("/api/v1/hosts")
     assert json.loads(body)["hosts"][0]["status"] == "healthy"
@@ -322,7 +322,7 @@ def _port(client):
 
 def test_host_detail_and_telemetry_routes(server):
     c, repo = server
-    hid = repo.register_host("bender", "100.104.39.6")
+    hid = repo.register_host("bender", "100.64.8.6")
     repo.record_telemetry(hid, {"cpu_pct": 12, "mem_pct": 38})
     # host detail must still work
     status, _, body = c.get(f"/api/v1/hosts/{hid}")
@@ -378,7 +378,7 @@ def test_ingest_endpoint_upserts_host(server):
     status, body = c.post("/api/v1/ingest", {
         "entity_type": "host", "entity_id": "bender",
         "event_type": "host.registered",
-        "payload": {"host_name": "bender", "tailnet_ip": "100.104.39.6"}})
+        "payload": {"host_name": "bender", "tailnet_ip": "100.64.8.6"}})
     assert status == 200
     assert json.loads(body)["ok"] is True
     status, body = c.post("/api/v1/ingest", {
@@ -799,7 +799,7 @@ def _post_as(port, path, body, key):
 def test_agent_role_may_post_ingest_and_host_tool_routes(keyed_server):
     port = keyed_server
     ev = {"entity_type": "host", "entity_id": "bender", "event_type": "host.registered",
-          "payload": {"host_name": "bender", "tailnet_ip": "100.104.39.6"}}
+          "payload": {"host_name": "bender", "tailnet_ip": "100.64.8.6"}}
     assert _post_as(port, "/api/v1/ingest", ev, "agentkey") == 200
     # reaches the handler (not 401/403): the body is invalid or the entity absent
     for path in ("/api/v1/llm/keys", "/api/v1/llm/keys/k1/revoke", "/api/v1/reviews",

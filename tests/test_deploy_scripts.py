@@ -2234,7 +2234,7 @@ fi
     ip = bindir / 'ip'
     ip.write_text('''#!/bin/bash
 case "$*" in
-  *address*) echo '[{"addr_info":[{"local":"100.104.39.6","family":"inet"}]}]' ;;
+  *address*) echo '[{"addr_info":[{"local":"100.64.8.6","family":"inet"}]}]' ;;
   *) echo '[]' ;;
 esac
 ''')
@@ -2260,7 +2260,7 @@ exit 99
 def test_private_egress_real_deploy_dry_run_adds_overlay_without_root_or_network_changes(env):
     _egress_inspection_stubs(env)
     result = deploy(env, '--dry-run', '--memory-private-egress',
-                    '--memory-private-egress-gateway', '100.104.39.6/32')
+                    '--memory-private-egress-gateway', '100.64.8.6/32')
     assert result.returncode == 0, result.stderr
     calls = env['log'].read_text()
     assert 'compose.web-egress.yaml' in calls
@@ -2290,7 +2290,7 @@ def test_private_egress_root_preflight_refuses_before_recreate_or_profile(env, f
     _egress_inspection_stubs(env)
     env['env']['STUB_UFW_PREFLIGHT'] = failure
     result = deploy(env, '--dry-run', '--memory-private-egress',
-                    '--memory-private-egress-gateway', '100.104.39.6/32')
+                    '--memory-private-egress-gateway', '100.64.8.6/32')
     assert result.returncode != 0
     assert 'preflight' in result.stderr
     calls = env['log'].read_text()
@@ -2305,7 +2305,7 @@ def test_explicit_permission_recovery_uses_existing_lock_and_no_fleet_or_compose
     state=env['home']/'.local/state/herdr-engineering/deploys'
     state.mkdir(parents=True,mode=0o700)
     attempt=state/'attempt-recovery'
-    record=make_record('172.31.252.0/29','100.104.39.6/32','a'*32)
+    record=make_record('172.31.252.0/29','100.64.8.6/32','a'*32)
     record['network_id']='c'*64
     record['rule_may_exist']=True
     private_json(attempt/'web-egress/candidate.json',record)
@@ -2317,8 +2317,8 @@ def test_explicit_permission_recovery_uses_existing_lock_and_no_fleet_or_compose
 case "$*" in
   "-n -- /usr/sbin/ufw status") echo 'Status: inactive'; exit 0 ;;
   "-n -- /usr/sbin/ufw show added")
-    echo 'ufw allow in on br-herdr-cp-eg proto tcp from 172.31.252.0/29 to 100.104.39.6 port 443 comment herdr-cp-web-egress-v1'; exit 0 ;;
-  "-n -- /usr/sbin/ufw --force delete allow in on br-herdr-cp-eg proto tcp from 172.31.252.0/29 to 100.104.39.6/32 port 443 comment herdr-cp-web-egress-v1")
+    echo 'ufw allow in on br-herdr-cp-eg proto tcp from 172.31.252.0/29 to 100.64.8.6 port 443 comment herdr-cp-web-egress-v1'; exit 0 ;;
+  "-n -- /usr/sbin/ufw --force delete allow in on br-herdr-cp-eg proto tcp from 172.31.252.0/29 to 100.64.8.6/32 port 443 comment herdr-cp-web-egress-v1")
     echo owned-root-delete >> "{env['log']}"; exit 0 ;;
 esac
 exit 99

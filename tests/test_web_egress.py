@@ -52,8 +52,8 @@ def policy(facts, **kwargs):
         networks=networks,
         routes=routes,
         web=web,
-        destination="100.104.39.6/32",
-        addresses=[{"addr_info": [{"local": "100.104.39.6", "family": "inet"}]}],
+        destination="100.64.8.6/32",
+        addresses=[{"addr_info": [{"local": "100.64.8.6", "family": "inet"}]}],
         **kwargs,
     )
 
@@ -111,7 +111,7 @@ def test_exact_host_input_rule_and_owned_removal(facts):
         "from",
         "172.31.252.0/29",
         "to",
-        "100.104.39.6/32",
+        "100.64.8.6/32",
         "port",
         "443",
         "comment",
@@ -167,8 +167,8 @@ def test_explicit_alternate_small_private_cidr(facts):
         networks=facts[0],
         routes=facts[1],
         web=facts[2],
-        destination="100.104.39.6/32",
-        addresses=[{"addr_info": [{"local": "100.104.39.6", "family": "inet"}]}],
+        destination="100.64.8.6/32",
+        addresses=[{"addr_info": [{"local": "100.64.8.6", "family": "inet"}]}],
     )
     assert result["cidr"] == "172.30.254.0/29"
     assert "172.30.254.0/29" in result["ufw_allow"]
@@ -233,7 +233,7 @@ def test_compose_override_adds_only_private_web_without_changing_ports():
 
 def test_inspection_failure_is_sanitized_and_no_firewall_is_executed(capsys):
     with patch.object(egress, "collect", side_effect=OSError("secret environment detail")):
-        assert egress.main(["--enabled", "--gateway-ip", "100.104.39.6/32"]) == 1
+        assert egress.main(["--enabled", "--gateway-ip", "100.64.8.6/32"]) == 1
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err.strip() == "Web egress policy refused; no changes made."
@@ -246,8 +246,8 @@ def test_host_bridge_name_collision_without_docker_network_refuses(facts):
             networks=facts[0],
             routes=facts[1],
             web=facts[2],
-            destination="100.104.39.6/32",
-            addresses=[{"addr_info": [{"local": "100.104.39.6", "family": "inet"}]}],
+            destination="100.64.8.6/32",
+            addresses=[{"addr_info": [{"local": "100.64.8.6", "family": "inet"}]}],
             interfaces=[{"ifname": "br-herdr-cp-eg", "ifindex": 14}],
         )
 
@@ -264,13 +264,13 @@ def test_disabled_policy_does_not_grant_other_host_ports_or_sibling_access(facts
             networks=facts[0],
             routes=facts[1],
             web=sibling,
-            destination="100.104.39.6/32",
-            addresses=[{"addr_info": [{"local": "100.104.39.6", "family": "inet"}]}],
+            destination="100.64.8.6/32",
+            addresses=[{"addr_info": [{"local": "100.64.8.6", "family": "inet"}]}],
         )
     result = policy(facts)
     rule = result["ufw_allow"]
     assert rule[rule.index("port") + 1] == "443"
-    assert rule[rule.index("to") + 1] == "100.104.39.6/32"
+    assert rule[rule.index("to") + 1] == "100.64.8.6/32"
     assert rule[rule.index("from") + 1] == "172.31.252.0/29"
     assert rule[rule.index("on") + 1] == "br-herdr-cp-eg"
 
@@ -314,8 +314,8 @@ def test_web_endpoint_must_reference_exact_owned_network_and_source_cidr(facts):
 @pytest.mark.parametrize(
     "gateway",
     [
-        "100.104.39.6",
-        "100.104.39.6/24",
+        "100.64.8.6",
+        "100.64.8.6/24",
         "8.8.8.8/32",
         "127.0.0.1/32",
         "0.0.0.0/32",
@@ -332,7 +332,7 @@ def test_gateway_must_be_explicit_private_unicast_assigned_host_address(facts, g
             routes=facts[1],
             web=facts[2],
             destination=gateway,
-            addresses=[{"addr_info": [{"local": "100.104.39.6", "family": "inet"}]}],
+            addresses=[{"addr_info": [{"local": "100.64.8.6", "family": "inet"}]}],
         )
 
 
@@ -343,5 +343,5 @@ def test_no_gateway_default_and_non_linux_enabled_preflight(capsys):
         patch.object(egress.sys, "platform", "darwin"),
         patch.object(egress, "collect", side_effect=AssertionError("must not inspect")),
     ):
-        assert egress.main(["--enabled", "--gateway-ip", "100.104.39.6/32"]) == 1
+        assert egress.main(["--enabled", "--gateway-ip", "100.64.8.6/32"]) == 1
     assert "Linux" in capsys.readouterr().err
