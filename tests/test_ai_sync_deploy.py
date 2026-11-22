@@ -38,7 +38,7 @@ def block():
 def test_tasks_install_user_unit_and_enable_only_where_ai_sync_exists():
     b = block()
     assert b["when"] == "ansible_facts['system'] == 'Linux'" and b["become"] is False
-    assert b["environment"]["XDG_RUNTIME_DIR"] == "/run/user/{{ ansible_user_uid }}"
+    assert b["environment"]["XDG_RUNTIME_DIR"] == "/run/user/{{ ansible_facts['user_uid'] }}"
     tasks = b["block"]
     copies = [t["ansible.builtin.copy"] for t in tasks if "ansible.builtin.copy" in t]
     assert len(copies) == 1 and copies[0]["dest"].endswith("/systemd/user/herdr-eng-ai-sync-feed.service")
