@@ -299,10 +299,30 @@ class Decision:
         }
 
 
+def _create_invocation(handoff_cli: str, session_id: str, harness: str) -> str:
+    """The create command to show the agent, keyed to this session when an id is known."""
+    keyed = f" --session-id {session_id}" if session_id else ""
+    return (
+        f'{handoff_cli} create{keyed} --goal "<goal>" --source-harness {harness} '
+        f"--target-harness {harness}"
+    )
+
+
 def prompt_text(
-    *, percent: float, threshold: float, harness: str, boundary: str, handoff_cli: str = HANDOFF_CLI
+    *,
+    percent: float,
+    threshold: float,
+    harness: str,
+    boundary: str,
+    handoff_cli: str = HANDOFF_CLI,
+    session_id: str = "",
 ) -> str:
-    """The instruction injected into the session. It tells the agent to hand off itself."""
+    """The instruction injected into the session. It tells the agent to hand off itself.
+
+    The session id is spelled out because the agent runs what it is told to run: an envelope
+    created without it names no session, so neither the underway suppression nor the uptake
+    record can tie the handoff back to the trigger that caused it.
+    """
     return (
         f"[HerdR automatic handoff] Context is at {percent:.0f}% of the window "
         f"(threshold {threshold:.0f}%), noticed at the {boundary} boundary. This session is "
@@ -311,8 +331,9 @@ def prompt_text(
         f"1. Use the `{HANDOFF_SKILL}` skill: it composes a self-sufficient briefing from the "
         "actual session, packages it, launches the successor pane in this same harness and "
         "proves the takeover before closing this one.\n"
-        f"2. Or drive `{handoff_cli}` directly: create the handoff for this session, then "
-        f"`{handoff_cli} launch <handoff_id>`.\n"
+        "2. Or drive the tool directly, passing this session's id so the handoff is attributable "
+        f"to the trigger that caused it: `{_create_invocation(handoff_cli, session_id, harness)}`, "
+        f"then `{handoff_cli} launch <handoff_id>`.\n"
         "Do not ask for confirmation and do not finish the current task first; the summarizer "
         "runs before the next turn ends. Commit and push your work before the takeover. If the "
         "tool refuses to close this pane because work is uncommitted or unpushed, stop and "
@@ -495,7 +516,13 @@ def decide(
         "context_is_full",
         f"context at {used:.0f}% reached the {threshold:.0f}% threshold at the {boundary} boundary",
         percent=used,
-        prompt=prompt_text(percent=used, threshold=threshold, harness=harness, boundary=boundary),
+        prompt=prompt_text(
+            percent=used,
+            threshold=threshold,
+            harness=harness,
+            boundary=boundary,
+            session_id=session_id,
+        ),
         threshold=threshold,
         window=window,
     )
@@ -651,47 +678,184 @@ def _write_private_json(path: Path, payload: dict[str, Any]) -> None:
 # ------------------------------------------------------------------- other handoffs seen
 
 
+def _data_home(home: Path | str | None = None) -> Path:
+    """Where `herdr-handoff` keeps its shared store, which is not where its state lives.
+
+    Passing `home` explicitly means "this tree and nothing else", so the environment variable is
+    honoured only for the real machine; otherwise a test that points at a fixture home would
+    read the developer's own handoffs.
+    """
+    if home is not None:
+        return _home(home) / ".local" / "share"
+    override = os.environ.get("XDG_DATA_HOME", "").strip()
+    if override:
+        return Path(override).expanduser()
+    return _home(None) / ".local" / "share"
+
+
 def handoff_roots(cwd: Path | str | None = None, home: Path | str | None = None) -> list[Path]:
-    """Directories where a handoff envelope for this session could be waiting."""
+    """Directories where a handoff envelope for this session could be waiting.
+
+    `herdr-handoff create` without `--root` writes the shared store under the XDG data home, and
+    `--root DIR` writes wherever it was pointed, so the worktree's `.herdr/handoffs`, the home
+    copy, and the shared store are all places a handoff can live. Searching only the first two
+    made a handoff that was genuinely underway invisible.
+    """
     start = Path(cwd) if cwd is not None else Path.cwd()
     roots: list[Path] = []
     for directory in [start, *start.parents]:
         candidate = directory / ".herdr" / "handoffs"
         if candidate.is_dir():
             roots.append(candidate)
-    home_root = _home(home) / ".herdr" / "handoffs"
-    if home_root.is_dir() and home_root not in roots:
-        roots.append(home_root)
+    for candidate in (
+        _home(home) / ".herdr" / "handoffs",
+        _data_home(home) / "herdr-handoff" / "store",
+    ):
+        if candidate.is_dir() and candidate not in roots:
+            roots.append(candidate)
     return roots
 
 
+def _envelope_paths(roots: Iterable[Path]) -> Iterator[Path]:
+    """Every envelope file under the roots, in the layout the tool actually writes.
+
+    `--root DIR` puts packages in `DIR/outbox/`, so the root itself holds no json at all; the
+    flat form is kept because hand-made and older envelopes live there.
+    """
+    for root in roots:
+        for directory in (root, root / "outbox"):
+            try:
+                yield from sorted(path for path in directory.glob("*.json") if path.is_file())
+            except OSError:
+                continue
+
+
+def _envelope_session(package: dict[str, Any]) -> str:
+    """The session an envelope belongs to, from either place the id is written.
+
+    `herdr-handoff create --session-id X` records it at the top level of the package; other
+    writers put it under `source`. Reading only one of them makes a real handoff look like it
+    belongs to nobody, which is how the underway suppression stopped ever firing.
+    """
+    source = package.get("source")
+    candidates = [package.get("session_id")]
+    if isinstance(source, dict):
+        candidates.append(source.get("session_id"))
+    for value in candidates:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _handoffs_by_session(
+    cwd: Path | str | None = None, home: Path | str | None = None
+) -> dict[str, dict[str, Any]]:
+    """The last envelope seen for each session id, whatever state it is in.
+
+    Unreadable envelopes are skipped rather than raised: a half-written package is a reason to
+    know less, never a reason to stall a hook.
+    """
+    seen: dict[str, dict[str, Any]] = {}
+    for envelope in _envelope_paths(handoff_roots(cwd=cwd, home=home)):
+        try:
+            package = json.loads(envelope.read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(package, dict):
+            continue
+        session = _envelope_session(package)
+        if not session:
+            continue
+        seen[session] = {
+            "handoff_id": package.get("handoff_id") or envelope.stem,
+            "state": package.get("state"),
+            "path": str(envelope),
+        }
+    return seen
+
+
 def active_handoff(
-    session_id: str, *, cwd: Path | str | None = None, home: Path | str | None = None
+    session_id: str,
+    *,
+    cwd: Path | str | None = None,
+    home: Path | str | None = None,
+    states: Iterable[str] = ACTIVE_HANDOFF_STATES,
 ) -> dict[str, Any] | None:
     """The newest non-terminal handoff envelope naming this session, if one exists."""
     if not session_id:
         return None
+    wanted = set(states)
     found: dict[str, Any] | None = None
-    for root in handoff_roots(cwd=cwd, home=home):
-        for envelope in sorted(root.glob("*.json")):
-            try:
-                package = json.loads(envelope.read_text())
-            except (OSError, ValueError):
-                continue
-            if not isinstance(package, dict):
-                continue
-            source = package.get("source") or {}
-            if source.get("session_id") != session_id:
-                continue
-            state = package.get("state")
-            if state not in ACTIVE_HANDOFF_STATES:
-                continue
-            found = {
-                "handoff_id": package.get("handoff_id") or envelope.stem,
-                "state": state,
-                "path": str(envelope),
-            }
+    for envelope in _envelope_paths(handoff_roots(cwd=cwd, home=home)):
+        try:
+            package = json.loads(envelope.read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(package, dict):
+            continue
+        if _envelope_session(package) != session_id:
+            continue
+        state = package.get("state")
+        if state not in wanted:
+            continue
+        found = {
+            "handoff_id": package.get("handoff_id") or envelope.stem,
+            "state": state,
+            "path": str(envelope),
+        }
     return found
+
+
+def settle_uptake(
+    *, cwd: Path | str | None = None, home: Path | str | None = None
+) -> dict[str, Any] | None:
+    """Record which of the sessions told to hand off actually did; return what was stamped.
+
+    A trigger counts as taken up when an envelope naming that session exists in any state: an
+    agent that completed the handoff and closed its pane leaves a finished package behind, and
+    that is the strongest evidence available. Nothing is written when there is nothing new to
+    record, so a boundary with no handoff leaves the ledger byte for byte as it was. A session
+    that was never told has nothing to attribute and is skipped.
+    """
+    path = state_path(home)
+    with _ledger_lock(path):
+        ledger, _ = _read_ledger(home)
+        sessions = ledger["sessions"]
+        pending = {
+            session_id: entry
+            for session_id, entry in sessions.items()
+            if isinstance(entry, dict) and not entry.get("taken_at")
+        }
+        if not pending:
+            return None
+        handoffs = _handoffs_by_session(cwd=cwd, home=home)
+        settled: dict[str, Any] = {}
+        now = _utc_now()
+        for session_id in sorted(pending):
+            handoff = handoffs.get(session_id)
+            if handoff is None:
+                continue
+            entry = dict(sessions[session_id])
+            entry["taken_at"] = now
+            entry["taken_handoff"] = handoff["handoff_id"]
+            entry["taken_state"] = handoff["state"]
+            sessions[session_id] = entry
+            settled[session_id] = entry
+        if settled:
+            _write_private_json(path, {"version": ledger["version"], "sessions": sessions})
+    return settled or None
+
+
+def _settle_uptake_quietly(
+    *, cwd: Path | str | None = None, home: Path | str | None = None
+) -> list[str]:
+    """Uptake bookkeeping for a hook: it may write the ledger, it may never stall the agent."""
+    try:
+        settled = settle_uptake(cwd=cwd, home=home)
+    except Exception:  # noqa: BLE001 - an unmeasurable handoff is not a reason to fail a hook
+        return []
+    return sorted(settled) if settled else []
 
 
 # --------------------------------------------------------------------- Claude Code hook
@@ -802,6 +966,10 @@ def hook(
         return {"trigger": False, "code": "invalid", "reason": str(exc)}
     out = decision.to_dict()
     out["hook_event"] = event
+    if record:
+        settled = _settle_uptake_quietly(cwd=payload.get("cwd") or Path.cwd(), home=home)
+        if settled:
+            out["uptake_settled"] = settled
     if not decision.trigger:
         return out
     if event in CLAUDE_MODEL_REACHING_EVENTS:
@@ -1125,6 +1293,15 @@ def installed(home: Path | str | None = None) -> dict[str, Any]:
     }
 
 
+def _uptake_counts(sessions: dict[str, Any]) -> dict[str, int]:
+    """How many sessions were told, and how many of them actually handed off."""
+    told = sum(1 for entry in sessions.values() if isinstance(entry, dict))
+    taken = sum(
+        1 for entry in sessions.values() if isinstance(entry, dict) and entry.get("taken_at")
+    )
+    return {"told": told, "taken": taken}
+
+
 def status(*, home: Path | str | None = None) -> dict[str, Any]:
     active_policy = policy()
     ledger, note = _read_ledger(home)
@@ -1138,12 +1315,20 @@ def status(*, home: Path | str | None = None) -> dict[str, Any]:
         },
         "installed": installed(home),
         "ledger": {"path": str(state_path(home)), "sessions": ledger["sessions"]},
-        "summary": (
-            f"automatic handoffs are {'armed' if active_policy.enabled else 'disabled'} at "
-            f"{active_policy.context_percent:.0f}% of the context window; the next boundary "
-            "with a full context hands the session off without being asked"
-        ),
+        "uptake": _uptake_counts(ledger["sessions"]),
+        "summary": "",
     }
+    counts = out["uptake"]
+    out["summary"] = (
+        f"automatic handoffs are {'armed' if active_policy.enabled else 'disabled'} at "
+        f"{active_policy.context_percent:.0f}% of the context window; the next boundary "
+        "with a full context hands the session off without being asked"
+    )
+    if counts["told"]:
+        out["summary"] += (
+            f"; {counts['taken']} of {counts['told']} sessions that were told went on to create "
+            "a handoff"
+        )
     if note:
         out["ledger"]["note"] = note
     return out

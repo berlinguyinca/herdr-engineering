@@ -1519,3 +1519,261 @@ def test_an_invalid_policy_is_a_clean_error_and_install_writes_nothing(
     assert not (host["home"] / ".claude").exists()
     assert not (host["home"] / ".pi").exists()
     assert not ha.state_path(host["home"]).parent.exists()
+
+
+# ------------------------------------------------------------------ uptake and attribution
+#
+# Every test above hand-writes the envelope shape it wants the lookup to accept. These write
+# envelopes with the real `herdr-handoff` CLI, or in the byte shape the CLI was observed to
+# write, because the suppression branch and any effectiveness measure are worthless if they are
+# only green against a fixture. `--root DIR` puts the package at `DIR/outbox/<handoff_id>.json`
+# and records the session at the TOP level of the package, not under `source`.
+
+
+def _envelope(
+    root: Path,
+    *,
+    handoff_id: str,
+    session_id: str,
+    state: str,
+    in_outbox: bool = True,
+) -> Path:
+    """An envelope in the shape `herdr-handoff create` writes (session id at the top level)."""
+    directory = root / "outbox" if in_outbox else root
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{handoff_id}.json"
+    path.write_text(
+        json.dumps(
+            {
+                "artifacts": [],
+                "context": {"completed": ["nothing"]},
+                "created_at": "2026-11-22T08:00:00Z",
+                "handoff_id": handoff_id,
+                "history": [],
+                "mission_id": None,
+                "provenance": {},
+                "redaction": {"policy": "herdr-handoff-v1", "redacted": False},
+                "room_id": None,
+                "schema_version": 2,
+                "session_id": session_id,
+                "source": {"agent_id": None, "harness": "claude", "pane_id": None},
+                "state": state,
+                "target": {"agent_id": None, "harness": "claude", "model_hint": None},
+                "updated_at": "2026-11-22T08:00:00Z",
+            }
+        )
+    )
+    return path
+
+
+@pytest.mark.skipif(
+    shutil.which("herdr-handoff") is None, reason="herdr-handoff is not installed on this host"
+)
+def test_the_envelope_the_real_cli_writes_is_the_one_the_autopilot_reads(host: dict) -> None:
+    """The suppression must work against the tool's output, not against a hand-made file.
+
+    `herdr-handoff create` puts the package in the root's `outbox/` and keys it by a top-level
+    `session_id`. The lookup globbed the root itself and compared `source.session_id`, so a
+    session with a handoff genuinely in flight stayed eligible to be told again, and any uptake
+    count built on the same lookup reads zero forever. This test drives the real binary so the
+    contract is the tool's, not the test's.
+    """
+    root = host["work"] / ".herdr" / "handoffs"
+    result = subprocess.run(
+        [
+            "herdr-handoff",
+            "--root",
+            str(root),
+            "create",
+            "--session-id",
+            "s-real",
+            "--goal",
+            "attribution probe",
+            "--source-harness",
+            "claude",
+            "--target-harness",
+            "claude",
+            "--from-json",
+            "-",
+        ],
+        input=json.dumps({"completed": ["nothing"]}),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=host["env"],
+        cwd=str(host["work"]),
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    package = json.loads(result.stdout)
+    assert (root / "outbox" / f"{package['handoff_id']}.json").is_file(), (
+        "the CLI writes the envelope under outbox/: the lookup has to search there"
+    )
+
+    found = ha.active_handoff("s-real", cwd=host["work"])
+    assert found is not None, (
+        "a handoff the CLI created for this session must be visible to the autopilot: "
+        f"{sorted(p.relative_to(root) for p in root.rglob('*.json'))}"
+    )
+    assert found["handoff_id"] == package["handoff_id"], found
+
+    decision = ha.decide(session_id="s-real", harness="claude", percent=95.0, cwd=host["work"])
+    assert decision.trigger is False, decision.to_dict()
+    assert decision.code == "handoff_underway", decision.to_dict()
+
+
+def test_a_handoff_in_the_shared_store_suppresses_a_second_trigger(host: dict) -> None:
+    """The default store is the XDG data location, which the lookup never searched at all."""
+    store = host["home"] / ".local" / "share" / "herdr-handoff" / "store"
+    _envelope(store, handoff_id="handoff_shared", session_id="s-store", state="queued")
+
+    found = ha.active_handoff("s-store", cwd=host["work"], home=host["home"])
+    assert found is not None, "the shared store holds every handoff made without --root"
+    assert found["handoff_id"] == "handoff_shared", found
+
+    decision = ha.decide(session_id="s-store", harness="claude", percent=95.0, cwd=host["work"])
+    assert decision.code == "handoff_underway", decision.to_dict()
+
+
+def test_the_instruction_carries_the_session_id_the_envelope_is_keyed_on(host: dict) -> None:
+    """An instruction that omits the session id produces an envelope nobody can attribute.
+
+    The agent that obeys runs what the instruction told it to run. Without `--session_id` the
+    package carries no session at all, so neither the suppression nor an uptake count can tie a
+    handoff back to the trigger that caused it - which is why the delivered command names it.
+    """
+    write_config(host["home"], "handoff_autopilot:\n  enabled: true\n")
+    decision = ha.decide(session_id="s-attr", harness="claude", percent=93.0)
+    assert decision.trigger is True, decision.to_dict()
+    assert "--session-id s-attr" in decision.prompt, decision.prompt
+
+
+def test_a_told_session_that_created_a_handoff_is_recorded_as_uptake(host: dict) -> None:
+    """The ledger has to say whether the instruction was obeyed, or the policy is unfalsifiable."""
+    write_config(host["home"], "handoff_autopilot:\n  enabled: true\n")
+    ha.record_trigger(session_id="s-obey", harness="claude", percent=88.0, prompt="go")
+    _envelope(
+        host["home"] / ".herdr" / "handoffs",
+        handoff_id="handoff_obey",
+        session_id="s-obey",
+        state="queued",
+    )
+
+    result = _cli(
+        [
+            "handoff",
+            "autopilot",
+            "check",
+            "--harness",
+            "claude",
+            "--session-id",
+            "s-other",
+            "--tokens",
+            "1000",
+            "--json",
+        ],
+        host["env"],
+        host["work"],
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    entry = json.loads(ha.state_path(host["home"]).read_text())["sessions"]["s-obey"]
+    assert entry["taken_at"], f"the trigger was obeyed and the ledger does not say so: {entry}"
+    assert entry["taken_handoff"] == "handoff_obey", entry
+
+
+def test_settling_uptake_touches_nothing_when_there_is_nothing_to_settle(host: dict) -> None:
+    """`check` is read-only for a session nobody handed off: no write, no new mtime."""
+    write_config(host["home"], "handoff_autopilot:\n  enabled: true\n")
+    ha.record_trigger(session_id="s-quiet", harness="claude", percent=88.0, prompt="go")
+    path = ha.state_path(host["home"])
+    before = path.stat().st_mtime_ns
+
+    result = _cli(
+        [
+            "handoff",
+            "autopilot",
+            "check",
+            "--harness",
+            "claude",
+            "--session-id",
+            "s-quiet",
+            "--tokens",
+            "1000",
+            "--json",
+        ],
+        host["env"],
+        host["work"],
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert path.stat().st_mtime_ns == before, "a check with no envelope must not rewrite the ledger"
+    entry = json.loads(path.read_text())["sessions"]["s-quiet"]
+    assert "taken_at" not in entry, entry
+
+
+def test_uptake_is_stamped_once_and_never_rewritten(host: dict) -> None:
+    write_config(host["home"], "handoff_autopilot:\n  enabled: true\n")
+    ha.record_trigger(session_id="s-twice-told", harness="claude", percent=88.0, prompt="go")
+    _envelope(
+        host["home"] / ".herdr" / "handoffs",
+        handoff_id="handoff_first",
+        session_id="s-twice-told",
+        state="queued",
+    )
+    assert ha.settle_uptake(home=host["home"]) is not None
+    first = json.loads(ha.state_path(host["home"]).read_text())["sessions"]["s-twice-told"]
+
+    _envelope(
+        host["home"] / ".herdr" / "handoffs",
+        handoff_id="handoff_second",
+        session_id="s-twice-told",
+        state="claimed",
+    )
+    assert ha.settle_uptake(home=host["home"]) is None, (
+        "one trigger is attributed to the first handoff that appeared; a second must not "
+        "overwrite when it happened"
+    )
+    again = json.loads(ha.state_path(host["home"]).read_text())["sessions"]["s-twice-told"]
+    assert again == first, again
+
+
+def test_status_reports_obeyed_triggers_against_issued_ones(host: dict) -> None:
+    """The operator's question is 'does this work?', so the status has to answer it."""
+    write_config(host["home"], "handoff_autopilot:\n  enabled: true\n")
+    for session in ("s-a", "s-b", "s-c"):
+        ha.record_trigger(session_id=session, harness="claude", percent=88.0, prompt="go")
+    _envelope(
+        host["home"] / ".herdr" / "handoffs",
+        handoff_id="handoff_a",
+        session_id="s-a",
+        state="queued",
+    )
+    assert ha.settle_uptake(home=host["home"]) is not None
+
+    report = ha.status(home=host["home"])
+    assert report["uptake"]["told"] == 3, report["uptake"]
+    assert report["uptake"]["taken"] == 1, report["uptake"]
+    assert "1 of 3" in report["summary"], report["summary"]
+
+
+def test_the_operator_doc_names_the_fields_that_measure_uptake() -> None:
+    """An operator tunes the threshold from the doc, so the doc has to name what the code writes.
+
+    The names come from `settle_uptake` rather than from memory: a doc that paraphrases the
+    ledger ("was it taken up?") while the file says `taken_at` leaves the operator grepping for
+    something that is never written.
+    """
+    fields = {"taken_at", "taken_handoff", "taken_state"}
+    ha.settle_uptake.__doc__ or pytest.fail("settle_uptake must explain what it records")
+    source = Path(ha.__file__).read_text()
+    for field in sorted(fields):
+        assert f'"{field}"' in source, (
+            f"settle_uptake no longer writes {field}: the doc and test drift"
+        )
+
+    text = DOC.read_text(encoding="utf-8")
+    assert "taken_at" in text, "the doc must name the ledger field that marks an obeyed trigger"
+    assert '"told"' in text and '"taken"' in text, (
+        "the doc must show the status fields side by side"
+    )
+    assert "--session-id" in text, "the doc must say that an unattributed handoff measures nothing"
+    assert "outbox/" in text, "the doc must name the layout the handoff envelopes are written in"
