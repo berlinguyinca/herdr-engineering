@@ -12,7 +12,7 @@ import herdr_engineering.tree as tree
 
 def _fixture(monkeypatch):
     monkeypatch.setattr(tree, "_fleet_machines", lambda: [
-        {"id": "beast", "label": "beast", "target": "100.96.156.65", "reachable": True}])
+        {"id": "beast", "label": "beast", "target": "100.64.8.65", "reachable": True}])
     monkeypatch.setattr(tree, "_workspaces", lambda: [
         {"workspace_id": "w1", "label": "fix augur", "agent_status": "working"},
         {"workspace_id": "w2", "label": "tournament", "agent_status": "idle"}])

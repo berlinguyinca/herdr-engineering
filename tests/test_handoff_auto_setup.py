@@ -2,10 +2,14 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
+from herdr_engineering import handoff_auto_setup as auto_setup
 from herdr_engineering.handoff_auto_setup import HOOK_COMMAND, HOOK_MARKER, START_COMMAND, STOP_COMMAND
 
 REPO = str(Path(__file__).resolve().parents[1])
@@ -160,3 +164,126 @@ def test_uninstall_removes_subagent_entries_too(tmp_path: Path) -> None:
     cli(tmp_path, "install")
     assert actions(cli(tmp_path, "uninstall")[1]) == ["removed"] * 3
     assert json.loads(settings_path(tmp_path).read_text()) == {}
+
+
+# --- install_subagent_hooks: SubagentStart/SubagentStop only, real files under .herdr-test/home/ ---------------------
+TEST_HOME = Path(REPO) / ".herdr-test" / "home"
+
+
+@pytest.fixture
+def home():
+    shutil.rmtree(TEST_HOME, ignore_errors=True)
+    (TEST_HOME / ".claude").mkdir(parents=True)  # Claude Code is present on this host
+    yield TEST_HOME
+    shutil.rmtree(TEST_HOME, ignore_errors=True)
+
+
+def test_install_subagent_hooks_writes_start_and_stop_only(home: Path) -> None:
+    items = auto_setup.install_subagent_hooks(home)
+    assert [i.action for i in items] == ["installed", "installed"]
+    assert json.loads(settings_path(home).read_text()) == {"hooks": {"SubagentStart": [START], "SubagentStop": [STOP]}}
+    assert [i.action for i in auto_setup.check(home)] == ["missing", "ok", "ok"]
+    assert {i.action for i in auto_setup.uninstall(home)} == {"removed", "unchanged"}
+    assert json.loads(settings_path(home).read_text()) == {}
+
+
+NO_CLAUDE_PATH = "/nonexistent-herdr-test-bin"
+
+
+def test_install_subagent_hooks_skips_and_writes_nothing_without_claude_code(tmp_path: Path) -> None:
+    items = auto_setup.install_subagent_hooks(tmp_path, path=NO_CLAUDE_PATH)
+    assert [i.action for i in items] == ["skipped"]
+    assert not (tmp_path / ".claude").exists()
+
+
+def test_install_subagent_hooks_installs_when_claude_is_on_path(tmp_path: Path) -> None:
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    fake = bindir / "claude"
+    fake.write_text("#!/bin/sh\n")
+    fake.chmod(0o755)
+    home = tmp_path / "home"
+    home.mkdir()
+    assert [i.action for i in auto_setup.install_subagent_hooks(home, path=str(bindir))] == ["installed", "installed"]
+
+
+@pytest.mark.parametrize("action", ["uninstall", "check"])
+def test_cli_subagents_only_is_an_argparse_error_for_other_actions(tmp_path: Path, action: str) -> None:
+    code = "import sys; from herdr_engineering import cli; sys.exit(cli.main(sys.argv[1:]))"
+    p = subprocess.run([sys.executable, "-c", code, "handoff", "auto", action, "--subagents-only", "--home", str(tmp_path)], cwd=REPO,
+                       env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "PYTHONPATH": REPO}, capture_output=True, text=True, timeout=60)
+    assert p.returncode == 2 and "--subagents-only" in p.stderr
+
+
+def test_second_install_is_noop(home: Path) -> None:
+    auto_setup.install_subagent_hooks(home)
+    before = settings_path(home).read_bytes()
+    assert [i.action for i in auto_setup.install_subagent_hooks(home)] == ["unchanged", "unchanged"]
+    assert settings_path(home).read_bytes() == before
+
+
+def test_foreign_hooks_untouched(home: Path) -> None:
+    other = {"matcher": "x", "hooks": [{"type": "command", "command": "echo hi"}]}
+    settings_path(home).parent.mkdir(parents=True, exist_ok=True)
+    settings_path(home).write_text(json.dumps({"model": "m", "hooks": {"SubagentStart": [other], "Stop": [other]}}, indent=2))
+    auto_setup.install_subagent_hooks(home)
+    data = json.loads(settings_path(home).read_text())
+    assert data["model"] == "m" and data["hooks"]["Stop"] == [other]
+    assert data["hooks"]["SubagentStart"] == [other, START] and data["hooks"]["SubagentStop"] == [STOP]
+    assert "UserPromptSubmit" not in data["hooks"]
+
+
+def test_invalid_json_not_rewritten(home: Path) -> None:
+    settings_path(home).parent.mkdir(parents=True, exist_ok=True)
+    raw = b'{"hooks": {oops'
+    settings_path(home).write_bytes(raw)
+    assert [i.action for i in auto_setup.install_subagent_hooks(home)] == ["refused"]
+    assert settings_path(home).read_bytes() == raw
+
+
+def test_cli_subagents_only_installs_just_the_two_hooks(home: Path) -> None:
+    rc, out = cli(home, "install", "--subagents-only")
+    assert rc == 0 and actions(out) == ["installed", "installed"]
+    assert set(json.loads(settings_path(home).read_text())["hooks"]) == {"SubagentStart", "SubagentStop"}
+
+
+def _installed_command(home: Path, event: str) -> str:
+    return json.loads(settings_path(home).read_text())["hooks"][event][0]["hooks"][0]["command"]
+
+
+def _run_hook(home: Path, event: str, payload: str, state: Path, bin_exists: bool) -> subprocess.CompletedProcess:
+    bindir = home / ".local/bin"
+    bindir.mkdir(parents=True, exist_ok=True)
+    wrapper = bindir / "herdr-eng"
+    if bin_exists:
+        wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" -c "import sys; from herdr_engineering import cli; sys.exit(cli.main(sys.argv[1:]))" "$@"\n')
+        wrapper.chmod(0o755)
+    env = {"PATH": "/usr/bin:/bin", "HOME": str(home), "PYTHONPATH": REPO, "HERDR_PANE_ID": "w1:p1", "HERDR_ENGINEERING_STATE": str(state)}
+    return subprocess.run(["sh", "-c", _installed_command(home, event)], input=payload, env=env, capture_output=True, text=True, timeout=60)
+
+
+def test_installed_start_hook_registers_agent(home: Path) -> None:
+    auto_setup.install_subagent_hooks(home)
+    state = home / "state"
+    payload = json.dumps({"agent_id": "a1", "agent_type": "general-purpose"})
+    done = _run_hook(home, "SubagentStart", payload, state, bin_exists=True)
+    assert done.returncode == 0 and done.stdout == "" and done.stderr == ""
+    assert (state / "subagents" / "w1:p1" / "a1").is_file()
+    done = _run_hook(home, "SubagentStop", payload, state, bin_exists=True)
+    assert done.returncode == 0 and not (state / "subagents" / "w1:p1" / "a1").exists()
+
+
+def test_installed_hooks_exit_zero_silently_when_binary_is_missing(home: Path) -> None:
+    auto_setup.install_subagent_hooks(home)
+    for event in ("SubagentStart", "SubagentStop"):
+        done = _run_hook(home, event, "{}", home / "state", bin_exists=False)
+        assert (done.returncode, done.stdout, done.stderr) == (0, "", "")
+        assert not (home / "state").exists()
+
+
+def test_install_sh_has_the_subagent_hooks_step() -> None:
+    script = (Path(REPO) / "scripts/install.sh").read_text()
+    assert 'WITH_SUBAGENT_HOOKS="${HERDR_INSTALL_SUBAGENT_HOOKS:-1}"' in script
+    assert "--no-subagent-hooks) WITH_SUBAGENT_HOOKS=0" in script
+    assert "handoff auto install --subagents-only" in script
+    assert subprocess.run(["bash", "-n", str(Path(REPO) / "scripts/install.sh")]).returncode == 0

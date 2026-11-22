@@ -20,7 +20,7 @@ from tests.control_plane.test_collab_tasks import USERS, code, svc  # noqa: F401
 REPO = str(Path(__file__).resolve().parents[2])
 FLEET_REL = ".config/herdr-engineering/fleet/fleet-config.yaml"
 CFG_REL = ".config/herdr-engineering/config.yaml"
-LISTENER = ("100.104.39.6", 9483)
+LISTENER = ("100.64.8.6", 9483)
 
 
 def cli(home, *argv, env_extra=None, cwd=REPO):
@@ -47,7 +47,7 @@ def write_fleet(home, host=LISTENER[0], port=LISTENER[1], mode=0o600):
 def test_listener_resolves_from_the_fleet_config_and_from_nothing_else(tmp_path):
     assert fj.resolve_listener(tmp_path) is None
     write_fleet(tmp_path)
-    assert fj.resolve_listener(tmp_path) == ("http://100.104.39.6:9483", "fleet-config")
+    assert fj.resolve_listener(tmp_path) == ("http://100.64.8.6:9483", "fleet-config")
 
 
 def test_a_group_readable_fleet_config_is_not_used(tmp_path):
@@ -95,7 +95,7 @@ def test_a_differing_existing_listener_is_reported_and_never_overwritten(tmp_pat
     cfg.parent.mkdir(parents=True, exist_ok=True)
     cfg.write_text("fabric_join:\n  listen_host: 100.64.0.9\n  listen_port: 1234\n")
     item = fj.install_listener(tmp_path)
-    assert item.action == "preserved" and "100.104.39.6" in item.detail
+    assert item.action == "preserved" and "100.64.8.6" in item.detail
     assert cfg.read_text() == "fabric_join:\n  listen_host: 100.64.0.9\n  listen_port: 1234\n"
 
 
@@ -311,7 +311,7 @@ def test_codex_rule_allows_only_the_join_prefix_per_the_real_codex_engine(tmp_pa
     assert decision("herdr-eng", "rooms", "list") is None
     assert decision("herdr-eng", "rooms") is None
     assert decision("herdr-eng") is None
-    assert decision("curl", "http://100.104.39.6:9483") is None
+    assert decision("curl", "http://100.64.8.6:9483") is None
 
 
 def test_check_reports_the_codex_rule(tmp_path):

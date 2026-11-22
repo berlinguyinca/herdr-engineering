@@ -131,7 +131,7 @@ The producer names each file `<run_number>-<40 lowercase hex revision>-hive-slur
 
 The whole UTF-8 bundle is limited to 2 MiB. XML must satisfy the uploader's parser limits. Test counts come from native cases; the relay never synthesizes reports from logs or runner exit codes. Missing or malformed reports remain missing in HerdR.
 
-Before publishing, the relay reads `GET /api/v1/ci/pipeline?repository=116&number=<run>` and requires an available provider run with exactly matching run number, full revision and branch. A matching filename alone is insufficient. Unknown or mismatched runs and unsuccessful uploads remain retryable. An operator key is read from `HERDR_ENGINEERING_API_KEY`, or explicitly use `--allow-open` for the intentionally open trusted-network deployment:
+Before publishing, the relay reads `GET /api/v1/ci/pipeline?repository=116&number=<run>` and requires an available provider run with exactly matching run number, full revision and branch. A matching filename alone is insufficient. A run the control plane reports as removed (the pipeline GET returned 404 while the repository GET still succeeds, so a repository-, auth- or endpoint-level 404 never counts) is skipped permanently: it is never published and is recorded as a `skipped` checkpoint so it is not retried, and the summary line counts it (`N published, M failed, K skipped`; the exit status ignores skips). Mismatched identities, provider/HTTP/auth/timeout errors and unsuccessful uploads remain retryable failures. An operator key is read from `HERDR_ENGINEERING_API_KEY`, or explicitly use `--allow-open` for the intentionally open trusted-network deployment:
 
 ```sh
 python3 -m herdr_engineering.ci_report_relay \

@@ -21,37 +21,50 @@ import subprocess
 import sys
 from pathlib import Path
 
+from .fleet_inventory import add_host, write_host_vars
 from .herdr_adapter import NativeHerdrAdapter
 
 #: LaunchAgent installed by `scripts/fleet-auto-update-macos.sh`; a test holds the two together so
 #: `fleet update` cannot look for a label the installer never writes.
 LAUNCHD_LABEL = "com.herdr-engineering.fleet-auto-update"
 
-try:  # reuse the private-inventory helper from scripts/ (may live beside repo)
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
-    from fleet_inventory import add_host, list_hosts, write_host_vars
-except Exception:  # pragma: no cover - best effort; inventory is optional
-    def add_host(*a, **k):  # type: ignore
-        raise RuntimeError("scripts/fleet_inventory.py not importable")
+class FleetError(Exception):
+    pass
 
-    def write_host_vars(*a, **k):  # type: ignore
-        raise RuntimeError("scripts/fleet_inventory.py not importable")
 
-    def list_hosts(*a, **k):  # type: ignore
-        return []
+def devfabric_leases(timeout: int = 60) -> list[dict]:
+    """Active fabric leases, read through `herdr-eng devfabric list --json` (never the native `herdr`).
+
+    Runs this interpreter's own package so the installed copy answers for itself.
+    """
+    proc = subprocess.run([sys.executable, "-m", "herdr_engineering.cli", "devfabric", "list", "--json"],
+                          capture_output=True, text=True, timeout=timeout)
+    if proc.returncode != 0:
+        raise FleetError(f"devfabric list failed (rc={proc.returncode}): {proc.stderr.strip()[-300:]}")
+    data = json.loads(proc.stdout)
+    if isinstance(data, dict):
+        data = data.get("leases") or []
+    return data if isinstance(data, list) else []
 
 
 def repo_root() -> Path:
-    """Locate the herdr-engineering checkout that holds the ansible fleet."""
+    """Locate the herdr-engineering checkout that holds the ansible fleet.
+
+    HERDR_ENGINEERING_REPO wins; otherwise walk up from the cwd for the private inventory
+    (`ansible/inventory/hosts.yml`) or, failing that, the tracked playbooks of a checkout without one.
+    Raises FleetError naming what was searched; the cwd is never assumed to be a checkout.
+    """
     env = os.environ.get("HERDR_ENGINEERING_REPO")
     if env:
         return Path(env)
-    # walk up from cwd looking for ansible/inventory/hosts.yml
     cwd = Path.cwd()
-    for p in [cwd, *cwd.parents]:
-        if (p / "ansible" / "inventory" / "hosts.yml").exists():
-            return p
-    return cwd
+    for marker in (Path("ansible/inventory/hosts.yml"), Path("ansible/playbooks/fleet-status.yml")):
+        for p in [cwd, *cwd.parents]:
+            if (p / marker).exists():
+                return p
+    raise FleetError(f"no inventory at {cwd / 'ansible' / 'inventory' / 'hosts.yml'} (searched {cwd} and its "
+                     "parents for ansible/inventory/hosts.yml and ansible/playbooks/fleet-status.yml); "
+                     "run from a herdr-engineering checkout or set HERDR_ENGINEERING_REPO")
 
 
 def _run(cmd: list[str], timeout: int = 600, env: dict[str, str] | None = None) -> tuple[int, str, str]:
@@ -70,10 +83,6 @@ def _run(cmd: list[str], timeout: int = 600, env: dict[str, str] | None = None) 
     except OSError as exc:
         return 127, "", str(exc)
     return proc.returncode, proc.stdout, proc.stderr
-
-
-class FleetError(Exception):
-    pass
 
 
 def _expected_hosts(inventory: Path, host: str | None) -> list[str]:
@@ -205,7 +214,11 @@ def fleet_join(*, ssh_target: str, label: str | None = None, os_name: str = "lin
     """
     report: dict = {"target": ssh_target, "label": label or ssh_target,
                     "steps": {}, "registered": False, "ok": False}
-    root = repo_root()
+    try:
+        root = repo_root()
+    except FleetError as exc:
+        report["errors"] = [str(exc)]
+        return report
     inv = inventory or (root / "ansible" / "inventory" / "hosts.yml")
     hv_dir = host_vars_dir or (root / "ansible" / "inventory" / "host_vars")
     host = label or ssh_target
@@ -277,8 +290,7 @@ def fleet_join(*, ssh_target: str, label: str | None = None, os_name: str = "lin
 
     # 4) verify registration with the fabric gateway
     try:
-        adapter = NativeHerdrAdapter(herdr_bin=herdr_bin)
-        leases = adapter.devfabric_list()
+        leases = devfabric_leases()
         registered = any(
             (str(lease.get("machine_id", "")) == host
              or str(lease.get("target", {})).find(host) >= 0)
@@ -311,6 +323,11 @@ def _refresh_controller_handoff(root: Path, report: dict) -> None:
             "by this step (issue #799)")
 
 
+def _cleanup_job_wanted(cleanup: object) -> bool:
+    """Build-hygiene's rule for keeping the cleanup job: anything but an explicit ``enabled: false``."""
+    return not isinstance(cleanup, dict) or bool(cleanup.get("enabled", True))
+
+
 def fleet_update(*, host: str | None = None, gateway: str = DEFAULT_GATEWAY,
                  inventory: Path | None = None, pull_controller: bool = True,
                  reinstall_local: bool = True, revision: str | None = None,
@@ -320,9 +337,13 @@ def fleet_update(*, host: str | None = None, gateway: str = DEFAULT_GATEWAY,
 
     Returns a JSON-serializable report.
     """
-    root = repo_root()
-    inv = inventory or (root / "ansible" / "inventory" / "hosts.yml")
     report: dict = {"target": host or "all inventory hosts", "steps": {}, "ok": False}
+    try:
+        root = repo_root()
+    except FleetError as exc:
+        report["error"] = str(exc)
+        return report
+    inv = inventory or (root / "ansible" / "inventory" / "hosts.yml")
     from .control_plane.agent_rules_config import AgentRulesConfigError
     try:   # before anything is pulled or deployed: a broken pin must stop the run, not be skipped
         rules_vars = _playbook_vars(fleet_config)
@@ -432,17 +453,10 @@ def fleet_update(*, host: str | None = None, gateway: str = DEFAULT_GATEWAY,
 
     from .config import load_config
     cleanup = load_config().get("build_cleanup", {})
-    roots = cleanup.get("roots", []) if isinstance(cleanup, dict) else []
-    enabled = (isinstance(cleanup, dict) and cleanup.get("enabled") is True
-               and isinstance(roots, list) and bool(roots)
-               and all(isinstance(path, str) and path.strip() for path in roots))
-    installer = root / "scripts" / "build-cleanup.sh"
-    if enabled and installer.exists():
-        ok, _ = step("controller_cleanup", ["bash", str(installer)], 120)
-        if not ok:
-            return report
-
-    elif not enabled and sys.platform.startswith("linux"):
+    # The same rule build-hygiene applies: only an explicit `enabled: false` removes the job (empty roots
+    # still sweep the managed targets), so the disable below never fights the re-enable that follows.
+    job_wanted = _cleanup_job_wanted(cleanup)
+    if not job_wanted and sys.platform.startswith("linux"):
         loaded, value, _ = _run(["systemctl", "--user", "show",
                                  "herdr-eng-build-cleanup.service",
                                  "-p", "LoadState", "--value"], timeout=30)
@@ -451,6 +465,11 @@ def fleet_update(*, host: str | None = None, gateway: str = DEFAULT_GATEWAY,
                          "--now", "herdr-eng-build-cleanup.service"], 120)
             if not ok:
                 return report
+
+    # Disk hygiene is on by default: the cleanup job (systemd on Linux, launchd on macOS) and the managed
+    # cargo launcher, all written by build-hygiene (it resolves the herdr-eng executable and skips a stale
+    # virtualenv's; the old systemd script did neither). Non-fatal - `herdr-eng doctor` reports a gap.
+    step("controller_build_hygiene", [sys.executable, "-m", "herdr_engineering.cli", "build-hygiene", "install"], 120)
 
     # Refresh whichever unattended updater the controller actually has loaded - the installer
     # holds the unit/plist templates, so a schedule or working-directory change reaches a host
@@ -494,11 +513,21 @@ def fleet_update(*, host: str | None = None, gateway: str = DEFAULT_GATEWAY,
     return report
 
 
+def _status_error(message: str, kind: str) -> dict:
+    """A status that never ran ansible: distinct from hosts that failed (rc set, hosts possibly empty)."""
+    return {"rc": None, "hosts": [], "stderr": None, "error": message, "error_kind": kind}
+
+
 def fleet_status(*, inventory: Path | None = None, host: str | None = None) -> dict:
     """Read-only per-host version/registration fingerprint."""
-    root = repo_root()
+    try:
+        root = repo_root()
+    except FleetError as exc:
+        return _status_error(str(exc), "no_inventory")
     inv = inventory or (root / "ansible" / "inventory" / "hosts.yml")
     playbook = root / "ansible" / "playbooks" / "fleet-status.yml"
+    if not inv.is_file():
+        return _status_error(f"no inventory at {inv}", "no_inventory")
     cmd = ["ansible-playbook", "-i", str(inv), str(playbook)]
     if host:
         cmd += ["-l", host]
@@ -570,9 +599,12 @@ def _summary_state(parts: list[str], root: Path) -> str:
 
 def stage_pi_runtime(revision: str, *, host: str, inventory: Path | None = None) -> dict:
     """Install/register a pinned Pi package; never reload or restart live sessions."""
-    root = repo_root()
-    inv = inventory or root / "ansible" / "inventory" / "hosts.yml"
     report: dict = {"ok": False, "revision": revision, "host": host}
+    try:
+        root = repo_root()
+    except FleetError as exc:
+        return {**report, "error": str(exc)}
+    inv = inventory or root / "ansible" / "inventory" / "hosts.yml"
     if not _is_revision(revision):
         return {**report, "error": "Pi revision must be a full immutable commit ID"}
     try:

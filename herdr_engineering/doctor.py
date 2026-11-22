@@ -11,7 +11,9 @@ import json
 import os
 import platform
 import shutil
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from . import __version__
@@ -69,21 +71,58 @@ class DoctorReport:
         return "\n".join(lines)
 
 
+def tailscale_running(returncode: int, stdout: str) -> bool:
+    """Decide from `tailscale status --json` output whether the backend is running.
+
+    The JSON `BackendState` is authoritative (`Running` vs `Stopped`, `NeedsLogin`, ...). When the output
+    is not the status object, the command's exit code decides.
+    """
+    try:
+        state = json.loads(stdout).get("BackendState")
+    except (ValueError, AttributeError):
+        return returncode == 0
+    if not isinstance(state, str):
+        return returncode == 0
+    return state == "Running"
+
+
 def _tailscale_up() -> bool:
     binpath = shutil.which("tailscale")
     if not binpath:
         return False
     import subprocess
     try:
-        out = subprocess.run([binpath, "status"], capture_output=True,
-                             text=True, timeout=10).stdout
-        return "tailscale" in out.lower() and "Logged out" not in out
-    except Exception:
+        proc = subprocess.run([binpath, "status", "--json"], capture_output=True,
+                              text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
         return False
+    return tailscale_running(proc.returncode, proc.stdout)
+
+
+#: The directory holding the `herdr_engineering` package; `lock/` sits beside it only in a checkout
+#: (or editable install), never in an installed copy.
+_PACKAGE_ROOT = Path(__file__).resolve().parent.parent
+
+
+def resolve_lock_path(env: Mapping[str, str], package_root: Path) -> Path | None:
+    """Where `lock/upstreams.yaml` lives, independent of the working directory.
+
+    Order: HERDR_ENGINEERING_LOCK, then `<HERDR_ENGINEERING_REPO>/lock/upstreams.yaml`, then the checkout
+    the running package was imported from. None when there is no checkout to look at (an installed copy).
+    """
+    explicit = env.get("HERDR_ENGINEERING_LOCK")
+    if explicit:
+        return Path(explicit)
+    repo = env.get("HERDR_ENGINEERING_REPO")
+    if repo:
+        return Path(repo) / "lock" / "upstreams.yaml"
+    candidate = package_root / "lock" / "upstreams.yaml"
+    return candidate if candidate.exists() else None
 
 
 def run_doctor(config: dict[str, Any] | None = None,
-               herdr_adapter=None, herdr_bin: str = "herdr", strict: bool = False) -> DoctorReport:
+               herdr_adapter=None, herdr_bin: str = "herdr", strict: bool = False,
+               package_root: Path | None = None) -> DoctorReport:
     report = DoctorReport()
     report.platform = platform.platform()
     report.python = platform.python_version()
@@ -106,13 +145,14 @@ def run_doctor(config: dict[str, Any] | None = None,
     else:
         report.add("config", "ok", "config provided")
 
-    lock_path = os.environ.get("HERDR_ENGINEERING_LOCK",
-                               str(__import__("pathlib").Path(
-                                   __import__("os").getcwd()) / "lock/upstreams.yaml"))
-    if os.path.exists(lock_path):
+    lock_path = resolve_lock_path(os.environ, package_root or _PACKAGE_ROOT)
+    if lock_path is None:
+        report.add("lock", "unknown", "not applicable: no checkout found (installed copy; "
+                   "set HERDR_ENGINEERING_REPO to check a checkout's lock)")
+    elif lock_path.exists():
         report.add("lock", "ok", "upstreams lock file present")
     else:
-        report.add("lock", "warn", "no lock/upstreams.yaml at repo root")
+        report.add("lock", "warn", f"no upstreams lock at {lock_path}")
 
     # herdr binary / capabilities
     if shutil.which(herdr_bin):
@@ -163,16 +203,28 @@ def run_doctor(config: dict[str, Any] | None = None,
                "enabled" if dev_enabled else "disabled by config")
 
     # adopted plugins (from lock)
-    adopted = _adopted_plugins(lock_path)
-    report.add("plugins", "ok" if adopted else "warn",
-               f"{len(adopted)} adopted plugin(s): {', '.join(adopted)}",
-               {"adopted": adopted})
+    if lock_path is None:
+        report.add("plugins", "unknown", "not applicable: no checkout found, so no lock to read")
+    else:
+        adopted = _adopted_plugins(str(lock_path))
+        report.add("plugins", "ok" if adopted else "warn",
+                   f"{len(adopted)} adopted plugin(s): {', '.join(adopted)}",
+                   {"adopted": adopted})
 
     from .handoff_dependency import check_handoff_dependency
     handoff = check_handoff_dependency()
     report.add("handoff", handoff.status if strict else ("ok" if handoff.status == "ok" else "warn"),
                handoff.detail, {"missing_harnesses": handoff.missing_harnesses,
                                 "executable": handoff.executable})
+
+    # automatic handoff triggers: is the next full-context session going to hand itself off?
+    try:
+        from .handoff_autopilot import doctor_check
+        autopilot = doctor_check()
+        detail = autopilot["detail"] if not autopilot["fix"] else f"{autopilot['detail']}; fix: {autopilot['fix']}"
+        report.add(autopilot["name"], autopilot["status"], detail, autopilot["data"])
+    except Exception as exc:  # doctor must never crash on an optional section
+        report.add("handoff-autopilot", "warn", f"autopilot check failed: {type(exc).__name__}")
 
     # herdr-memory managed adapters (only when opted in; never fake healthy)
     try:
@@ -196,6 +248,7 @@ def run_doctor(config: dict[str, Any] | None = None,
         report.add("memory_hindsight", "warn", f"memory backend checks failed: {type(exc).__name__}")
 
     _add_build_cache_toolchain(report)
+    _add_build_hygiene(report, config or {})
 
     # external providers
     ci_offline = not (config or {}).get("ci", {}).get("provider")
@@ -240,6 +293,44 @@ def _add_build_cache_toolchain(report: DoctorReport) -> None:
     report.add("build_cache_python_deps", "warn" if absent else "ok",
                f"missing python modules: {', '.join(absent)}; fix: pip install -e ." if absent
                else "python deps import (PyYAML)")
+
+
+def _add_build_hygiene(report: DoctorReport, config: dict[str, Any]) -> None:
+    """Disk pressure plus whether the cleanup job and cargo wrapper are installed/enabled."""
+    from pathlib import Path
+
+    from .build_coord import _default_state_dir
+    from .build_hygiene import status
+    try:
+        merged = config if config.get("build_cleanup") else load_config()
+        info = status(Path.home(), merged, _default_state_dir())
+    except Exception as exc:  # doctor must never crash on an optional section
+        report.add("build_hygiene", "warn", f"disk hygiene check failed: {type(exc).__name__}")
+        return
+    usage = info["usage_percent"]
+    level = "fail" if usage >= 97 else "warn" if usage >= info["pressure_percent"] else "ok"
+    report.add("disk_pressure", level,
+               f"disk {usage}% used (pressure {info['pressure_percent']:g}%, builds refused at "
+               f"{info['refuse_builds_percent']:g}%)", info)
+    if not info["build_cleanup_enabled"]:
+        report.add("build_cleanup", "warn", "build cleanup disabled by config (build_cleanup.enabled: false)")
+    elif not info["build_cleanup_job_installed"]:
+        report.add("build_cleanup", "warn",
+                   "build cleanup enabled but its timer is not installed; fix: herdr-eng build-hygiene install")
+    elif info.get("build_cleanup_job_loaded") is False:
+        report.add("build_cleanup", "warn",
+                   "build cleanup job is written but not loaded in launchd; fix: herdr-eng build-hygiene install")
+    else:
+        report.add("build_cleanup", "ok",
+                   f"build cleanup job installed; last run {info['build_cleanup_last_run'] or 'never'}")
+    if not info["cargo_host_enabled"]:
+        report.add("cargo_host", "warn", "cargo-host / managed targets disabled by config")
+    elif not info["cargo_host_installed"]:
+        report.add("cargo_host", "warn",
+                   "cargo-host enabled but the managed cargo launcher is not installed; "
+                   "fix: herdr-eng build-hygiene install")
+    else:
+        report.add("cargo_host", "ok", "managed cargo launcher installed (one managed target per worktree, incremental off)")
 
 
 def _adopted_plugins(lock_path: str) -> list[str]:

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import signal
 import threading
@@ -32,8 +33,9 @@ def server_running(proc_root: Path = Path('/proc')) -> bool:
 
 
 def watch(cleanup, *, interval: float, stop: threading.Event,
-          is_running=server_running, wait=None) -> None:
-    """Keep individual scan failures from taking down the companion."""
+          is_running=None, wait=None) -> None:
+    """Sweep every ``interval`` seconds (only while ``is_running()`` when given); a failed scan never stops it."""
+    is_running = is_running or (lambda: True)
     if interval <= 0:
         raise ValueError('cleanup interval must be positive')
     wait = wait or stop.wait
@@ -47,8 +49,130 @@ def watch(cleanup, *, interval: float, stop: threading.Event,
         wait(interval)
 
 
-def command(args) -> int:
+_DEFAULT_MAX_TARGET_GB = 50.0
+_DEFAULT_SIZE_CAP_IDLE_HOURS = 2.0
+_WARNED: set[tuple[str, str]] = set()  # bad values already reported by this process (the watcher loops forever)
+
+
+def _checked(cfg: dict, key: str, default: float, minimum: float) -> float:
+    """``build_cleanup.<key>``: a finite number >= ``minimum`` (not a bool, not null); anything else is the
+    documented default, with one warning per process and value."""
+    value = cfg.get(key, default)
+    number = value
+    if isinstance(value, str):  # YAML reads 1e-06 (no dot) as a string
+        try:
+            number = float(value)
+        except ValueError:
+            number = None
+    if (isinstance(number, bool) or not isinstance(number, (int, float))
+            or not math.isfinite(number) or number < minimum):
+        if (key, repr(value)) not in _WARNED:
+            _WARNED.add((key, repr(value)))
+            log.warning('ignoring build_cleanup.%s=%r (not a number >= %g); using %g', key, value, minimum, default)
+        return default
+    return float(number)
+
+
+def _max_target_bytes(cfg: dict) -> int | None:
+    """The cap in bytes; 0 switches it off. A positive value too small to be one byte is a typo, not "off":
+    it is the default, with the same one warning."""
+    gb = _checked(cfg, 'max_target_gb', _DEFAULT_MAX_TARGET_GB, 0)
+    if gb > 0 and int(gb * 1024 ** 3) == 0:
+        value = cfg.get('max_target_gb')
+        if ('max_target_gb', repr(value)) not in _WARNED:
+            _WARNED.add(('max_target_gb', repr(value)))
+            log.warning('ignoring build_cleanup.max_target_gb=%r (under one byte); using %g',
+                        value, _DEFAULT_MAX_TARGET_GB)
+        gb = _DEFAULT_MAX_TARGET_GB
+    return int(gb * 1024 ** 3) or None
+
+
+def policy_kwargs(cfg: dict) -> dict:
+    """``run_once`` policy values from a ``build_cleanup`` config block (defaults match config.DEFAULTS)."""
+    from .build_cleanup import MIN_IDLE_HOURS
+    return {
+        "high_water": float(cfg.get('high_water_percent', 85)),
+        "low_water": float(cfg.get('low_water_percent', 80)),
+        "min_age_hours": float(cfg.get('min_age_hours', 24)),
+        "pressure_water": float(cfg.get('pressure_percent', 90)),
+        "pressure_min_age_hours": float(cfg.get('pressure_min_age_hours', 2)),
+        # 0 switches the per-target cap off
+        "max_target_bytes": _max_target_bytes(cfg),
+        "size_cap_idle_hours": _checked(cfg, 'size_cap_idle_hours', _DEFAULT_SIZE_CAP_IDLE_HOURS, MIN_IDLE_HOURS),
+    }
+
+
+def _tier_bases() -> list[Path]:
+    """Parent directory of every enrolled storage tier's cache dir (managed targets live beside it).
+
+    A ``volume_uuid`` tier's directory is relative to its mount, exactly as the build resolves it.
+    """
+    from .build_cache_config import validate
+    from .build_cache_location import mounted_volume
+    from .config import load_config
+    section = load_config().get("fabric_build_cache")
+    bases = []
+    for tier in validate(section).local.storage_tiers if section else ():
+        if tier.volume_uuid:
+            mount = mounted_volume(tier.volume_uuid)
+            if mount is not None:
+                bases.append((mount / tier.directory).parent)
+        else:
+            bases.append(Path(tier.directory).expanduser().parent)
+    return bases
+
+
+def _managed_output_dirs() -> list[Path]:
+    """Retired shared pools and per-workspace target folders of the state dir and every storage tier."""
+    from .build_coord import _default_state_dir
+    from .cargo_target_storage import shared_targets_root
+    bases = [_default_state_dir()]
+    try:
+        bases += _tier_bases()
+    except Exception:  # noqa: BLE001 - a config problem must not stop the sweep of the default dirs
+        log.warning("build cleanup: storage tiers unreadable; sweeping the default state dir only",
+                    exc_info=True)
+    found = []
+    for base in bases:
+        for path in (shared_targets_root(base), base / "targets"):
+            real = Path(os.path.realpath(path))
+            if real.is_dir() and real not in found:
+                found.append(real)
+    return found
+
+
+def effective_roots(cfg: dict, explicit: list[str] | None = None) -> list[Path]:
+    """Configured roots (or explicit ones) plus every managed target folder that exists right now.
+
+    Explicit and configured roots are returned as given (only ``~`` expanded) so the sweep's
+    canonical-root check still sees a symlinked root; managed folders are resolved because they
+    are derived from state locations. Recomputed by the watcher on every cycle, so a pool created
+    after it started is picked up.
+    """
+    roots = list(explicit if explicit is not None else cfg.get('roots', []))
+    paths = [Path(root).expanduser() for root in roots]
+    if explicit is None:
+        # Default roots may not exist on every host (e.g. no ~/work); explicit ones must.
+        paths = [path for path in paths if path.is_dir()]
+        paths += [path for path in _managed_output_dirs() if path not in paths]
+    chosen: dict[str, Path] = {}
+    for path in paths:  # a root named twice (or through a link) is swept once, by its canonical spelling
+        key = os.path.realpath(path)
+        if key not in chosen or (str(path) == key and str(chosen[key]) != key):
+            chosen[key] = path
+    return list(chosen.values())
+
+
+def cleanup_cycle(cfg: dict, explicit: list[str] | None, state_dir: Path, dry_run: bool = False,
+                  cached: bool = False) -> dict:
+    """One sweep. Roots are re-evaluated every cycle: pools appear after the watcher has started.
+    ``cached`` (the watcher) reuses each root's target list for a few hours instead of walking again."""
     from .build_cleanup import run_once
+    return run_once(roots=effective_roots(cfg, explicit), state_dir=state_dir, dry_run=dry_run,
+                    discovery='cached' if cached else 'walk', **policy_kwargs(cfg))
+
+
+def command(args) -> int:
     from .build_coord import _default_state_dir
     from .config import load_config
 
@@ -58,26 +182,33 @@ def command(args) -> int:
         status = state_dir / 'build-cleanup.json'
         print(status.read_text() if status.exists() else json.dumps({'status': 'never_run'}))
         return 0
-    roots = args.root if args.root is not None else cfg.get('roots', [])
+    if args.cleanup_command == 'run' and not cfg.get('enabled', True) and not args.root:
+        # `enabled` stops the background job and the guard; a sweep the operator names still runs.
+        print(json.dumps({'status': 'disabled',
+                          'message': 'build_cleanup.enabled is false (pass --root to sweep anyway)'}))
+        return 0
+    roots = effective_roots(cfg, args.root)
     if not roots:
         print(json.dumps({'error': 'configure build_cleanup.roots or pass --root'}))
         return 2
-    def cleanup():
-        return run_once(
-            roots=[Path(root).expanduser() for root in roots], state_dir=state_dir,
-            dry_run=args.dry_run, high_water=float(cfg.get('high_water_percent', 85)),
-            low_water=float(cfg.get('low_water_percent', 80)),
-            min_age_hours=float(cfg.get('min_age_hours', 24)))
+    def cleanup(cached: bool = False):
+        return cleanup_cycle(cfg, args.root, state_dir, args.dry_run, cached)
     if args.cleanup_command == 'run':
         result = cleanup()
+        skipped = [w for w in result.get('warnings', []) if w.startswith('skipped root')]
+        if args.root and skipped:  # a root the operator named must work; only default roots are skipped
+            result['status'] = 'error'
+            result['errors'] = [*result.get('errors', []), *skipped]
         print(json.dumps(result, indent=2, sort_keys=True))
         return 1 if result.get('status') == 'error' else 0
-    if not cfg.get('enabled', False):
+    if not cfg.get('enabled', True):
         print(json.dumps({'status': 'disabled', 'message': 'set build_cleanup.enabled: true'}))
         return 0
     logging.basicConfig(level=logging.INFO)
     stop = threading.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda signum, frame: stop.set())
-    watch(cleanup, interval=float(cfg.get('interval_seconds', 900)), stop=stop)
+    # Hosts without a Herdr server still need their disks kept: the server gate is opt-in.
+    watch(lambda: cleanup(cached=True), interval=float(cfg.get('interval_seconds', 900)), stop=stop,
+          is_running=server_running if cfg.get('require_herdr_server') is True else None)
     return 0

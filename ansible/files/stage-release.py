@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import platform
 import re
 import subprocess
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 REPOSITORIES = {
@@ -47,6 +49,74 @@ def validate_revision(revision):
         raise ValueError('A full immutable commit ID is required')
     if platform.system() not in ('Linux', 'Darwin'):
         raise RuntimeError('Release staging supports Linux and macOS only')
+
+
+def _entry_bytes(path):
+    """Bytes a tracked entry contributes to the digest. A regular file (or a link to
+    one) contributes its content. A link to a directory, a dangling link, or a
+    directory entry (a gitlink/submodule) has no readable content, so it contributes
+    its link target (or a fixed marker): retargeting a tracked link still moves the
+    digest, but ``read_bytes()`` is never called on a directory."""
+    if path.is_file():
+        return path.read_bytes()
+    if path.is_symlink():
+        return b'symlink:' + os.readlink(path).encode('utf-8', 'surrogateescape')
+    return b'directory:'
+
+
+def compute_digest(release, runner):
+    """sha256 over sorted ``relpath + NUL + bytes`` for every git-tracked file in
+    ``release`` (``git ls-files``). The artifact a release name denotes is its
+    tracked tree at that revision, so install/build output -- node_modules, the
+    setuptools ``build/`` and ``*.egg-info/`` trees, ``__pycache__`` -- is
+    untracked and never enters the digest. That makes the digest deterministic
+    across two stagings of one commit (a converge/re-stage reproduces it exactly)
+    while any in-place edit to a tracked file (the 599c06d0 shape) changes it."""
+    release = Path(release)
+    listing = runner(['git', '-C', str(release), 'ls-files', '-z'])
+    digest = hashlib.sha256()
+    for relative in sorted(part for part in listing.split('\x00') if part):
+        digest.update(relative.encode('utf-8'))
+        digest.update(b'\x00')
+        digest.update(_entry_bytes(release / relative))
+    return 'sha256:' + digest.hexdigest()
+
+
+def verify_artifact(release, receipt, runner):
+    """Classify a staged release against its receipt by content, not by HEAD.
+
+    ``verified`` -- current content matches the receipt's digest, or a recorded
+    patch chain explains the difference end to end. ``drift`` -- content differs
+    with no ledger entry that accounts for it (the 599c06d0 incident shape).
+    ``unknown`` -- a pre-#881 receipt has no digest, so it can be neither trusted
+    nor condemned."""
+    recorded = receipt.get('artifactDigest')
+    if not recorded:
+        return 'unknown'
+    current = compute_digest(release, runner)
+    if current == recorded:
+        return 'verified'
+    expected = recorded
+    patches = receipt.get('patches') or []
+    for patch in patches:
+        if patch.get('beforeDigest') != expected:
+            return 'drift'
+        expected = patch.get('afterDigest')
+    if patches and expected == current:
+        return 'verified'
+    return 'drift'
+
+
+def record_patch(root, revision, *, path, before, after, actor, reason):
+    """Append one ledger entry to a release receipt's ``patches`` list so an
+    in-place edit leaves a verifiable paper trail instead of silent drift."""
+    receipt = Path(root) / 'receipts' / (revision + '.json')
+    data = json.loads(receipt.read_text())
+    entry = {'path': path, 'beforeDigest': before, 'afterDigest': after,
+             'appliedAt': datetime.now(timezone.utc).isoformat(), 'actor': actor, 'reason': reason}
+    data.setdefault('patches', []).append(entry)
+    atomic_json(receipt, data)
+    return entry
 
 
 def verify_checkout(path, revision, runner):
@@ -157,8 +227,14 @@ def _stage(home, revision, kind, repository, runner):
                 runner(['python3', '-m', 'venv', str(venv)])
             runner([str(venv / 'bin/python'), '-m', 'pip', 'install', '--quiet', '--upgrade', str(release)])
             verify_herdr_distribution(home, release, runner)
+        # verify_checkout ran inside checkout() before any install step and runs
+        # again here: the tree is clean, so its tracked content equals the commit's
+        # and the digest is reproduced exactly. A re-stage therefore cannot launder
+        # drift -- an in-place edit to a tracked file is `git status` dirty and was
+        # already refused above, before the venv/node_modules were touched.
         verify_checkout(release, revision, runner)
-        result = {'revision': revision, 'sourceRoot': str(release)}
+        result = {'revision': revision, 'sourceRoot': str(release),
+                  'artifactDigest': compute_digest(release, runner), 'patches': []}
         atomic_json(receipt, result)
         if pending_settings:
             settings, before, value = pending_settings
@@ -199,7 +275,15 @@ def describe(home, kind, runner=run):
         if result['sourceRoot'] != str(release):
             return None
         verify_checkout(release, revision, runner)
-        if json.loads((root / 'receipts' / (revision + '.json')).read_text()) != result:
+        receipt = json.loads((root / 'receipts' / (revision + '.json')).read_text())
+        # installed.json and the receipt must agree on identity; the receipt may
+        # additionally carry a patch ledger that installed.json does not mirror.
+        if ({k: v for k, v in receipt.items() if k != 'patches'}
+                != {k: v for k, v in result.items() if k != 'patches'}):
+            return None
+        # Verify by content: a drifted artifact is not the release it claims to be.
+        # A pre-#881 receipt (unknown) stays reusable but is surfaced by callers.
+        if verify_artifact(release, receipt, runner) == 'drift':
             return None
         if kind == 'pi':
             packages = json.loads((home / '.pi/agent/settings.json').read_text()).get('packages', [])
@@ -209,7 +293,7 @@ def describe(home, kind, runner=run):
         else:
             verify_herdr_distribution(home, release, runner)
         return result
-    except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError):
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError, subprocess.SubprocessError):
         return None
 
 

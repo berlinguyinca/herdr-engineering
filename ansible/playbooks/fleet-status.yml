@@ -9,7 +9,7 @@
   gather_facts: false
   become: "{{ herdr_engineering_become | default((ansible_user | default(lookup('env', 'USER'), true)) != 'root') }}"
   environment:
-    PATH: "/opt/homebrew/bin:/usr/local/bin:{{ ansible_env.HOME | default('~', true) }}/.local/bin:{{ ansible_env.PATH | default('/usr/bin:/bin:/usr/sbin:/sbin') }}"
+    PATH: "/opt/homebrew/bin:/usr/local/bin:{{ ansible_facts['env']['HOME'] | default('~', true) }}/.local/bin:{{ ansible_facts['env']['PATH'] | default('/usr/bin:/bin:/usr/sbin:/sbin') }}"
   vars:
     herdr_engineering_repo_root: "{{ playbook_dir }}/../.."
   tasks:
@@ -19,8 +19,8 @@
 
     - name: "Record the fleet user's home + uid"
       ansible.builtin.set_fact:
-        fleet_home: "{{ ansible_env.HOME }}"
-        fleet_user: "{{ ansible_user_id }}"
+        fleet_home: "{{ ansible_facts['env']['HOME'] }}"
+        fleet_user: "{{ ansible_facts['user_id'] }}"
 
     - name: "Gather host version/registration fingerprint"
       ansible.builtin.include_tasks: ../tasks/fleet-fingerprint.yml

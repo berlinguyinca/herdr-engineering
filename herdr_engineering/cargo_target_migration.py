@@ -210,7 +210,7 @@ def migration_run(roots: list[Path], *, apply: bool = False, quiescent: bool = F
     real = _real_cargo(Path.home())
     items: list[dict[str, object]] = []
     for root in roots:
-        for source in _discover(root.expanduser().resolve()):
+        for source in _discover(root.expanduser().resolve(), managed=False):
             try:
                 workspace = workspace_root(real, [], source.parent)
                 recognized_source(source, workspace)
