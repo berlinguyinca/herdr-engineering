@@ -56,6 +56,7 @@ Rules: never fabricate paths, hashes, URLs, counts or results; mark doubt in `un
    - `status: source_close_failed`: the handoff went ahead and herdr refused the close - report it, do not force it.
    - `status: manual_launch_required`: herdr is not usable here. Show the user the printed `command` verbatim, run from `cwd`; `resume_command` prints the full resume prompt.
    - Keep the source pane up (the pre-0.4.0 behaviour) with `--keep-source`.
+   - Panes left open by earlier handoffs: `herdr-handoff reap` lists them (dry run, changes nothing); `herdr-handoff reap --apply` closes them through the same gate as `confirm` (live pane checks: `source_working`, `source_is_caller`, `source_pane_reused`, `successor_gone`). Review the dry run first. Never add `--include-unrecorded` unless the user says to: records from before close options existed cannot detect pane-id reuse.
    - `--allow-dirty-source` closes a pane with uncommitted or unpushed work and loses it. Use it only when the user says to; `git -C <worktree> status --short` and `git -C <worktree> log @{u}..HEAD --oneline` show what would be lost. It cannot bypass the live-successor or same-tab checks, and it is never a retry of a refusal.
    - Never close a pane by hand to make a refusal go away: a refusal is the guard working, and the pane you delete by hand is the one holding the work.
 5. Reply with the target, the handoff id, the document path and the placement or command. No recap of the briefing.

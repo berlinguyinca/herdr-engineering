@@ -1,0 +1,58 @@
+---
+# Provision WPCI_CI_DIR for Woodpecker runners.
+#
+# .woodpecker/main-cron.yml reads $${WPCI_CI_DIR}/state/herdr as the persistent
+# memo directory (HERDR_CI_STATE) and fails when the runner does not export it.
+# This play gives each runner agent a systemd drop-in that
+#   * injects WPCI_CI_DIR into every pipeline step (WOODPECKER_ENVIRONMENT), and
+#   * bind-mounts the shared CI store at that path inside step containers
+#     (WOODPECKER_BACKEND_DOCKER_VOLUMES).
+#
+# No host paths live in this repository. Set the two required vars in private
+# inventory/group_vars (group `ci_runners`):
+#   wpci_ci_store: <host path of the shared CI store>
+#   wpci_ci_mount: <in-container mount point; becomes WPCI_CI_DIR>
+# Optional: wpci_agent_unit (default woodpecker-agent.service).
+#
+#   cd ansible && ansible-playbook -i inventory/hosts.yml playbooks/ci-runner-env.yml --check --diff
+#   cd ansible && ansible-playbook -i inventory/hosts.yml playbooks/ci-runner-env.yml
+- name: "Export WPCI_CI_DIR to Woodpecker runner agents"
+  hosts: ci_runners
+  gather_facts: false
+  become: true
+  vars:
+    wpci_agent_unit: woodpecker-agent.service
+    wpci_dropin_dir: "/etc/systemd/system/{{ wpci_agent_unit }}.d"
+  tasks:
+    - name: "Require the store and mount variables"
+      ansible.builtin.assert:
+        that:
+          - wpci_ci_store is defined
+          - wpci_ci_store is match('^/')
+          - wpci_ci_mount is defined
+          - wpci_ci_mount is match('^/')
+        fail_msg: "set wpci_ci_store and wpci_ci_mount (absolute paths) in private inventory for group ci_runners"
+
+    - name: "Create the drop-in directory"
+      ansible.builtin.file:
+        path: "{{ wpci_dropin_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: "Install the WPCI_CI_DIR drop-in"
+      ansible.builtin.copy:
+        dest: "{{ wpci_dropin_dir }}/wpci-ci-dir.conf"
+        mode: "0644"
+        content: |
+          # Managed by herdr-engineering ansible/playbooks/ci-runner-env.yml
+          [Service]
+          Environment="WOODPECKER_ENVIRONMENT=WPCI_CI_DIR:{{ wpci_ci_mount }}"
+          Environment="WOODPECKER_BACKEND_DOCKER_VOLUMES={{ wpci_ci_store }}:{{ wpci_ci_mount }}"
+      register: wpci_dropin
+
+    - name: "Reload systemd and restart the agent when the drop-in changed"
+      ansible.builtin.systemd:
+        name: "{{ wpci_agent_unit }}"
+        daemon_reload: true
+        state: restarted
+      when: wpci_dropin is changed

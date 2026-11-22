@@ -141,8 +141,8 @@ Both tiers now get the operator's project rules and a review checklist (`deploy/
   as the `Authorization` header, to that provider's https `baseUrl` host. Redirects are not followed. The key is
   redacted from every message.
 - **Plain http to a tailnet node is an explicit opt-in.** `reviewer.allow_plain_http_hosts` takes exact IPv4
-  literals in `100.64.0.0/10`, for example `["100.104.39.6"]` for pi's `development` provider
-  (`http://100.104.39.6:8390/v1`). Hostnames, IPv6, public addresses and other private ranges are refused, and so
+  literals in `100.64.0.0/10`, for example `["100.64.8.6"]` for pi's `development` provider
+  (`http://100.64.8.6:8390/v1`). Hostnames, IPv6, public addresses and other private ranges are refused, and so
   is a tailnet IP that is not listed. The default is empty: https only. With a listed host:
   - the key, the diff and the verdict cross the tailnet as plain HTTP. WireGuard still encrypts the link between
     the two machines, but anything on either end can read them: a proxy or sniffer on the reviewing host, the

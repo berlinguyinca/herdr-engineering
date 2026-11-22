@@ -9,6 +9,11 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 - `AGENTS.md` and the managed `SessionStart` reminder no longer require an explicit per-message ask before pushing herdr-engineering or opening a PR. Agents push their own work branches and open PRs themselves; pushing `main` and force-pushing or pushing someone else's branch stay forbidden (the reminder says so). The managed `PreToolUse` guard matches: a plain herdr-engineering push of a non-main branch is allowed, while force/destructive pushes (`-f`, `--force*`, `--mirror`, `--delete`/`-d`, `--prune`, `+` or `:branch` refspecs) still need the one-shot human token, including in the untokenizable-command fallback. Push to main/master stays denied.
 
+### Chore: bump herdr-handoff to 0.6.0 (c16c2dfd), `reap` required by the capability gate
+
+- `lock/upstreams.yaml` pins herdr-handoff `c16c2dfdd86d6c0f22d8523f894718420e23d3a1` (v0.6.0; herdr-handoff#14, #16): `herdr-handoff reap [--apply] [--include-unrecorded]` (dry run by default) closes panes replaced by confirmed handoffs; `confirm` and `reap` check the live pane first and refuse with `source_is_caller`, `successor_gone`, `source_pane_reused` or `source_working`; takeover records `close_options.source_terminal_id`; successor panes are named `<project>: <goal summary>`.
+- `herdr_engineering.handoff_dependency` now requires `reap` beside `takeover --direction`. 0.5.1 has every other command and flag but none of the live pane checks, and `reap` is the only marker its help gives for them. `herdr-eng doctor` on a host still on 0.5.x reports `does not provide reap (herdr-handoff 0.6.0 or newer is needed)`; fix with `scripts/install-handoff.sh`.
+- `docs/operations/handoff.md` and the vendored handoff skill describe `reap`: dry run by default, `--apply` to close, and `--include-unrecorded` only after reviewing the dry run, because old records cannot detect pane-id reuse.
 ### Fix: Pi fleet rollouts converge - pinned target, resumable drain, bounded state (#844)
 
 - **Pin the target**: `~/.config/herdr-engineering/pi-rollout-revision` (one 40-hex SHA; `HERDR_PI_ROLLOUT_REVISION` overrides) is now the canonical Pi runtime revision. `fleet rollout plan` falls back to it when `--pi-revision` is omitted and fails closed without one; an invalid pin is a failure, never a fallback.
@@ -230,6 +235,13 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 - `wpci-agent-prune`: a null or non-object queue response, a null `agent_id` in a queue task, or a non-list agents response now exits 1 with the normal `abort: API error` line instead of a traceback. The unreachable "more candidates than agents" abort is removed (candidates are a subset of the agents listed). README documents that after a >24h Woodpecker outage up to `--max-deletions` live agents per run may be removed (they re-register) and how to lower the cap.
 - `collab-fabric-firewall.sh --check`: a missing iptables binary is exit 3 with a clear message (was folded into 2, "need root"); one chain absent plus the other unreadable reports absent (1). `deploy.sh` treats 3 like absent (the strong WARNING). `--install`/`--remove` unchanged apart from the message. Exit-code list in `docs/operations/fabric-trust.md` updated.
+
+### Chore: scrub private infrastructure identifiers from tracked files
+
+- Tailscale IPs, the tailnet name, and a personal hostname in docs, tests, examples and help text are now documentation placeholders (100.64.8.x, <tailnet>, operator-laptop). Git history still contains the old values; a history rewrite has not been done (owner decision). deploy/fabric-stack/config.yaml keeps the live tailnet name because the deployment mounts it.
+
+- scripts/ci/main-cron-gates.sh no longer defaults HERDR_CI_STATE to a personal home path and now fails (exit 2) when it is unset, rather than guessing a non-persistent directory. .woodpecker/main-cron.yml sets it to $${WPCI_CI_DIR}/state/herdr; the runner must export WPCI_CI_DIR as the in-container mount of the shared CI store (the runner WPCI_CI_MOUNT).
+- New ansible/playbooks/ci-runner-env.yml provisions that runner side: a systemd drop-in for the Woodpecker agent exporting WPCI_CI_DIR (WOODPECKER_ENVIRONMENT) and mounting the shared CI store at it (WOODPECKER_BACKEND_DOCKER_VOLUMES). Paths come from private inventory vars `wpci_ci_store` / `wpci_ci_mount` on group `ci_runners`; none are committed.
 
 ### Fix: deploy.sh no longer warns that the fabric firewall is missing when it merely cannot read it
 
@@ -627,7 +639,7 @@ Key files must be mode 0600 and are refused otherwise; the key is never printed.
 - New routes `POST/GET /api/v1/assistant-team-briefs` and `GET /api/v1/assistant-references/<id>`, and `herdr-eng assistant brief-offer|brief-list|brief-reference`; `rooms queue` shows the brief card. No migration. Flag off changes nothing (pinned). Not built: web UI, automatic inbox scanning, external actions, `direct`. Roll back the flag, not the image (references are lost on an image rollback). See `docs/operations/team-rooms.md`; threat model section 3.8.
 
 ### Fix: the fabric agent forwarder no longer breaks SigV4-signed requests
-- `AgentForwarder` rewrote `Host:` to `127.0.0.1:<port>`, which invalidates AWS SigV4 (the signature covers Host), so rustfs/MinIO answered `SignatureDoesNotMatch` on the tailnet address. SigV4-signed requests (Authorization header or presigned query) are now forwarded byte-for-byte; unsigned requests behave as before. Takes effect when the operator restarts the agent (`systemctl --user restart herdr-eng-fabric-agent.service`). Proven with a throwaway forwarder on the tailnet IP: aws-cli list/put/get/delete and sccache cold+warm via `http://100.104.39.6:<port>`.
+- `AgentForwarder` rewrote `Host:` to `127.0.0.1:<port>`, which invalidates AWS SigV4 (the signature covers Host), so rustfs/MinIO answered `SignatureDoesNotMatch` on the tailnet address. SigV4-signed requests (Authorization header or presigned query) are now forwarded byte-for-byte; unsigned requests behave as before. Takes effect when the operator restarts the agent (`systemctl --user restart herdr-eng-fabric-agent.service`). Proven with a throwaway forwarder on the tailnet IP: aws-cli list/put/get/delete and sccache cold+warm via `http://100.64.8.6:<port>`.
 
 ### Fabric build cache: the shared tier works against the herdr rustfs server
 - `herdr-eng build-cache-rustfs-provision` (dry-run default, `--apply`): additive, idempotent creation of bucket `herdr-build-cache` (hard quota), read/write and read-only users with bucket-limited policies, and 0600 credential/registry files. Admin credential from the central fleet config, never echoed; MinIO client runs in the container with a private removed config dir; never touches `herdr-artifacts`; no delete path.
@@ -1425,7 +1437,7 @@ Key files must be mode 0600 and are refused otherwise; the key is never printed.
   owning machine, and a probe loop that renews healthy leases, expires dead
   ones (TTL), and releases their ports. Every lease gets a stable fleet-wide
   address `http://<gateway-magicdns>:<port>` (e.g.
-  `http://bender.tail0c50da.ts.net:18000`) reachable from any tailnet device.
+  `http://bender.<tailnet>.ts.net:18000`) reachable from any tailnet device.
 - `HERDR_ENGINEERING_FABRIC_URL` / `fabric.gateway_url` config: registrar
   commands route through the gateway automatically and degrade to local mode
   with an explicit warning when it is unreachable.

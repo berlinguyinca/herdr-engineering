@@ -108,7 +108,7 @@ look like the dashboard, and lets agents connected to `mcp.local.metabolomics.us
 
 Done means implemented, deployed, integrated in the Herdr dashboard, and hosted under the right URLs:
 
-- **Dashboard (Tailscale only, `bender.tail0c50da.ts.net:9447`)** gets the same functionality as the public library:
+- **Dashboard (Tailscale only, `bender.<tailnet>.ts.net:9447`)** gets the same functionality as the public library:
   the unified feed with source badges, search and filters, folders (create, rename, delete, file), the Pending
   inbox for agent pushes (accept or discard), claimed links, and sharing. It uses the dashboard's own sign-in and
   design system. It is never routed publicly.

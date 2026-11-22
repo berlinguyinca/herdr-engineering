@@ -95,7 +95,7 @@ def test_unavailable_and_recovery_transitions_are_recorded():
 def test_legacy_cpu_mem_heartbeat_updates_in_memory_without_event():
     repo, svc, clock, sink = _setup()
     svc.ingest({"entity_type": "host", "entity_id": "bender", "event_type": "host.registered",
-                "payload": {"host_name": "bender", "tailnet_ip": "100.104.39.6"}})
+                "payload": {"host_name": "bender", "tailnet_ip": "100.64.8.6"}})
     clock.t += 30
     svc.ingest({"entity_type": "host", "entity_id": "bender", "event_type": "host.heartbeat",
                 "payload": {"cpu": 12, "mem": 40}})

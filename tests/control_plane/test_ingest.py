@@ -14,7 +14,7 @@ def test_host_upsert_is_idempotent_across_heartbeats():
     svc = make_svc(repo)
     svc.ingest({"entity_type": "host", "entity_id": "bender",
                 "event_type": "host.registered",
-                "payload": {"host_name": "bender", "tailnet_ip": "100.104.39.6"}})
+                "payload": {"host_name": "bender", "tailnet_ip": "100.64.8.6"}})
     svc.ingest({"entity_type": "host", "entity_id": "bender",
                 "event_type": "host.heartbeat",
                 "payload": {"cpu": 12, "mem": 40}})
@@ -26,7 +26,7 @@ def test_host_upsert_is_idempotent_across_heartbeats():
     h = hosts[0]
     assert h["host_id"] == "bender"
     assert h["host_name"] == "bender"
-    assert h["tailnet_ip"] == "100.104.39.6"
+    assert h["tailnet_ip"] == "100.64.8.6"
     assert h["cpu"] == 15
     # Routine heartbeats (same identity) refresh liveness in memory only: one
     # registered event, no per-heartbeat HostHeartbeat (I-1, unbounded growth).

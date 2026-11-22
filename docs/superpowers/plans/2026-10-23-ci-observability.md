@@ -108,7 +108,7 @@
 - [ ] Add relay invocation after successful Rust registry publication and the Go modules cache save; keep failure status independent of telemetry upload.
 - [ ] Validate YAML command preservation and run one cold/warm allocation for each pilot.
 - [ ] Upload only sanitized summaries to the live HerdR endpoint; record request IDs, counts, and bounded timings without credentials.
-- [ ] Verify live API aggregates, alerts, filter propagation, and screenshots at `http://100.104.39.6/#/ci`.
+- [ ] Verify live API aggregates, alerts, filter propagation, and screenshots at `http://100.64.8.6/#/ci`.
 - [ ] Run the full relevant Python/Node gates and request independent review before deployment.
 - [ ] Deploy through `deploy/control-plane/deploy.sh`, verify health, and document baseline versus warm results.
 - [ ] Commit pilot evidence and open reviewable PRs; do not broaden to compiled target snapshots or notifications.
