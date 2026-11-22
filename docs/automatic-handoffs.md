@@ -219,8 +219,11 @@ herdr-eng handoff autopilot status --json   # "uptake": {"told": 12, "taken": 3}
 ```
 
 A session is counted as taken up when a handoff envelope naming it exists in any state, so a
-session that finished the takeover and closed its pane still counts. The stamp lands on the
-ledger entry the next time any session reaches a boundary (`check`, `record` or a Claude hook):
+session that finished the takeover and closed its pane still counts. The envelope has to
+postdate the trigger — a handoff that was already there when the instruction was issued is not
+evidence the instruction worked — and where several name the same session the newest wins. The
+stamp lands on the ledger entry the next time any session reaches a boundary (`check`, `record`
+or a Claude hook):
 
 ```json
 "s-example": {

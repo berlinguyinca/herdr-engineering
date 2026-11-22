@@ -1537,6 +1537,7 @@ def _envelope(
     session_id: str,
     state: str,
     in_outbox: bool = True,
+    created_at: str = "2026-11-22T08:00:00Z",
 ) -> Path:
     """An envelope in the shape `herdr-handoff create` writes (session id at the top level)."""
     directory = root / "outbox" if in_outbox else root
@@ -1547,7 +1548,7 @@ def _envelope(
             {
                 "artifacts": [],
                 "context": {"completed": ["nothing"]},
-                "created_at": "2026-11-22T08:00:00Z",
+                "created_at": created_at,
                 "handoff_id": handoff_id,
                 "history": [],
                 "mission_id": None,
@@ -1559,7 +1560,7 @@ def _envelope(
                 "source": {"agent_id": None, "harness": "claude", "pane_id": None},
                 "state": state,
                 "target": {"agent_id": None, "harness": "claude", "model_hint": None},
-                "updated_at": "2026-11-22T08:00:00Z",
+                "updated_at": created_at,
             }
         )
     )
@@ -1777,3 +1778,39 @@ def test_the_operator_doc_names_the_fields_that_measure_uptake() -> None:
     )
     assert "--session-id" in text, "the doc must say that an unattributed handoff measures nothing"
     assert "outbox/" in text, "the doc must name the layout the handoff envelopes are written in"
+
+
+def test_a_handoff_that_predates_the_trigger_is_not_credited_to_it(host: dict) -> None:
+    """Uptake answers "did the instruction work", so a handoff already there is not an answer.
+
+    A session that handed off manually and only then crossed the threshold would otherwise be
+    counted as obeying a trigger that could not have caused it, which is the exact error the
+    measurement exists to avoid.
+    """
+    write_config(host["home"], "handoff_autopilot:\n  enabled: true\n")
+    ha.record_trigger(session_id="s-before", harness="claude", percent=88.0, prompt="go")
+    _envelope(
+        host["home"] / ".herdr" / "handoffs",
+        handoff_id="handoff_older",
+        session_id="s-before",
+        state="queued",
+        created_at="2020-01-01T00:00:00Z",
+    )
+
+    assert ha.settle_uptake(home=host["home"]) is None, (
+        "a handoff created before the trigger cannot be its consequence"
+    )
+    entry = json.loads(ha.state_path(host["home"]).read_text())["sessions"]["s-before"]
+    assert "taken_at" not in entry, entry
+
+    # The same session, a handoff created after the trigger: now it is evidence.
+    _envelope(
+        host["home"] / ".herdr" / "handoffs",
+        handoff_id="handoff_newer",
+        session_id="s-before",
+        state="queued",
+        created_at=ha._utc_now(),
+    )
+    assert ha.settle_uptake(home=host["home"]) is not None
+    entry = json.loads(ha.state_path(host["home"]).read_text())["sessions"]["s-before"]
+    assert entry["taken_handoff"] == "handoff_newer", entry

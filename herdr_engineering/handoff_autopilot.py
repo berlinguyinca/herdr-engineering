@@ -40,7 +40,7 @@ import tempfile
 import time
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -89,6 +89,13 @@ CLAUDE_MODEL_REACHING_EVENTS = frozenset(
 #: The envelope states that mean a handoff is already underway (herdr-handoff's own
 # schemas/handoff-v2.schema.json enum; the rest are terminal).
 ACTIVE_HANDOFF_STATES = frozenset({"draft", "queued", "claimed", "accepted", "in_progress"})
+
+# How far before the trigger an envelope's modification time may sit and still be parsed. The
+# mtime test is only a cheap pre-filter, so it is generous; `created_at` decides attribution.
+_ENVELOPE_MTIME_SLACK_DAYS = 7
+
+# Ordering floor for envelopes with no readable time at all.
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 HANDOFF_SKILL = "handoff"
 HANDOFF_CLI = "herdr-handoff"
 ENV_OPT_OUT = "HERDR_HANDOFF_AUTOPILOT"
@@ -730,6 +737,51 @@ def _envelope_paths(roots: Iterable[Path]) -> Iterator[Path]:
                 continue
 
 
+def _parse_time(text: str) -> datetime | None:
+    """An ISO timestamp, or None when it cannot be read. Absent time is not an error."""
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _read_envelopes(
+    *,
+    cwd: Path | str | None = None,
+    home: Path | str | None = None,
+    wanted: Iterable[str] = (),
+    since: datetime | None = None,
+) -> Iterator[tuple[Path, dict[str, Any]]]:
+    """The envelopes worth parsing, cheapest test first.
+
+    The shared store accumulates every handoff the machine ever made and a boundary runs this
+    every turn, so two filters run before any JSON is parsed: a file whose modification time
+    predates the window cannot be the evidence asked for, and a file whose text does not even
+    contain one of the session ids is not it either. A week of slack on the time filter keeps
+    clock skew and a restored backup from hiding a handoff that did happen.
+    """
+    needles = {needle for needle in wanted if needle}
+    floor = since - timedelta(days=_ENVELOPE_MTIME_SLACK_DAYS) if since is not None else None
+    for path in _envelope_paths(handoff_roots(cwd=cwd, home=home)):
+        try:
+            if floor is not None:
+                modified = datetime.fromtimestamp(path.stat().st_mtime, UTC)
+                if modified < floor:
+                    continue
+            text = path.read_text()
+        except (OSError, ValueError):
+            continue
+        if needles and not any(needle in text for needle in needles):
+            continue
+        try:
+            package = json.loads(text)
+        except ValueError:
+            continue
+        if isinstance(package, dict):
+            yield path, package
+
+
 def _envelope_session(package: dict[str, Any]) -> str:
     """The session an envelope belongs to, from either place the id is written.
 
@@ -749,7 +801,11 @@ def _envelope_session(package: dict[str, Any]) -> str:
 
 
 def _handoffs_by_session(
-    cwd: Path | str | None = None, home: Path | str | None = None
+    cwd: Path | str | None = None,
+    home: Path | str | None = None,
+    *,
+    wanted: Iterable[str] = (),
+    since: datetime | None = None,
 ) -> dict[str, dict[str, Any]]:
     """The last envelope seen for each session id, whatever state it is in.
 
@@ -757,21 +813,28 @@ def _handoffs_by_session(
     know less, never a reason to stall a hook.
     """
     seen: dict[str, dict[str, Any]] = {}
-    for envelope in _envelope_paths(handoff_roots(cwd=cwd, home=home)):
-        try:
-            package = json.loads(envelope.read_text())
-        except (OSError, ValueError):
-            continue
-        if not isinstance(package, dict):
-            continue
+    for envelope, package in _read_envelopes(cwd=cwd, home=home, wanted=wanted, since=since):
         session = _envelope_session(package)
         if not session:
             continue
-        seen[session] = {
+        created = _parse_time(str(package.get("created_at") or ""))
+        try:
+            # Without a usable `created_at` the file's own clock is the only ordering there is.
+            stamp = created or datetime.fromtimestamp(envelope.stat().st_mtime, UTC)
+        except OSError:
+            stamp = created
+        keep = {
             "handoff_id": package.get("handoff_id") or envelope.stem,
             "state": package.get("state"),
             "path": str(envelope),
+            "created_at": created,
+            "stamp": stamp,
         }
+        # Newest wins. Glob order is a filename order, and `handoff_aaa` written last year would
+        # otherwise outrank a handoff written moments ago, which is the whole question here.
+        earlier = seen.get(session)
+        if earlier is None or (keep["stamp"] or _EPOCH) >= (earlier["stamp"] or _EPOCH):
+            seen[session] = keep
     return seen
 
 
@@ -787,13 +850,7 @@ def active_handoff(
         return None
     wanted = set(states)
     found: dict[str, Any] | None = None
-    for envelope in _envelope_paths(handoff_roots(cwd=cwd, home=home)):
-        try:
-            package = json.loads(envelope.read_text())
-        except (OSError, ValueError):
-            continue
-        if not isinstance(package, dict):
-            continue
+    for envelope, package in _read_envelopes(cwd=cwd, home=home, wanted=[session_id]):
         if _envelope_session(package) != session_id:
             continue
         state = package.get("state")
@@ -829,19 +886,30 @@ def settle_uptake(
         }
         if not pending:
             return None
-        handoffs = _handoffs_by_session(cwd=cwd, home=home)
+        first_told = min(
+            (_parse_time(str(entry.get("first_at") or "")) for entry in pending.values()),
+            default=None,
+        )
+        handoffs = _handoffs_by_session(cwd=cwd, home=home, wanted=pending, since=first_told)
         settled: dict[str, Any] = {}
         now = _utc_now()
         for session_id in sorted(pending):
+            entry = pending[session_id]
             handoff = handoffs.get(session_id)
             if handoff is None:
                 continue
-            entry = dict(sessions[session_id])
-            entry["taken_at"] = now
-            entry["taken_handoff"] = handoff["handoff_id"]
-            entry["taken_state"] = handoff["state"]
-            sessions[session_id] = entry
-            settled[session_id] = entry
+            # A handoff that already existed when the instruction was issued is not evidence the
+            # instruction worked, so the envelope has to postdate the trigger that explains it.
+            told_at = _parse_time(str(entry.get("first_at") or ""))
+            created = handoff.get("created_at")
+            if told_at is not None and created is not None and created < told_at:
+                continue
+            stamped = dict(entry)
+            stamped["taken_at"] = now
+            stamped["taken_handoff"] = handoff["handoff_id"]
+            stamped["taken_state"] = handoff["state"]
+            sessions[session_id] = stamped
+            settled[session_id] = stamped
         if settled:
             _write_private_json(path, {"version": ledger["version"], "sessions": sessions})
     return settled or None
