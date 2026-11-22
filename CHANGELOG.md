@@ -9,6 +9,11 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 - The private-inventory helper moved into the package as `herdr_engineering/fleet_inventory.py`; `scripts/fleet_inventory.py` is now a thin shim that re-exports it (and still runs as a file for `scripts/fleet-join.sh`). The wheel ships only `herdr_engineering*`, so the installed venv could not import it, silently skipped the inventory, and the provision step then failed with "Could not match supplied host pattern". `herdr_engineering.fleet` no longer rewrites `sys.path` and the silent stub fallback is gone.
 - `fleet join` step 4 (verify registration) read the leases through the native `herdr` binary, which has no `devfabric` command, so it always failed. It now runs `herdr-eng devfabric list --json` via this interpreter (`fleet.devfabric_leases`). `NativeHerdrAdapter.devfabric_list` and `devfabric_register` (same mistake, no other callers) are removed.
+### Chore(ci): drop the Woodpecker `opus-review` workflow; the always-on timer posts the status
+
+- Removed `.woodpecker/opus-review.yaml`, `scripts/ci/opus-review.sh`, `tests/ci_review/test_per_pr_opus_review.py` and `docs/operations/per-pr-opus-review.md`.
+- Why: the workflow needed an agent labelled `review-host=true` and `/usr/local/bin/herdr-opus-review`; neither ever existed, so `ci/woodpecker/pr/opus-review` stayed pending on every PR.
+- The `herdr-always-on-review` systemd user timer is the only path and posts `Opus agent review`; docs and timer header updated to say so.
 
 ### Chore: bump herdr-handoff to 0.6.0 (c16c2dfd), `reap` required by the capability gate
 

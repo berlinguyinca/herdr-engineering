@@ -934,6 +934,13 @@ class FabricAgent:
             try:
                 data = json.loads(self.cfg.store_path.read_text())
                 if isinstance(data, dict):
+                    # ``last_hb`` is a time.monotonic() reading, meaningless in
+                    # a new process: after a reboot it can lie in the future,
+                    # and the lease would never be due again. Make every
+                    # loaded lease due on the first cycle.
+                    for entry in data.values():
+                        if isinstance(entry, dict):
+                            entry["last_hb"] = 0.0
                     return data
             except (OSError, json.JSONDecodeError) as exc:
                 log.warning("agent store unreadable (%s); starting fresh", exc)
