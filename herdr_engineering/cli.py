@@ -1791,6 +1791,20 @@ def _autopilot_transcript_model(args) -> str | None:
     return autopilot.transcript_model(transcript) if transcript else None
 
 
+def _autopilot_settle_uptake(autopilot, kwargs: dict) -> list[str]:
+    """Record which told sessions actually handed off; names of the sessions stamped.
+
+    Bookkeeping only, and it writes nothing when there is nothing new to record. A handoff tool
+    that is not installed, or a store that cannot be read, is not a reason to lose the decision
+    the caller came for, so any failure here is swallowed after being reported as no settlements.
+    """
+    try:
+        settled = autopilot.settle_uptake(cwd=kwargs.get("cwd"), home=kwargs.get("home"))
+    except Exception:  # noqa: BLE001 - an unmeasurable handoff must not stall the session
+        return []
+    return sorted(settled) if settled else []
+
+
 def _cmd_handoff_autopilot_check(args) -> int:
     from . import handoff_autopilot as autopilot
 
@@ -1799,7 +1813,11 @@ def _cmd_handoff_autopilot_check(args) -> int:
     if measured is not None:
         kwargs["tokens"] = measured
         kwargs["model"] = _autopilot_transcript_model(args)
-    _print_json(autopilot.decide(**kwargs).to_dict())
+    settled = _autopilot_settle_uptake(autopilot, kwargs)
+    verdict = autopilot.decide(**kwargs).to_dict()
+    if settled:
+        verdict["uptake_settled"] = settled
+    _print_json(verdict)
     return 0
 
 
@@ -1826,6 +1844,8 @@ def _cmd_handoff_autopilot_record(args) -> int:
             default_window=active.context_window_tokens,
             large_window=active.large_context_window_tokens,
         )
+    # `home` is the whole question for the settle step too, so read it before it is consumed.
+    autopilot_home = kwargs.get("home")
     entry = autopilot.record_trigger(
         session_id=kwargs.pop("session_id"),
         harness=kwargs.pop("harness"),
@@ -1833,7 +1853,11 @@ def _cmd_handoff_autopilot_record(args) -> int:
         boundary=kwargs.pop("boundary"),
         home=kwargs.pop("home"),
     )
-    _print_json({"schema_version": 1, "ok": True, "session_id": args.session_id, **entry})
+    settled = _autopilot_settle_uptake(autopilot, {"home": autopilot_home})
+    payload = {"schema_version": 1, "ok": True, "session_id": args.session_id, **entry}
+    if settled:
+        payload["uptake_settled"] = settled
+    _print_json(payload)
     return 0
 
 

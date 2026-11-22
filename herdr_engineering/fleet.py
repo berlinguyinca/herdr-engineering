@@ -21,28 +21,30 @@ import subprocess
 import sys
 from pathlib import Path
 
+from .fleet_inventory import add_host, write_host_vars
 from .herdr_adapter import NativeHerdrAdapter
 
 #: LaunchAgent installed by `scripts/fleet-auto-update-macos.sh`; a test holds the two together so
 #: `fleet update` cannot look for a label the installer never writes.
 LAUNCHD_LABEL = "com.herdr-engineering.fleet-auto-update"
 
-try:  # reuse the private-inventory helper from scripts/ (may live beside repo)
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
-    from fleet_inventory import add_host, list_hosts, write_host_vars
-except Exception:  # pragma: no cover - best effort; inventory is optional
-    def add_host(*a, **k):  # type: ignore
-        raise RuntimeError("scripts/fleet_inventory.py not importable")
-
-    def write_host_vars(*a, **k):  # type: ignore
-        raise RuntimeError("scripts/fleet_inventory.py not importable")
-
-    def list_hosts(*a, **k):  # type: ignore
-        return []
-
-
 class FleetError(Exception):
     pass
+
+
+def devfabric_leases(timeout: int = 60) -> list[dict]:
+    """Active fabric leases, read through `herdr-eng devfabric list --json` (never the native `herdr`).
+
+    Runs this interpreter's own package so the installed copy answers for itself.
+    """
+    proc = subprocess.run([sys.executable, "-m", "herdr_engineering.cli", "devfabric", "list", "--json"],
+                          capture_output=True, text=True, timeout=timeout)
+    if proc.returncode != 0:
+        raise FleetError(f"devfabric list failed (rc={proc.returncode}): {proc.stderr.strip()[-300:]}")
+    data = json.loads(proc.stdout)
+    if isinstance(data, dict):
+        data = data.get("leases") or []
+    return data if isinstance(data, list) else []
 
 
 def repo_root() -> Path:
@@ -288,8 +290,7 @@ def fleet_join(*, ssh_target: str, label: str | None = None, os_name: str = "lin
 
     # 4) verify registration with the fabric gateway
     try:
-        adapter = NativeHerdrAdapter(herdr_bin=herdr_bin)
-        leases = adapter.devfabric_list()
+        leases = devfabric_leases()
         registered = any(
             (str(lease.get("machine_id", "")) == host
              or str(lease.get("target", {})).find(host) >= 0)
