@@ -5,6 +5,26 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: Codex second-reviewer follow-ups from #820 (always-on-review.py)
+
+- Codex spend is counted when Codex fails: a non-zero exit, time cap or missing answer after it reported tokens logs a
+  `tier: codex` line with the priced `usage` (counts toward `daily_budget_usd`); with no tokens the line says
+  `usage_unknown: true` and no cost is invented.
+- A clean Opus approve is remembered per head in `state.json` (`opus_approved`, with the tier model) when only Codex
+  failed to run, so the retry runs Codex alone; a new head, another model or `--force` reruns Opus. Cooldown and
+  budget rules are unchanged; the entry is cleared once a verdict is posted.
+- Config: `risky: null` / `risky.codex: null` mean the defaults; non-list or non-string `risky.globs` raise a config
+  error naming the entry; a glob with a trailing `/` (`deploy/`) means `deploy/**`.
+- A failed reviewer's `why` falls back to the first 300 characters of stdout (control characters stripped) when stderr is
+  empty (claude prints its errors to stdout). A usage-limit message logs `why: usage-limit: ...`, is not a cooldown
+  strike (state `limit_sha` lets the next poll retry), and stops the poll launching more reviews of that tier in the run.
+- Review fixes: Codex has its own usage-limit bucket (a Codex limit skips only later risky PRs, before Opus; an Opus
+  limit still stops Opus for the poll; a PR stuck on a limit is polled after the others). Codex limit detection scans
+  only stderr and the `error` / `turn.failed` events, never command output. `opus_approved` also records the base sha
+  (a retarget reruns Opus). A glob of only `**` / `**/` is refused.
+- Rollback: revert this PR. The extra `state.json` keys (`opus_approved`, `limit_sha`) are ignored by older code;
+  `risky: null` then fails the old config check, so restore a mapping (or remove the key) first.
+
 ### Fix: `fleet join` works from the installed copy (inventory import, verify step)
 
 - The private-inventory helper moved into the package as `herdr_engineering/fleet_inventory.py`; `scripts/fleet_inventory.py` is now a thin shim that re-exports it (and still runs as a file for `scripts/fleet-join.sh`). The wheel ships only `herdr_engineering*`, so the installed venv could not import it, silently skipped the inventory, and the provision step then failed with "Could not match supplied host pattern". `herdr_engineering.fleet` no longer rewrites `sys.path` and the silent stub fallback is gone.

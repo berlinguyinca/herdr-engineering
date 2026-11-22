@@ -216,13 +216,26 @@ Codex review of the same head is also clean:
   posts `failure` (with the usual marked comment); both approving posts `success`.
 - If Codex cannot produce a verified verdict (not installed or not logged in, time cap, non-zero exit, malformed
   answer or wrong `head_sha`, a block whose blockers fail the evidence rule, or a daily budget that cannot be
-  counted) the status stays `pending`: never `success`, and it counts toward the failure cooldown. Opus has already
-  run by then and runs again on the retry; the cooldown bounds that.
+  counted) the status stays `pending`: never `success`, and it counts toward the failure cooldown. A clean Opus
+  approve is remembered in `state.json` for that exact head, base and tier model, so the retry runs Codex only (same
+  cooldown and budget rules); a new head, a changed model or `--force` runs Opus again.
 - Non-risky PRs and tier 1 never call Codex. A head that moved posts nothing. Dry-run is unchanged (Codex runs, nothing
   is posted; posting needs `post: true` and `--post`).
 - Cost: `risky.codex.daily_budget_usd` (optional) is summed from `reviews.jsonl` lines with `tier: codex`, since
   00:00 UTC. Codex reports tokens only, so the cost is `input_usd_per_mtok` and `output_usd_per_mtok` (both required
   with a budget) times the tokens. At or over the budget a risky PR is skipped before Opus runs, status unchanged.
+  A Codex run that fails or times out after reporting tokens is logged (`tier: codex`, `state: not-run`) with its
+  cost and counts too; if no tokens were reported the line says `usage_unknown: true` and no cost is invented.
+- `risky:` and `risky.codex:` left empty or `null` mean the defaults. `risky.globs` must be a list of strings (the
+  error names the bad entry). A glob ending in `/` means everything below it: `deploy/` is `deploy/**`.
+- A failed reviewer's `why` is the first 300 characters of its stderr, or of its stdout when stderr is empty (`claude`
+  prints its errors there; control characters are stripped). A usage-limit message ("hit your ... limit", "usage
+  limit") logs `why: usage-limit: ...`, is no cooldown strike, and stops `poll` launching more reviews of that
+  quota in the same run (it is retried on the next run). Codex has its own quota: a Codex limit only skips the later
+  risky PRs (before Opus runs) and never stops Opus on non-risky PRs; an Opus limit stops Opus. A PR stuck on a limit
+  is retried after the others. For Codex only stderr and the `error`/`turn.failed` events are scanned, never command
+  output (it holds the PR's own text). A `risky.globs` entry that is only `**` or `**/` is refused (it would make every
+  PR risky).
 - `show-command --tier codex` prints the command line. The host needs `codex` on PATH and `codex login` (or API key
   in codex's own auth store); concurrency stays 1 and nothing uses a GPU.
 
