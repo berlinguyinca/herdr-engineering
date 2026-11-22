@@ -311,10 +311,19 @@ def test_enrollment_and_live_uuid_selection_on_real_volume(tmp_path: Path):
 
 
 def _real_cargo_path() -> Path:
-    cargo = shutil.which("cargo")
-    if not cargo:
-        pytest.skip("real Cargo required")
-    return Path(cargo)
+    """The first real Cargo on PATH, skipping any herdr-managed launcher a developer host already has installed."""
+    from herdr_engineering.cargo_host import MARKER
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        candidate = Path(directory or ".") / "cargo"
+        if not (candidate.is_file() and os.access(candidate, os.X_OK)):
+            continue
+        try:
+            head = candidate.read_bytes()[:256]
+        except OSError:
+            continue
+        if MARKER.encode() not in head:
+            return candidate
+    pytest.skip("real Cargo required")
 
 
 def test_install_into_new_home_captures_the_real_cargo_behind_an_existing_launcher(tmp_path: Path):
