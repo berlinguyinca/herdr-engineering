@@ -5,6 +5,11 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Chore: bump herdr-handoff to 0.6.0 (c16c2dfd), `reap` required by the capability gate
+
+- `lock/upstreams.yaml` pins herdr-handoff `c16c2dfdd86d6c0f22d8523f894718420e23d3a1` (v0.6.0; herdr-handoff#14, #16): `herdr-handoff reap [--apply] [--include-unrecorded]` (dry run by default) closes panes replaced by confirmed handoffs; `confirm` and `reap` check the live pane first and refuse with `source_is_caller`, `successor_gone`, `source_pane_reused` or `source_working`; takeover records `close_options.source_terminal_id`; successor panes are named `<project>: <goal summary>`.
+- `herdr_engineering.handoff_dependency` now requires `reap` beside `takeover --direction`. 0.5.1 has every other command and flag but none of the live pane checks, and `reap` is the only marker its help gives for them. `herdr-eng doctor` on a host still on 0.5.x reports `does not provide reap (herdr-handoff 0.6.0 or newer is needed)`; fix with `scripts/install-handoff.sh`.
+- `docs/operations/handoff.md` and the vendored handoff skill describe `reap`: dry run by default, `--apply` to close, and `--include-unrecorded` only after reviewing the dry run, because old records cannot detect pane-id reuse.
 ### Fix: Pi fleet rollouts converge - pinned target, resumable drain, bounded state (#844)
 
 - **Pin the target**: `~/.config/herdr-engineering/pi-rollout-revision` (one 40-hex SHA; `HERDR_PI_ROLLOUT_REVISION` overrides) is now the canonical Pi runtime revision. `fleet rollout plan` falls back to it when `--pi-revision` is omitted and fails closed without one; an invalid pin is a failure, never a fallback.
