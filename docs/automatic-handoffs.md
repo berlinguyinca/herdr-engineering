@@ -6,7 +6,7 @@ summarizer replaces the conversation with a lossy recap.
 
 ```bash
 scripts/install.sh                       # arms it (step 7e); re-running is idempotent
-herdr-eng handoff autopilot status       # policy, what is installed, what has fired
+herdr-eng handoff autopilot status       # policy, what is installed, what has fired, where state lives
 herdr-eng handoff autopilot install      # arm it on a machine that was installed earlier
 herdr-eng handoff autopilot uninstall    # remove both triggers; the audit ledger is kept
 herdr-eng doctor                         # handoff-autopilot: ok | warn | skip | fail
@@ -179,7 +179,7 @@ whenever the cached threshold is crossed.
 ## Audit
 
 ```bash
-herdr-eng handoff autopilot status --json      # policy + installed state + per-session ledger
+herdr-eng handoff autopilot status --json      # policy + installed state + both state roots + per-session ledger
 cat "${XDG_STATE_HOME:-$HOME/.local/state}"/herdr-engineering/handoff-autopilot.json
 ```
 
@@ -198,6 +198,19 @@ expecting to sandbox itself, spends a real trigger against a session that never 
 ```bash
 XDG_STATE_HOME="$PWD/.tmp/autopilot-probe" herdr-eng handoff autopilot status --json
 ```
+
+`status` names both directories, so the choice is not a guess. Each root carries the variable that
+moves it:
+
+```json
+"state_roots": {
+  "trigger_ledger":       { "path": "…/state/herdr-engineering/handoff-autopilot.json", "moves_with": "XDG_STATE_HOME" },
+  "context_hook_markers": { "path": "…/state/handoff-context",                          "moves_with": "HERDR_ENGINEERING_STATE" }
+}
+```
+
+`installed.state_path` and `ledger.path` still appear, both naming the trigger ledger. They are
+aliases kept for one release for scripts already reading them; `state_roots` replaces them.
 
 `install` rewrites `~/.claude/settings.json` in place through a temp file in the same directory,
 preserving the file's existing mode, its unrelated keys and every foreign hook group, but it takes

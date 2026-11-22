@@ -25,8 +25,12 @@ _USAGE_KEYS = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_
 
 
 def _state_dir(env: Mapping[str, str]) -> Path:
-    root = env.get("HERDR_ENGINEERING_STATE") or str(Path.home() / ".local/share/herdr-engineering/state")
-    return Path(root) / "handoff-context"
+    # Resolved by the autopilot, which reads these markers back (`_context_hook_warned`) and prints
+    # the root in `handoff autopilot status`. Imported lazily: this hook runs on every prompt, and
+    # the autopilot module pulls in config loading it does not need here.
+    from .handoff_autopilot import context_hook_marker_root
+
+    return context_hook_marker_root(env)
 
 
 def _float_env(env: Mapping[str, str], name: str, default: float) -> float:

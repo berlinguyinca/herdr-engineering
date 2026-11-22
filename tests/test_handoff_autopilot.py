@@ -1036,6 +1036,66 @@ def test_only_xdg_state_home_moves_the_trigger_ledger(
     )
 
 
+def test_status_names_both_state_roots_and_the_variable_that_moves_each(
+    host: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`status` has to say where each kind of state lives, not just one of them.
+
+    The autopilot touches two directories, moved by two different variables: the trigger ledger
+    under `$XDG_STATE_HOME`, and the `handoff context-hook` markers under `$HERDR_ENGINEERING_STATE`.
+    The old output printed one unlabelled `state_path`, which read as "the state root" - so an
+    operator who redirected `$HERDR_ENGINEERING_STATE` to sandbox a test still spent real triggers
+    in the real ledger (#934, and the probe incident behind #933). A reader who cannot tell the
+    two apart cannot sandbox either safely, so both are printed with the variable that moves each.
+    """
+    write_config(host["home"], "handoff_autopilot:\n  enabled: true\n")
+    markers = host["tmp"] / "marker-root"
+    monkeypatch.setenv("HERDR_ENGINEERING_STATE", str(markers))
+
+    roots = ha.status(home=host["home"])["state_roots"]
+
+    assert roots["trigger_ledger"]["path"] == str(ha.state_path(host["home"]))
+    assert roots["trigger_ledger"]["moves_with"] == "XDG_STATE_HOME"
+    assert roots["context_hook_markers"]["path"] == str(markers / "handoff-context")
+    assert roots["context_hook_markers"]["moves_with"] == "HERDR_ENGINEERING_STATE"
+    assert roots["trigger_ledger"]["path"] != roots["context_hook_markers"]["path"], (
+        "one labelled root is the same bug as no labels: the reader cannot tell which file a variable moves"
+    )
+
+
+def test_the_marker_root_status_prints_is_the_one_the_context_hook_writes(
+    host: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reported marker root must be the real one, or the status view is a lie with a reason attached.
+
+    `handoff_context_hook` writes the per-session marker; `_context_hook_warned` reads it back so a
+    session with both triggers installed is not told twice. Both now resolve the directory through
+    one accessor - three copies of a default path drift, and the drift is silent: the autopilot
+    would read a directory the hook never wrote and warn a session all over again.
+    """
+    from herdr_engineering import handoff_context_hook as context_hook
+
+    for env in ({}, {"HERDR_ENGINEERING_STATE": str(host["tmp"] / "alt-root")}):
+        assert ha.context_hook_marker_root(env) == context_hook._state_dir(env), env
+
+    root = ha.context_hook_marker_root({"HERDR_ENGINEERING_STATE": str(host["tmp"] / "alt-root")})
+    root.mkdir(parents=True)
+    (root / "session-a.fired").write_text("")
+    monkeypatch.setenv("HERDR_ENGINEERING_STATE", str(host["tmp"] / "alt-root"))
+    assert ha._context_hook_warned("session-a"), "the reader must look where the writer wrote"
+
+
+def test_status_keeps_the_unlabelled_ledger_path_as_an_alias(host: dict) -> None:
+    """`installed.state_path` and `ledger.path` stay, pointing at the trigger ledger.
+
+    Scripts already read them; the labels arrive alongside rather than replacing them, and the
+    alias is documented to go away after a release of `state_roots` (#934).
+    """
+    status = ha.status(home=host["home"])
+    assert status["installed"]["state_path"] == status["state_roots"]["trigger_ledger"]["path"]
+    assert status["ledger"]["path"] == status["installed"]["state_path"]
+
+
 def test_precompact_advises_without_spending_the_trigger(host: dict) -> None:
     """PreCompact cannot reach the model, so it must not consume the per-session trigger.
 

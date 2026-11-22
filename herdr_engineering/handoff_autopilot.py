@@ -38,7 +38,7 @@ import stat
 import sys
 import tempfile
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -67,6 +67,17 @@ DEFAULT_HARNESSES = ("pi", "claude")
 
 STATE_DIR_NAME = "herdr-engineering"
 STATE_FILE_NAME = "handoff-autopilot.json"
+#: The two state roots automatic handoffs are involved with, and the variable that moves each.
+# They are different directories with different variables on purpose: the trigger ledger is
+# freedesktop state under `$XDG_STATE_HOME`, while the opt-in `handoff context-hook` trigger keeps
+# its per-session markers under `$HERDR_ENGINEERING_STATE`, this project's own state root. Setting
+# one does not move the other - which is why `status` prints both, labelled (#934): the old output
+# showed one unlabelled `state_path`, and an operator who sandboxed the wrong name still spent real
+# triggers in the real ledger.
+ENV_STATE_HOME = "XDG_STATE_HOME"
+ENV_MARKER_HOME = "HERDR_ENGINEERING_STATE"
+MARKER_DIR_NAME = "handoff-context"
+DEFAULT_MARKER_STATE_ROOT_REL = (".local", "share", "herdr-engineering", "state")  # relative to $HOME
 EXTENSION_FILE_NAME = "herdr-handoff-autopilot.ts"
 PI_EXTENSION_DIR = ("pi", "agent", "extensions")  # ~/.pi/agent/extensions
 CLAUDE_HOOK_EVENTS = ("Stop", "PreCompact")
@@ -114,10 +125,26 @@ def _home(home: Path | str | None = None) -> Path:
 
 
 def _state_home(home: Path | str | None = None) -> Path:
-    env = os.environ.get("XDG_STATE_HOME", "").strip()
+    env = os.environ.get(ENV_STATE_HOME, "").strip()
     if env:
         return Path(env)
     return _home(home) / ".local" / "state"
+
+
+def context_hook_marker_root(env: Mapping[str, str] | None = None) -> Path:
+    """Where `handoff context-hook` keeps its per-session `<session>.fired` markers.
+
+    This is the other state root, moved by `HERDR_ENGINEERING_STATE` and not by `XDG_STATE_HOME`.
+    It lives here, beside the ledger's own accessor, so the two are read together and `status` can
+    name them both; `handoff_context_hook._state_dir` resolves through this function rather than
+    repeating the default, because two copies of a default path drift - and the drift is silent,
+    since the autopilot would then read a directory the hook never wrote and warn a session again.
+    """
+    environ = os.environ if env is None else env
+    root = environ.get(ENV_MARKER_HOME, "").strip()
+    if not root:
+        root = str(Path.home().joinpath(*DEFAULT_MARKER_STATE_ROOT_REL))
+    return Path(root) / MARKER_DIR_NAME
 
 
 def state_path(home: Path | str | None = None) -> Path:
@@ -890,12 +917,10 @@ def _context_hook_warned(session_id: str) -> bool:
     configured threshold - which is the nagging `max_per_session` exists to prevent. A marker root
     that is not a directory is read as "not warned": the decision must still be made.
     """
-    root = os.environ.get("HERDR_ENGINEERING_STATE") or str(
-        Path.home() / ".local/share/herdr-engineering/state"
-    )
+    root = context_hook_marker_root()
     safe = re.sub(r"[^A-Za-z0-9._-]", "_", session_id)[:128]
     try:
-        return (Path(root) / "handoff-context" / f"{safe}.fired").is_file()
+        return (root / f"{safe}.fired").is_file()
     except OSError:
         return False
 
@@ -1121,7 +1146,22 @@ def installed(home: Path | str | None = None) -> dict[str, Any]:
         "pi_extension_path": str(target),
         "claude_hooks": claude,
         "claude_settings_path": str(claude_settings_path(base)),
+        # Deprecated alias of `state_roots.trigger_ledger.path` in `status` output; kept for one
+        # release because scripts read it (#934).
         "state_path": str(state_path(base)),
+    }
+
+
+def state_roots(home: Path | str | None = None) -> dict[str, Any]:
+    """Every directory automatic handoffs write to, each labelled with the variable that moves it.
+
+    Printing one path and calling it "the state root" is what made sandboxing a guess (#934): the
+    ledger follows `XDG_STATE_HOME`, the context-hook markers follow `HERDR_ENGINEERING_STATE`, and
+    only an explicit label tells a reader which to redirect.
+    """
+    return {
+        "trigger_ledger": {"path": str(state_path(home)), "moves_with": ENV_STATE_HOME},
+        "context_hook_markers": {"path": str(context_hook_marker_root()), "moves_with": ENV_MARKER_HOME},
     }
 
 
@@ -1137,11 +1177,14 @@ def status(*, home: Path | str | None = None) -> dict[str, Any]:
             "opted_out": flags in _FALSE,
         },
         "installed": installed(home),
+        "state_roots": state_roots(home),
         "ledger": {"path": str(state_path(home)), "sessions": ledger["sessions"]},
         "summary": (
             f"automatic handoffs are {'armed' if active_policy.enabled else 'disabled'} at "
             f"{active_policy.context_percent:.0f}% of the context window; the next boundary "
-            "with a full context hands the session off without being asked"
+            "with a full context hands the session off without being asked. State roots are "
+            f"listed under `state_roots`: the trigger ledger follows ${ENV_STATE_HOME} and the "
+            f"context-hook markers follow ${ENV_MARKER_HOME}; one does not move the other"
         ),
     }
     if note:
