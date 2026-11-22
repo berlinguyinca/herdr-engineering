@@ -101,10 +101,14 @@ It reads Claude Code and Pi/Codex JSONL and OpenCode's SQLite database (opened
   sessions) expose child records. Pi and Codex expose dispatches and final messages
   only; the report says so.
 - Long sessions are elided in the middle (first 60 + last events); the omitted count is
-  reported.
+  reported. The middle is not lost: the helper adds an `outline` of it (at most 20 chunks, each with its event
+  range, time span, tool-call and failure counts, up to three failed calls and the last assistant sentence), and
+  `previous_snapshot` carries forward the last report of the same session, so a report covers the whole history.
+  The outline is code-computed; a span covered only through it is reported as outline-level evidence.
 - Codex failure detection from tool output is a text heuristic; treat `ok` there as
   weaker evidence than for the other three.
-- A report is a snapshot: repository state is read now, not as of the session start.
+- A report is a snapshot: repository state is read now, not as of the session start. Every publish keeps its
+  snapshot (see Snapshot history), so the series of snapshots is the history of the reports.
 - `git` is run with `--no-optional-locks`, so even `git status` does not touch the index.
 - **Codex:** Herdr reports no conversation for idle Codex panes, so the helper identifies one from Codex's own process log (pid + thread id, newer than the process, primary conversations only; a tie is reported, not guessed). The method shows as `herdr-pane (codex process log)`.
 - Herdr's own `journal summary` projection is included only if a journal file already
@@ -214,6 +218,18 @@ It publishes the report and prints one line:
   `skipped`); a failure there never affects the summary. The two viewers are peers: closing either closes both, and
   a re-publish closes any live pair first. `scripts/check_summary_panes.sh` checks the resize behaviour in a real
   Herdr pane.
+- **Snapshot history.** Each `publish` also records a snapshot of the session in
+  `~/.cache/herdr-engineering/summary/<agent>-<session>.snapshots.json` (directory 0700, file 0600, atomic write,
+  text redacted). A snapshot is numbers only, all computed by code: prompts, events, tool calls and failures,
+  compactions, child agents, time worked, fresh and cached tokens, drift segments, whether drift was flagged, the
+  evidence verdict and the time taken. The report text is kept for the newest 5 snapshots only; the store holds at
+  most 200 snapshots (the first is always kept, the rest are thinned) and 2 MB. `summary view` draws a sparkline per
+  metric under the report from 2 snapshots on (ASCII when the terminal is not UTF-8, re-read on every redraw), and
+  the dashboard draws the same plot under the full report from the `SummaryReportCompleted` events, so it needs no
+  new store. A failure to record is reported as `snapshot` in the `publish` result and never affects the summary.
+  `summary history` stays read-only: it reads the previous snapshot but never writes one. Not covered: a
+  pass/fail plot of tests (it would need a text heuristic; failed tool calls are plotted instead), snapshots for
+  dashboard-triggered runs (`summary report`), and a time-spaced x axis (snapshots are evenly spaced).
 - If publishing fails, the skill prints the complete report so nothing is lost. Target mode and prepared
   evidence runs never publish.
 
