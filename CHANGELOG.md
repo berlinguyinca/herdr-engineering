@@ -5,6 +5,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Chore(ci): drop the Woodpecker `opus-review` workflow; the always-on timer posts the status
+
+- Removed `.woodpecker/opus-review.yaml`, `scripts/ci/opus-review.sh`, `tests/ci_review/test_per_pr_opus_review.py` and `docs/operations/per-pr-opus-review.md`.
+- Why: the workflow needed an agent labelled `review-host=true` and `/usr/local/bin/herdr-opus-review`; neither ever existed, so `ci/woodpecker/pr/opus-review` stayed pending on every PR.
+- The `herdr-always-on-review` systemd user timer is the only path and posts `Opus agent review`; docs and timer header updated to say so.
+
 ### Chore: bump herdr-handoff to 0.6.0 (c16c2dfd), `reap` required by the capability gate
 
 - `lock/upstreams.yaml` pins herdr-handoff `c16c2dfdd86d6c0f22d8523f894718420e23d3a1` (v0.6.0; herdr-handoff#14, #16): `herdr-handoff reap [--apply] [--include-unrecorded]` (dry run by default) closes panes replaced by confirmed handoffs; `confirm` and `reap` check the live pane first and refuse with `source_is_caller`, `successor_gone`, `source_pane_reused` or `source_working`; takeover records `close_options.source_terminal_id`; successor panes are named `<project>: <goal summary>`.
