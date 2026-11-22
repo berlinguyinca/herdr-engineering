@@ -9,6 +9,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 - The private-inventory helper moved into the package as `herdr_engineering/fleet_inventory.py`; `scripts/fleet_inventory.py` is now a thin shim that re-exports it (and still runs as a file for `scripts/fleet-join.sh`). The wheel ships only `herdr_engineering*`, so the installed venv could not import it, silently skipped the inventory, and the provision step then failed with "Could not match supplied host pattern". `herdr_engineering.fleet` no longer rewrites `sys.path` and the silent stub fallback is gone.
 - `fleet join` step 4 (verify registration) read the leases through the native `herdr` binary, which has no `devfabric` command, so it always failed. It now runs `herdr-eng devfabric list --json` via this interpreter (`fleet.devfabric_leases`). `NativeHerdrAdapter.devfabric_list` and `devfabric_register` (same mistake, no other callers) are removed.
+### Fix(ci): main push pipeline records green in the shared CI store (#931)
+
+- `.woodpecker/unit-gates-main.yml` now exports `HERDR_CI_STATE` from the runner's `WPCI_CI_DIR` before `main-cron-gates.sh --record-green`, as `main-cron.yml` does. Without it every main push failed after a fully green suite with `HERDR_CI_STATE is not set`, and the cron never learned the commit was already green.
+- `tests/test_ci_integrate_main.py` checks that every pipeline step calling `main-cron-gates.sh` exports the state dir first, and that the main push step passes it to `--record-green`.
 ### Chore(ci): drop the Woodpecker `opus-review` workflow; the always-on timer posts the status
 
 - Removed `.woodpecker/opus-review.yaml`, `scripts/ci/opus-review.sh`, `tests/ci_review/test_per_pr_opus_review.py` and `docs/operations/per-pr-opus-review.md`.
