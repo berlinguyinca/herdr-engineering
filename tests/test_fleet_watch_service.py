@@ -722,7 +722,7 @@ def block():
 def test_tasks_install_the_unit_but_enable_only_when_fleet_watch_enabled_on_beast():
     b = block()
     assert b["when"] == "ansible_facts['system'] == 'Linux'" and b["become"] is False
-    assert b["environment"]["XDG_RUNTIME_DIR"] == "/run/user/{{ ansible_user_uid }}"
+    assert b["environment"]["XDG_RUNTIME_DIR"] == "/run/user/{{ ansible_facts['user_uid'] }}"
     wanted = b["vars"]["watch_wanted"]
     assert "fleet_watch_enabled | default(false) | bool" in wanted and "inventory_hostname == 'beast'" in wanted
     service = [t["ansible.builtin.systemd_service"] for t in b["block"] if "ansible.builtin.systemd_service" in t][0]
