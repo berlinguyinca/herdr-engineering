@@ -14,7 +14,9 @@ from pathlib import Path
 from herdr_engineering.handoff_adapters.base import Harness
 from herdr_engineering.handoff_controller.briefing import (
     _command_output,
+    fallback_supported,
     headless_argv,
+    headless_runner,
     write_fallback_briefing,
 )
 from tests.handoff_controller_herdr import _our_program_pids
@@ -45,18 +47,12 @@ CODEX_HELP = "Usage: codex exec\n      --ignore-user-config\n          Do not lo
 CLAUDE_HELP = "Usage: claude\n  --bare   Minimal mode (OAuth and keychain are never read)\n  --safe-mode   Start with all customizations disabled\n"
 
 
-def test_codex_gets_the_ignore_flags_when_its_exec_help_lists_them(tmp_path: Path) -> None:
+def test_codex_has_no_fallback_writer_because_its_help_shows_no_way_to_turn_every_tool_off(tmp_path: Path) -> None:
     seen = fake_cli(tmp_path / "bin", "codex", CODEX_HELP)
-    argv = headless_argv(Harness.CODEX, env={"PATH": str(tmp_path / "bin")})
-    assert argv is not None and argv[:2] == ["codex", "exec"]
-    assert "--ignore-user-config" in argv and "--ignore-rules" in argv and argv[-1] == "-"
-    assert seen.read_text().split() == ["exec", "--help"]  # nothing but `--help` was run
-
-
-def test_codex_keeps_the_plain_flags_when_its_help_does_not_list_them(tmp_path: Path) -> None:
-    fake_cli(tmp_path / "bin", "codex", "Usage: codex exec\n      --sandbox <MODE>\n")
-    assert headless_argv(Harness.CODEX, env={"PATH": str(tmp_path / "bin")}) == [
-        "codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check", "--ephemeral", "-"]
+    env = {"PATH": str(tmp_path / "bin")}
+    assert not fallback_supported(Harness.CODEX) and headless_argv(Harness.CODEX, env=env) is None
+    assert headless_runner(Harness.CODEX, "p", cwd=tmp_path, timeout_s=5) is None
+    assert not seen.exists()  # not even `--help` was run
 
 
 def test_claude_uses_safe_mode_but_never_bare_because_bare_drops_the_login(tmp_path: Path) -> None:

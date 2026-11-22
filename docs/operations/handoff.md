@@ -428,7 +428,7 @@ red or orange outcome the source session keeps running.
 | `drain_prompt_uncertain` | typing the order failed in a way that leaves it unknown whether it landed | look at the pane; run `/handoff` if it did not start |
 | `drain_order_too_long` | the order exceeds the typed-input limit | report it; use `/handoff` |
 | `no_record` | the session's record stayed unreadable for 30 minutes mid-chain | check that the harness still writes its session file |
-| `no_briefing` | no briefing, and the fallback writer could not write one (OpenCode, or the headless call failed) | run `/handoff` yourself |
+| `no_briefing` | no briefing, and the fallback writer could not write one (Codex or OpenCode, or the headless call failed) | run `/handoff` yourself |
 | `git_state_unknown` | a git command failed or timed out, so the state of the work is unknown | inspect the repository (for example a leftover `.git/index.lock`, which the controller never deletes) |
 | `record_unreadable` | `herdr-handoff inspect` could not read the record | check the record with `herdr-handoff inspect`; run `/handoff` yourself |
 | `pane_gone` | the pane of an open chain was not listed, or held another session, for 60 seconds of credited time (`pane_gone_after_s`) | look at what replaced it; start a handoff by hand if work remains. It does not count towards `gave_up` |
@@ -481,10 +481,12 @@ the unpushed commits. Repositories whose own rules forbid pushing (herdr-enginee
 When the session does not write the briefing in time, the controller writes it with one headless model call to the same
 harness the session uses (the same provider; the transcript tail goes nowhere else). The call runs in a fresh empty
 directory under `<store>/fallback-work/`, with every `HERDR_*` and session-identity variable removed, and with every tool
-turned off: Claude (`--tools ""`, `--setting-sources ""`, `--safe-mode` when offered), Pi (`--no-tools` and the other `--no-*`
-flags), and Codex with a read-only sandbox in the empty directory (`--ignore-user-config --ignore-rules` when offered).
-OpenCode has no way to turn tools off from the command line, so it is not enabled: its fallback briefing is never written
-and it compacts instead (red `no_briefing` when that fails). The record is created with `herdr-handoff create --fallback`,
+turned off: Claude (`--tools ""`, `--setting-sources ""`, `--safe-mode` when offered) and Pi (`--no-tools` and the other
+`--no-*` flags). Codex and OpenCode have no way to turn tools off from the command line, so they are not enabled. Codex has
+only `--sandbox read-only`, which stops writes but leaves its shell able to read any absolute path (`~/.ssh`, token files),
+and the transcript tail is untrusted text that could make it copy a secret into the stored briefing; an empty work
+directory does not stop that. For these two the fallback briefing is never written and the session compacts instead (red
+`no_briefing` when that fails). The record is created with `herdr-handoff create --fallback`,
 which stores `provenance.fallback = true`, so a briefing that the session did not write is always marked.
 
 ### The one-controller lock
@@ -498,7 +500,7 @@ is no stale pid. A second controller prints a message and exits 0.
 The controller needs `herdr`, `herdr-handoff` (0.5.0 or newer) and `git`, and uses `gh` when present (the fallback writer lists
 open pull requests). It resolves them to absolute paths once, at start, from `PATH` plus the directories in
 `HERDR_HANDOFF_BIN_DIRS` (`:`-separated; useful when a plugin's `PATH` is short); a missing required one is a one-line error
-and exit code 2. The same directories are used to find `claude`, `codex` and `pi` for the fallback writer.
+and exit code 2. The same directories are used to find `claude`, `codex` and `pi`; the fallback writer runs only `claude` and `pi`.
 
 An error on the file system during a tick (for example a full disk or a permission problem on the state directory) is
 logged as one line naming the exception type only. The loop waits 5 seconds, doubling to 60 seconds, and tries again; with

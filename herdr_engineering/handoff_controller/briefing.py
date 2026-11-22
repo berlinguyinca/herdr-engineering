@@ -7,16 +7,16 @@ stores like any other briefing.
 Isolation: the headless call is a model session with no tools, started in a fresh empty directory under
 `<store_root>/fallback-work/`, with every `HERDR_*` variable and the harness's session-identity variables removed (it
 must never look like, or act on, the Herdr pane and session it is writing about). A harness is enabled only when its
-own `--help` shows a way to turn every tool off, or (Codex) a sandbox that stops every write in an empty directory (nothing is run to check beyond `--help`; no real model call was made):
+own `--help` shows a way to turn every tool off (nothing is run to check beyond `--help`; no real model call was made):
 
 | Harness | Enabled | Flags | Unverified without a real call |
 | --- | --- | --- | --- |
 | claude | yes | `-p --output-format text --no-session-persistence --setting-sources "" --strict-mcp-config --disable-slash-commands --tools ""`, plus `--safe-mode` when `claude --help` lists it | that an empty `--setting-sources` and `--tools` value are accepted and drop user/project hooks; prompt on stdin. `--bare` is never used: its help says Anthropic auth is then strictly `ANTHROPIC_API_KEY`/`apiKeyHelper` ("OAuth and keychain are never read"), which would break a subscription login. `--safe-mode` says "Auth, model selection, built-in tools and plugins, and permissions work normally" |
 | pi | yes | `-p --no-session --no-tools --no-extensions --no-mcp --no-skills --no-prompt-templates --no-context-files` | prompt on stdin with no message argument; that `--no-extensions` leaves its provider login usable |
-| codex | yes | `exec --sandbox read-only --skip-git-repo-check --ephemeral -` (prompt on stdin: `[PROMPT]` read from stdin when absent or `-`), plus `--ignore-user-config --ignore-rules` when `codex exec --help` lists them (auth still uses `CODEX_HOME`) | that the read-only sandbox is enough: tools stay on but cannot write, and the empty work directory holds nothing to read; that `--ephemeral` leaves its login usable |
+| codex | no | `codex exec --help` has `--sandbox read-only`, which stops writes but leaves the shell tool able to read any absolute path (`~/.ssh`, token files), and `--disable <FEATURE>` without a listed feature that turns the shell off | not enabled: tools cannot be shown off, and the transcript tail is untrusted text that could make the model copy a secret into the stored briefing |
 | opencode | no | `opencode run` has `--agent` and `--auto` but no way to deny tools from the command line | not enabled: tools cannot be shown off |
 
-The optional flags come from running only `<harness> --help` (`codex exec --help`), once per PATH, never a model call.
+The optional flags come from running only `<harness> --help`, once per PATH, never a model call.
 
 `wait_for_briefing` reads the store's on-disk layout (`<root>/outbox/handoff_<32 hex>.json`) rather than the CLI's
 `list`: `list` fails as a whole on one corrupt record, and the wait must skip those.
@@ -104,7 +104,6 @@ class HarnessRunner(Protocol):
 _HEADLESS: dict[Harness, list[str]] = {
     Harness.CLAUDE: ["claude", "-p", "--output-format", "text", "--no-session-persistence", "--setting-sources", "",
                      "--strict-mcp-config", "--disable-slash-commands", "--tools", ""],
-    Harness.CODEX: ["codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check", "--ephemeral", "-"],
     Harness.PI: ["pi", "-p", "--no-session", "--no-tools", "--no-extensions", "--no-mcp", "--no-skills",
                  "--no-prompt-templates", "--no-context-files"],
 }
@@ -125,7 +124,6 @@ def fallback_supported(harness: Harness) -> bool:
 # Flags added only when the harness's own `--help` lists them: (help argv, flags, position in the argv to insert at).
 _OPTIONAL_FLAGS: dict[Harness, tuple[tuple[str, ...], tuple[str, ...]]] = {
     Harness.CLAUDE: (("claude", "--help"), ("--safe-mode",)),  # never `--bare`: it stops reading the user's OAuth login
-    Harness.CODEX: (("codex", "exec", "--help"), ("--ignore-user-config", "--ignore-rules")),
 }
 _HELP_S = 15.0
 
@@ -159,7 +157,7 @@ def headless_argv(harness: Harness, env: Mapping[str, str] | None = None) -> lis
     if text is None:
         return None
     extra = [flag for flag in flags if re.search(rf"(?<![\w-]){re.escape(flag)}(?![\w-])", text)]
-    keep = len(help_argv) - 1  # `claude`, `-p` / `codex`, `exec`: the flags go right after the command words
+    keep = len(help_argv) - 1  # `claude`, `-p`: the flags go right after the command words
     return [*argv[:keep], *extra, *argv[keep:]]
 
 

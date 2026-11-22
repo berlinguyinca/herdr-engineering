@@ -230,10 +230,9 @@ def test_headless_argv_per_harness(tmp_path: Path) -> None:
     assert headless_argv(Harness.PI, no_help) == [
         "pi", "-p", "--no-session", "--no-tools", "--no-extensions", "--no-mcp", "--no-skills",
         "--no-prompt-templates", "--no-context-files"]
-    assert fallback_supported(Harness.CODEX)
 
 
-@pytest.mark.parametrize("harness", [Harness.OPENCODE])
+@pytest.mark.parametrize("harness", [Harness.OPENCODE, Harness.CODEX])
 def test_harness_without_a_proven_tool_off_switch_is_unsupported(harness: Harness, tmp_path: Path) -> None:
     assert not fallback_supported(harness) and headless_argv(harness) is None
     assert headless_runner(harness, "p", cwd=tmp_path, timeout_s=5) is None
