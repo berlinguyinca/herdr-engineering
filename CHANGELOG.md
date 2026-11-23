@@ -5,6 +5,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: the control-plane inspector runs on the repo's clock
+
+- `ControlPlaneRepo` now hands its own clock to `InspectorStore`. The inspector clamped event times to its 30-day
+  retention ceiling around the wall clock, so with a fixed test clock (2026-10-24) four `tests/control_plane/test_llm_stats.py`
+  transcript tests started failing on 2026-11-23 and turned unit-gates shard 3 red on every PR.
+
 ### Fix: Codex second-reviewer follow-ups from #820 (always-on-review.py)
 
 - Codex spend is counted when Codex fails: a non-zero exit, time cap or missing answer after it reported tokens logs a
