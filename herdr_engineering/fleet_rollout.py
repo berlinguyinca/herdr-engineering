@@ -1346,6 +1346,11 @@ def apply_rollout(store, rollout_id, *, transport=None, stage=None):
                     if s.get("status") == "retired"
                 ]
                 nothing_to_do = not agents and not host_state["sessions"] and not session_errors
+                if nothing_to_do and any(r.get("reachable") is True for r in rows):
+                    # A Pi outside a herdr pane, or one herdr never tagged 'pi', answers on its
+                    # control socket yet is absent from the native inventory: it may still be
+                    # on the old revision, so "nothing to reload" cannot be claimed.
+                    raise ValueError("no native Pi sessions; expected coverage unverified")
                 if nothing_to_do:
                     host_state["statusReason"] = (
                         "no Pi sessions on host; release staged, nothing to reload"

@@ -2620,6 +2620,7 @@ def test_host_with_no_pi_sessions_is_settled_complete_with_a_reason(tmp_path):
     wire = Wire()
     wire.offline.clear()
     wire.native = lambda target: []
+    wire.sessions = lambda target, root: []
     result = apply(store, plan, wire)
     for host in ("bender", "beast"):
         state = result["hosts"][host]
@@ -2629,6 +2630,22 @@ def test_host_with_no_pi_sessions_is_settled_complete_with_a_reason(tmp_path):
         assert state["sourceRoot"].endswith(plan["revision"])
         assert "error" not in state
     assert result["status"] == "complete"
+
+
+def test_live_pi_row_outside_the_native_inventory_blocks_the_empty_host_settle(tmp_path):
+    """A Pi herdr never tagged (or running outside a pane) answers on its control socket."""
+    store, plan = setup_rollout(tmp_path)
+    wire = Wire()
+    wire.offline.clear()
+    wire.native = lambda target: []
+    result = apply(store, plan, wire)
+    for host in ("bender", "beast"):
+        state = result["hosts"][host]
+        assert state["status"] == "blocked"
+        assert "no native Pi sessions; expected coverage unverified" in state["error"]
+        assert "statusReason" not in state
+    assert result["status"] != "complete"
+    assert not wire.mutations
 
 
 def test_no_pi_sessions_does_not_hide_a_still_tracked_session(tmp_path):
@@ -2648,6 +2665,7 @@ def test_delta_plan_covers_hosts_added_after_a_plan_settled(tmp_path):
     wire = Wire()
     wire.offline.clear()
     wire.native = lambda target: []
+    wire.sessions = lambda target, root: []
     apply(store, plan, wire)
     assert store.read(plan["id"])["status"] == "complete"
     current = [
