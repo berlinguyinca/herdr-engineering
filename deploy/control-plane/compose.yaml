@@ -581,12 +581,12 @@ services:
       - ${HOME}/.config/herdr-engineering/acme:/acme:ro
       - ${HOME}/.config/herdr-engineering/ca:/ca:ro
       - ${HOME}/.config/herdr-engineering/tailnet-cert:/tailnet-cert:ro
-      # Host-local route overrides (scripts/fabric-stack.sh memory-route writes config.yaml here). Absolute and outside
-      # any checkout, so it survives deploys; it is read after the baked /app/config.yaml and a missing file is skipped.
+      # Host-local route overrides (scripts/fabric-stack.sh memory-route writes memory-route.yaml here). Absolute and outside
+      # any checkout, so it survives deploys; it is read after the baked /app/config.yaml and a missing file is skipped. deploy.sh creates the directory.
       - ${HOME}/.config/herdr-engineering/fabric:/fabric-local:ro
     environment:
       HERDR_ENGINEERING_STATE: /state
-      HERDR_ENGINEERING_CONFIG: /app/config.yaml:/fabric-local/config.yaml
+      HERDR_ENGINEERING_CONFIG: /app/config.yaml:/fabric-local/memory-route.yaml
     command:
       - "devfabric"
       - "gateway"

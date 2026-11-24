@@ -93,12 +93,12 @@ containers and the now-empty test network. No canary resources remain.
 | Host collaboration :9482 `/health` | HTTP 404 | HTTP 404 |
 | GitHub HTTPS | HTTP 200 | HTTP 200 |
 | Google OAuth host HTTPS `/` | HTTP 404 | HTTP 404 |
+| Gateway HTTPS, without a new UFW grant | Timeout | Timeout |
+| `host.docker.internal:9482` | Timeout | Timeout |
 
 The values above are what the canary measured, on `172.31.252.0/29`. The default was changed afterwards to
 `172.31.252.32/29` (gateway .33, source .34) because the old one sat inside the artifact host's fixed edge network; those
 addresses were never observed in a canary.
-| Gateway HTTPS, without a new UFW grant | Timeout | Timeout |
-| `host.docker.internal:9482` | Timeout | Timeout |
 
 404 establishes an HTTP response path, not application correctness. No response
 bodies, credentials or session data were captured. A synthetic

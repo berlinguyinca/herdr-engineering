@@ -2487,7 +2487,10 @@ def test_runtime_image_installs_from_the_exported_lock_constraints():
     dockerfile = (ROOT / "deploy/fabric-stack/Dockerfile").read_text()
     assert "COPY deploy/fabric-stack/constraints.txt" in dockerfile
     assert re.search(r"pip install --no-cache-dir -c \S*constraints\.txt \".\[collab,review-gate,share\]\"", dockerfile)
-    # uv comes from the dev extra (pinned) and runs as a module of this interpreter: CI builds a pip venv and has
+    import importlib.util
+    if importlib.util.find_spec("uv") is None and not os.environ.get("CI"):
+        pytest.skip("uv lives in the ci-tools extra (installed by scripts/ci/unit-gates.sh); CI never skips this")
+    # uv comes from the ci-tools extra (pinned) and runs as a module of this interpreter: CI builds a pip venv and has
     # no uv on PATH, and a test that skips there would protect nothing. --locked fails when uv.lock no longer
     # matches pyproject.toml, so a pin bumped only in pyproject cannot pass here and break the image build.
     fresh = subprocess.run(
@@ -2500,3 +2503,19 @@ def test_runtime_image_installs_from_the_exported_lock_constraints():
         return [line for line in text.splitlines() if line.strip() and not line.startswith("#")]
 
     assert pins((ROOT / "deploy/fabric-stack/constraints.txt").read_text()) == pins(fresh.stdout)
+
+
+def test_deploy_creates_the_fabric_local_dir_as_the_deploying_user(env):
+    env["env"]["FAIL_COMPOSE"] = "1"
+    d = env["home"] / ".config/herdr-engineering/fabric"
+    assert not d.exists()
+    deploy(env)
+    assert d.is_dir() and d.stat().st_uid == os.getuid()
+
+
+def test_deploy_refuses_a_fabric_local_path_that_is_not_a_directory(env):
+    d = env["home"] / ".config/herdr-engineering/fabric"
+    d.parent.mkdir(parents=True)
+    d.write_text("x")
+    r = deploy(env)
+    assert r.returncode == 1 and "must be a real directory" in r.stderr

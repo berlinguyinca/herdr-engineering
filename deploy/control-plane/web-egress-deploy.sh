@@ -39,10 +39,13 @@ PYAPPROVED
   # Auto mode already took the approved cidr above, so only an explicit enable needs this.
   if [ "$requested" = 1 ] && [ "${MEMORY_PRIVATE_EGRESS_CIDR_SET:-0}" != 1 ] && [ -e "$WEB_EGRESS_CURRENT" ]; then
     local kept
-    kept="$(web_egress_cmd approved --current "$WEB_EGRESS_CURRENT" 2>/dev/null | python3 -c '
+    kept="$(web_egress_cmd approved --current "$WEB_EGRESS_CURRENT" | python3 -c '
 import json,sys
 v=json.load(sys.stdin)
-print(v["cidr"] if v.get("enabled") else "")' 2>/dev/null)" || kept=""
+print(v["cidr"] if v.get("enabled") else "")')" || {
+      echo "web egress: could not read the approved network's subnet from $WEB_EGRESS_CURRENT (see the error above); using $MEMORY_PRIVATE_EGRESS_CIDR" >&2
+      kept=""
+    }
     [ -z "$kept" ] || MEMORY_PRIVATE_EGRESS_CIDR="$kept"
   fi
   WEB_EGRESS_COMPOSE_ENABLED="$MEMORY_PRIVATE_EGRESS"

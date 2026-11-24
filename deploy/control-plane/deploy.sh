@@ -946,6 +946,21 @@ if [ ! -e "$PIPELINES_DIR" ]; then
 fi
 check_pipelines_dir || exit 1
 
+# The fabric-gateway bind-mounts this at /fabric-local (host-local route files). Create it as the deploying user
+# first: otherwise docker creates it root-owned and `scripts/fabric-stack.sh memory-route enable` cannot write to it.
+FABRIC_LOCAL_DIR="$HOME/.config/herdr-engineering/fabric"
+check_fabric_local_dir() {
+  local d="$FABRIC_LOCAL_DIR"
+  if [ -L "$d" ] || { [ -e "$d" ] && [ ! -d "$d" ]; }; then
+    echo "$d must be a real directory (not a symlink or a file)" >&2; return 1
+  fi
+  if [ -d "$d" ] && [ "$(stat -c %u "$d")" != "$(id -u)" ]; then
+    echo "$d must be owned by the deploying user (uid $(id -u)); fix with: sudo chown $(id -un) $d" >&2; return 1
+  fi
+}
+check_fabric_local_dir || exit 1
+mkdir -p "$FABRIC_LOCAL_DIR" || { echo "cannot create $FABRIC_LOCAL_DIR" >&2; exit 1; }
+
 # ---- host files this deploy may change, backed up so every failure path restores them
 BACKUP_DIR="$ENV_DIR/backup"; mkdir -p "$BACKUP_DIR"
 BACKED_UP=()

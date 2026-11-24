@@ -3537,7 +3537,7 @@ def _cmd_dev_gateway(args) -> int:
         promote_after=int(getattr(args, "promote_after", 3)),
         named_domain=None if getattr(args, "no_named_urls", False) else acme_domain,
         named_port=int(getattr(args, "named_port", None) or cfg.get("named_port") or 443),
-        host_routes=dict(_route(r) for r in [*getattr(args, "route", []), *(cfg.get("routes") or [])]),
+        host_routes=dict(_route(r) for r in [*getattr(args, "route", []), *(cfg.get("routes") or []), *(cfg.get("local_routes") or [])]),
         apex_upstream=_host_port(getattr(args, "apex_upstream", None) or cfg.get("apex_upstream")),
         url_aliases=tuple(dict.fromkeys([*getattr(args, "url_alias", []), *(cfg.get("url_aliases") or []),
                                          *_private_ca_domains(cfg)])))

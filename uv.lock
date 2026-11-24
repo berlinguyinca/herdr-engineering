@@ -700,6 +700,9 @@ acme = [
     { name = "certbot" },
     { name = "certbot-dns-route53" },
 ]
+ci-tools = [
+    { name = "uv" },
+]
 collab = [
     { name = "cryptography" },
     { name = "pyjwt", extra = ["crypto"] },
@@ -715,7 +718,6 @@ dev = [
     { name = "pytest-timeout" },
     { name = "pytest-xdist" },
     { name = "ruff" },
-    { name = "uv" },
 ]
 federation = [
     { name = "cryptography" },
@@ -756,9 +758,9 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.5" },
     { name = "slack-sdk", specifier = "==3.45.0" },
-    { name = "uv", marker = "extra == 'dev'", specifier = "==0.13.7" },
+    { name = "uv", marker = "extra == 'ci-tools'", specifier = "==0.13.7" },
 ]
-provides-extras = ["dev", "collab", "review-gate", "acme", "share", "federation"]
+provides-extras = ["dev", "ci-tools", "collab", "review-gate", "acme", "share", "federation"]
 
 [[package]]
 name = "idna"

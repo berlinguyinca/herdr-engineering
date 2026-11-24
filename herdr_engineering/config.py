@@ -337,7 +337,14 @@ def _discover_config_sources() -> list[tuple[Path, bool]]:
     ]
     env = os.environ.get("HERDR_ENGINEERING_CONFIG")
     if env:
-        candidates.extend((Path(part), True) for part in env.split(os.pathsep) if part)
+        if os.pathsep in env and Path(env).is_file():
+            parts = [env]   # one path that happens to contain the separator
+        else:
+            parts = [p for p in env.split(os.pathsep) if p]
+        for part in parts:
+            if not Path(part).exists() and len(parts) > 1:
+                logging.getLogger(__name__).warning("HERDR_ENGINEERING_CONFIG: %s does not exist; skipped", part)
+        candidates.extend((Path(part), True) for part in parts)
     return [(c, trusted) for c, trusted in candidates if c.exists()]
 
 

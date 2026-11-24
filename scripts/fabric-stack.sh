@@ -84,7 +84,19 @@ stop_old_host_services() {
     fi
 }
 
+ensure_local_dir() {   # the gateway bind-mounts it; if docker made it, it is root-owned and memory-route cannot write
+    local d="$HOME/.config/herdr-engineering/fabric"
+    if [ -L "$d" ] || { [ -e "$d" ] && [ ! -d "$d" ]; }; then
+        echo "$d must be a real directory (not a symlink or a file)" >&2; exit 1
+    fi
+    if [ -d "$d" ] && [ "$(stat -c %u "$d")" != "$(id -u)" ]; then
+        echo "$d must be owned by $(id -un); fix with: sudo chown $(id -un) $d" >&2; exit 1
+    fi
+    mkdir -p "$d" || { echo "cannot create $d" >&2; exit 1; }
+}
+
 up() {
+    ensure_local_dir
     write_env
     gen_coredns
     "${COMPOSE[@]}" build fabric-gateway
@@ -110,32 +122,33 @@ memory_status() {
 }
 
 memory_route() {
-    # The shipped deploy/fabric-stack/config.yaml (baked into the image) keeps the memory routes OFF. They live in a
-    # host-local file the gateway container mounts and reads after the baked one, so a deploy never loses them.
+    # The shipped deploy/fabric-stack/config.yaml (baked into the image) keeps the memory routes OFF. They live in
+    # their own host-local file, the gateway's third HERDR_ENGINEERING_CONFIG entry, under fabric.local_routes (the
+    # gateway appends them to the baked fabric.routes), so a deploy never loses them, a changed shipped route still
+    # reaches this host, and no other host-local file is touched.
     local shipped="$STACK_DIR/config.yaml" mark='# herdr-memory-route'
     local dir="$HOME/.config/herdr-engineering/fabric" port="${2:-}"; [ -n "$port" ] || port=8888
-    local local_cfg="$dir/config.yaml"
+    local route_file="$dir/memory-route.yaml"
     case "${1:-status}" in
         enable)
             case "$port" in ''|*[!0-9]*) echo "usage: $0 memory-route enable [PORT]  (control_plane.memory.port, default 8888)" >&2; exit 2 ;; esac
-            mkdir -p "$dir"
-            {
-                echo "# Host-local fabric routes, written by scripts/fabric-stack.sh memory-route (read by fabric-gateway after the"
-                echo "# baked config; replaces its routes list). Re-run 'memory-route enable' after the shipped routes change."
-                echo "fabric:"
-                echo "  routes:"
-                sed -n '/^  routes:/,/^  [a-z_]*:/p' "$shipped" | grep -E '^ *- "' | grep -v "$mark\$"
-                sed -n '/^  routes:/,/^  [a-z_]*:/p' "$shipped" | grep "$mark\$" | sed -E "s/^( *)# - /\1- /; s/:[0-9]+\"/:$port\"/"
-            } >"$local_cfg.new" && mv "$local_cfg.new" "$local_cfg"
-            say "memory routes enabled in $local_cfg (https://memory.<domain> and https://memory.dev.lan -> 127.0.0.1:$port)"
+            ensure_local_dir
+            local lines
+            lines="$(sed -n '/^  routes:/,/^  [a-z_]*:/p' "$shipped" | grep "$mark\$" | sed -E "s/^( *)# - /\1- /; s/:[0-9]+\"/:$port\"/")" \
+                && [ -n "$lines" ] || { echo "no '$mark' lines in $shipped" >&2; rm -f "$route_file.new"; exit 1; }
+            { printf '%s\n' "# Written by scripts/fabric-stack.sh memory-route; appended to fabric.routes by the gateway." \
+                  "fabric:" "  local_routes:"; printf '%s\n' "$lines"; } >"$route_file.new" \
+                && mv "$route_file.new" "$route_file" \
+                || { echo "could not write $route_file" >&2; rm -f "$route_file.new"; exit 1; }
+            say "memory routes enabled in $route_file (https://memory.<domain> and https://memory.dev.lan -> 127.0.0.1:$port)"
             say "apply: docker restart herdr-fabric-gateway   (it re-reads the file; leases return when agents re-register)"
             ;;
         disable)
-            rm -f "$local_cfg"
-            say "memory routes disabled (removed $local_cfg); apply: docker restart herdr-fabric-gateway"
+            rm -f "$route_file" || { echo "could not remove $route_file" >&2; exit 1; }
+            say "memory routes disabled (removed $route_file); apply: docker restart herdr-fabric-gateway"
             ;;
         status)
-            if [ -f "$local_cfg" ]; then grep -E '^ *- "' "$local_cfg"; else echo "(memory routes off: no $local_cfg)"; fi
+            if [ -f "$route_file" ]; then grep -E '^ *- "' "$route_file"; else echo "(memory routes off: no $route_file)"; fi
             ;;
         *) echo "usage: $0 memory-route enable [PORT]|disable|status" >&2; exit 2 ;;
     esac
@@ -181,7 +194,7 @@ case "$cmd" in
         exit 0
         ;;
     *)
-        echo "usage: $0 [up|up-replace|down|status|stop-old|memory-route enable|disable|status]" >&2
+        echo "usage: $0 [up|up-replace|down|status|stop-old|memory-route enable [PORT]|disable|status]" >&2
         exit 2
         ;;
 esac
