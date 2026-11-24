@@ -155,3 +155,60 @@ def test_the_bound_name_reaches_the_collab_and_deployment_routes():
         assert "dashboard host" not in json.dumps(body), (status, body)
     finally:
         svr.shutdown()
+
+
+def _fleet_file(path, hosts=()):
+    import hashlib
+    import os
+
+    import yaml
+    doc = {
+        "version": 1,
+        "sections": {
+            "llm": {"roles": ["builder"], "values": {"key": "placeholder-fleet-value"}},
+            "control_plane": {"roles": ["control-plane"], "values": {"collab": {"dashboard_hosts": list(hosts)}}},
+        },
+        "hosts": {"bender": {"roles": ["builder"],
+                             "token_sha256": hashlib.sha256(b"placeholder-host-bender").hexdigest()}},
+    }
+    path.write_text(yaml.safe_dump(doc))
+    os.chmod(path, 0o600)
+
+
+def test_a_host_token_route_answers_to_an_unlisted_name_but_only_with_the_token(tmp_path):
+    # Hosts reach the control plane by whatever name their control_plane_url uses and are no browsers: the token,
+    # not the Host allowlist, is their credential. Without a valid token the same request is refused.
+    from herdr_engineering.fleet_config import FleetConfigStore
+    path = tmp_path / "fleet.yaml"
+    _fleet_file(path)
+    svr = ControlPlaneServer(ControlPlaneRepo(), fleet_config=FleetConfigStore(path))
+    threading.Thread(target=svr.serve, daemon=True).start()
+    svr.wait_until_ready()
+    try:
+        name = {"Host": "cp.tail1234.ts.net"}
+        status, body = call(svr, "GET", "/api/v1/fleet/config", {**name, "X-Host-Token": "placeholder-host-bender"})
+        assert status == 200 and body["values"] == {"llm": {"key": "placeholder-fleet-value"}}, (status, body)
+        status, body = call(svr, "POST", "/api/v1/fleet/config/applied",
+                            {**name, **JSON, "X-Host-Token": "placeholder-host-bender"},
+                            body=json.dumps({"host_id": "bender", "revision": body["revision"]}).encode())
+        assert status == 200, body
+        for headers in (name, {**name, "X-Host-Token": "wrong"}):
+            status, body = call(svr, "GET", "/api/v1/fleet/config", headers)
+            assert status == 403 and "host not allowed" in json.dumps(body), (status, body)
+    finally:
+        svr.shutdown()
+
+
+def test_a_name_added_to_dashboard_hosts_works_without_a_restart(tmp_path):
+    from herdr_engineering.fleet_config import FleetConfigStore
+    path = tmp_path / "fleet.yaml"
+    _fleet_file(path)
+    svr = ControlPlaneServer(ControlPlaneRepo(), fleet_config=FleetConfigStore(path))
+    threading.Thread(target=svr.serve, daemon=True).start()
+    svr.wait_until_ready()
+    try:
+        assert call(svr, "GET", "/api/v1/sessions", {"Host": "cp.tail1234.ts.net"})[0] == 403
+        _fleet_file(path, hosts=["cp.tail1234.ts.net"])
+        assert call(svr, "GET", "/api/v1/sessions", {"Host": "cp.tail1234.ts.net"})[0] == 200
+    finally:
+        svr.shutdown()

@@ -662,10 +662,13 @@ def make_handler(state: ProxyState):
         def _forward_slotted(self, key: dict, raw: bytes, body: dict | None, meta: dict):
             model = body.get("model") if body else None
             custom = state.custom_model(model)
-            if custom is not None and state.serves_upstream(model):
-                custom = None       # a registered name never captures a model the upstream serves
-            elif (custom is not None and custom.get("project") and not custom.get("fabric_model")
-                  and not state.catalog_read()):
+            leaves_upstream = bool(custom and custom.get("base_url") and not custom.get("fabric_model"))
+            if leaves_upstream and state.serves_upstream(model):
+                # A registered name never captures a model the upstream serves. Only a route that would leave the
+                # upstream (a private base_url without a gateway model) is neutralised: a fabric_model registration
+                # stays on the gateway and keeps its fallback and egress policy.
+                custom = None
+            elif leaves_upstream and custom.get("project") and not state.catalog_read():
                 # Whether this plain registration shadows a gateway model is unknown until a catalog has been read
                 # once. (A policy model has its own gateway fallback and is built around the catalog.)
                 meta.update(status=503, error_class="model_catalog_unavailable")

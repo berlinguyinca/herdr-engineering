@@ -743,7 +743,7 @@ class ControlPlaneServer:
         self.host = host
         # Host names the main listener answers to besides IP literals and localhost: the names the operator
         # configured (control_plane.collab.dashboard_hosts / --collab-dashboard-host) and the name it is bound to.
-        self.allowed_hosts = self.collab_dashboard_hosts | (
+        self._static_allowed_hosts = self.collab_dashboard_hosts | (
             frozenset() if _is_wildcard_bind(host) else frozenset({str(host).lower()}))
         self.port = port
         self.web_root = Path(web_root) if web_root else _WEB_ROOT
@@ -898,6 +898,19 @@ class ControlPlaneServer:
         bridge = self.intelligence_bridge
         return {"bridge": dict(bridge.stats), "queue_depth": bridge._q.qsize(),
                 "incidents": dict(Counter(i["state"] for i in bridge.board.summary()))}
+
+    @property
+    def allowed_hosts(self):
+        """Names the main listener answers to: those fixed at start plus the fleet file's current
+        ``control_plane.collab.dashboard_hosts``, so adding a name needs no restart."""
+        collab = self._control_plane_value(self.fleet_config, "collab")
+        names = collab.get("dashboard_hosts") if isinstance(collab, dict) else None
+        extra = frozenset(n.lower() for n in names if isinstance(n, str)) if isinstance(names, list) else frozenset()
+        return self._static_allowed_hosts | extra
+
+    @allowed_hosts.setter
+    def allowed_hosts(self, value):
+        self._static_allowed_hosts = frozenset(value)
 
     @staticmethod
     def _control_plane_value(fleet_config, key):
@@ -2203,15 +2216,37 @@ def _make_handler(server, public=False, operator=False, fabric=False):
             Every request needs a Host an attacker's DNS name cannot be (DNS rebinding); every state-changing
             method (``writes``) also refuses cross-origin / cross-site browser requests and non-JSON browser
             bodies. Agents and the CLI send no Origin, so they only need a Host the operator listed."""
-            if self._path_only() in _BROWSER_GUARD_EXEMPT:
+            path = self._path_only()
+            if path in _BROWSER_GUARD_EXEMPT or path in _DEPLOYMENT_ACTION_PATHS:
+                # Deployment actions run their own audited Host/Origin refusal (the audit row and counter).
                 return False
-            if not host_ok(self.headers.get("Host", ""), server.allowed_hosts):
+            host = self.headers.get("Host", "")
+            if not host_ok(host, server._static_allowed_hosts) and not host_ok(host, server.allowed_hosts):
+                if (self._host_token_route(path) and self.headers.get("Origin") is None
+                        and self._valid_host_token()):
+                    return False   # not a browser: the per-host token is the credential, any name will do
                 return self._deny(403, "host not allowed: add it to control_plane.collab.dashboard_hosts")
             if writes:
                 refusal = browser_write_refusal(self.headers, server.allowed_hosts)
                 if refusal:
                     return self._deny(*refusal)
             return False
+
+        def _host_token_route(self, path):
+            return (path == _FLEET_CONFIG_PATH or path in (_FLEET_CONFIG_PATH + "/applied", _FLEET_CONFIG_PATH + "/telemetry")
+                    or path in _DEPLOYMENT_HOST_GET_PATHS or path in _DEPLOYMENT_EVENTS_PATHS
+                    or path.startswith("/api/v1/host/terminal/"))
+
+        def _valid_host_token(self):
+            """True when the request carries a fleet host token the current fleet file knows."""
+            if server.fleet_config is None:
+                return False
+            from ..fleet_config import FleetConfigError
+            try:
+                return (self._fleet_host(server.fleet_config.current()) is not None
+                        or self._deployment_host() is not None)
+            except FleetConfigError:
+                return False
 
         def _deny(self, status, message):
             """Send the error response, close the connection, and report the refusal.

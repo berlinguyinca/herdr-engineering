@@ -1032,6 +1032,18 @@ def test_a_plain_custom_model_cannot_shadow_a_model_the_upstream_serves():
         _teardown(proxy, srvs)
 
 
+def test_a_policy_model_sharing_the_upstream_name_keeps_its_registration():
+    # Only a record whose route would leave the upstream is neutralised; a fabric_model registration stays on the
+    # gateway on purpose, so its fallback and egress policy keep applying.
+    _, key, proxy, gpu, cpu, srvs, _ = _policy_setup(catalog=[_gpu_model(aliases=["qwen-small", "summary"])])
+    try:
+        status, headers, _ = _summary_post(proxy, key)
+        assert status == 200 and headers["X-Herdr-LLM-Route"] == "fabric"
+        assert gpu[0]["body"]["model"] == "gpu/qwen-small" and cpu == []
+    finally:
+        _teardown(proxy, srvs)
+
+
 def test_a_shadowed_name_is_not_registered_for_a_guarded_request():
     repo, key, proxy, upstream, custom, srvs = _setup()
     try:
