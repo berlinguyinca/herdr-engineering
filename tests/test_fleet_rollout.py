@@ -2734,8 +2734,26 @@ def test_existing_group_readable_state_directory_is_tightened_not_refused(tmp_pa
     root = tmp_path / "state"
     root.mkdir(mode=0o755)
     root.chmod(0o755)
-    RolloutStore(root)._directory()
+    with RolloutStore(root).lock():
+        pass
     assert root.stat().st_mode & 0o777 == 0o700
+
+
+def test_read_only_paths_never_change_state_directory_permissions(tmp_path):
+    from herdr_engineering.fleet_rollout import RolloutStore, latest_unfinished, list_rollouts
+
+    store = RolloutStore(tmp_path / "state")
+    plan = _make_plan(store, "1" * 40, status="pending", created_at="2026-11-01T00:00:00+00:00")
+    store.root.chmod(0o755)
+    assert [p["id"] for p in list_rollouts(store)] == [plan["id"]]
+    assert latest_unfinished(store)["id"] == plan["id"]
+    assert store.read(plan["id"])["id"] == plan["id"]
+    assert store.root.stat().st_mode & 0o777 == 0o755  # looked at, not touched
+    # The ownership and symlink refusals still hold on the read path.
+    link = tmp_path / "link"
+    link.symlink_to(store.root)
+    with pytest.raises(ValueError, match="private"):
+        list_rollouts(RolloutStore(link))
 
 
 def test_symlinked_state_directory_is_still_refused(tmp_path):

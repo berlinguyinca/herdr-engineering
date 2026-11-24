@@ -112,14 +112,14 @@ class RolloutStore:
     def __init__(self, root: Path | None = None):
         self.root = root or _default_rollout_root()
 
-    def _directory(self):
+    def _directory(self, *, tighten=False):
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         info = self.root.lstat()
         if self.root.is_symlink() or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
             raise ValueError("rollout state must be a private, owned directory")
-        if info.st_mode & 0o077:
+        if tighten and info.st_mode & 0o077:
             # Ours and not a link: tighten rather than refuse (an older release or a umask
-            # may have left it 0755).
+            # may have left it 0755). Only write paths do; status/latest only look.
             self.root.chmod(0o700)
 
     def _path(self, rollout_id):
@@ -129,7 +129,7 @@ class RolloutStore:
 
     @contextmanager
     def lock(self, *, runner_id=None):
-        self._directory()
+        self._directory(tighten=True)
         name = ".lock" if runner_id is None else ".run-" + self._path(runner_id).stem + ".lock"
         fd = os.open(self.root / name, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         try:
@@ -154,7 +154,7 @@ class RolloutStore:
         return data
 
     def write(self, data):
-        self._directory()
+        self._directory(tighten=True)
         path = self._path(data["id"])
         if path.exists():
             old = self.read(data["id"])
