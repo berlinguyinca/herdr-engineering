@@ -16,6 +16,12 @@
 * **staging**: ``MemberService.sweep_staging``.
 * **blobs**: blob files with no ``artifact_blobs`` row and no manifest reference, older than ``blob_grace``, are
   deleted under the per-sha advisory lock publish holds (try-lock: a sha being published is skipped).
+* **versions**: a version that no longer backs anything is marked ``purged`` and the blobs only it used are deleted
+  (the ``artifact_blobs`` row and the file), so the quota (current versions of live artifacts) matches what is stored.
+  Purgeable: a superseded version once a newer one is ``version_grace`` seconds old, and every version of a retracted or
+  tombstoned artifact once it was last touched ``version_grace`` seconds ago.  Never purged: the current version of a
+  live artifact, anything under ``legal_hold``, a version a pending or live share points at, and any blob a kept
+  version's manifest still names.  A version whose blob is mid-publish (per-sha lock held) waits for the next pass.
 * **usage**: ``member_usage.bytes_used`` is recomputed from the artifacts under the member_usage row lock.
 
 Pending-intake needs no sweep: the cap is enforced when an item is claimed and the original never expired pending items.
@@ -50,8 +56,10 @@ REMOVED_GRACE: Final = 3600.0
 STAGING_MAX_AGE: Final = 24 * 3600.0
 BLOB_GRACE: Final = 3600.0
 BLOB_GC_EVERY: Final = 900.0
+VERSION_GRACE: Final = 3600.0
 EXPIRY_FLOOR: Final = timedelta(days=7)
 _BLOB_BATCH: Final = 500
+_PURGE_BATCH: Final = 200
 _LIVE_QUOTA: Final = "lifecycle NOT IN ('retracted','tombstoned')"
 
 
@@ -64,6 +72,7 @@ class SweepReport:
     groups_cleared: int = 0
     staging_removed: int = 0
     blobs_removed: int = 0
+    versions_purged: int = 0
     usage_corrected: int = 0
     failed: tuple[str, ...] = ()
     skipped: bool = False  # another replica holds the leader lock: nothing was swept
@@ -75,6 +84,7 @@ class HousekeepingConfig:
     removed_grace: float = REMOVED_GRACE
     staging_max_age: float = STAGING_MAX_AGE
     blob_grace: float = BLOB_GRACE
+    version_grace: float = VERSION_GRACE
     blob_gc_every: float = (
         BLOB_GC_EVERY  # the blob walk is the costly duty: it runs on this slower cadence
     )
@@ -195,6 +205,7 @@ class Housekeeper:
                 "blobs" not in failed
             ):  # a failed pass is retried on the next sweep, not after blob_gc_every
                 self._last_blob_gc = now
+        await duty("versions", "versions_purged", self._purge_versions(now))
         await duty("usage", "usage_corrected", self._reconcile_usage())
         return SweepReport(**counts, failed=tuple(dict.fromkeys(failed)))
 
@@ -328,7 +339,7 @@ class Housekeeper:
                 if await conn.fetchval("SELECT 1 FROM artifact_blobs WHERE sha256=$1", sha):
                     return False
                 if await conn.fetchval(
-                    "SELECT 1 FROM artifact_versions WHERE output_manifest @> $1::jsonb LIMIT 1",
+                    "SELECT 1 FROM artifact_versions WHERE state <> 'purged' AND output_manifest @> $1::jsonb LIMIT 1",
                     json.dumps([{"sha256": sha}]),
                 ):
                     return False
@@ -346,6 +357,81 @@ class Housekeeper:
             return self.blobs._path(sha).stat().st_mtime < cutoff
         except OSError:
             return False
+
+    # -- versions
+
+    async def _purge_versions(self, now: datetime) -> int:
+        cutoff = now - timedelta(seconds=self.config.version_grace)
+        due = await self.pool.fetch(
+            "SELECT v.version_id FROM artifact_versions v JOIN artifacts a ON a.artifact_id = v.artifact_id "
+            "WHERE v.state <> 'purged' AND NOT a.legal_hold "
+            "AND ((a.lifecycle IN ('retracted','tombstoned') AND a.updated_at < $1) "
+            "  OR (a.lifecycle NOT IN ('retracted','tombstoned') AND v.version_id IS DISTINCT FROM a.current_version_id "
+            "      AND EXISTS (SELECT 1 FROM artifact_versions n WHERE n.artifact_id = v.artifact_id "
+            "                  AND n.version_number > v.version_number AND n.created_at < $1))) "
+            "AND NOT EXISTS (SELECT 1 FROM shares s WHERE s.version_id = v.version_id "
+            "                AND s.state IN ('pending','live')) "
+            "ORDER BY v.created_at LIMIT $2",
+            cutoff,
+            _PURGE_BATCH,
+        )
+        return sum([1 for r in due if await self._purge_one(r["version_id"], cutoff)])
+
+    async def _purge_one(self, version_id: str, cutoff: datetime) -> bool:
+        """Mark one version purged and delete the blobs only it used, under publish's per-sha locks (try-lock: a sha
+        somebody holds defers the whole version to the next pass).  The due-conditions are re-checked under the locks'
+        protection by the UPDATE itself, so a share or publish that landed since the listing is respected."""
+        async with self.pool.acquire() as conn:
+            manifest = await conn.fetchval(
+                "SELECT output_manifest::text FROM artifact_versions WHERE version_id=$1 AND state <> 'purged'",
+                version_id,
+            )
+            if manifest is None:
+                return False
+            shas = sorted(
+                {f["sha256"] for f in json.loads(manifest) if isinstance(f.get("sha256"), str)}
+            )
+            held: list[str] = []
+            try:
+                for sha in shas:
+                    if not await conn.fetchval(
+                        "SELECT pg_try_advisory_lock($1, hashtext($2))", LOCK_NS_BLOB, sha
+                    ):
+                        return False
+                    held.append(sha)
+                done = await conn.execute(
+                    "UPDATE artifact_versions v SET state='purged', purged_at=now() FROM artifacts a "
+                    "WHERE v.version_id=$1 AND v.state <> 'purged' AND a.artifact_id = v.artifact_id "
+                    "AND NOT a.legal_hold "
+                    "AND ((a.lifecycle IN ('retracted','tombstoned') AND a.updated_at < $2) "
+                    "  OR (a.lifecycle NOT IN ('retracted','tombstoned') "
+                    "      AND v.version_id IS DISTINCT FROM a.current_version_id)) "
+                    "AND NOT EXISTS (SELECT 1 FROM shares s WHERE s.version_id = v.version_id "
+                    "                AND s.state IN ('pending','live'))",
+                    version_id,
+                    cutoff,
+                )
+                if done.rsplit(" ", 1)[-1] != "1":
+                    return False
+                for sha in shas:
+                    await self._drop_unused_blob(conn, sha)
+                return True
+            finally:
+                for sha in held:
+                    await conn.execute(
+                        "SELECT pg_advisory_unlock($1, hashtext($2))", LOCK_NS_BLOB, sha
+                    )
+
+    async def _drop_unused_blob(self, conn: asyncpg.Connection, sha: str) -> None:
+        """Delete a blob's row and file unless a kept version still names it.  The caller holds the sha's lock."""
+        if await conn.fetchval(
+            "SELECT 1 FROM artifact_versions WHERE state <> 'purged' AND output_manifest @> $1::jsonb LIMIT 1",
+            json.dumps([{"sha256": sha}]),
+        ):
+            return
+        await conn.execute("DELETE FROM artifact_blobs WHERE sha256=$1", sha)
+        if await run_to_completion(self.blobs.remove, sha):
+            await run_to_completion(self.blobs.prune_empty_dirs, sha)
 
     # -- quotas
 

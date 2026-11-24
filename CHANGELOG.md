@@ -5,6 +5,11 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: artifact host storage is reclaimed, and disabled Cognito accounts are refused per request
+
+- `herdr_artifact_host` housekeeping gains a `versions` duty: superseded versions (once a newer one is `version_grace`, default 1 h, old) and every version of a retracted or tombstoned artifact are marked `purged`, and the blobs only they used are deleted (row and file) under publish's per-sha lock. The current version of a live artifact, `legal_hold` artifacts, versions a pending or live share points at, and blobs a kept version still names are never touched. Before this, publishing repeatedly or deleting an artifact left every old blob on the volume while the quota counted only the current version, so one member could fill the disk. The orphan-blob sweep now ignores purged versions' manifests. `SweepReport` gains `versions_purged`.
+- `SyncedDirectory.groups` returns no groups for an account listed under `disabled` in `members.json` (the sync still lists it under its group), so a disabled account's member session and agent tokens are refused on the next recheck instead of waiting for housekeeping's revocation pass.
+
 ### Feature: periodic `herdr-handoff reap --apply` timer (opt-in, off by default)
 
 - `herdr-eng handoff-reap {run,status}` and `scripts/install-handoff-reap.sh` install a systemd user timer (Linux) or LaunchAgent (macOS) that closes panes replaced by confirmed handoffs, including those whose `confirm` was refused because the source pane was still working. Wired into `scripts/install.sh` (step 7f2) and, for Linux fleet hosts, `ansible/tasks/handoff-reap.yml` (`site.yml`, `fleet-sync.yml`).
