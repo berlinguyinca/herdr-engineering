@@ -84,3 +84,56 @@ def test_room_user_principals_are_web_grants_but_agent_collaborators_stay_reserv
     assert fresh.has_grants("a1")
     assert [g["principal_id"] for g in fresh.grants_with_source_prefix("room:")] == ["collab:user:bob"]
     assert not any(g.get("principal_id") == "collab:agent1" for g in fresh._grants.values())
+
+
+def test_expiring_grants_survive_a_store_round_trip():
+    """The store hands timestamps back as ISO strings (datetime or text); can/held/principals_with must still decide."""
+    from datetime import datetime, timezone
+    now = [100.0]
+    acl = ArtifactAcl(now=lambda: now[0])
+    future = datetime.fromtimestamp(1000.0, tz=timezone.utc)
+    acl.load([{"artifact_id": "a1", "principal_id": "u1", "permissions": ["read"], "expires_at": future.isoformat()},
+              {"artifact_id": "a1", "principal_id": "u2", "permissions": ["read"], "expires_at": future}])
+    assert acl.can("a1", "u1", "read") and acl.held("a1", "u2") is not None
+    assert acl.principals_with("a1", "read") == ["u1", "u2"]
+    now[0] = 2000.0
+    assert acl.can("a1", "u1", "read") is False and acl.principals_with("a1", "read") == []
+
+
+def test_grant_normalises_an_iso_expiry_and_rejects_nonsense():
+    import pytest
+    acl = ArtifactAcl(now=lambda: 0.0)
+    grant = acl.grant("a1", "u1", {"read"}, expires_at="1970-01-01T00:16:40+00:00")
+    assert grant["expires_at"] == 1000.0 and acl.can("a1", "u1", "read")
+    for bad in ("tomorrow", [1], True):
+        with pytest.raises(ValueError, match="expires_at"):
+            acl.grant("a1", "u2", {"read"}, expires_at=bad)
+
+
+def test_concurrent_grants_and_reads_do_not_corrupt_the_maps():
+    import threading
+    acl = ArtifactAcl()
+    errors = []
+
+    def writer(n):
+        try:
+            for i in range(300):
+                acl.grant("a1", f"u{n}-{i}", {"read"})
+                acl.revoke("a1", f"u{n}-{i}")
+        except Exception as exc:        # noqa: BLE001
+            errors.append(exc)
+
+    def reader():
+        try:
+            for _ in range(300):
+                acl.has_grants("a1")
+                acl.principals_with("a1", "read")
+                acl.grants_by("x")
+                acl.grants_with_source_prefix("room:")
+        except Exception as exc:        # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=writer, args=(n,)) for n in range(3)] + [threading.Thread(target=reader) for _ in range(3)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert errors == []

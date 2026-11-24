@@ -402,3 +402,28 @@ def test_output_download_rejects_digest_substitution_before_blob_read(reports_se
     assert status == 409
     assert blobs.downloads == 0
     assert b"evidence" not in body
+
+
+def _raw_exchange(base, request_bytes, *, send_body=b""):
+    import socket
+    host, port = base.removeprefix("http://").split(":")
+    with socket.create_connection((host, int(port)), timeout=5) as sock:
+        sock.sendall(request_bytes + send_body)
+        sock.shutdown(socket.SHUT_WR)
+        chunks = []
+        while chunk := sock.recv(65536):
+            chunks.append(chunk)
+    return b"".join(chunks).decode("latin-1")
+
+
+@pytest.mark.parametrize("query,mime", [("filename=../x", "application/octet-stream"),
+                                        ("filename=ok.bin", "text/plain; charset=utf-8")])
+def test_a_refused_blob_upload_closes_the_connection(reports_server, query, mime):
+    base, _, blobs = reports_server
+    body = b"B" * 64
+    head = (f"POST /api/v1/artifacts/artifact_report/blobs?{query} HTTP/1.1\r\nHost: x\r\nX-API-Key: owner-key\r\n"
+            f"Content-Type: {mime}\r\nContent-Length: {len(body)}\r\n\r\n").encode()
+    reply = _raw_exchange(base, head, send_body=body)
+    assert reply.startswith("HTTP/1.0 400") or reply.startswith("HTTP/1.1 400")
+    assert "connection: close" in reply.lower()
+    assert blobs.uploads == 0

@@ -73,3 +73,9 @@ def test_ensure_bucket_creates_when_missing_and_is_idempotent():
     assert c._s3.buckets == {"herdr-artifacts"}
     c.ensure_bucket()  # already exists -> no error, no dup
     assert c._s3.buckets == {"herdr-artifacts"}
+
+
+def test_the_default_boto3_client_has_explicit_timeouts():
+    client = rustfs.RustFSClient(endpoint="http://127.0.0.1:9", bucket="b")
+    config = client._s3.meta.config
+    assert config.connect_timeout == 5 and config.read_timeout == 30

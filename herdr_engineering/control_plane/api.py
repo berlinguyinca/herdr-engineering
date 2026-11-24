@@ -151,6 +151,7 @@ _PDFJS_VENDOR_DIR = Path(__file__).resolve().parent / "share_static" / "vendor" 
 _VENDORED_PDFJS = frozenset({"vendor/pdfjs/pdf.min.mjs", "vendor/pdfjs/pdf.worker.min.mjs"})
 _INDEX = "index.html"
 _MAX_JSON_BODY = 4 * 1024 * 1024
+_MAX_LEGACY_UPLOAD_BYTES = 256 * 1024 * 1024    # POST /api/v1/artifacts buffers the whole body in memory
 _MAX_ATTACHMENT_JSON = 36 * 1024 * 1024        # a 25 MiB attachment is ~33.4 MiB of base64 plus its mail envelope
 
 
@@ -6373,7 +6374,11 @@ def _make_handler(server, public=False, operator=False, fabric=False):
             return None
 
         def _upload_artifact(self, r, parts):
-            length = int(self.headers.get("Content-Length") or 0)
+            length = _content_length(self.headers.get("Content-Length"))
+            if length is None:
+                return self._deny(400, "invalid Content-Length")
+            if length > _MAX_LEGACY_UPLOAD_BYTES:       # the whole body is buffered below: refuse before reading it
+                return self._deny(413, "upload exceeds the size limit")
             if length <= 0:
                 return self._json({"error": "empty body"}, 400)
             data = self.rfile.read(length)
@@ -6606,7 +6611,9 @@ def _make_handler(server, public=False, operator=False, fabric=False):
 
         def _read_json(self, limit=_MAX_JSON_BODY):
             try:
-                length = int(self.headers.get("Content-Length") or 0)
+                length = _content_length(self.headers.get("Content-Length"))
+                if length is None:
+                    raise ValueError("invalid Content-Length")
                 if not length:
                     return None
                 if length > limit:
@@ -6681,6 +6688,9 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                              artifact_id=artifact_id, version_id=version_id, reason=body.get("reason"),
                              persist=persist, on_unpersisted=on_unpersisted)
             result["restrict_all_applied"] = False
+            from .artifact_delete_api import _actor, revoke_shares
+            # a retracted artifact (or version) must stop being served through its share links too
+            result["shares_revoked"] = revoke_shares(self, server, artifact_id, _actor(self, server), version_id)
             if result["error"]:
                 result["restrict_all_offered"] = True
                 if "write" in pending:

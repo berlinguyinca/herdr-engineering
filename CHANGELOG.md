@@ -5,6 +5,14 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: artifact ACL expiry after restart, body-size and connection hygiene, retract revokes shares
+
+- Artifact ACL: expiring grants reloaded from the registry (ISO strings) no longer raise `TypeError` in `can`/`held`/`principals_with`; `expires_at` is normalised to epoch seconds and an invalid value is a 400. The ACL maps are now guarded by a lock.
+- `POST /api/v1/artifacts` refuses a body over 256 MiB (413) or a malformed Content-Length (400) before reading it; `_read_json` refuses a negative or malformed Content-Length (400, connection closed) instead of reading to EOF.
+- Report blob uploads close the connection when they answer before reading the body.
+- Dashboard render routes answer `too_large` from the stored size without reading oversized blobs.
+- Retracting an artifact (or one version) now revokes its live share links (the response carries `shares_revoked`).
+
 ### Fix: Slack approval of unseen text, calendar block-list alias, Rakazo first-bot cache
 
 - Slack ask: the Approve buttons are only offered when the command is shown in full; a long (truncated) command gets Deny only and a "cannot be approved from Slack" note, and an approve tap on such an ask is refused (`not_fully_shown`).

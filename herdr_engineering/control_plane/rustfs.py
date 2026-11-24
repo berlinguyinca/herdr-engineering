@@ -16,6 +16,10 @@ def content_key(data: bytes) -> str:
     return f"sha256/{hex_[:2]}/{hex_[2:4]}/{hex_}"
 
 
+_CONNECT_TIMEOUT_S = 5
+_READ_TIMEOUT_S = 30
+
+
 class RustFSClient:
     """Thin S3-compatible client over RustFS. ``s3`` is a boto3 client or fake."""
 
@@ -29,10 +33,14 @@ class RustFSClient:
             self._s3 = s3
         else:
             import boto3
+            from botocore.config import Config
+            # Explicit timeouts: an unreachable store must fail fast, not hold the artifact adapter lock for minutes.
             self._s3 = boto3.client(
                 "s3", endpoint_url=endpoint,
                 region_name=region,
                 aws_access_key_id=access_key, aws_secret_access_key=secret_key,
+                config=Config(connect_timeout=_CONNECT_TIMEOUT_S, read_timeout=_READ_TIMEOUT_S,
+                              retries={"max_attempts": 2, "mode": "standard"}),
             )
 
     def ensure_bucket(self) -> None:

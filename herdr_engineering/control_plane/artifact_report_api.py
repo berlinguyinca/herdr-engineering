@@ -142,6 +142,7 @@ def route_report(handler, server, parts, resource):
     if not any((creating, building, build_status, uploading, versioned)):
         return False
     if server.artifact_store is None:
+        handler.close_connection = True         # a POST body may be unread: never parse it as the next request
         handler._json({"error": "versioned report registry is unavailable"}, 503)
         return True
     method = handler.command
@@ -184,6 +185,8 @@ def route_report(handler, server, parts, resource):
         return True
     query = parse_qs(urlsplit(handler.path).query)
     if uploading:
+        client_closes = handler.close_connection
+        handler.close_connection = True         # every answer below that precedes the body read leaves it unread
         if method != "POST" or server.rustfs is None or not hasattr(server.rustfs, "put_stream"):
             handler._json({"error": "streaming report upload is unavailable"}, 503)
             return True
@@ -207,6 +210,7 @@ def route_report(handler, server, parts, resource):
             raise ValueError("invalid report asset media type")
         uploaded = server.rustfs.put_stream(LimitedInput(handler.rfile, length), expected_size=length,
                                             media_type=mime, chunk_size=CHUNK_BYTES)
+        handler.close_connection = client_closes    # the body was consumed in full: keep-alive is safe again
         registered = handler._artifact_call("register_report_blob", artifact_id,
             storage_key=uploaded["key"], sha256=uploaded["sha256"], size_bytes=uploaded["size"], media_type=mime)
         handler._json({"name": name, **registered}, 201)
