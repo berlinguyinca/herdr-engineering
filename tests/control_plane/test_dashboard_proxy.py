@@ -278,3 +278,49 @@ def test_settings_built_from_key_files_proxy_a_real_server(cp, tmp_path):
     finally:
         px.shutdown()
         thread.join(timeout=3)
+
+
+# --- browser Origin handling: the proxy is the same-origin gate, then presents an Origin the upstream accepts ---
+
+def _browser_post(px, path, *, origin, extra=None, content_type="application/json"):
+    headers = {"Host": f"dash.example:{px.port}", "Content-Type": content_type}
+    if origin is not None:
+        headers["Origin"] = origin
+    headers.update(extra or {})
+    conn = http.client.HTTPConnection("127.0.0.1", px.port, timeout=10)
+    try:
+        conn.request("POST", path, body=b"{}", headers=headers)
+        resp = conn.getresponse()
+        return resp.status, resp.read()
+    finally:
+        conn.close()
+
+
+def test_same_origin_browser_write_reaches_the_origin_guarded_upstream_route(cp, proxy):
+    # /attention/* is Origin-guarded upstream (Origin netloc must equal Host); Host is rewritten to the upstream.
+    status, body = _browser_post(proxy, "/api/v1/attention/ack", origin=f"http://dash.example:{proxy.port}")
+    assert status not in (401, 403, 415), body
+
+
+def test_cross_origin_browser_write_is_refused_by_the_proxy(proxy):
+    status, body = _browser_post(proxy, "/api/v1/attention/ack", origin="http://evil.example")
+    assert status == 403 and b"cross-origin" in body
+
+
+def test_cross_origin_no_cors_write_to_an_upstream_unguarded_route_is_refused(proxy):
+    # The CSRF case: a CORS-simple text/plain POST to a route the upstream does not Origin-guard.
+    status, body = _browser_post(proxy, "/api/v1/sessions/s1/messages", origin="http://evil.example",
+                                 content_type="text/plain")
+    assert status == 403 and b"cross-origin" in body
+
+
+@pytest.mark.parametrize("fetch_site", ["cross-site", "same-site"])
+def test_cross_site_fetch_metadata_is_refused(proxy, fetch_site):
+    status, _ = _browser_post(proxy, "/api/v1/attention/ack", origin=f"http://dash.example:{proxy.port}",
+                              extra={"Sec-Fetch-Site": fetch_site})
+    assert status == 403
+
+
+def test_non_http_origin_scheme_is_refused(proxy):
+    assert _browser_post(proxy, "/api/v1/attention/ack", origin="null")[0] == 403
+

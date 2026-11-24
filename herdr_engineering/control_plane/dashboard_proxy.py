@@ -6,6 +6,8 @@ control plane answers every browser request with 401. This proxy sits in front o
 * GET/HEAD (static UI, JSON, SSE) are sent upstream with the ``viewer`` key;
 * a mutating request is sent with the ``operator`` key only when ``METHOD /path`` matches the configured allowlist
   (default: the dashboard's own write actions); every other mutation is refused here with 403;
+* a mutation from a browser must be same-origin with the proxy itself (Origin netloc == Host, Sec-Fetch-Site not
+  cross-site) before the operator key is attached, then goes upstream with an Origin the upstream accepts;
 * a client-supplied ``X-API-Key`` (and ``X-Forwarded-*``) is always dropped, the browser never sees a key.
 
 Configuration is YAML only (``control_plane.dashboard_proxy``); the keys are read from 0600 files.
@@ -60,6 +62,7 @@ _HOP_BY_HOP = frozenset({"connection", "keep-alive", "proxy-authenticate", "prox
 # Dropped on the way upstream in addition: the browser must never choose the credential or the client identity.
 _NEVER_FORWARD = frozenset({"x-api-key", "host", "content-length", "x-forwarded-for", "x-forwarded-host",
                             "x-forwarded-proto", "forwarded", "x-real-ip"})
+_ORIGIN_SCHEMES = frozenset({"http", "https"})
 _MAX_BODY = 128 * 1024 * 1024
 _ALLOW_ENTRY = re.compile(r"^(POST|PUT|PATCH|DELETE) (/\S*)$")
 _SETTINGS_KEYS = frozenset({"viewer_key_file", "operator_key_file", "upstream", "operator_post_allowlist"})
@@ -194,6 +197,19 @@ class DashboardProxy:
         return None, 405, "proxy: method not allowed"
 
 
+def cross_origin_refusal(method: str, origin: str | None, host: str | None, fetch_site: str | None) -> str | None:
+    """Why a browser mutation is not same-origin with the proxy (None when it is, or is not a mutation)."""
+    if method not in _MUTATING:
+        return None
+    if fetch_site is not None and fetch_site.strip().lower() not in {"same-origin", "none"}:
+        return "proxy: cross-site write refused"
+    if origin is not None:
+        parts = urlsplit(origin)
+        if parts.scheme not in _ORIGIN_SCHEMES or not host or parts.netloc.lower() != host.lower():
+            return "proxy: cross-origin write refused"
+    return None
+
+
 def _make_handler(proxy: DashboardProxy):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -217,6 +233,10 @@ def _make_handler(proxy: DashboardProxy):
             key, status, message = proxy.key_for(method, self.path)
             if key is None:
                 return self._refuse(status or 403, message)
+            refusal = cross_origin_refusal(method, self.headers.get("Origin"), self.headers.get("Host"),
+                                           self.headers.get("Sec-Fetch-Site"))
+            if refusal:
+                return self._refuse(403, refusal)
             if self.headers.get("Transfer-Encoding"):
                 return self._refuse(411, "proxy: chunked request bodies are not supported")
             try:
@@ -230,6 +250,10 @@ def _make_handler(proxy: DashboardProxy):
                        if k.lower() not in _HOP_BY_HOP and k.lower() not in _NEVER_FORWARD}
             headers["X-API-Key"] = key
             headers["Host"] = proxy._up_netloc
+            if method in _MUTATING and self.headers.get("Origin") is not None:
+                # Already proven same-origin with the proxy; the upstream compares Origin with the Host it sees.
+                headers = {k: v for k, v in headers.items() if k.lower() != "origin"}
+                headers["Origin"] = f"{proxy._scheme}://{proxy._up_netloc}"
             headers["Connection"] = "close"
             if body is not None:
                 headers["Content-Length"] = str(len(body))

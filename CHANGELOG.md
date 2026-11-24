@@ -5,6 +5,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: dashboard proxy is the same-origin gate for browser writes
+
+- The proxy rewrote `Host` but forwarded the browser's `Origin`, so the control plane's same-origin guard answered 403 to every real browser write on Origin-guarded routes (attention, scheduler, ci, review-gate, artifacts, ...). It now refuses a mutation whose `Origin` is not its own `Host` (or whose `Sec-Fetch-Site` is cross-site) with 403 before attaching the operator key, then sends `Origin` rewritten to the upstream. This also closes the CSRF path where a hostile page could make the proxy inject the operator key into upstream-unguarded allowlisted writes (`sessions/*/messages`, `assistants`, `library`, ...). Requests with no `Origin` (non-browser clients) are unchanged.
+
 ### Feature: periodic `herdr-handoff reap --apply` timer (opt-in, off by default)
 
 - `herdr-eng handoff-reap {run,status}` and `scripts/install-handoff-reap.sh` install a systemd user timer (Linux) or LaunchAgent (macOS) that closes panes replaced by confirmed handoffs, including those whose `confirm` was refused because the source pane was still working. Wired into `scripts/install.sh` (step 7f2) and, for Linux fleet hosts, `ansible/tasks/handoff-reap.yml` (`site.yml`, `fleet-sync.yml`).
