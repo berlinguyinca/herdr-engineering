@@ -46,9 +46,9 @@ def cp():
     thread.join(timeout=3)
 
 
-def start_proxy(cp_port, *, operator_key=OPERATOR, allowlist=DEFAULT_OPERATOR_POST_ALLOWLIST):
+def start_proxy(cp_port, *, operator_key=OPERATOR, allowlist=DEFAULT_OPERATOR_POST_ALLOWLIST, **extra):
     px = DashboardProxy(f"http://127.0.0.1:{cp_port}", viewer_key=VIEWER, operator_key=operator_key,
-                        allowlist=allowlist, host="127.0.0.1", port=0)
+                        allowlist=allowlist, host="127.0.0.1", port=0, **extra)
     thread = threading.Thread(target=px.serve, daemon=True)
     thread.start()
     px.wait_until_ready()
@@ -282,14 +282,17 @@ def test_settings_built_from_key_files_proxy_a_real_server(cp, tmp_path):
 
 # --- browser Origin handling: the proxy is the same-origin gate, then presents an Origin the upstream accepts ---
 
-def _browser_post(px, path, *, origin, extra=None, content_type="application/json"):
-    headers = {"Host": f"dash.example:{px.port}", "Content-Type": content_type}
+ACK_BODY = b'{"key": "k", "fingerprint": "f"}'   # valid: reaches the handler, which answers 200 not_current
+
+
+def _browser_post(px, path, *, origin, extra=None, content_type="application/json", host=None, body=ACK_BODY):
+    headers = {"Host": host or f"dash.example:{px.port}", "Content-Type": content_type}
     if origin is not None:
         headers["Origin"] = origin
     headers.update(extra or {})
     conn = http.client.HTTPConnection("127.0.0.1", px.port, timeout=10)
     try:
-        conn.request("POST", path, body=b"{}", headers=headers)
+        conn.request("POST", path, body=body, headers=headers)
         resp = conn.getresponse()
         return resp.status, resp.read()
     finally:
@@ -299,7 +302,7 @@ def _browser_post(px, path, *, origin, extra=None, content_type="application/jso
 def test_same_origin_browser_write_reaches_the_origin_guarded_upstream_route(cp, proxy):
     # /attention/* is Origin-guarded upstream (Origin netloc must equal Host); Host is rewritten to the upstream.
     status, body = _browser_post(proxy, "/api/v1/attention/ack", origin=f"http://dash.example:{proxy.port}")
-    assert status not in (401, 403, 415), body
+    assert status == 200 and json.loads(body)["reason"] == "not_current", body
 
 
 def test_cross_origin_browser_write_is_refused_by_the_proxy(proxy):
@@ -324,3 +327,74 @@ def test_cross_site_fetch_metadata_is_refused(proxy, fetch_site):
 def test_non_http_origin_scheme_is_refused(proxy):
     assert _browser_post(proxy, "/api/v1/attention/ack", origin="null")[0] == 403
 
+
+
+@pytest.fixture
+def public_proxy(cp):
+    px, thread = start_proxy(cp.port, public_hosts=("dash.example",), public_scheme="https")
+    yield px
+    px.shutdown()
+    thread.join(timeout=3)
+
+
+def test_host_rewriting_front_works_when_the_public_host_is_configured(cp, public_proxy):
+    # A reverse proxy that rewrites Host: the browser's Origin names the public host, Host is the internal one.
+    status, body = _browser_post(public_proxy, "/api/v1/attention/ack", origin="https://dash.example",
+                                 host=f"127.0.0.1:{public_proxy.port}")
+    assert status == 200 and json.loads(body)["reason"] == "not_current", body
+
+
+def test_host_rewriting_front_is_refused_by_default(proxy):
+    status, _ = _browser_post(proxy, "/api/v1/attention/ack", origin="http://dash.example",
+                              host=f"internal:{proxy.port}")
+    assert status == 403
+
+
+def test_unlisted_host_is_refused_for_reads_and_writes_when_hosts_are_configured(public_proxy):
+    # DNS rebinding: the attacker's name resolves to the proxy, so Host and Origin agree with each other.
+    for host in ("evil.example", f"evil.example:{public_proxy.port}"):
+        assert _get(public_proxy, "/api/v1/sessions", host)[0] == 403
+        assert _browser_post(public_proxy, "/api/v1/attention/ack", origin=f"https://{host}", host=host)[0] == 403
+
+
+def test_ip_literal_and_localhost_hosts_are_accepted_when_hosts_are_configured(public_proxy):
+    for host in (f"127.0.0.1:{public_proxy.port}", f"localhost:{public_proxy.port}", f"[::1]:{public_proxy.port}",
+                 "dash.example"):
+        assert _get(public_proxy, "/api/v1/sessions", host)[0] == 200
+
+
+def test_origin_scheme_must_match_the_configured_public_scheme(public_proxy):
+    status, body = _browser_post(public_proxy, "/api/v1/attention/ack", origin="http://dash.example",
+                                 host="dash.example")
+    assert status == 403 and b"cross-origin" in body
+
+
+def test_refusal_does_not_reset_the_connection_when_the_client_is_still_sending(proxy):
+    status, body = _browser_post(proxy, "/api/v1/attention/ack", origin="http://evil.example",
+                                 body=b"x" * (4 * 1024 * 1024))
+    assert status == 403 and b"cross-origin" in body
+
+
+def test_parse_public_host_keys():
+    s = parse_dashboard_proxy({"viewer_key_file": "/k/v", "public_hosts": ["Dash.Example:8443"],
+                               "public_scheme": "https"})
+    assert s.public_hosts == ("dash.example:8443",) and s.public_scheme == "https"
+    s = parse_dashboard_proxy({"viewer_key_file": "/k/v"})
+    assert s.public_hosts == () and s.public_scheme is None
+
+
+@pytest.mark.parametrize("extra", [{"public_hosts": "dash"}, {"public_hosts": [""]}, {"public_hosts": [1]},
+                                   {"public_scheme": "ftp"}, {"public_scheme": 3}])
+def test_parse_rejects_bad_public_host_keys(extra):
+    with pytest.raises(ValueError):
+        parse_dashboard_proxy({"viewer_key_file": "/k/v", **extra})
+
+
+def _get(px, path, host):
+    conn = http.client.HTTPConnection("127.0.0.1", px.port, timeout=10)
+    try:
+        conn.request("GET", path, headers={"Host": host})
+        resp = conn.getresponse()
+        return resp.status, resp.read()
+    finally:
+        conn.close()

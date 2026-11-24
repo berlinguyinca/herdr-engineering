@@ -196,6 +196,17 @@ same-origin reverse proxy for browser traffic that adds the key server-side:
   write actions; `*` = one path segment, trailing `**` = the rest). Anything else is 403
   at the proxy. No `operator_key_file` = read-only dashboard.
 - A client-supplied `X-API-Key` / `X-Forwarded-*` is dropped; the browser never sees a key.
+- A browser write (a mutation carrying `Origin`) must be same-origin with the proxy: the `Origin` host must equal
+  the `Host` the proxy receives (or be listed in `public_hosts`), and `Sec-Fetch-Site`, when sent, must not be
+  cross-site; otherwise 403 before the operator key is attached. `X-Forwarded-Host` is not trusted. Reach the proxy
+  directly (tailnet name, IP, `tailscale serve` or the fabric gateway, which forward `Host` unchanged) and nothing
+  needs configuring. A front that rewrites `Host` (nginx without `proxy_set_header Host $http_host`, an ingress) makes
+  every browser write 403 until you either keep the browser's `Host` or list the public name in `public_hosts`.
+- Optional hardening (both keys unset by default, which keeps today's behaviour): `public_hosts` lists the
+  `host[:port]` names the browser uses; once set, any request (read or write) whose `Host` is not an IP literal,
+  `localhost` or listed is 403 (DNS rebinding), and a listed name is accepted as `Origin` even if the front rewrote
+  `Host`. `public_scheme: https` additionally requires the `Origin` scheme to match; set it when TLS is terminated in
+  front of the proxy.
 
 ```yaml
 control_plane:

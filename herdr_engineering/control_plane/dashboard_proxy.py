@@ -6,8 +6,11 @@ control plane answers every browser request with 401. This proxy sits in front o
 * GET/HEAD (static UI, JSON, SSE) are sent upstream with the ``viewer`` key;
 * a mutating request is sent with the ``operator`` key only when ``METHOD /path`` matches the configured allowlist
   (default: the dashboard's own write actions); every other mutation is refused here with 403;
-* a mutation from a browser must be same-origin with the proxy itself (Origin netloc == Host, Sec-Fetch-Site not
-  cross-site) before the operator key is attached, then goes upstream with an Origin the upstream accepts;
+* a mutation from a browser must be same-origin with the proxy itself (Origin netloc == Host or a configured
+  ``public_hosts`` entry, Origin scheme == ``public_scheme`` when set, Sec-Fetch-Site not cross-site) before the
+  operator key is attached, then goes upstream with an Origin the upstream accepts;
+* with ``public_hosts`` set, a request whose Host is neither an IP literal, localhost nor listed is refused 403
+  before any key is attached (DNS rebinding);
 * a client-supplied ``X-API-Key`` (and ``X-Forwarded-*``) is always dropped, the browser never sees a key.
 
 Configuration is YAML only (``control_plane.dashboard_proxy``); the keys are read from 0600 files.
@@ -63,9 +66,11 @@ _HOP_BY_HOP = frozenset({"connection", "keep-alive", "proxy-authenticate", "prox
 _NEVER_FORWARD = frozenset({"x-api-key", "host", "content-length", "x-forwarded-for", "x-forwarded-host",
                             "x-forwarded-proto", "forwarded", "x-real-ip"})
 _ORIGIN_SCHEMES = frozenset({"http", "https"})
+_DRAIN_LIMIT = 8 * 1024 * 1024   # a refused request's body is read up to this much, so the 403 is not a reset
 _MAX_BODY = 128 * 1024 * 1024
 _ALLOW_ENTRY = re.compile(r"^(POST|PUT|PATCH|DELETE) (/\S*)$")
-_SETTINGS_KEYS = frozenset({"viewer_key_file", "operator_key_file", "upstream", "operator_post_allowlist"})
+_SETTINGS_KEYS = frozenset({"viewer_key_file", "operator_key_file", "upstream", "operator_post_allowlist",
+                           "public_hosts", "public_scheme"})
 
 
 class ProxyConfigError(Exception):
@@ -78,6 +83,8 @@ class DashboardProxySettings:
     operator_key_file: str | None = None
     upstream: str = DEFAULT_UPSTREAM
     allowlist: tuple[str, ...] = DEFAULT_OPERATOR_POST_ALLOWLIST
+    public_hosts: tuple[str, ...] = ()
+    public_scheme: str | None = None
 
 
 def parse_dashboard_proxy(raw) -> DashboardProxySettings | None:
@@ -103,8 +110,14 @@ def parse_dashboard_proxy(raw) -> DashboardProxySettings | None:
     if not isinstance(allow, list) or not all(isinstance(v, str) and _ALLOW_ENTRY.match(v) for v in allow):
         raise ValueError("dashboard_proxy.operator_post_allowlist must be a list of 'METHOD /path' strings "
                          "(POST, PUT, PATCH or DELETE; * = one segment, trailing ** = the rest)")
+    hosts = raw.get("public_hosts", [])
+    if not isinstance(hosts, list) or not all(isinstance(h, str) and h.strip() and "/" not in h for h in hosts):
+        raise ValueError("dashboard_proxy.public_hosts must be a list of 'host[:port]' strings")
+    scheme = raw.get("public_scheme")
+    if scheme is not None and scheme not in _ORIGIN_SCHEMES:
+        raise ValueError("dashboard_proxy.public_scheme must be 'http' or 'https'")
     return DashboardProxySettings(viewer.strip(), operator.strip() if operator else None, upstream.rstrip("/"),
-                                  tuple(allow))
+                                  tuple(allow), tuple(h.strip().lower() for h in hosts), scheme)
 
 
 def read_key_file(path: str) -> str:
@@ -153,12 +166,15 @@ class DashboardProxy:
     """Threaded reverse proxy. ``serve()`` blocks; ``shutdown()`` stops it."""
 
     def __init__(self, upstream: str, *, viewer_key: str, operator_key: str | None,
-                 allowlist: tuple[str, ...], host: str = "0.0.0.0", port: int = 8081):
+                 allowlist: tuple[str, ...], host: str = "0.0.0.0", port: int = 8081,
+                 public_hosts: tuple[str, ...] = (), public_scheme: str | None = None):
         parts = urlsplit(upstream)
         self._scheme, self._up_host = parts.scheme, parts.hostname
         self._up_port = parts.port or (443 if parts.scheme == "https" else 80)
         self._up_netloc = parts.netloc
         self._viewer, self._operator, self._allowlist = viewer_key, operator_key, tuple(allowlist)
+        self._public_hosts = frozenset(h.lower() for h in public_hosts)
+        self._public_scheme = public_scheme
         self._ready = threading.Event()
         proxy = self
 
@@ -197,15 +213,34 @@ class DashboardProxy:
         return None, 405, "proxy: method not allowed"
 
 
-def cross_origin_refusal(method: str, origin: str | None, host: str | None, fetch_site: str | None) -> str | None:
-    """Why a browser mutation is not same-origin with the proxy (None when it is, or is not a mutation)."""
+def host_refusal(host: str | None, public_hosts: frozenset[str]) -> str | None:
+    """With ``public_hosts`` configured, why this Host is not one the proxy answers to (None when it is).
+
+    Mirrors the control plane's ``_dashboard_host_ok``: an IP literal, localhost or a listed name; a bare DNS name that
+    is not listed is what a DNS-rebinding page uses."""
+    if not public_hosts:
+        return None
+    from .api import _dashboard_host_ok
+    if host and _dashboard_host_ok(host, public_hosts):
+        return None
+    return "proxy: host not allowed"
+
+
+def cross_origin_refusal(method: str, origin: str | None, host: str | None, fetch_site: str | None,
+                         public_hosts: frozenset[str] = frozenset(), public_scheme: str | None = None) -> str | None:
+    """Why a browser mutation is not same-origin with the proxy (None when it is, or is not a mutation).
+
+    Behind a front that rewrites Host, the browser's Origin names the public host: list it in ``public_hosts``."""
     if method not in _MUTATING:
         return None
     if fetch_site is not None and fetch_site.strip().lower() not in {"same-origin", "none"}:
         return "proxy: cross-site write refused"
     if origin is not None:
         parts = urlsplit(origin)
-        if parts.scheme not in _ORIGIN_SCHEMES or not host or parts.netloc.lower() != host.lower():
+        netloc = parts.netloc.lower()
+        if parts.scheme not in _ORIGIN_SCHEMES or (public_scheme and parts.scheme != public_scheme):
+            return "proxy: cross-origin write refused"
+        if netloc not in public_hosts and (not host or netloc != host.lower()):
             return "proxy: cross-origin write refused"
     return None
 
@@ -228,15 +263,36 @@ def _make_handler(proxy: DashboardProxy):
             self.wfile.write(body)
             self.close_connection = True
 
+        def _refuse_unread(self, status: int, message: str) -> None:
+            """Refuse before the body was read: drain a bounded amount so the client reads the 403, not a reset."""
+            try:
+                remaining = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                remaining = 0
+            remaining = min(remaining, _DRAIN_LIMIT)
+            try:
+                while remaining > 0:
+                    chunk = self.rfile.read(min(remaining, 65536))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+            except OSError:
+                pass
+            self._refuse(status, message)
+
         def _forward(self) -> None:
             method = self.command
+            refusal = host_refusal(self.headers.get("Host"), proxy._public_hosts)
+            if refusal:
+                return self._refuse_unread(403, refusal)
             key, status, message = proxy.key_for(method, self.path)
             if key is None:
                 return self._refuse(status or 403, message)
             refusal = cross_origin_refusal(method, self.headers.get("Origin"), self.headers.get("Host"),
-                                           self.headers.get("Sec-Fetch-Site"))
+                                           self.headers.get("Sec-Fetch-Site"), proxy._public_hosts,
+                                           proxy._public_scheme)
             if refusal:
-                return self._refuse(403, refusal)
+                return self._refuse_unread(403, refusal)
             if self.headers.get("Transfer-Encoding"):
                 return self._refuse(411, "proxy: chunked request bodies are not supported")
             try:
@@ -307,4 +363,5 @@ def build_from_settings(settings: DashboardProxySettings, host: str, port: int) 
     viewer = read_key_file(settings.viewer_key_file)
     operator = read_key_file(settings.operator_key_file) if settings.operator_key_file else None
     return DashboardProxy(settings.upstream, viewer_key=viewer, operator_key=operator,
-                          allowlist=settings.allowlist, host=host, port=port)
+                          allowlist=settings.allowlist, host=host, port=port,
+                          public_hosts=settings.public_hosts, public_scheme=settings.public_scheme)
