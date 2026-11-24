@@ -939,9 +939,9 @@ def test_only_xdg_state_home_moves_the_trigger_ledger(
 ) -> None:
     """`XDG_STATE_HOME` moves the ledger; `HERDR_ENGINEERING_STATE` never touches it.
 
-    The two names look interchangeable and are not. `HERDR_ENGINEERING_STATE` is the *other*
-    mechanism's root: the directory holding `handoff context-hook` markers, read by
-    `_context_hook_warned()`. A probe that redirects it expecting to sandbox the ledger writes
+    The two names look interchangeable and are not. `HERDR_ENGINEERING_STATE` is another
+    root (the subagent registry and the handoff controller keep their state there; the retired
+    `handoff context-hook` kept its markers there). A probe that redirects it expecting to sandbox the ledger writes
     straight to the operator's real `$XDG_STATE_HOME/herdr-engineering/handoff-autopilot.json`
     and spends a trigger for a session that never happened - and that file is the audit record
     of when the machine took over on its own, the one artifact `uninstall` deliberately keeps.
