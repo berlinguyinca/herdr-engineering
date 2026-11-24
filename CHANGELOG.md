@@ -5,6 +5,13 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: gateway lease and pipe bug-hunt findings
+
+- `FabricGateway.op_register` validates every lease `routes[].host` with `validate_target_host` (same SSRF rule as `target_host`), including re-registration of an existing lease id.
+- `rewriting_pipe` (TLS / header-rewrite path) is bounded: the request head must arrive within the inactivity timeout, both sockets get TCP keepalive (also on accepted clients in `_proxy_one`), and the pumps end on whole-connection idleness.
+- `proxy_pair` / `prefixed_pipe` use one shared inactivity clock for both directions and no longer half-close the peer on a recv timeout, so healthy one-way streams (SSE, downloads) are not cut at 30 s / 70 s.
+- `DevServiceRegistry.heartbeat` refuses to revive an expired lease whose external port was re-allocated (the agent re-registers); idempotent `register` refreshes `expires_at`, moves a lapsed lease off a taken port, and runs under the registry lock.
+
 ### Feature: periodic `herdr-handoff reap --apply` timer (opt-in, off by default)
 
 - `herdr-eng handoff-reap {run,status}` and `scripts/install-handoff-reap.sh` install a systemd user timer (Linux) or LaunchAgent (macOS) that closes panes replaced by confirmed handoffs, including those whose `confirm` was refused because the source pane was still working. Wired into `scripts/install.sh` (step 7f2) and, for Linux fleet hosts, `ansible/tasks/handoff-reap.yml` (`site.yml`, `fleet-sync.yml`).

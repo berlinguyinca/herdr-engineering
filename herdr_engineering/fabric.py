@@ -32,7 +32,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from .devfabric import DevServiceRegistry, proxy_pair, route_and_pipe
+from .devfabric import DevServiceRegistry, enable_keepalive, proxy_pair, route_and_pipe
 from .errors import ConflictError, UnreachableError
 from .fabric_named import AcceptBackoff
 
@@ -259,6 +259,7 @@ class GatewayRouter:
                 except OSError:
                     pass
                 return
+        enable_keepalive(client)
         client, tls = self._terminate_tls(client)
         if client is None:
             return
@@ -646,6 +647,11 @@ class FabricGateway:
     def op_register(self, body: dict[str, Any]) -> dict[str, Any]:
         from .fabric_urls import validate_target_host
         validate_target_host(str(body.get("target_host", "")), self.allowed_target_networks)
+        # Route hosts are connect targets too: same SSRF rules as the lease target.
+        routes = body.get("routes")
+        for route in routes if isinstance(routes, list) else ():
+            host = route.get("host") if isinstance(route, dict) else getattr(route, "host", None)
+            validate_target_host(str(host or ""), self.allowed_target_networks)
         lease = self.registry.register(
             target_machine_id=body["target_machine_id"],
             target_host=body["target_host"],
