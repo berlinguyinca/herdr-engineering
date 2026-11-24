@@ -41,7 +41,7 @@ def _no_real_host_config(monkeypatch):
     hc.reset_host_config()
 
     def _unavailable():
-        raise hc.HostConfigUnavailable("no host configuration in tests")
+        raise hc.HostConfigUnavailable("no host configuration in tests", permanent=True)
 
     monkeypatch.setattr(hc, "host_config", _unavailable)
     yield

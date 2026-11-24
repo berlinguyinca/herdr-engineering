@@ -945,6 +945,26 @@ if [ ! -e "$PIPELINES_DIR" ]; then
   mkdir -p "$(dirname "$PIPELINES_DIR")" && mkdir -m 755 "$PIPELINES_DIR"
 fi
 check_pipelines_dir || exit 1
+# the fabric control-API token directory (mounted read-only into fabric-gateway and herdr-web): create it 0700 so
+# docker does not create it root-owned. It may stay empty during the --allow-open rollout.
+# (scripts/fabric-stack.sh up does the same before its compose run.)
+check_fabric_token_dir() {   # create it 0700 when missing, then verify it; never prints token content
+  local d="$HOME/.config/herdr-engineering/fabric-gateway" mode
+  if [ ! -e "$d" ] && [ ! -L "$d" ]; then
+    mkdir -p "$(dirname "$d")" && mkdir -m 700 "$d" || return 1
+  fi
+  if [ -L "$d" ] || [ ! -d "$d" ]; then
+    echo "$d (the fabric-gateway token mount) must be a real directory (not a symlink or a file)" >&2; return 1
+  fi
+  if [ "$(stat -c %u "$d")" != "$(id -u)" ]; then
+    echo "$d (the fabric-gateway token mount) must be owned by the deploying user (uid $(id -u)); docker creates it root-owned when it is missing at compose time" >&2; return 1
+  fi
+  mode="$(stat -c %a "$d")"
+  if [ "$mode" != 700 ]; then
+    echo "$d (the fabric-gateway token mount) must be mode 0700 (it is $mode): chmod 700 $d" >&2; return 1
+  fi
+}
+check_fabric_token_dir || exit 1
 
 # The fabric-gateway bind-mounts this at /fabric-local (host-local route files). Create it as the deploying user
 # first: otherwise docker creates it root-owned and `scripts/fabric-stack.sh memory-route enable` cannot write to it.

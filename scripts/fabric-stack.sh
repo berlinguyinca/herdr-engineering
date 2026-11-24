@@ -32,6 +32,23 @@ warn() { printf '\033[1;33mWARN: %s\033[0m\n' "$*" >&2; }
 command -v docker >/dev/null || { echo "docker is required" >&2; exit 1; }
 command -v tailscale >/dev/null || { echo "tailscale is required (to discover the tailnet IP)" >&2; exit 1; }
 
+check_fabric_token_dir() {   # create it 0700 when missing, then verify it; never prints token content
+  local d="$HOME/.config/herdr-engineering/fabric-gateway" mode
+  if [ ! -e "$d" ] && [ ! -L "$d" ]; then
+    mkdir -p "$(dirname "$d")" && mkdir -m 700 "$d" || return 1
+  fi
+  if [ -L "$d" ] || [ ! -d "$d" ]; then
+    echo "$d (the fabric-gateway token mount) must be a real directory (not a symlink or a file)" >&2; return 1
+  fi
+  if [ "$(stat -c %u "$d")" != "$(id -u)" ]; then
+    echo "$d (the fabric-gateway token mount) must be owned by the deploying user (uid $(id -u)); docker creates it root-owned when it is missing at compose time" >&2; return 1
+  fi
+  mode="$(stat -c %a "$d")"
+  if [ "$mode" != 700 ]; then
+    echo "$d (the fabric-gateway token mount) must be mode 0700 (it is $mode): chmod 700 $d" >&2; return 1
+  fi
+}
+
 write_env() {
     local ip
     ip="$(tailscale ip -4 | head -1)"
@@ -97,6 +114,9 @@ ensure_local_dir() {   # the gateway bind-mounts it; if docker made it, it is ro
 
 up() {
     ensure_local_dir
+    # The compose file bind-mounts the token directory read-only into fabric-gateway and herdr-web; docker would
+    # create a missing source root-owned 0755, and nothing would fix it afterwards.
+    check_fabric_token_dir || exit 1
     write_env
     gen_coredns
     "${COMPOSE[@]}" build fabric-gateway
@@ -159,7 +179,11 @@ status() {
     say "hindsight memory (optional profile):"
     memory_status
     say "gateway healthz:"
-    curl -fsS "http://127.0.0.1:29999/healthz" || echo "(unreachable)"
+    local tokfile="${HERDR_ENGINEERING_FABRIC_TOKEN_FILE:-$HOME/.config/herdr-engineering/fabric-token}" auth=()
+    if [ -r "$tokfile" ] && [ -s "$tokfile" ]; then   # the full payload needs the bearer; without it only the minimal reply
+        auth=(-H "Authorization: Bearer $(tr -d '[:space:]' <"$tokfile")")
+    fi
+    curl -fsS "${auth[@]}" "http://127.0.0.1:29999/healthz" || echo "(unreachable)"
     echo
     say "coredns dev.lan resolution (local):"
     if command -v dig >/dev/null; then
