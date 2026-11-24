@@ -171,7 +171,7 @@ def db_row(ev):
 
 INSERT_ROW = ("INSERT INTO fabric_events (event_id, sequence, event_type, entity_type, entity_id, session_id, payload,"
               " source_timestamp, ingest_timestamp) VALUES ($1,$2,$3,'inspector',$4,$4,$5::jsonb,$6,$7)")
-_LOOP = asyncio.new_event_loop()      # one loop for the module: an asyncpg connection belongs to the loop that opened it
+_LOOP: asyncio.AbstractEventLoop | None = None      # the running test's loop: an asyncpg connection belongs to the loop that opened it
 
 
 class RealLog:
@@ -222,12 +222,16 @@ def pg_dsn(tmp_path_factory):
 @pytest.fixture
 def pg(pg_dsn):
     import asyncpg
-    conn = _LOOP.run_until_complete(asyncpg.connect(pg_dsn))
-    _LOOP.run_until_complete(conn.execute("TRUNCATE fabric_events, inspector_snapshots"))
+    global _LOOP
+    _LOOP = loop = asyncio.new_event_loop()
+    conn = loop.run_until_complete(asyncpg.connect(pg_dsn))
+    loop.run_until_complete(conn.execute("TRUNCATE fabric_events, inspector_snapshots"))
     try:
         yield RealLog(conn)
     finally:
-        _LOOP.run_until_complete(conn.close())
+        loop.run_until_complete(conn.close())
+        loop.close()
+        _LOOP = None
 
 
 def writer_of(**kw):
@@ -256,7 +260,6 @@ def run(coro):
     return _LOOP.run_until_complete(coro)
 
 
-@pytest.mark.integration
 def test_writer_snapshot_then_boot_equals_full_replay_and_advances(pg):
     rows = [db_row(e) for e in stream(500, seed=11)]
     conn = pg
@@ -272,7 +275,6 @@ def test_writer_snapshot_then_boot_equals_full_replay_and_advances(pg):
     assert run(writer.tick(conn)) == "unchanged"
 
 
-@pytest.mark.integration
 def test_a_new_writer_resumes_from_the_stored_snapshot(pg):
     rows = [db_row(e) for e in stream(300, seed=2)]
     conn = pg
@@ -283,7 +285,6 @@ def test_a_new_writer_resumes_from_the_stored_snapshot(pg):
     assert booted(conn, rows) == ("snapshot", full_state(rows))
 
 
-@pytest.mark.integration
 def test_boot_replays_everything_when_the_log_below_the_watermark_changed(pg):
     rows = [db_row(e) for e in stream(300, seed=4)]
     conn = pg
@@ -297,7 +298,6 @@ def test_boot_replays_everything_when_the_log_below_the_watermark_changed(pg):
     assert outcome.startswith("full:") and state == full_state(all_rows)
 
 
-@pytest.mark.integration
 def test_boot_replays_everything_when_the_snapshot_is_unusable(monkeypatch, pg):
     rows = [db_row(e) for e in stream(200, seed=6)]
     conn = pg
@@ -315,14 +315,12 @@ def test_boot_replays_everything_when_the_snapshot_is_unusable(monkeypatch, pg):
     assert outcome.startswith("full:") and state == full_state(rows)     # a changed redaction rule re-sanitises everything
 
 
-@pytest.mark.integration
 def test_no_snapshot_is_a_plain_full_replay(pg):
     rows = [db_row(e) for e in stream(120, seed=8)]
     pg.add(rows)
     assert booted(pg, rows) == ("full:no snapshot", full_state(rows))
 
 
-@pytest.mark.integration
 def test_writer_rebuilds_when_it_finds_it_missed_an_event(pg):
     rows = [db_row(e) for e in stream(250, seed=9)]
     conn = pg
@@ -336,7 +334,6 @@ def test_writer_rebuilds_when_it_finds_it_missed_an_event(pg):
     assert booted(conn, logged) == ("snapshot", full_state(logged))
 
 
-@pytest.mark.integration
 def test_writer_never_raises_into_the_worker(pg):
     run(pg.execute("ALTER TABLE inspector_snapshots RENAME TO inspector_snapshots_away"))     # the table does not exist
     try:
@@ -345,7 +342,6 @@ def test_writer_never_raises_into_the_worker(pg):
         run(pg.execute("ALTER TABLE inspector_snapshots_away RENAME TO inspector_snapshots"))
 
 
-@pytest.mark.integration
 def test_writer_waits_between_runs(pg):
     conn = pg
     conn.add([db_row(e) for e in stream(40, seed=1)])
@@ -355,7 +351,6 @@ def test_writer_waits_between_runs(pg):
     assert run(writer.tick(conn)) == "waiting"
 
 
-@pytest.mark.integration
 def test_repo_boot_uses_the_snapshot_and_matches_a_full_boot(pg):
     from herdr_engineering.control_plane.repo import ControlPlaneRepo
     rows = [db_row(e) for e in stream(300, seed=12)]
@@ -398,7 +393,6 @@ def skipped_boot(rows, saved, *, backfill=True):
     return outcome, canon(s.export_state())
 
 
-@pytest.mark.integration
 def test_boot_without_the_covered_rows_equals_a_full_replay(pg):
     rows = [db_row(e) for e in stream(400, seed=31)]
     conn = pg
@@ -407,7 +401,6 @@ def test_boot_without_the_covered_rows_equals_a_full_replay(pg):
     assert skipped_boot(rows, conn.saved) == ("snapshot", full_state(rows))
 
 
-@pytest.mark.integration
 def test_a_refused_snapshot_loads_the_skipped_rows_and_still_equals_a_full_replay(monkeypatch, pg):
     rows = [db_row(e) for e in stream(300, seed=32)]
     conn = pg
@@ -418,7 +411,6 @@ def test_a_refused_snapshot_loads_the_skipped_rows_and_still_equals_a_full_repla
     assert outcome.startswith("full:") and state == full_state(rows)
 
 
-@pytest.mark.integration
 def test_a_refused_snapshot_without_a_way_to_load_the_skipped_rows_refuses_to_start(monkeypatch, pg):
     rows = [db_row(e) for e in stream(200, seed=33)]
     conn = pg

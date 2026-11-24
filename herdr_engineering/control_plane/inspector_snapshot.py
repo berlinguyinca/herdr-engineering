@@ -34,9 +34,10 @@ _VALID = "entity_type = 'inspector' AND entity_id IS NOT NULL AND entity_id <> '
 _LIVE = "fabric_events"
 # Rows the archive job moved out of fabric_events still count toward a snapshot's event_count, so a full rebuild reads both.
 _WITH_ARCHIVE = f"(SELECT {_COLUMNS} FROM fabric_events UNION ALL SELECT {_COLUMNS} FROM fabric_events_archive) AS fe"
-# A row can sit in both tables for a moment (the archive job copies before it deletes). The page queries stay a plain
-# ordered merge of the two tables so both indexes serve them, and the reader drops the adjacent copy (see _first_of_each);
-# only the covered count, which has no ordering to protect, anti-joins against the live table.
+# No writer leaves a row in both tables: the archive job and fabric_compaction each move rows in one statement (DELETE ...
+# RETURNING feeding the INSERT). A hand-made copy (an operator's restore) still must not be replayed twice, so the page queries
+# stay a plain ordered merge of the two tables (both indexes serve them) and the reader drops the adjacent copy (see
+# _first_of_each); the rebuild's own covered count anti-joins against the live table, the per-tick and boot counts do not.
 _NOT_LIVE = ("NOT EXISTS (SELECT 1 FROM fabric_events f WHERE f.entity_type = 'inspector' "
              "AND f.sequence = a.sequence AND f.event_id = a.event_id)")
 
@@ -141,19 +142,21 @@ def parse_inspector_snapshots(raw) -> dict:
     return {"enabled": enabled, "interval_seconds": float(interval)}
 
 
-async def archived_inspector_count(conn, watermark: int) -> int:
-    """Inspector rows the archive job moved out of ``fabric_events`` at or below ``watermark``. The snapshot consumed them,
-    so they count toward its ``event_count``; 0 when the archive table does not exist."""
+async def archived_inspector_count(conn, watermark: int, *, distinct: bool = False) -> int:
+    """Inspector rows moved out of ``fabric_events`` into the archive at or below ``watermark``. The snapshot consumed them,
+    so they count toward its ``event_count``; 0 when the archive table does not exist. ``distinct`` leaves out the rows that
+    are also still in ``fabric_events`` (a copy no job makes; a rebuild, which replays such a row once, counts that way)."""
     if not await conn.fetchval("SELECT to_regclass('fabric_events_archive') IS NOT NULL"):
         return 0
-    return int(await conn.fetchval(f"SELECT count(*) FROM fabric_events_archive a WHERE {_VALID} AND a.sequence <= $1 "
-                                   f"AND {_NOT_LIVE}", int(watermark)))
+    anti = f"AND {_NOT_LIVE}" if distinct else ""
+    return int(await conn.fetchval(f"SELECT count(*) FROM fabric_events_archive a WHERE {_VALID} AND a.sequence <= $1 {anti}",
+                                   int(watermark)))
 
 
 def _cursor_of(state: dict) -> tuple[int, str] | None:
     """The (sequence, event_id) a stored snapshot says it consumed up to; None for one written without it."""
     cursor = state.get("cursor")
-    if isinstance(cursor, list) and len(cursor) == 2 and isinstance(cursor[0], int) and isinstance(cursor[1], str):
+    if isinstance(cursor, list) and len(cursor) == 2 and type(cursor[0]) is int and isinstance(cursor[1], str):
         return cursor[0], cursor[1]
     return None
 
@@ -247,10 +250,7 @@ class SnapshotWriter:
         except SnapshotStale as exc:
             log.warning("inspector snapshot restarts from the full log: %s", exc)
             return await self._rebuild(conn)
-        covered = await conn.fetchval(f"SELECT count(*) FROM fabric_events WHERE {_VALID} AND sequence <= $1 "
-                                      "AND ingest_timestamp < now() - make_interval(secs => $2)",
-                                      shadow.replay_watermark, self.settle)
-        covered = int(covered) + await archived_inspector_count(conn, shadow.replay_watermark)
+        covered = await self._covered(conn, shadow.replay_watermark)
         if int(covered) != shadow.replay_count:
             log.warning("inspector snapshot missed or lost events (%s stored, %s consumed); rebuilding", covered, shadow.replay_count)
             return await self._rebuild(conn)
@@ -262,8 +262,14 @@ class SnapshotWriter:
         if row is not None:
             try:
                 state = decode(row["body"])
+                cursor = _cursor_of(state)
+                if cursor is None:
+                    # Written before the cursor existed. The in-order replay of that code keyed rows by sequence alone, so a
+                    # snapshot it wrote can have fed one of two same-millisecond rows twice and dropped the other with the
+                    # count still right; the only way to tell is to replay once and write one that carries the cursor.
+                    raise SnapshotStale("stored snapshot has no cursor; rebuilding once")
                 shadow.load_state(state)
-                self._cursor = _cursor_of(state)
+                self._cursor = cursor
                 return shadow
             except (SnapshotStale, OSError, EOFError, ValueError, TypeError, KeyError) as exc:
                 log.warning("stored inspector snapshot ignored: %s", exc)
@@ -279,7 +285,7 @@ class SnapshotWriter:
         abandons the streaming pass for :meth:`_replay_in_order`."""
         self._shadow = shadow = self._make_store()
         self._cursor = None
-        fetched = 0
+        fetched, cutoff = 0, None
         try:
             async for page in self._pages(conn, -1, archived=True):
                 await asyncio.to_thread(shadow.hydrate_delta, page)
@@ -288,17 +294,25 @@ class SnapshotWriter:
             log.warning("inspector snapshot rebuild is out of replay order across pages (%s); replaying the log in one pass", exc)
             self._shadow = shadow = self._make_store()
             self._cursor = None
-            fetched = await self._replay_in_order(conn, shadow)
-        covered = await conn.fetchval(f"SELECT count(*) FROM fabric_events WHERE {_VALID} AND sequence <= $1 "
-                                      "AND ingest_timestamp < now() - make_interval(secs => $2)",
-                                      shadow.replay_watermark, self.settle)
-        covered = int(covered) + await archived_inspector_count(conn, shadow.replay_watermark)
+            fetched, cutoff = await self._replay_in_order(conn, shadow)
+        covered = await self._covered(conn, shadow.replay_watermark, cutoff, distinct=True)
         if int(covered) != shadow.replay_count:
             self._shadow, self._cursor = None, None
             return "rebuild did not match the stored log; nothing written"
         return await self._write(conn, shadow, fetched)
 
-    async def _replay_in_order(self, conn, shadow: InspectorStore) -> int:
+    async def _covered(self, conn, watermark: int, cutoff=None, *, distinct: bool = False) -> int:
+        """Settled inspector rows at or below ``watermark``, archived ones included. ``cutoff`` is the fixed time a replay read
+        with; without it, rows settle by age at the time of the query."""
+        if cutoff is None:
+            live = await conn.fetchval(f"SELECT count(*) FROM fabric_events WHERE {_VALID} AND sequence <= $1 "
+                                       "AND ingest_timestamp < now() - make_interval(secs => $2)", watermark, self.settle)
+        else:
+            live = await conn.fetchval(f"SELECT count(*) FROM fabric_events WHERE {_VALID} AND sequence <= $1 "
+                                       "AND ingest_timestamp < $2", watermark, cutoff)
+        return int(live) + await archived_inspector_count(conn, watermark, distinct=distinct)
+
+    async def _replay_in_order(self, conn, shadow: InspectorStore) -> tuple[int, object]:
         """Replay the whole log in exact replay order with bounded memory per row held.
 
         The order is the store's own Python key (``_replay_order``: a clamped receive time with a timestamp fallback), which
@@ -306,7 +320,7 @@ class SnapshotWriter:
         packed key (:class:`_OrderKeys`, about 28 bytes a row: a 10M-row log is roughly 280 MB, where a tuple with the event_id
         was 2-3 GB), then the rows are fetched ``_PAGE`` at a time in key order by fabric sequence and hydrated. Both passes
         read the rows settled before one cutoff, so they see the same log. Ties on the key keep (sequence, event_id) order.
-        Returns the rows replayed."""
+        Returns the rows replayed and that cutoff, which the caller counts the log with."""
         keys = _OrderKeys(_PAGE)
         source = await _source(conn, True)
         cutoff = await conn.fetchval("SELECT now() - make_interval(secs => $1)", self.settle)
@@ -345,7 +359,7 @@ class SnapshotWriter:
             batch = [by_key[w] for w in wanted if w in by_key]
             await asyncio.to_thread(shadow.hydrate, batch)
             replayed += len(batch)
-        return replayed
+        return replayed, cutoff
 
     async def _row_pages(self, conn, after: int, archived: bool = False, cursor: tuple[int, str] | None = None):
         """Raw inspector rows newer than ``after`` (or than the ``cursor`` pair, which also takes the rest of a sequence tie),

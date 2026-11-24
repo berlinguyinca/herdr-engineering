@@ -436,11 +436,9 @@ def _with_real_log(tmp_path, scenario):
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("strip_cursor", [False, True], ids=["cursor", "snapshot-without-cursor"])
-def test_an_incremental_tick_takes_a_row_that_ties_the_watermark_on_sequence(tmp_path, caplog, strip_cursor):
+def test_an_incremental_tick_takes_a_row_that_ties_the_watermark_on_sequence(tmp_path, caplog):
     """The row shares the last consumed sequence and sorts later on event_id. Resuming from (watermark + 1, "") skips it
-    and only the count check notices; resuming from the consumed (sequence, event_id) pair takes it incrementally. A
-    snapshot written without the pair still loads, and falls back to the count check."""
+    and only the count check notices; resuming from the consumed (sequence, event_id) pair takes it incrementally."""
     rows = tied(stream(120, seed=4), width=1)
     ingest = ingest_of(rows)
     last = rows[-1]["sequence"]
@@ -450,13 +448,7 @@ def test_an_incremental_tick_takes_a_row_that_ties_the_watermark_on_sequence(tmp
         await insert(conn, rows, ingest)
         writer = snap.SnapshotWriter(make_store, interval=0, settle=-10**9)
         assert (await writer.tick(conn)).startswith("written")
-        if strip_cursor:
-            state = snap.decode(await conn.fetchval("SELECT body FROM inspector_snapshots WHERE id = 1"))
-            state.pop("cursor")
-            await conn.execute("UPDATE inspector_snapshots SET body = $1 WHERE id = 1", snap.encode(state))
-            writer = snap.SnapshotWriter(make_store, interval=0, settle=-10**9)
-        else:
-            assert writer._cursor == (last, rows[-1]["event_id"])
+        assert writer._cursor == (last, rows[-1]["event_id"])
         await insert(conn, [late], ingest_of([late]))
         first = writer._shadow
         with caplog.at_level("WARNING"):
@@ -467,10 +459,67 @@ def test_an_incremental_tick_takes_a_row_that_ties_the_watermark_on_sequence(tmp
     assert outcome.startswith("written"), outcome
     reference = full_replay([*rows, late], lambda e: ingest_of(rows)(e) if e is not late else ingest_of([late])(e))
     assert canon(writer._shadow.export_state()) == canon(reference.export_state())
-    if strip_cursor:
-        assert "missed or lost events" in caplog.text
-    else:
-        assert "missed or lost events" not in caplog.text and writer._shadow is first
+    assert "missed or lost events" not in caplog.text and writer._shadow is first
+
+
+@pytest.mark.integration
+def test_a_snapshot_without_a_cursor_is_replaced_by_one_full_rebuild(tmp_path, caplog):
+    """Main's in-order replay keyed rows by sequence alone: with two rows in one millisecond it fed one twice and dropped
+    the other, and the count still matched. Such a snapshot has no cursor, and must not stay trusted."""
+    rows = tied(stream(120, seed=4), width=2)
+    ingest = ingest_of(rows)
+    correct = full_replay(rows, ingest)
+    streams, _ = _rebuild_events([{**r, "entity_type": "inspector", "ingest_timestamp": ingest(r)} for r in rows])
+    events = [e for s in streams.values() for e in s]
+    ordered = sorted(events, key=make_store()._replay_order)
+    k = next(i for i in range(1, len(ordered)) if ordered[i]["sequence"] == ordered[i - 1]["sequence"]
+             and ordered[i]["payload"] != ordered[i - 1]["payload"])
+    buggy_events = [*ordered[:k], {**ordered[k - 1]}, *ordered[k + 1:]]      # one fed twice, its tie partner dropped
+    buggy = make_store()
+    buggy.hydrate(buggy_events)
+    assert (buggy.replay_count, buggy.replay_watermark) == (correct.replay_count, correct.replay_watermark)
+    assert canon(buggy.export_state()) != canon(correct.export_state())
+    state = buggy.export_state()
+    assert "cursor" not in state
+
+    async def scenario(conn):
+        await insert(conn, rows, ingest)
+        await conn.execute("INSERT INTO inspector_snapshots (id, schema_version, fingerprint, watermark, event_count, body)"
+                           " VALUES (1, $1, $2, $3, $4, $5)", state["version"], state["fingerprint"], state["watermark"],
+                           state["count"], snap.encode(state))
+        writer = snap.SnapshotWriter(make_store, interval=0, settle=-10**9)
+        with caplog.at_level("WARNING"):
+            outcome = await writer.tick(conn)
+        stored = snap.decode(await conn.fetchval("SELECT body FROM inspector_snapshots WHERE id = 1"))
+        return writer, outcome, stored
+
+    writer, outcome, stored = _with_real_log(tmp_path, scenario)
+    assert outcome.startswith("written"), outcome
+    assert "has no cursor" in caplog.text and "cursor" in stored
+    assert canon(writer._shadow.export_state()) == canon(correct.export_state())
+
+
+@pytest.mark.integration
+def test_the_in_order_replay_hands_back_the_cutoff_it_read_with_and_the_count_uses_it(tmp_path):
+    """A row that settles after the replay's cutoff is counted by a query at now() but was not replayed: counting with the
+    replay's cutoff is what keeps a correct in-order rebuild from reporting a mismatch."""
+    rows = tied(stream(80, seed=5), width=2)
+    base = datetime.now(UTC)
+    ingest = lambda e: base.replace(year=base.year - 1)      # noqa: E731
+
+    async def scenario(conn):
+        await insert(conn, rows, ingest)
+        writer = snap.SnapshotWriter(make_store, interval=0, settle=0)
+        shadow = make_store()
+        replayed, cutoff = await writer._replay_in_order(conn, shadow)
+        await conn.execute(INSERT, "settled-late", 1, "inspector.message", "s1",
+                           json.dumps({"kind": "message", "role": "user", "text": "late"}), datetime.now(UTC), datetime.now(UTC))
+        return (replayed, shadow.replay_count, await writer._covered(conn, shadow.replay_watermark, cutoff, distinct=True),
+                await writer._covered(conn, shadow.replay_watermark))
+
+    replayed, count, at_cutoff, by_age = _with_real_log(tmp_path, scenario)
+    assert replayed == count == at_cutoff
+    assert by_age == at_cutoff + 1
 
 
 @pytest.mark.integration
