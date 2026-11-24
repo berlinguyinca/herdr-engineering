@@ -5,6 +5,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Feat: `templates/ci-merge-defaults`, the "CI does the merging" defaults as a repo-agnostic template
+
+- `integrate-main.sh` (kept byte-identical to `scripts/ci/integrate-main.sh` by a test), Woodpecker `pr-gate.yml` and `main-gate.yml` snippets, and a README covering adoption plus the GitHub settings (`strict` off, required contexts, allow auto-merge, `gh pr merge --auto --squash`, `CHANGELOG.md merge=union`). Tested against real throwaway git repositories (`tests/test_ci_merge_defaults_template.py`).
 ### Agent rules: push work branches and open PRs autonomously
 
 - `AGENTS.md` and the managed `SessionStart` reminder no longer require an explicit per-message ask before pushing herdr-engineering or opening a PR. Agents push their own work branches and open PRs themselves; pushing `main` and force-pushing or pushing someone else's branch stay forbidden (the reminder says so). The managed `PreToolUse` guard matches: a plain herdr-engineering push of a non-main branch is allowed, while force/destructive pushes (`-f`, `--force*`, `--mirror`, `--delete`/`-d`, `--prune`, `+` or `:branch` refspecs) still need the one-shot human token, including in the untokenizable-command fallback. Push to main/master stays denied.
