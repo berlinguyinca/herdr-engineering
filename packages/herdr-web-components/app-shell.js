@@ -87,7 +87,7 @@ export class HerdrAppShell extends HTMLElement {
   // {count, critical}; null or a zero count removes it. Updated in place so focus and an open menu survive.
   setBadge(path, badge) {
     const count = badge && Number.isFinite(badge.count) && badge.count > 0 ? Math.floor(badge.count) : 0;
-    if (count) this._badges.set(path, { count, critical: Number(badge.critical) > 0 });
+    if (count) this._badges.set(path, { count, critical: Number.isFinite(Number(badge.critical)) && Number(badge.critical) > 0 ? Math.floor(Number(badge.critical)) : 0 });
     else this._badges.delete(path);
     const link = [...this.shadowRoot.querySelectorAll('.hd-shell__link')].find((a) => a.getAttribute('data-path') === path);
     if (!link) return;
