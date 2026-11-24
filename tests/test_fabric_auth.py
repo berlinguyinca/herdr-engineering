@@ -3,6 +3,7 @@ import json
 import os
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 import pytest
 
@@ -605,3 +606,83 @@ def test_the_startup_banner_value_is_closed_for_a_tokenless_gateway_that_is_not_
         assert gw.control_auth == "closed"
     finally:
         gw.stop()
+
+
+# -- review round 4 ---------------------------------------------------------------------------------------------------
+
+def test_a_client_with_a_failed_host_config_fetch_talks_to_an_open_gateway_without_a_bearer(tmp_path, monkeypatch):
+    from herdr_engineering.fabric import reset_fabric_token_cache
+    monkeypatch.setattr(_hc, "host_config", _REAL_HOST_CONFIG)
+    reset_fabric_token_cache()
+    _enrol_host(tmp_path, "http://127.0.0.1:1")               # host.json, control plane unreachable, no cache
+    gw = _gw(tmp_path, allow_open=True)
+    try:
+        assert gw.control_auth == "unreadable" or gw.control_auth == "open"
+        gw2 = _gw(tmp_path / "o", allow_open=True, token="")  # an explicitly open gateway
+        try:
+            assert read_fabric_token(strict=False) is None
+            assert FabricClient(f"http://127.0.0.1:{gw2.control_port}").list() is not None
+        finally:
+            gw2.stop()
+        with pytest.raises(OSError):
+            read_fabric_token()                                # the gateway itself still fails closed
+    finally:
+        gw.stop()
+        reset_fabric_token_cache()
+
+
+def test_promote_and_demote_reset_the_standby_and_unauthorised_counters(tmp_path):
+    gw = _gw(tmp_path, token="t", auto_ha=False)
+    try:
+        gw._standby_cycles, gw._unauth_cycles = 5, 5
+        gw.promote()
+        assert (gw._standby_cycles, gw._unauth_cycles) == (0, 0)
+        gw._standby_cycles, gw._unauth_cycles = 5, 5
+        gw.demote()
+        assert (gw._standby_cycles, gw._unauth_cycles) == (0, 0)
+    finally:
+        gw.stop()
+
+
+@pytest.mark.parametrize("peer_auth,expect", [("closed", "active"), ("unreadable", "active"), ("token", "standby")])
+def test_a_tokened_standby_takes_over_from_an_active_peer_that_is_not_tokened(tmp_path, peer_auth, expect):
+    gw = _gw(tmp_path, token="t", node_id="zz", promote_after=1, auto_ha=False)
+    try:
+        gw.demote()
+        gw.peer_unauthorised = True
+        gw.peer_info = {"role": "active", "epoch": 1, "node_id": "aa", "auth": peer_auth}
+        for _ in range(3):
+            gw._ha_step_unauthorised()
+        assert gw.role == expect
+    finally:
+        gw.stop()
+
+
+def test_follow_config_builds_the_client_without_pinning_the_host_config_token():
+    import inspect
+    src = inspect.getsource(cli)
+    assert "FabricClient(new_base, fab[1] or None)" not in src
+
+
+def test_a_gateway_that_rejects_the_token_counts_as_configured_or_reachable(tmp_path, monkeypatch, capsys):
+    gw = _gw(tmp_path, token="sekrit")
+    try:
+        import herdr_engineering.config as config
+        monkeypatch.setattr(config, "load_config", lambda: {})
+        monkeypatch.setattr(cli, "load_config", lambda: {}, raising=False)
+        monkeypatch.setenv("HERDR_ENGINEERING_FABRIC_TOKEN", "wrong")
+        monkeypatch.setattr("herdr_engineering.fabric.gateway_url_from_config", lambda *_a, **_k: None)
+        import herdr_engineering.fabric as fabric
+        orig = fabric.FabricClient.__init__
+        monkeypatch.setattr(fabric.FabricClient, "__init__",
+                            lambda self, url, token=None, **k: orig(self, f"http://127.0.0.1:{gw.control_port}", token, **k))
+        assert cli._gateway_configured_or_reachable() is True
+        assert "token" in capsys.readouterr().err
+    finally:
+        gw.stop()
+
+
+def test_fabric_stack_status_sends_the_bearer_when_a_token_file_exists():
+    text = (Path(__file__).parent.parent / "scripts" / "fabric-stack.sh").read_text()
+    status = text[text.index("status() {"):text.index("down()")]
+    assert "Authorization: Bearer" in status

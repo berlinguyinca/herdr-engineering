@@ -153,7 +153,11 @@ status() {
     say "hindsight memory (optional profile):"
     memory_status
     say "gateway healthz:"
-    curl -fsS "http://127.0.0.1:29999/healthz" || echo "(unreachable)"
+    local tokfile="${HERDR_ENGINEERING_FABRIC_TOKEN_FILE:-$HOME/.config/herdr-engineering/fabric-token}" auth=()
+    if [ -r "$tokfile" ] && [ -s "$tokfile" ]; then   # the full payload needs the bearer; without it only the minimal reply
+        auth=(-H "Authorization: Bearer $(tr -d '[:space:]' <"$tokfile")")
+    fi
+    curl -fsS "${auth[@]}" "http://127.0.0.1:29999/healthz" || echo "(unreachable)"
     echo
     say "coredns dev.lan resolution (local):"
     if command -v dig >/dev/null; then

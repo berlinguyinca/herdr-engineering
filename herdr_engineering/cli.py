@@ -2741,8 +2741,13 @@ def _gateway_configured_or_reachable() -> bool:
     if url:
         return True  # configured (even if currently unreachable)
     # Not configured: check if one is somehow reachable (e.g. via env override)
+    from .fabric import TokenNotAccepted, TokenUnreadable
     try:
         FabricClient("http://127.0.0.1:29999").healthz()
+        return True
+    except (TokenNotAccepted, TokenUnreadable) as exc:
+        print(f"herdr-eng: a fabric gateway is reachable but this host's token does not work with it: {exc}",
+              file=sys.stderr, flush=True)
         return True
     except Exception:
         return False
@@ -3936,7 +3941,7 @@ def _cmd_dev_agent(args) -> int:
         if fab == seen["fabric"] and cp == seen["cp"] and key == seen["key"]:
             return
         new_base = gateway_url_from_config(cfg, fabric_url=fab[0] or "") or base
-        agent.retarget(FabricClient(new_base, fab[1] or None), cp, key)
+        agent.retarget(FabricClient(new_base), cp, key)
         seen["fabric"], seen["cp"], seen["key"] = fab, cp, key
 
     try:

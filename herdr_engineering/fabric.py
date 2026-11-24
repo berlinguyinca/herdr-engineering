@@ -139,7 +139,8 @@ def read_fabric_token(*, strict: bool = True) -> str | None:
     directory where the file should be, a symlink, a mode wider than 0600, non-UTF-8 content, a failed
     host-config fetch) raises ``OSError`` so callers fail closed instead of treating it as "no token".
     ``strict=False`` (clients) warns once about a token file with a wide mode and falls through to host config
-    instead of raising; the gateway stays strict."""
+    instead of raising, and a failed host-config fetch means "no token" (no bearer is sent); the gateway stays
+    strict."""
     env = os.environ.get(_FABRIC_TOKEN_ENV, "").strip()
     if env:
         return env
@@ -155,7 +156,12 @@ def read_fabric_token(*, strict: bool = True) -> str | None:
         from_file = None
     if from_file:
         return from_file
-    return _host_config_token()
+    try:
+        return _host_config_token()
+    except OSError:
+        if strict:
+            raise
+        return None      # a client with no token sends no bearer and lets the gateway decide
 
 
 def _is_ip_literal(host: str) -> bool:
@@ -662,11 +668,13 @@ class FabricGateway:
         self.epoch += 1
         self.role = "active"
         self._peer_failures = 0
+        self._unauth_cycles = self._standby_cycles = 0
         self.registry.renew_all()
         self._sync_router()
 
     def demote(self) -> None:
         self.role = "standby"
+        self._unauth_cycles = self._standby_cycles = 0
         self._sync_router()
 
     def _ha_step(self) -> None:
@@ -723,8 +731,11 @@ class FabricGateway:
                 if peer_tokened and not self.token or not self._wins_against(info):
                     self.demote()                    # tokenless yields to tokened; otherwise epoch, then node id
             return
-        if peer_role != "standby":
-            self._unauth_cycles = 0                  # peer active, or unknown (our own token unreadable): wait
+        if peer_role == "active" and info.get("auth") == "token":
+            self._unauth_cycles = 0                  # a tokened active peer keeps serving: wait
+            return
+        if peer_role not in ("standby", "active"):
+            self._unauth_cycles = 0                  # unknown (our own token unreadable): wait
             return
         self._unauth_cycles += 1
         if not self.token:
@@ -1259,7 +1270,7 @@ class FabricClient:
 
     def healthz(self) -> dict[str, Any]:
         """The gateway's full health payload. A gateway answers a missing or wrong token with only
-        ``{"ok": ...}`` (so the container healthcheck needs no token); that is "reachable, but not
+        ``ok``, ``role``, ``epoch``, ``node_id`` and ``auth`` (so the container healthcheck needs no token); that is "reachable, but not
         authorised", not healthy, so it raises."""
         health = self._req("GET", "/healthz")
         if "bound_ports" not in health:

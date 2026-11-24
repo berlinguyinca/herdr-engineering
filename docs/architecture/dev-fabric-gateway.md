@@ -55,11 +55,12 @@ close|list`).
   `--allow-open` is passed. Precedence is env var, then the token file (re-read per request,
   must be a regular file, not a symlink, mode 0600, UTF-8), then host config `fabric.token`
   (re-fetched every 300 s; a failed fetch fails closed, it never reads as "no token").
+  A token file at the default path beats host-config `fabric.token`: remove stale files before a rollout.
   Replace the file atomically (temp file, then rename). Superseded tokens stay valid for an
   hour, so rotation does not revoke a leaked token for that hour: for an emergency, restart
   the gateway (the previous-token list lives in memory only). An unreadable file (not merely
   missing) fails closed and the startup banner reports `control_auth: "unreadable"`.
-  `/healthz` answers `{"ok": ...}` without a token; `FabricClient.healthz()` treats that as
+  `/healthz` answers `ok`, `role`, `epoch`, `node_id`, `auth` (no ports, leases or tokens) without a token; `FabricClient.healthz()` treats that as
   "token not accepted" (`TokenNotAccepted`), which is different from "down": in an HA pair a
   peer that is reachable but rejects our token (or a node that cannot read its own token) is never
   counted toward `promote_after`; `/healthz` also gives `role`, `epoch`, `node_id` and `auth`
