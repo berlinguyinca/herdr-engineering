@@ -1496,3 +1496,68 @@ def test_forwarder_stop_releases_port_immediately():
             probe.listen(1)  # fails with EADDRINUSE while the old listener lives
         finally:
             probe.close()
+
+
+def test_incomplete_scan_does_not_release_leases(tmp_path, monkeypatch):
+    """An empty, incomplete scan (ss timed out) is not evidence services are gone."""
+    gw = _FakeGateway()
+    server, port = _http_target(tmp_path)
+    live: dict = {"inv": fa.ListenerInventory(_listeners({port: "testapp"}), complete=True)}
+    monkeypatch.setattr(fa, "scan_listening_ports", lambda: live["inv"])
+    agent = _agent(tmp_path, gw)
+    try:
+        agent.scan_once()
+        lease_id = next(lease["id"] for lease in gw.leases.values()
+                        if lease["target"]["port"] == port)
+        live["inv"] = fa.ListenerInventory(complete=False)  # failed scan
+        summary = agent.scan_once()
+        assert summary["closed"] == []
+        assert lease_id not in gw.closed
+        assert str(port) in _store(tmp_path)
+        live["inv"] = fa.ListenerInventory(complete=True)  # genuinely gone
+        server.shutdown()
+        agent.scan_once()
+        assert lease_id in gw.closed
+    finally:
+        agent.stop()
+        gw.stop()
+
+
+def test_restore_failure_drops_entry_so_it_is_readopted(tmp_path, monkeypatch):
+    """A remembered forward port that cannot be rebound must not leave a forwarder-less entry."""
+    gw = _FakeGateway()
+    server, port = _http_target(tmp_path)
+    import herdr_engineering.fabric_agent as fa_mod
+
+    real_tcp_open = fa_mod.tcp_open
+    monkeypatch.setattr(
+        fa_mod, "tcp_open",
+        lambda host, p, timeout=1.0: False if p == port else real_tcp_open(host, p, timeout))
+    monkeypatch.setattr(fa, "scan_listening_ports",
+                        lambda: _listeners({port: "testapp"}))
+    agent = _agent(tmp_path, gw)
+    blocker = None
+    try:
+        agent.scan_once()
+        old_fwd = _store(tmp_path)[str(port)]["fwd_port"]
+        old_lease = _store(tmp_path)[str(port)]["lease_id"]
+        agent.stop()
+        blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        blocker.bind(("127.0.0.1", old_fwd))  # another process took the port
+        blocker.listen(1)
+        agent2 = _agent(tmp_path, gw)
+        try:
+            assert port not in agent2._forwards
+            assert str(port) not in agent2._store
+            assert old_lease in gw.closed
+            agent2.scan_once()
+            entry = _store(tmp_path)[str(port)]
+            assert entry["fwd_port"] != old_fwd
+            assert port in agent2._forwards
+        finally:
+            agent2.stop()
+    finally:
+        if blocker:
+            blocker.close()
+        server.shutdown()
+        gw.stop()
