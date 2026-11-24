@@ -17,6 +17,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - Gateway-less renewal: a lease moved to a new port restarts its forwarder (`enroll --serve`, `enroll-dir --serve`), `devfabric heartbeat` re-registers like the serve loops, and `heartbeat`/re-register reload the store first so a port another CLI process took is seen. `HERDR_GATEWAY_RESPONSE_TIMEOUT` must be finite and positive, else the 300 s default applies.
 - `enroll --serve` tracks the bound port itself (`_renew_serving_origin`) instead of comparing against the enroll-time lease object, so a lease that moved port restarts its forwarder once, not every 30 s cycle.
 - `DevServiceRegistry.reload_if_changed` checks, reads and swaps under the registry lock and keeps in-memory health fields, so a threaded gateway cannot lose a lease to an older read. `enroll-dir --serve` renewal logs and retries a forwarder that failed to bind (the moved port is recorded only once bound) and one lease that cannot be re-registered no longer stops the others renewing. `--route` help and docs say route hosts must be IP literals or localhost.
+### Fix: fabric agent no longer drops every lease on a failed listener scan
+
+- `scan_once` ignored `ListenerInventory.complete`, so one timed-out or failed `ss`/`lsof` (an empty inventory) released every lease and stopped every forwarder, and the next cycle re-adopted them with new leases. A port is now treated as gone only on a complete scan.
+- At startup, a remembered forward port that cannot be rebound (or whose forwarder fails to start) now drops the store entry and closes its lease, so the next scan re-adopts the service with a working forwarder instead of advertising a dead URL.
 
 ### Fix: web packages bug-hunt (collaboration sign-in/out, room polling, composer, member routes, nav badge)
 

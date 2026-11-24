@@ -37,3 +37,19 @@ test('connectEvents reports contact for keepalives but never delivers them as ev
   assert.equal(contacts, 4);
   assert.deepEqual(events.map((e) => e.event_type), ['SessionUpdated']);
 });
+
+test('freshness text splits into a short state label and a ticking detail, and the label only changes with the state', async () => {
+  const { freshnessParts } = await import('../freshness.js');
+  const base = { ago: 'updated 3s ago', error: null, detail: '', waiting: false };
+  const a = freshnessParts({ ...base, state: 'fresh' });
+  const b = freshnessParts({ ...base, ago: 'updated 4s ago', state: 'fresh' });
+  assert.equal(a.label, 'live');
+  assert.equal(a.label, b.label, 'ticking the age never changes the announced label');
+  assert.notEqual(a.rest, b.rest);
+  assert.equal(a.label + a.rest, 'live · updated 3s ago');
+  assert.equal(freshnessParts({ ...base, state: 'stale', detail: 'partial' }).label, 'stale');
+  const err = freshnessParts({ ...base, state: 'error', error: 'boom' });
+  assert.equal(err.label + err.rest, 'error · boom · updated 3s ago');
+  const wait = freshnessParts({ ...base, state: 'fresh', waiting: true });
+  assert.equal(wait.label + wait.rest, 'waiting for first update');
+});
