@@ -330,3 +330,21 @@ test('expanded keyboard editing, indentation and previews never submit implicitl
   assert.deepEqual(await input.evaluate((el) => [el.selectionStart, el.selectionEnd]), [4,7]);
   assert.deepEqual(await page.evaluate(() => window.sent), []);
 }));
+
+test('a message delivered after the composer was disposed mid-send is not kept as a draft', async () => withComposer(async (page) => {
+  await page.evaluate(() => {
+    window.mount({ onSend: (text) => new Promise((resolve) => { window.release = () => { window.sent.push({ text }); resolve({ status: 'delivered' }); }; }) });
+  });
+  const input = page.getByRole('combobox', { name: 'Message' });
+  await input.fill('ship it');
+  await input.press('Enter');
+  await page.waitForFunction(() => typeof window.release === 'function');
+  await page.evaluate(() => { window.composer.dispose(); });      // the user navigated away before the POST returned
+  assert.equal(await page.evaluate(() => sessionStorage.getItem('herdr.conversation.draft:test-draft')), 'ship it');   // saved on the way out
+  await page.evaluate(() => window.release());
+  await page.waitForFunction(() => window.sent.length === 1);
+  await page.waitForTimeout(100);
+  assert.equal(await page.evaluate(() => sessionStorage.getItem('herdr.conversation.draft:test-draft')), null);
+  await page.evaluate(() => window.mount());                       // coming back shows an empty composer
+  assert.equal(await input.inputValue(), '');
+}));

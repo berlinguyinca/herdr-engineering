@@ -10,15 +10,16 @@ was ingested.
 """
 from __future__ import annotations
 
+import contextlib
 import copy
 import json
 import logging
 import secrets
 import threading
+import time
 from collections.abc import Callable
-from dataclasses import asdict
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import datetime
 from typing import Any
 
@@ -28,10 +29,20 @@ from .agent_identity import (
     AgentIdentityRegistry,
     AgentIdentityVersionConflict,
 )
-from .bridge import _LoopRunner, _rebuild_events
+from .bridge import _LoopRunner, _rebuild_events, env_seconds
 from .events import V2_COLUMNS, Event, EventStore
 
 log = logging.getLogger(__name__)
+
+#: Bounds on the sink's one database connection (seconds); override with the named environment variable.
+SINK_CONNECT_TIMEOUT_S = 5.0     # HERDR_CP_SINK_CONNECT_TIMEOUT_S: opening the connection
+SINK_COMMAND_TIMEOUT_S = 10.0    # HERDR_CP_SINK_COMMAND_TIMEOUT_S: one statement
+SINK_WAIT_TIMEOUT_S = 15.0       # HERDR_CP_SINK_WAIT_TIMEOUT_S: the caller's wait; above the two, so they fire first
+#: After a failed write, best-effort writes are skipped (counted as dropped) for this long, so a hung database costs
+#: the repo's event lock one timeout, not one per event. HERDR_CP_SINK_RETRY_COOLDOWN_S (0 disables).
+SINK_RETRY_COOLDOWN_S = 5.0
+SINK_TERMINATE_TIMEOUT_S = 2.0   # waiting for the loop to terminate a discarded connection
+SINK_LOG_INTERVAL_S = 30.0       # at most one failure log line per interval
 
 
 def _parse_dt(value: Any) -> datetime:
@@ -86,46 +97,153 @@ class DurableEventSink:
                  run: Callable | None = None,
                  events_table: str = "fabric_events"):
         if run is None:
-            run = _LoopRunner().run
+            runner = _LoopRunner()
+            wait = env_seconds("HERDR_CP_SINK_WAIT_TIMEOUT_S", SINK_WAIT_TIMEOUT_S)
+            run = lambda coro: runner.run(coro, timeout=wait)  # noqa: E731
+            self._terminate_run = lambda coro: runner.run(coro, timeout=SINK_TERMINATE_TIMEOUT_S)  # noqa: E731
+        else:
+            self._terminate_run = run
         self._dsn = dsn
         self._conn = conn
         self._run = run
         self._events_table = events_table
         self._store = EventStore(conn, table=events_table)
         self._write_lock = threading.RLock()
+        self._stats_lock = threading.Lock()
+        self._failed = 0
+        self._dropped = 0
+        self._last_failure_mono: float | None = None
+        self._last_failure_wall: str | None = None
+        self._last_failure_reason: str | None = None
+        self._last_success_wall: str | None = None
+        self._failing_since_success = False
+        self._retry_after = 0.0
+        self._next_log = 0.0
+        self._suppressed = 0
+
+    # ---------------------------------------------------------- failure visibility
+    def write_health(self) -> dict:
+        """Counters for health: failed durable writes, events dropped from the best-effort path, the last failure.
+
+        The reason is the exception class and a category only (never a message), so no DSN or credential can reach it."""
+        with self._stats_lock:
+            # degraded until a write succeeds: elapsed time alone proves nothing about the database
+            return {"degraded": self._failing_since_success, "failed_writes": self._failed, "dropped_events": self._dropped,
+                    "last_failure_at": self._last_failure_wall, "last_failure_reason": self._last_failure_reason,
+                    "last_success_at": self._last_success_wall}
+
+    def _note_success(self) -> None:
+        with self._stats_lock:
+            self._failing_since_success = False
+            self._last_success_wall = datetime.now().astimezone().isoformat(timespec="seconds")
+
+    def _note_failure(self, exc: BaseException, what: str) -> None:
+        if isinstance(exc, TimeoutError):
+            category = "timeout"
+        elif isinstance(exc, OSError) or type(exc).__module__.startswith("asyncpg"):
+            category = "database"
+        else:
+            category = "error"
+        reason = f"{category}: {type(exc).__name__}"
+        now = time.monotonic()
+        with self._stats_lock:
+            self._failed += 1
+            self._failing_since_success = True
+            self._last_failure_mono = now
+            self._last_failure_wall = datetime.now().astimezone().isoformat(timespec="seconds")
+            self._last_failure_reason = reason
+            self._retry_after = now + env_seconds("HERDR_CP_SINK_RETRY_COOLDOWN_S", SINK_RETRY_COOLDOWN_S, allow_zero=True)
+            emit = now >= self._next_log
+            suppressed = self._suppressed
+            if emit:
+                self._next_log, self._suppressed = now + SINK_LOG_INTERVAL_S, 0
+            else:
+                self._suppressed += 1
+        if emit:
+            log.warning("durable sink failed to persist %s (%s); %d earlier failures not logged",
+                        what, reason, suppressed)
+
+    def _discard_connection(self) -> None:
+        """Drop a connection whose state is unknown (a timed-out or failed command); the next write reconnects."""
+        conn = self._store._conn
+        if not self._dsn or conn is None:
+            return                      # an injected connection cannot be reopened
+
+        async def terminate():
+            conn.terminate()            # on the loop: asyncio transports are not thread-safe
+        try:
+            self._terminate_run(terminate())
+        except Exception:               # noqa: BLE001 - already unusable
+            pass
+        self._conn = None
+        self._store = EventStore(None, table=self._events_table)
+
+    def _call(self, coro):
+        """Run on the loop; a timeout or lost connection discards the connection before the error propagates."""
+        try:
+            return self._run(coro)
+        except (TimeoutError, OSError, ConnectionError):
+            self._discard_connection()
+            raise
+        except Exception as exc:        # noqa: BLE001
+            if type(exc).__module__.startswith("asyncpg") and "onnection" in type(exc).__name__:
+                self._discard_connection()
+            raise
 
     def _ensure_store(self) -> None:
         conn = self._store._conn
         closed = getattr(conn, "is_closed", None)
         if self._dsn and (conn is None or (callable(closed) and closed())):
             import asyncpg
-            self._conn = self._run(asyncpg.connect(self._dsn))
+            self._conn = self._call(asyncpg.connect(
+                self._dsn, timeout=env_seconds("HERDR_CP_SINK_CONNECT_TIMEOUT_S", SINK_CONNECT_TIMEOUT_S),
+                command_timeout=env_seconds("HERDR_CP_SINK_COMMAND_TIMEOUT_S", SINK_COMMAND_TIMEOUT_S)))
             self._store = EventStore(self._conn, table=self._events_table)
 
     def record(self, ev: dict) -> None:
-        """Persist one event. Best-effort: never raises, never breaks the repo."""
+        """Persist one event. Best-effort: never raises, never breaks the repo.
+
+        While the database is failing, writes are skipped for a short cooldown (counted as dropped) so the caller,
+        which holds the repo's event lock, is not made to wait out a timeout per event."""
+        with self._stats_lock:
+            skip = time.monotonic() < self._retry_after
+            if skip:
+                self._dropped += 1
+        if skip:
+            return
         try:
             self.record_required(ev)
-        except Exception:
-            log.exception("durable sink failed to persist event %s",
-                          ev.get("event_id"))
+        except Exception:               # noqa: BLE001 - already counted and logged by record_required
+            with self._stats_lock:
+                self._dropped += 1
 
     def record_required(self, ev: dict) -> dict | None:
         """Persist a command receipt, propagating failure before side effects."""
+        try:
+            result = self._write_event(ev)
+        except (EventAlreadyStored, AgentIdentityConflict, ValueError):
+            raise                       # a duplicate or a rejected request, not a failed write (conflicts are ValueErrors)
+        except Exception as exc:
+            self._note_failure(exc, f"event {ev.get('event_id')}")
+            raise
+        self._note_success()
+        return result
+
+    def _write_event(self, ev: dict) -> dict | None:
         # The synchronous web server has concurrent request threads; asyncpg
         # permits one operation per connection, including reconnection.
         with self._write_lock:
             self._ensure_store()
             if ev.get("entity_type") == "agent_identity":
-                return self._run(self._record_agent_identity(ev))
+                return self._call(self._record_agent_identity(ev))
             event = _dict_to_event(ev)
             if (event.entity_type in {"scheduler_reservation", "scheduler_lease", "scheduler_observation"}
                     or event.event_type == "HostPolicyChanged"):
-                event = replace(event, sequence=self._run(self._store.next_sequence(
+                event = replace(event, sequence=self._call(self._store.next_sequence(
                     event.entity_type, event.entity_id)))
             # append() returns False only for an existing event_id; any write
             # error propagates from here unchanged.
-            if not self._run(self._store.append(event)):
+            if not self._call(self._store.append(event)):
                 raise EventAlreadyStored(
                     "durable event insert was not acknowledged "
                     "(event_id already stored)")
@@ -192,23 +310,26 @@ class DurableEventSink:
         with self._write_lock:
             self._ensure_store()
             conn = self._store._conn
-            self._run(conn.execute("BEGIN"))
+            self._call(conn.execute("BEGIN"))
             try:
-                self._run(conn.execute("SELECT pg_advisory_xact_lock(724965310221)"))
-                rows = self._run(conn.fetch(
+                self._call(conn.execute("SELECT pg_advisory_xact_lock(724965310221)"))
+                rows = self._call(conn.fetch(
                     f"SELECT DISTINCT ON (entity_id) payload FROM {self._events_table} "
                     "WHERE entity_type='scheduler_reservation' "
                     "ORDER BY entity_id, sequence DESC"))
                 yield [json.loads(row["payload"]) if isinstance(row["payload"], str)
                        else dict(row["payload"]) for row in rows]
-                self._run(conn.execute("COMMIT"))
-            except BaseException:
-                self._run(conn.execute("ROLLBACK"))
+                self._call(conn.execute("COMMIT"))
+            except BaseException as exc:
+                if self._store._conn is conn and not isinstance(exc, TimeoutError):
+                    # best effort: a failing rollback must not mask the original error
+                    with contextlib.suppress(Exception):
+                        self._call(conn.execute("ROLLBACK"))
                 raise
 
     def scheduler_leases(self):
         """Read latest lease state while the caller holds the admission lock."""
-        rows = self._run(self._store._conn.fetch(
+        rows = self._call(self._store._conn.fetch(
             f"SELECT DISTINCT ON (entity_id) entity_id, payload FROM {self._events_table} "
             "WHERE entity_type='scheduler_lease' ORDER BY entity_id, sequence DESC"))
         return {row["entity_id"]: json.loads(row["payload"]) if isinstance(row["payload"], str)
@@ -216,7 +337,7 @@ class DurableEventSink:
 
     def scheduler_observations(self):
         """Latest token-bound host facts, read under the admission transaction."""
-        rows = self._run(self._store._conn.fetch(
+        rows = self._call(self._store._conn.fetch(
             f"SELECT DISTINCT ON (entity_id) entity_id, payload FROM {self._events_table} "
             "WHERE entity_type='scheduler_observation' ORDER BY entity_id, sequence DESC"))
         return {row["entity_id"]: json.loads(row["payload"]) if isinstance(row["payload"], str)
@@ -224,7 +345,7 @@ class DurableEventSink:
 
     def scheduler_policies(self):
         """Read authoritative policies while the caller holds admission lock."""
-        rows = self._run(self._store._conn.fetch(
+        rows = self._call(self._store._conn.fetch(
             f"SELECT DISTINCT ON (entity_id) entity_id, payload FROM {self._events_table} "
             "WHERE entity_type='host' AND event_type='HostPolicyChanged' "
             "AND NOT (payload ? '_envelope') "
@@ -236,15 +357,21 @@ class DurableEventSink:
         """(source, source_sequence) of this principal's stored event, or None when absent."""
         with self._write_lock:
             self._ensure_store()
-            return self._run(self._store.identity(event_id, actor_id))
+            return self._call(self._store.identity(event_id, actor_id))
 
     def record_source_state(self, state: dict) -> None:
         """Best-effort upsert of per-source ingest state (fabric_event_sources)."""
         import json
+        with self._stats_lock:
+            skip = time.monotonic() < self._retry_after
+            if skip:
+                self._dropped += 1
+        if skip:
+            return
         try:
             with self._write_lock:
                 self._ensure_store()
-                self._run(self._store._conn.execute(
+                self._call(self._store._conn.execute(
                     "INSERT INTO fabric_event_sources "
                     "(source_actor, source, last_sequence, last_seen_at, gaps) VALUES ($1,$2,$3,$4,$5) "
                     "ON CONFLICT (source_actor, source) DO UPDATE SET "
@@ -252,14 +379,17 @@ class DurableEventSink:
                     "last_seen_at=EXCLUDED.last_seen_at, gaps=EXCLUDED.gaps",
                     state.get("actor") or "", state["source"], state["last_sequence"],
                     _parse_dt(state["last_seen_at"]), json.dumps(state["gaps"])))
-        except Exception:
-            log.exception("durable sink failed to persist source state %s",
-                          state.get("source"))
+        except Exception as exc:
+            self._note_failure(exc, f"source state {state.get('source')}")
 
 
     def prune_events_before(self, entity_type: str, cutoff: datetime) -> None:
         """Delete one entity type's durable events older than ``cutoff`` (retention)."""
-        with self._write_lock:
-            self._ensure_store()
-            self._run(self._store._conn.execute(
-                prune_events_sql(self._events_table), entity_type, cutoff))
+        try:
+            with self._write_lock:
+                self._ensure_store()
+                self._call(self._store._conn.execute(
+                    prune_events_sql(self._events_table), entity_type, cutoff))
+        except Exception as exc:
+            self._note_failure(exc, f"retention prune of {entity_type}")
+            raise
