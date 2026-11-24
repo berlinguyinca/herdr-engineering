@@ -37,6 +37,7 @@ from ..version import __version__
 from .artifact_acl import is_agent_collaborator
 from .artifacts import ArtifactConflict, ArtifactError
 from .browser_guard import browser_write_refusal, host_ok
+from .rakazo_bridge import RakazoBridge
 from .envelope import EnvelopeConflict
 from .events import SequenceCollision
 from .federation import kind_for_role
@@ -2217,6 +2218,10 @@ def _make_handler(server, public=False, operator=False, fabric=False):
             method (``writes``) also refuses cross-origin / cross-site browser requests and non-JSON browser
             bodies. Agents and the CLI send no Origin, so they only need a Host the operator listed."""
             path = self._path_only()
+            if server.rakazo is None and RakazoBridge.handles(self.path):
+                # Bridge off: its routes do not exist, whoever asks (a phone app sends Origin: rakazo://).
+                self._send_json(404, {"error": "not found"})
+                return True
             if path in _BROWSER_GUARD_EXEMPT or path in _DEPLOYMENT_ACTION_PATHS:
                 # Deployment actions run their own audited Host/Origin refusal (the audit row and counter).
                 return False
