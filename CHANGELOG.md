@@ -9,6 +9,11 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 - `herdr_artifact_host` housekeeping gains a `versions` duty: superseded versions (once a newer one is `version_grace`, default 1 h, old) and every version of a retracted or tombstoned artifact are marked `purged`, and the blobs only they used are deleted (row and file) under publish's per-sha lock. The current version of a live artifact, `legal_hold` artifacts, versions a pending or live share points at, and blobs a kept version still names are never touched. Before this, publishing repeatedly or deleting an artifact left every old blob on the volume while the quota counted only the current version, so one member could fill the disk. The orphan-blob sweep now ignores purged versions' manifests. `SweepReport` gains `versions_purged`.
 - `SyncedDirectory.groups` returns no groups for an account listed under `disabled` in `members.json` (the sync still lists it under its group), so a disabled account's member session and agent tokens are refused on the next recheck instead of waiting for housekeeping's revocation pass.
+### Fix: Slack approval of unseen text, calendar block-list alias, Rakazo first-bot cache
+
+- Slack ask: the Approve buttons are only offered when the command is shown in full; a long (truncated) command gets Deny only and a "cannot be approved from Slack" note, and an approve tap on such an ask is refused (`not_fully_shown`).
+- `CalendarPolicy`: blocking both `primary` and the primary's real id no longer blocks every other calendar.
+- Rakazo bridge: the first-bot cache is keyed by `(tenant, user)`, so two spaces of one account no longer share a cached bot id.
 
 ### Feature: periodic `herdr-handoff reap --apply` timer (opt-in, off by default)
 
