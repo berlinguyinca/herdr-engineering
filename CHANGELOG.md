@@ -14,6 +14,11 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - A failed send on one pump direction no longer stops the opposite direction, so an origin that answers early and closes still has its response delivered; ETIMEDOUT from TCP keepalive is no longer mistaken for a poll timeout, and TCP keepalive idle is 15 s (was 60 s, longer than the idle timeout).
 - `rewriting_pipe` waits up to `HERDR_GATEWAY_RESPONSE_TIMEOUT` seconds (default 300) for the origin's response head and answers 504 on expiry; local (gateway-less) lease renewal re-registers a lease whose port was re-allocated.
 
+### Fix: assistant store snapshot loading, ordering and locking
+
+- `PostgresStoreBackend.load()` no longer turns a failed read into "no snapshot": it raises `StoreLoadError`, so a control plane that boots while Postgres is unreachable fails startup instead of running with an empty store whose first mutation overwrote the stored snapshot.
+- Backend snapshot writes are numbered under the store lock and written one at a time; a slow older write can no longer land after a newer snapshot.
+- The store's list/search methods, `request_tool_action`'s idempotency scan and `list_approvals` read the shared dicts under the store lock (no more `dictionary changed size during iteration`), and `decide_approval` is atomic, so two concurrent decisions on one approval cannot both pass the pending check.
 ### Fix: Slack approval of unseen text, calendar block-list alias, Rakazo first-bot cache
 
 - Slack ask: the Approve buttons are only offered when the command is shown in full; a long (truncated) command gets Deny only and a "cannot be approved from Slack" note, and an approve tap on such an ask is refused (`not_fully_shown`).
