@@ -272,16 +272,19 @@ def resolve_plan_revision(explicit: str | None = None, pin: Path | None = None) 
     return pinned
 
 
-def delta_targets(store, revision, targets) -> list:
-    """Targets not covered by any completed plan for `revision`.
+def delta_targets(store, revision, targets, *, abandoned_covers=False) -> list:
+    """Targets not covered by any settled plan for `revision`.
 
     A host added to the inventory after a plan settled is in none of that plan's hosts, so
-    the settled plan alone would never roll the new host out. Abandoned plans cover nothing.
+    the settled plan alone would never roll the new host out. By default an abandoned plan
+    covers nothing; with `abandoned_covers` the operator's decision to stop rolling its hosts
+    is respected, so only hosts no settled plan ever named count as uncovered.
     """
+    settled = ("complete", "abandoned") if abandoned_covers else ("complete",)
     covered = {
         host
         for plan in list_rollouts(store)
-        if plan["revision"] == revision and plan.get("status") == "complete"
+        if plan["revision"] == revision and plan.get("status") in settled
         for host in plan["hosts"]
     }
     return [t for t in targets if t["host"] not in covered]
@@ -326,12 +329,42 @@ def abandon_rollout(store, rollout_id, *, reason: str = "abandoned by operator")
     return plan
 
 
-def prune_settled(store, *, older_than_days: int = 30, now=None) -> list:
+def _coverage_keepers(plans, revisions) -> set:
+    """IDs of the fewest newest-first settled plans whose hosts cover everything the settled
+    plans of `revisions` cover: the record `delta_targets` infers coverage from."""
+    keep = set()
+    for revision in revisions:
+        ordered = sorted(
+            (
+                p
+                for p in plans
+                if p["revision"] == revision and p.get("status") in ("complete", "abandoned")
+            ),
+            key=lambda p: (p.get("createdAt", ""), p["id"]),
+            reverse=True,
+        )
+        chosen, covered = [], set()
+        for plan in ordered:  # newest first: prefer the freshest record that adds a host
+            if not set(plan["hosts"]) <= covered:
+                chosen.append(plan)
+                covered |= set(plan["hosts"])
+        for plan in list(chosen):  # drop what later picks made redundant
+            others = set().union(*(set(o["hosts"]) for o in chosen if o is not plan))
+            if set(plan["hosts"]) <= others:
+                chosen.remove(plan)
+        keep |= {plan["id"] for plan in chosen}
+    return keep
+
+
+def prune_settled(store, *, older_than_days: int = 30, now=None, keep_revisions=()) -> list:
     """Delete settled (complete/abandoned) plans older than the horizon; return what left.
 
     Unsettled plans are never touched: a blocked rollout may be the operator's next action,
     and only a deliberate abandon marks it done. A settled record whose settle time is
-    unreadable is kept, never guessed. The horizon is bounded: a negative one would delete
+    unreadable is kept, never guessed. For each revision in `keep_revisions` (the pin), the
+    settled plans that together record which hosts were covered are kept however old: pruning
+    them would make a later small delta plan look like the whole fleet and re-roll it. The
+    horizon is bounded: a negative one would delete
     every settled record (losing the abandon audit trail), and an absurd one overflows.
     """
     if not 0 <= older_than_days <= 3650:
@@ -340,8 +373,10 @@ def prune_settled(store, *, older_than_days: int = 30, now=None) -> list:
     cutoff = now - timedelta(days=older_than_days)
     pruned = []
     with store.lock():
-        for plan in list_rollouts(store):
-            if plan.get("status") not in ("complete", "abandoned"):
+        plans = list_rollouts(store)
+        protected = _coverage_keepers(plans, set(keep_revisions))
+        for plan in plans:
+            if plan.get("status") not in ("complete", "abandoned") or plan["id"] in protected:
                 continue
             # An abandoned plan's audit window starts when it was abandoned, not when it
             # was created: judging it by createdAt would delete a freshly-abandoned old

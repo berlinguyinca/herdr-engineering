@@ -2987,3 +2987,29 @@ def test_dirty_release_filenames_never_read_as_an_offline_marker(tmp_path):
     wire.stage = Wire().stage
     again = apply(store, plan, wire)
     assert "blockCode" not in again["hosts"]["bender"]
+
+
+def test_prune_keeps_the_settled_plans_that_cover_the_pinned_revision(tmp_path):
+    """Pruning the old full plan would make a small later delta plan look like the whole fleet."""
+    from datetime import UTC, datetime
+
+    from herdr_engineering.fleet_rollout import RolloutStore, delta_targets, prune_settled
+
+    store = RolloutStore(tmp_path / "state")
+    full = _make_plan(store, SHA, status="complete", created_at="2026-08-01T00:00:00+00:00",
+                      hosts=("a", "b"))
+    redundant = _make_plan(store, SHA, status="complete", created_at="2026-08-02T00:00:00+00:00",
+                           hosts=("a",))
+    _make_plan(store, SHA, status="complete", created_at="2026-11-20T00:00:00+00:00",
+               hosts=("c",))
+    other = _make_plan(store, "d" * 40, status="complete", created_at="2026-08-01T00:00:00+00:00")
+    pruned = prune_settled(store, older_than_days=30, now=datetime(2026, 11, 24, tzinfo=UTC),
+                           keep_revisions={SHA})
+    assert {p["id"] for p in pruned} == {redundant["id"], other["id"]}
+    assert (store.root / (full["id"] + ".json")).exists()
+    current = [{"host": h, "sshTarget": h, "port": 22, "local": False} for h in "abc"]
+    assert delta_targets(store, SHA, current) == []
+    # Without the pin's protection the old behaviour is still available.
+    again = prune_settled(store, older_than_days=30, now=datetime(2026, 11, 24, tzinfo=UTC))
+    assert {p["id"] for p in again} == {full["id"]}
+    assert [t["host"] for t in delta_targets(store, SHA, current)] == ["a", "b"]

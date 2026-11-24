@@ -280,24 +280,45 @@ absent from the native inventory is treated as transient, not as a missing-sessi
 
 ## Correctness rules
 
-- **Offline detection** uses the staging return code (4, 124, 255) and the controller's own
-  typed errors only. Playbook output is never searched, because every Ansible recap contains
-  `unreachable=0`.
+- **Offline detection** uses the staging return code (4, 124, 255) and whole ssh transport
+  phrases (`Network is unreachable`, `Host is unreachable`, `No route to host`,
+  `Connection timed out`, ...) in the error text the controller recorded. Playbook output is
+  never searched, because every Ansible recap contains `unreachable=0`. A dirty-release block
+  (`blockCode: managed_release_dirty`) is never classified offline: its text carries remote
+  file names.
 - **Stale herdr registration.** When a pane's native conversation id names a registration with
   no reachable row (for example a dead predecessor whose row reports `session_process_gone`),
-  the live Pi in that pane is identified by its foreground PID before anything settles. A host
-  is never marked `complete` while a live Pi session in a pane was not reloaded.
-- **No Pi sessions.** A host with no native Pi sessions and nothing tracked is settled
-  `complete` with `statusReason: no Pi sessions on host; release staged, nothing to reload`.
-  The release is staged and attested, so the revision is ready when a session starts.
-- **Hosts added later.** The unattended step compares the settled plans for the pinned revision
-  with the current inventory and mints a delta plan for the hosts no completed plan covers.
+  the live Pi in that pane is identified by its foreground PID before anything settles. Only
+  "no Pi process runs in the pane" (an empty pane, or only a shell) lets the registration be
+  treated as a husk and ended. If the pane cannot be proved (invalid pane or terminal id, no
+  revision token, a failing process query, a live Pi whose control row did not answer) the
+  session stays `pending` with a `lastUnreachableAt` note and is retried; it never ends and the
+  host never completes. A registration that is only transiently unreachable keeps its previous
+  status without any remote pane query. A host is never marked `complete` while a live Pi
+  session in a pane was not reloaded.
+- **No Pi sessions.** A host with no native Pi sessions, nothing tracked, and no reachable Pi
+  control row is settled `complete` with
+  `statusReason: no Pi sessions on host; release staged, nothing to reload`. If a Pi control
+  row answers although herdr lists no Pi (a Pi outside a pane, or one herdr never tagged), the
+  host stays `blocked` with `no native Pi sessions; expected coverage unverified`.
+- **Hosts added later.** The unattended step mints a delta plan for the hosts no settled plan
+  (complete or abandoned) for the pinned revision ever named, whatever the newest plan's
+  status; hosts of an abandoned plan stay retired. Pruning keeps, for the pinned revision, the
+  settled plans that together record that coverage, however old, so a small delta plan can
+  never make the whole fleet look uncovered. `fleet rollout prune` protects the current pin
+  the same way.
 - **State directory.** An existing rollout state directory owned by you that is group or
-  world readable is tightened to `0700`; symlinks and foreign owners are still refused.
+  world readable is tightened to `0700` by commands that write (apply, run, abandon, prune,
+  plan). Read-only commands (`status`, `latest`) never change permissions; symlinks and
+  foreign owners are refused on every path.
 - **Dirty managed release.** If the staged release directory has local changes, staging fails
   with a typed `managed_release_dirty` error. The host is `blocked` with
   `managed release is dirty: <files>; local work preserved` and a `nextStep` naming the
-  release directory. Local work is never reset; clean or move it, then re-run apply.
+  release directory. Local work is never reset; clean or move it, then re-run apply. Files
+  come from `git status --porcelain=v2 -z` (names with spaces or quotes intact, renames shown
+  as `old -> new`), the list is capped at 20 with an explicit `(+N more)` note, and all
+  remote-derived text is stripped of control characters and ANSI escapes before it is stored
+  or printed.
 
 ## Validation coverage
 

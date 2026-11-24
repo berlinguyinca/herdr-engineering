@@ -2444,6 +2444,7 @@ def _cmd_fleet_rollout(args) -> int:
         inventory_targets,
         latest_unfinished,
         prune_settled,
+        read_pin,
         resolve_plan_revision,
         retire_identityless,
         run_rollout,
@@ -2467,7 +2468,15 @@ def _cmd_fleet_rollout(args) -> int:
         elif args.rollout_command == "abandon":
             report = abandon_rollout(store, args.id, reason=args.reason)
         elif args.rollout_command == "prune":
-            report = {"pruned": prune_settled(store, older_than_days=args.older_than_days)}
+            try:
+                pinned = {read_pin()} - {None}
+            except ValueError:
+                pinned = set()  # an invalid pin protects nothing; prune is not the place to fail
+            report = {
+                "pruned": prune_settled(
+                    store, older_than_days=args.older_than_days, keep_revisions=pinned
+                )
+            }
         else:
             report = store.read(args.id)
     except (OSError, ValueError, RuntimeError, FleetError) as exc:
