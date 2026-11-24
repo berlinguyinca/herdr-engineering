@@ -452,32 +452,23 @@ def test_a_host_that_was_never_enrolled_is_no_token_not_a_failed_fetch(tmp_path,
         _hc.reset_host_config()
 
 
-def test_host_config_memo_can_be_cleared_while_other_threads_read_it(tmp_path, monkeypatch):
-    import threading
+def test_host_config_memo_can_be_cleared_between_the_membership_check_and_the_read(monkeypatch):
+    """The 300 s refresh clears the memo from another thread. Deterministic: a dict that empties itself right after
+    answering "present" to ``in`` (the old check-then-read raised KeyError; a single ``get`` does not care)."""
+    class Clearing(dict):
+        def __contains__(self, key):
+            hit = super().__contains__(key)
+            self.clear()
+            return hit
+
     monkeypatch.setattr(_hc, "host_config", _REAL_HOST_CONFIG)
     _hc.reset_host_config()
-    errors = []
-    stop = threading.Event()
-
-    def reader():
-        while not stop.is_set():
-            try:
-                _hc.host_config()
-            except _hc.HostConfigUnavailable:
-                pass
-            except BaseException as exc:                      # a KeyError here killed a handler thread
-                errors.append(exc)
-                return
-
-    ts = [threading.Thread(target=reader) for _ in range(4)]
-    for t in ts:
-        t.start()
-    for _ in range(3000):
-        _hc.forget_memoised_host_config()
-    stop.set()
-    for t in ts:
-        t.join()
-    assert not errors
+    memo = Clearing()
+    monkeypatch.setattr(_hc, "_MEMO", memo)
+    for _ in range(3):
+        with pytest.raises(_hc.HostConfigUnavailable):        # no host.json: a clean "unavailable", never KeyError
+            _hc.host_config()
+        dict.__setitem__(memo, "v", _hc.HostConfigUnavailable("x", permanent=True))
 
 
 def test_a_whitespace_only_token_file_is_no_token(tmp_path):
@@ -593,10 +584,12 @@ def test_a_negative_or_garbage_content_length_is_a_400_and_a_non_object_body_is_
     gw = _gw(tmp_path, token="sekrit")
     try:
         for length in ("-1", "abc"):
-            with socket.create_connection(("127.0.0.1", gw.control_port), timeout=3) as c:
-                c.sendall(f"POST /rewrite HTTP/1.1\r\nHost: x\r\nContent-Length: {length}\r\n\r\n".encode())
-                assert c.recv(4096).startswith(b"HTTP/1.0 400") or True
-                c.settimeout(3)
+            for path in ("/rewrite", "/register"):
+                with socket.create_connection(("127.0.0.1", gw.control_port), timeout=3) as c:
+                    c.settimeout(3)                           # a regression that reads to EOF times out here
+                    c.sendall((f"POST {path} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer sekrit\r\n"
+                               f"Content-Length: {length}\r\n\r\n").encode())
+                    assert c.recv(4096).split(b"\r\n")[0].split()[1] == b"400", (path, length)
         code, _ = _post(gw, "/rewrite", [])
         assert code == 400
         code, _ = _post(gw, "/rewrite", "text")
