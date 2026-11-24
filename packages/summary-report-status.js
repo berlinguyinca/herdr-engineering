@@ -33,7 +33,8 @@ export function reportView(full, local) {
   if (f.state === 'done' && typeof f.report === 'string' && f.report) {
     const when = f.generated_at ? ` · ${f.generated_at}` : '';
     const unsaved = f.persisted === false ? ' · not saved; it disappears when the dashboard restarts' : '';
-    return {label: REPORT_LABELS.done, locked: false, status: `Full report${f.source === 'terminal' ? ' · from the terminal' : f.harness ? ` · ${f.harness}` : ''}${when}${unsaved}`, report: f.report, basisSeq: Number.isFinite(f.basis_seq) ? f.basis_seq : null};
+    const view = {label: REPORT_LABELS.done, locked: false, status: `Full report${f.source === 'terminal' ? ' · from the terminal' : f.harness ? ` · ${f.harness}` : ''}${when}${unsaved}`, report: f.report, basisSeq: Number.isFinite(f.basis_seq) ? f.basis_seq : null};
+    return Array.isArray(f.snapshots) && f.snapshots.length > 1 ? {...view, snapshots: f.snapshots} : view;
   }
   if (f.state === 'failed') {
     return {label: REPORT_LABELS.failed, locked: false, status: reportFailure(f.error, f.detail), error: true, report: ''};
