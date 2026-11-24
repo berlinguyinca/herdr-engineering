@@ -526,13 +526,21 @@ def test_a_pinned_size_over_the_cap_is_too_large_without_reading_the_blob(world)
     assert store.blobs.reads == []
 
 
-def test_a_record_size_over_the_cap_is_too_large_without_reading_the_blob(world):
+def test_an_inflated_record_size_does_not_make_a_small_file_too_large(world):
     base, store = world
-    store.records["h1"]["size_bytes"] = share_render.MAX_RENDER_INPUT + 1
+    store.records["h1"]["size_bytes"] = share_render.MAX_RENDER_INPUT + 1      # a report version rewrites it to a sum
+    status, body, _ = envelope(base, "/api/v1/artifacts/h1/render")
+    assert status == 200 and body["too_large"] is False and body["html"]
+
+
+def test_a_stored_file_over_the_cap_is_too_large_by_a_bounded_read(world):
+    base, store = world
+    big = b"<p>" + b"x" * (share_render.MAX_RENDER_INPUT + 10) + b"</p>"
+    store.records["h1"].update(store.blobs.add(big))
     store.blobs.reads.clear()
     status, body, _ = envelope(base, "/api/v1/artifacts/h1/render")
     assert (status, body) == (200, {"kind": "html", "html": None, "too_large": True})
-    assert store.blobs.reads == []
+    assert store.blobs.reads == []                  # never buffered whole through get()
 
 
 def test_a_report_artifact_without_a_current_file_stays_404_whatever_its_summed_size(world):

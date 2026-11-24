@@ -923,3 +923,12 @@ def test_a_retracted_version_is_neither_shared_nor_approved_even_when_the_regist
         assert status == 409 and "retracted" in body["error"]
         assert shares.rows[share_id]["state"] == "pending" and tree(root) == []
         assert create(base, version="v_pdf")[0] == 201          # only the retracted version is refused
+
+
+def test_a_version_the_registry_marks_retracted_is_a_409_not_a_400(tmp_path):
+    servers = []
+    with share_server(tmp_path, servers=servers) as (base, registry, shares, blobs, root):
+        servers[0].artifact_graph_gate.retract(AID, "v_html")
+        registry.versions["v_html"]["state"] = "retracted"
+        status, body = create(base)
+        assert status == 409 and "retracted" in body["error"]

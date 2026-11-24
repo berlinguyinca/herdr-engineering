@@ -63,6 +63,7 @@ def pinned_output(output, *, require_size=True):
 
 def _body(handler, allowed):
     if handler.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
+        handler.close_connection = True         # the body is never read; it must not be parsed as the next request
         raise ValueError("report mutations require application/json")
     value = handler._read_json()
     if not isinstance(value, dict) or set(value) - set(allowed):
@@ -302,5 +303,7 @@ def route_report(handler, server, parts, resource):
         handler._json(handler._artifact_call(function, artifact_id, version_id,
                                              **body, actor=handler._resource_principal()), 201)
         return True
+    if method == "POST":
+        handler.close_connection = True         # an unmatched POST leaves its body unread
     handler._json({"error": "not found"}, 404)
     return True

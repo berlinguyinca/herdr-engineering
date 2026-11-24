@@ -22,6 +22,16 @@ def normalize_expiry(value) -> float | None:
         if value is None:
             return None
         raise ValueError("expires_at must be a number or null")
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            raise ValueError("expires_at must be a number or ISO-8601 timestamp") from None
+    if isinstance(value, datetime):
+        try:
+            value = (value if value.tzinfo else value.replace(tzinfo=UTC)).timestamp()
+        except (OverflowError, OSError, ValueError):
+            raise ValueError("expires_at must be a finite time within years 1 to 9999") from None
     if isinstance(value, (int, float)):
         try:
             seconds = float(value)
@@ -29,13 +39,6 @@ def normalize_expiry(value) -> float | None:
         except (OverflowError, OSError, ValueError):
             raise ValueError("expires_at must be a finite time within years 1 to 9999") from None
         return seconds
-    if isinstance(value, str):
-        try:
-            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError:
-            raise ValueError("expires_at must be a number or ISO-8601 timestamp") from None
-    if isinstance(value, datetime):
-        return (value if value.tzinfo else value.replace(tzinfo=UTC)).timestamp()
     raise ValueError("expires_at must be a number or null")
 
 
@@ -43,7 +46,8 @@ class ArtifactAcl:
     def __init__(self, *, now: Callable[[], float] = time.time, on_change=None):
         self.now = now
         self.on_change = on_change
-        self._lock = threading.RLock()          # request threads and the room-sync thread share the maps
+        self._lock = threading.RLock()          # short: guards the in-memory maps only, never held across I/O
+        self._write_lock = threading.Lock()     # serialises on_change so persistence follows map order; readers never take it
         self._grants: dict[tuple[str, str], dict] = {}
         self._holders: dict[str, set] = {}      # artifact id -> principals with a stored grant (read-time gate index)
 
@@ -58,17 +62,19 @@ class ArtifactAcl:
                  "permissions": sorted(permissions), "expires_at": normalize_expiry(expires_at)}
         if granted_by is not None:          # who wrote it; room-derived grants say "room:<id>" so they can be revoked as a set
             grant["granted_by"] = granted_by
-        with self._lock:
-            self._grants[(artifact_id, principal_id)] = grant
-            self._holders.setdefault(artifact_id, set()).add(principal_id)
-            if self.on_change:                      # under the lock: concurrent writes persist in the order they apply
+        with self._write_lock:                      # persistence order == map order; readers only wait on _lock
+            with self._lock:
+                self._grants[(artifact_id, principal_id)] = grant
+                self._holders.setdefault(artifact_id, set()).add(principal_id)
+            if self.on_change:
                 self.on_change("grant", dict(grant))
         return dict(grant)
 
     def revoke(self, artifact_id: str, principal_id: str) -> None:
-        with self._lock:
-            self._grants.pop((artifact_id, principal_id), None)
-            self._holders.get(artifact_id, set()).discard(principal_id)
+        with self._write_lock:
+            with self._lock:
+                self._grants.pop((artifact_id, principal_id), None)
+                self._holders.get(artifact_id, set()).discard(principal_id)
             if self.on_change:
                 self.on_change("revoke", {"artifact_id": artifact_id, "principal_id": principal_id})
 

@@ -264,17 +264,40 @@ def route_render(handler, server, parts, resource) -> bool:
             def renders(rec):
                 return render_kind(rec.get("original_filename") or "", rec.get("mime_type")) in ("html", "text")
 
+            probed: dict[str, bool] = {}
+
             def oversized(rec):
-                # only a stored file can be too large: a report's size_bytes is the sum of its outputs
-                return (route == "render" and renders(rec) and bool(rec.get("storage_key") and rec.get("sha256"))
-                        and (rec.get("size_bytes") or 0) > MAX_RENDER_INPUT)
+                key = str(rec.get("storage_key") or "")
+                if key not in probed:
+                    probed[key] = _measure(rec)
+                return probed[key]
+
+            def _measure(rec):
+                # size_bytes is not trusted (a report version rewrites it to the sum of its outputs while storage_key still
+                # names the original upload): measure the stored object, reading at most MAX_RENDER_INPUT + 1 bytes
+                if route != "render" or not renders(rec) or server.rustfs is None \
+                        or not (rec.get("storage_key") and rec.get("sha256")):
+                    return False
+                seen = 0
+                try:
+                    stream = server.rustfs.iter_get(rec["storage_key"], rec["sha256"])
+                    try:
+                        for chunk in stream:
+                            seen += len(chunk)
+                            if seen > MAX_RENDER_INPUT:
+                                return True
+                    finally:
+                        stream.close()
+                except Exception:               # noqa: BLE001 - unreadable: let the normal read path answer
+                    return False
+                return False
 
             def wanted(rec):
                 return route == "live" or (renders(rec) and not oversized(rec))
             record, data = handler._artifact_current_file(artifact_id, want=wanted)
             if record is not None and data is None and oversized(record):
                 _send_json(handler, {"kind": render_kind(record.get("original_filename") or "", record.get("mime_type")),
-                                     "html": None, "too_large": True})       # the stored size says so: no read
+                                     "html": None, "too_large": True})       # the bounded probe says so
                 return True
             if record is None or (data is None and route == "live") or (
                     data is None and wanted(record)):

@@ -441,3 +441,12 @@ def test_early_report_answers_to_a_post_close_the_connection(reports_server, pat
     reply = _raw_exchange(base, head, send_body=body)
     assert f" {status} " in reply.split("\r\n", 1)[0]
     assert "connection: close" in reply.lower()
+
+
+def test_a_post_with_a_non_json_content_type_closes_the_connection(reports_server):
+    base, _, _ = reports_server
+    body = b"x=1"
+    head = (f"POST /api/v1/artifacts/artifact_report/versions/v1/feedback HTTP/1.1\r\nHost: x\r\nX-API-Key: owner-key\r\n"
+            f"Content-Type: text/plain\r\nContent-Length: {len(body)}\r\n\r\n").encode()
+    reply = _raw_exchange(base, head, send_body=body)
+    assert " 400 " in reply.split("\r\n", 1)[0] and "connection: close" in reply.lower()

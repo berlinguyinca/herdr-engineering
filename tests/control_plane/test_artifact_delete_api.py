@@ -429,3 +429,23 @@ def test_retracting_an_artifact_or_version_revokes_its_live_shares(registry_pg, 
             assert not (tmp_path / whole_share).exists() and not any((tmp_path / "by-token").iterdir())
     finally:
         shares.close()
+
+
+def test_retract_is_a_failure_when_its_share_links_could_not_be_revoked(registry_pg, tmp_path):
+    from herdr_engineering.control_plane.artifact_acl import ArtifactAcl
+    from herdr_engineering.control_plane.artifact_shares import ShareStore
+
+    async def make_shares():
+        return ShareStore(await asyncpg.connect(registry_pg["dsn"]))
+
+    shares = SyncArtifactAdapter(make_shares)
+    settings = {"public_url": "http://127.0.0.1", "max_share_bytes": 1 << 28, "max_files": 100,
+                "max_total_bytes": 1 << 30, "default_public_days": 30}
+    acl = ArtifactAcl()
+    with api(registry_pg, extra={"share_store": shares, "shares_root": tmp_path, "share_settings": settings,
+                                 "artifact_acl": acl}) as env:
+        aid, _, _ = _shared_html(env, tmp_path)
+        acl.grant(aid, CREATOR, {"read", "edit", "review", "share", "admin"})
+        shares.close()                              # the share store is now unreachable: revocation cannot complete
+        got, out = request(env.base, f"/api/v1/artifacts/{aid}/retract", key="creator-key", body={"reason": "leak"})
+        assert got == 500 and out["shares_revoked"] is None and "share links" in out["share_revocation_error"], out

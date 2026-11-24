@@ -184,3 +184,35 @@ def test_acl_route_answers_400_for_an_out_of_range_expiry_and_leaves_no_grant():
                           {'principal_id': 'agent:9', 'permissions': ['read'], 'expires_at': bad})[0]
             assert status == 400
         assert server.artifact_acl.principals_with('private', 'read') == [principal('owner')]
+
+
+def test_readers_never_wait_on_a_grant_that_is_persisting():
+    import threading
+    import time
+    entered, release = threading.Event(), threading.Event()
+
+    def on_change(kind, grant):
+        entered.set()
+        release.wait(5)                           # a slow registry write behind the adapter lock
+
+    acl = ArtifactAcl(on_change=on_change)
+    writer = threading.Thread(target=acl.grant, args=("a1", "u1", {"read"}))
+    writer.start()
+    assert entered.wait(5)
+    started = time.monotonic()
+    assert acl.can("a1", "u1", "read") is True          # the map already holds it; the read must not wait for the write
+    assert acl.held("a1", "u1") is not None and acl.principals_with("a1", "read") == ["u1"]
+    assert time.monotonic() - started < 1.0
+    release.set()
+    writer.join()
+
+
+def test_a_datetime_or_iso_expiry_out_of_range_is_refused_like_a_number():
+    from datetime import datetime
+
+    import pytest
+    acl = ArtifactAcl()
+    for bad in (datetime.max.replace(tzinfo=UTC), "9999-12-31T23:59:59-12:00", "0001-01-01T00:00:00+14:00"):
+        with pytest.raises(ValueError, match="expires_at"):
+            acl.grant("a1", "u1", {"read"}, expires_at=bad)
+    assert acl.has_grants("a1") is False
