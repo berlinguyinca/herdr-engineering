@@ -99,6 +99,15 @@ def applicability(repo: Path, sha: str, event: str = "pull_request", base: str =
     ".woodpecker/artifact-handoff.yml",
     "scripts/ci-pipeline-freshness.sh",      # not under scripts/ci/
     "scripts/ci/integrate-main.sh",
+    # Bug-hunt: these used to skip the required check because the unit gate was an allow-list. Default is now RUN.
+    "herdr_artifact_host/server.py",
+    "ansible/site.yml",
+    "skills/herdr/SKILL.md",                 # a skill's markdown is not a doc: tests read it
+    "scripts/install.sh",
+    "package.json",
+    "package-lock.json",
+    "schemas/new.json",
+    "a_brand_new_top_level_dir/anything.py", # drift guard: an unknown path must run the suite
 ])
 def test_a_change_that_can_affect_the_suite_runs_it(repo, path):
     result = applicability(repo, change(repo, path))
@@ -118,6 +127,23 @@ def test_a_change_that_cannot_affect_the_suite_is_skipped(repo, path):
     result = applicability(repo, change(repo, path))
     assert result.returncode == 3, (result.stdout, result.stderr)
     assert "skipping the suite" in result.stdout
+
+
+@pytest.mark.parametrize("path", [".gitignore", ".github/CODEOWNERS", "LICENSE", "docs/adr/x.png"])
+def test_the_explicit_exempt_list_is_skipped(repo, path):
+    assert applicability(repo, change(repo, path)).returncode == 3
+
+
+def test_every_tracked_path_outside_the_exempt_list_runs_the_suite():
+    """Drift guard: ask the real matcher about every tracked file; only docs and the known-inert files may be skipped."""
+    script = (
+        f'set -- unit; src="$(sed -n "/^gate=/,/^label=/p" {APPLICABLE})"; eval "$src"; '
+        f'eval "$(sed -n "/^herdr_covered_path()/,/^}}/p" {APPLICABLE})"; path="$1"; herdr_covered_path'
+    )
+    skipped = [p for p in _tracked() if subprocess.run(["bash", "-c", script, "x", p], capture_output=True).returncode != 0]
+    unexpected = [p for p in skipped if not (p.startswith(("docs/", ".github/", ".autospec/")) or "/" not in p)]
+    assert not unexpected, f"paths that skip the required unit gate: {unexpected[:10]}"
+    assert any(p.startswith("herdr_artifact_host/") for p in _tracked()), "vacuous: no tracked files found"
 
 
 def test_a_branch_identical_to_its_base_has_nothing_to_prove(repo):
