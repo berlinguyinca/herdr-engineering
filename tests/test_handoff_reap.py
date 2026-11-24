@@ -8,6 +8,9 @@ import plistlib
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -27,6 +30,36 @@ def write_config(home: Path, body: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body)
 
+
+@pytest.fixture
+def isolated_herdr(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
+    """`reap --apply` closes panes: keep the real CLI off the operator's store and herdr server. XDG_DATA_HOME
+    locates the envelopes and HERDR_SOCKET_PATH the server, so both are pinned to throwaway paths, and a real,
+    empty herdr server is started on that socket (reap refuses to run without one)."""
+    herdr = shutil.which("herdr")
+    if not herdr:
+        pytest.skip("herdr binary not installed")
+    sock_dir = Path(tempfile.mkdtemp(prefix="hr."))  # short: a unix socket path is capped near 108 bytes
+    monkeypatch.delenv("HERDR_PANE_ID", raising=False)
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / ".local" / "share"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / ".local" / "state"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+    monkeypatch.setenv("HERDR_SOCKET_PATH", str(sock_dir / "t.sock"))
+    env = {**os.environ, "HOME": str(tmp_path)}
+    proc = subprocess.Popen([herdr, "server"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            cwd=tmp_path)
+    try:
+        for _ in range(60):
+            if subprocess.run([herdr, "workspace", "list"], env=env, capture_output=True).returncode == 0:
+                break
+            time.sleep(0.25)
+        else:
+            pytest.skip("could not start an isolated herdr server")
+        yield tmp_path
+    finally:
+        subprocess.run([herdr, "server", "stop"], env=env, capture_output=True, timeout=10)
+        proc.wait(timeout=10)
+        shutil.rmtree(sock_dir, ignore_errors=True)
 
 def test_disabled_by_default_with_a_fifteen_minute_interval(tmp_path: Path) -> None:
     policy = load_policy(home=tmp_path)
@@ -81,7 +114,7 @@ def test_a_missing_cli_is_reported_not_raised(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(HANDOFF is None, reason="herdr-handoff is not installed")
-def test_enabled_run_applies_reap_against_the_shared_store_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_enabled_run_applies_reap_against_the_shared_store_only(isolated_herdr: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The real CLI, with HOME moved: it must read <home>/.local/share/herdr-handoff/store and ignore a
     HERDR_HANDOFF_DIR / HERDR_HANDOFF_FILE inherited from the pane that started us."""
     write_config(tmp_path, "handoff_reap:\n  enabled: true\n")
@@ -97,7 +130,7 @@ def test_enabled_run_applies_reap_against_the_shared_store_only(tmp_path: Path, 
 
 
 @pytest.mark.skipif(HANDOFF is None, reason="herdr-handoff is not installed")
-def test_legacy_roots_are_imported_into_the_shared_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_legacy_roots_are_imported_into_the_shared_store(isolated_herdr: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     legacy = tmp_path / "proj" / ".herdr" / "handoffs"
     legacy.mkdir(parents=True)
     write_config(tmp_path, f"handoff_reap:\n  enabled: true\n  legacy_roots: [{legacy}]\n")
