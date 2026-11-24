@@ -119,6 +119,69 @@ module-level `pytestmark` or a class decorator would hide a whole file, so it ne
 Past its expiry date an entry stops quarantining and the test fails the gate again, so fix it or renew the date deliberately.
 The plugin is `scripts/ci/herdr_flaky_plugin.py`.
 
+## Reading a unit gate while it runs, and when it overruns
+
+A CI step that the platform stops keeps only what it had already printed. `--durations=40` and `pytest_file_times` both report at
+teardown, so for the two runs this section exists for - pipeline 1754's single-pass gate (6829 s, tail truncated) and pipeline 1978's
+shard 3 (`killed` at 1950 s) - neither reported anything, and the next session had to re-measure from zero (#937).
+
+`scripts/ci/pytest-plugins/pytest_ci_progress.py` is loaded on every pass (`herdr_pytest_report_load` in `scripts/ci/pytest-parallel.sh`,
+so it covers the fast pass, the xdist rerun and the slow tail) and prints, as the pass runs:
+
+```
+[ci-progress] shard=3/3 t=612.4s done=1420 pass=1380 fail=2 skip=38 err=0 workers=8/8 running=[gw3:tests/x.py::test_y(41s)] slow=[tests/z.py::test_w 88s]
+```
+
+* cadence: every `HERDR_PYTEST_PROGRESS_EVERY_SECONDS` (60) or `HERDR_PYTEST_PROGRESS_EVERY_TESTS` (200), whichever comes first, plus a
+  final record. A wall-clock tick is used, not only report arrivals, because a wedged pass produces no reports - the run worth reading is
+  the one that has gone quiet;
+* a stall is reported **once**, then the plugin writes nothing at all (no line, no state-file read, no fsync) until a test finishes again.
+  This is a safety property, not tidiness: `scripts/ci/run-watched.py` decides a pass is wedged from two signals only - no byte on the
+  pipe and no CPU rise in the tree (`run-watched.py:266-292`) - and both are reset by anything the plugin does. A line every interval
+  would keep a deadlocked pass alive forever and re-create pipeline 1362's 8 h 20 m run. The one line (`quiet=true`) names what each worker
+  was inside when the pass went quiet, and the silence after it belongs to the watchdog. `tests/test_ci_pytest_progress.py` runs a hung
+  pass under `run-watched.py` and requires exit 124;
+* `running=` names the test each worker is inside and for how long. A finished test's report reaches the controller only at the end, and
+  xdist's forwarded `pytest_runtest_logstart` (`xdist/dsession.py:308-315`) carries no worker identity, so the controller cannot tell from
+  it who is inside what: each worker writes the test it started to `$HERDR_PYTEST_PROGRESS_DIR/<pass-id>/worker-<id>.json` and the
+  controller reads those files (default `.tmp/ci-progress`, gitignored). `workers=` counts what has reported, over what xdist will
+  actually start - the transport list, so `-n auto --maxprocesses=8` says 8 and not the uncapped auto count - because a worker that has
+  started nothing yet is invisible and a killed pass must not read as an idle one;
+* `<pass-id>` is the xdist test-run id, taken from the worker's own `workerinput` or the controller's session plugin (or `--testrunuid`
+  when pinned), or `local-<pid>` for a pass without workers. Never from `PYTEST_XDIST_TESTRUNUID`: a pytest that a test starts in a
+  subprocess inherits that variable from the worker which started it, and a nested controller reading it would clean and read its parent's
+  directory while filing its own records under the parent's id, so the parent's live workers would read as vanished. The id is needed
+  because `herdr_pytest_run_gate` in `scripts/ci/pytest-rerun.sh` can have the slow tail running beside the fast pass in one progress
+  directory: filed together, the serial pass's `main` reads as a fifth xdist worker and either pass's cleanup erases the other's evidence
+  mid-run. Only the pass that owns the run writes records - a worker inherits `HERDR_PYTEST_PROGRESS_DIR`, and if it appended its own
+  records every test would be counted twice;
+* `slow=` lists the finished tests over 1 s, longest first; sub-second tests are left out because they push the answer off the line;
+* the same records go to `$HERDR_PYTEST_PROGRESS_DIR/progress.jsonl`, one JSON object per line;
+* the lines are written to a duplicate of descriptor 1 taken when the plugin loads, so pytest's own capture cannot hold them until
+  teardown.
+
+Past `HERDR_PYTEST_PROGRESS_BUDGET_SECONDS` the same view repeats as `[ci-budget]` lines (and `kind: "budget"` records), once per interval.
+**A budget stops nothing.** `unit-gates.sh` has no flat cap by design ("a slow but live run is never killed") and
+`scripts/ci/run-watched.py` owns stopping a wedged pass; the budget's whole job is that the last thing a step prints before the platform
+stops it names what it was inside. The defaults come from measured walls (`herdr_pytest_progress_defaults`):
+
+| run | default budget | what CI measured (pipelines 1958-2012, since the shards landed) |
+| --- | --- | --- |
+| a shard (`HERDR_UNIT_SHARD` set) | 900 s | shard medians 346-611 s, maximum 741 s; shard 3 was killed at 1950 s (pipeline 1978) |
+| unsharded (`unit-gates-main`, any local run) | 1800 s | `unit-gates-main` 999-1405 s; the pre-shard single-pass gate 6829-8118 s (pipelines 1754, 1941, 1942, 1954) |
+
+Set it to `0` to have no budget. `tests/test_ci_pytest_progress.py` runs real pytest passes (real xdist workers, real subprocesses) and
+asserts the records name a test that is still running, that a budget exceedance leaves both the dump and the original verdict, and that
+the plugin changes no result.
+
+**Why the overruns stopped being the common case.** The 6800 s class was a single unsharded pass, and `#919` (2026-11-21) split the gate
+into three shards; across pipelines 1958-2012 no shard exceeded 741 s. Two things #937 asked for are therefore already partly answered:
+`#919` removed the flat 6861 s exposure for pull requests, and `#907` ("size unit-gates workers from the Slurm allocation", closed
+unmerged 2026-11-21) is superseded rather than needed: `scripts/ci/cpu-quota.py` now takes the real budget from the cgroup quota, and the
+load average only shaves `auto` down to a floor of half the visible CPUs and never below 4 (`herdr_free_cpus`), so the squeeze pipeline
+1804 hit - `-n 1` on a shared node - cannot recur. Re-measured after `#919`: shards finish in 346-611 s median, which is what 8 workers
+look like; `-n 1` would be minutes-long shards.
+
 ## Known-flaky gates
 
 `tests/control_plane/test_assistant_hub_slack_questions.py` is timing-coupled and reddens `unit-gates` intermittently on more than

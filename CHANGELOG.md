@@ -5,6 +5,46 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: the unit gate says what it was inside, while it runs (#937)
+
+- `scripts/ci/pytest-plugins/pytest_ci_progress.py` (loaded by `herdr_pytest_report_load`, so on the fast pass, the xdist rerun and the
+  slow tail) prints one `[ci-progress]` line per `HERDR_PYTEST_PROGRESS_EVERY_SECONDS` (60) or `HERDR_PYTEST_PROGRESS_EVERY_TESTS` (200),
+  and to `$HERDR_PYTEST_PROGRESS_DIR/progress.jsonl`: shard, elapsed, counts by outcome, and per worker the test id it is inside and for
+  how long. It ticks on wall time rather than only on report arrivals, because a wedged pass sends no reports - the pass worth reading is
+  the quiet one. Lines go to a duplicate of descriptor 1 taken at plugin load, so pytest's capture cannot hold them until teardown; that
+  is the only reason this is worth writing, since `--durations=40` and `pytest_file_times` already report at teardown and reported nothing
+  for pipeline 1754 (6829 s, truncated tail) or pipeline 1978's shard 3 (`killed` at 1950 s).
+- Per-pass wall budget (`HERDR_PYTEST_PROGRESS_BUDGET_SECONDS`, defaults from measured CI walls: 900 s for a shard, 1800 s unsharded;
+  `0` = none). Exceeding it prints a `[ci-budget]` dump of what every worker is inside and keeps running - no flat cap is added
+  (`scripts/ci/unit-gates.sh` keeps "a slow but live run is never killed"; `scripts/ci/run-watched.py` still owns wedged passes).
+  `herdr_pytest_progress_defaults` in `scripts/ci/pytest-parallel.sh` sets it; a non-numeric override fails the gate instead of running
+  without evidence.
+- Workers publish the test they started to `$HERDR_PYTEST_PROGRESS_DIR/<pass-id>/worker-<id>.json` (a finished test's report arrives only at
+  the end, and xdist's forwarded `pytest_runtest_logstart` carries no worker identity - `xdist/dsession.py:308-315`) and only the pass that
+  owns the run writes records. `<pass-id>` comes from the worker's own `workerinput` or the controller's session plugin, never from
+  `PYTEST_XDIST_TESTRUNUID`, or `local-<pid>` without workers: a pytest that a test starts in a subprocess inherits that variable from the
+  worker that started it, so a nested controller reading it would clean and read its parent's directory and file its records under the
+  parent's id. The id is needed because the gate can run its slow tail beside its fast pass in one progress directory, and filed together
+  the serial pass's `main` reads as a fifth xdist worker, either pass's startup cleanup erases the other's evidence mid-run, and a worker
+  appending its own records counts every test twice. A role is decided from `config.workerinput`, never from an inherited
+  `PYTEST_XDIST_WORKER`: a controller that believed itself a worker would emit nothing in exactly the shape CI runs in.
+- A stall is reported once and then the plugin goes completely silent (no line, no state-file read, no fsync) until a test finishes again,
+  marked `quiet=true`. `scripts/ci/run-watched.py` decides a pass is wedged from two signals only - no byte on the pipe and no CPU rise in
+  the tree (`run-watched.py:266-292`) - and both are reset by anything the plugin does, so a ticker repeating on an interval would keep a
+  deadlocked pass alive forever and re-create pipeline 1362's 8 h 20 m run. The one line names what each worker was inside; the silence
+  after it is what the watchdog measures, and `tests/test_ci_pytest_progress.py` proves a hung pass under `run-watched.py` still exits 124.
+- `workers=N/M` divides by the workers xdist will really start (the transport list), not the raw `-n`: `-n auto --maxprocesses=8`, which is
+  what `scripts/ci/pytest-parallel.sh` passes, resolved `auto` to the visible-CPU count and capped only the transports
+  (`xdist/plugin.py:318-324`), so printing the option read "8 workers out of 64" - a "workers vanished" alarm on a healthy pass.
+- Docs (`docs/operations/ci-gates.md`): how to read the lines, the measured numbers behind both budgets, and the disposition of #907 -
+  closed unmerged because `scripts/ci/cpu-quota.py` sizes workers from the cgroup quota and the load average now only shaves `auto` to a
+  floor of half the visible CPUs, never below 4, so the `-n 1` squeeze of pipeline 1804 cannot recur.
+- Tests: `tests/test_ci_pytest_progress.py` (16) runs real pytest passes with real xdist workers over a subprocess - no mocks - and
+  asserts progress names a test still running, that an exceedance dumps the in-flight view without changing the verdict, shard labelling,
+  the serial `main` worker, two concurrent passes sharing one directory staying separate, that a nested pass neither borrows its parent's
+  test-run id nor touches its state directory, that `workers=` divides by what `--maxprocesses` allows, that the gate's exported cadence is
+  the cadence the plugin runs at, that results are identical with and without the plugin, the gate wiring/budget/override rules, and - on
+  Linux - that a hung pass under `run-watched.py` still dies at the hard timeout (exit 124) with the stall named in the log.
 ### Feature: periodic `herdr-handoff reap --apply` timer (opt-in, off by default)
 
 - `herdr-eng handoff-reap {run,status}` and `scripts/install-handoff-reap.sh` install a systemd user timer (Linux) or LaunchAgent (macOS) that closes panes replaced by confirmed handoffs, including those whose `confirm` was refused because the source pane was still working. Wired into `scripts/install.sh` (step 7f2) and, for Linux fleet hosts, `ansible/tasks/handoff-reap.yml` (`site.yml`, `fleet-sync.yml`).

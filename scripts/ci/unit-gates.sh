@@ -19,6 +19,12 @@
 #
 # If the xdist machinery itself breaks (workers die, pytest exit 3) the parallel pass is rerun once on HERDR_PYTEST_RERUN_WORKERS workers
 # (default 2, 0 = serial); a real test failure or a hang is never rerun. `auto` also shrinks on a loaded host (HERDR_LOADAVG_FILE).
+#
+# Progress (issue #937): pytest_ci_progress prints, every HERDR_PYTEST_PROGRESS_EVERY_SECONDS (60) / HERDR_PYTEST_PROGRESS_EVERY_TESTS
+# (200), one line naming what each worker is inside - to the step log and to $HERDR_PYTEST_PROGRESS_DIR/progress.jsonl - and once past
+# HERDR_PYTEST_PROGRESS_BUDGET_SECONDS (900 for a shard, 1800 unsharded; see scripts/ci/pytest-parallel.sh) repeats a `[ci-budget]` dump of
+# the same view. It stops nothing: the budgets exist so a step the platform stops still says what it was inside. Pipeline 1978's shard 3
+# was killed at 1950 s with no such line, and pipeline 1754's single-pass gate ran 6829 s; both logs are silent about the cause.
 # Sharding: HERDR_UNIT_SHARD=<i>/<n> runs only shard i's test files (scripts/ci/unit-shard.py; one workflow per shard, see
 # .woodpecker/unit-gates-shard-N.yml); the client tests run in shard 1.
 # Tests marked `slow` are deselected from the parallel pass and run serially in a tail pass, concurrently with it (see pytest-parallel.sh).
@@ -34,6 +40,7 @@ need python3; need node; need git; need flock
 . scripts/ci/pytest-parallel.sh
 . scripts/ci/pytest-rerun.sh
 herdr_pytest_report_load                 # --durations=40 and the per-file/per-worker time summary on both passes
+herdr_pytest_progress_defaults || exit 1 # live per-worker progress + the pass's wall budget (#937); a bad override fails loudly
 herdr_pytest_parallel_load || exit 1     # a bad override fails loudly instead of silently running serial
 herdr_pytest_shard_load || exit 1        # HERDR_UNIT_SHARD=<i>/<n>: only this shard's test files (empty = the whole suite)
 

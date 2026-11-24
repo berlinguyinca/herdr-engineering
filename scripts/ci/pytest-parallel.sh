@@ -70,10 +70,36 @@ herdr_pytest_parallel_args() {
 # Fills the global array PYTEST_REPORT (read as ${PYTEST_REPORT[@]+"${PYTEST_REPORT[@]}"}) with the arguments that make a pass report where
 # its time went: the 40 slowest tests (`--durations=40`) and, from the scripts/ci/pytest-plugins/pytest_file_times.py plugin, a per-test-file
 # and per-xdist-worker total, which shows `--dist=loadfile` imbalance (one slow file keeping one worker busy while the rest idle).
+# Plus pytest_ci_progress (scripts/ci/pytest-plugins/pytest_ci_progress.py), which reports the same view WHILE the pass runs, because a
+# teardown summary is worth nothing to a step the platform stopped (issue #937).
 PYTEST_REPORT=()
 herdr_pytest_report_load() {
-  PYTEST_REPORT=(--durations=40 -p pytest_file_times)
+  PYTEST_REPORT=(--durations=40 -p pytest_file_times -p pytest_ci_progress)
   export PYTHONPATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pytest-plugins${PYTHONPATH:+:$PYTHONPATH}"
+}
+
+# Progress cadence and the per-pass wall budget (#937), exported for pytest_ci_progress. The budgets are measured, not guessed: since the
+# shards landed (#919, pipelines 1958-2012) a shard's median wall is 346-611 s and its maximum 741 s, so 900 s marks a shard overrunning
+# long before the platform stops it (pipeline 1978's shard 3 was `killed` at 1950 s having said nothing about what it was inside). An
+# unsharded pass - `unit-gates-main`, or anyone's local run - measured 999-1405 s, and the single-pass gate ran 6829 s in pipeline 1754,
+# so its budget is 1800 s. Exceeding a budget prints a dump of what each worker is inside and keeps running: scripts/ci/unit-gates.sh has
+# deliberately no flat cap ("a slow but live run is never killed") and scripts/ci/run-watched.py owns stopping a wedged one.
+herdr_pytest_progress_defaults() {
+  local every="${HERDR_PYTEST_PROGRESS_EVERY_SECONDS:-60}"
+  local tests="${HERDR_PYTEST_PROGRESS_EVERY_TESTS:-200}"
+  local budget="${HERDR_PYTEST_PROGRESS_BUDGET_SECONDS-}"
+  case "$every" in ''|*[!0-9]*) echo "HERDR_PYTEST_PROGRESS_EVERY_SECONDS must be a whole number of seconds, got '$every'" >&2; return 1 ;; esac
+  case "$tests" in ''|*[!0-9]*) echo "HERDR_PYTEST_PROGRESS_EVERY_TESTS must be a whole number of tests, got '$tests'" >&2; return 1 ;; esac
+  if [ -z "$budget" ]; then
+    if [ -n "${HERDR_UNIT_SHARD:-}" ]; then budget=900; else budget=1800; fi
+  fi
+  case "$budget" in ''|*[!0-9]*) echo "HERDR_PYTEST_PROGRESS_BUDGET_SECONDS must be a whole number of seconds (0 = no budget), got '$budget'" >&2; return 1 ;; esac
+  export HERDR_PYTEST_PROGRESS_EVERY_SECONDS="$every"
+  export HERDR_PYTEST_PROGRESS_EVERY_TESTS="$tests"
+  export HERDR_PYTEST_PROGRESS_BUDGET_SECONDS="$budget"
+  export HERDR_PYTEST_PROGRESS_DIR="${HERDR_PYTEST_PROGRESS_DIR:-$PWD/.tmp/ci-progress}"
+  mkdir -p "$HERDR_PYTEST_PROGRESS_DIR" || return 1
+  echo "ci progress: dir=$HERDR_PYTEST_PROGRESS_DIR every=${every}s/${tests}-tests budget=${budget}s shard=${HERDR_UNIT_SHARD:-none}"
 }
 
 # Fills the global array PYTEST_PARALLEL with those arguments (empty for a serial run) and fails if an override is invalid. Read it
