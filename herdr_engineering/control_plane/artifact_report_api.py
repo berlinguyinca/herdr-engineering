@@ -153,6 +153,7 @@ def route_report(handler, server, parts, resource):
         return True
     if creating:
         if method != "POST":
+            handler.close_connection = True  # a POST body may be unread: never parse it as the next request
             handler._json({"error": "not found"}, 404)
             return True
         body = _body(handler, {"title"})
@@ -175,6 +176,7 @@ def route_report(handler, server, parts, resource):
         return True
     if build_status:
         if method != "GET":
+            handler.close_connection = True  # a POST body may be unread: never parse it as the next request
             handler._json({"error": "not found"}, 404)
             return True
         job = handler._artifact_call("get_report_job", artifact_id, parts[6])
@@ -217,6 +219,7 @@ def route_report(handler, server, parts, resource):
         return True
     if building:
         if method != "POST" or server.artifact_job_manager is None:
+            handler.close_connection = True  # a POST body may be unread: never parse it as the next request
             handler._json({"error": "report build worker is unavailable"}, 503)
             return True
         body = _body(handler, {"base_version_id", "request"})
@@ -256,6 +259,7 @@ def route_report(handler, server, parts, resource):
         _download(handler, server, asset)
         return True
     if len(parts) != 8:
+        handler.close_connection = True  # a POST body may be unread: never parse it as the next request
         handler._json({"error": "not found"}, 404)
         return True
     if method == "GET":

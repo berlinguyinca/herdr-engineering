@@ -427,3 +427,17 @@ def test_a_refused_blob_upload_closes_the_connection(reports_server, query, mime
     assert reply.startswith("HTTP/1.0 400") or reply.startswith("HTTP/1.1 400")
     assert "connection: close" in reply.lower()
     assert blobs.uploads == 0
+
+
+@pytest.mark.parametrize("path,status", [
+    ("/api/v1/artifact-reports/artifact_report/jobs/job1", "404"),       # build status is GET only
+    ("/api/v1/artifacts/artifact_report/versions/v1/diff/extra", "404"),  # a path no report route serves
+])
+def test_early_report_answers_to_a_post_close_the_connection(reports_server, path, status):
+    base, _, _ = reports_server
+    body = b'{"x": 1}'
+    head = (f"POST {path} HTTP/1.1\r\nHost: x\r\nX-API-Key: owner-key\r\nContent-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n\r\n").encode()
+    reply = _raw_exchange(base, head, send_body=body)
+    assert f" {status} " in reply.split("\r\n", 1)[0]
+    assert "connection: close" in reply.lower()

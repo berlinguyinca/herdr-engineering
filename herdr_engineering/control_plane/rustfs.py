@@ -17,7 +17,7 @@ def content_key(data: bytes) -> str:
 
 
 _CONNECT_TIMEOUT_S = 5
-_READ_TIMEOUT_S = 30
+_READ_TIMEOUT_S = 60      # botocore's own default: large puts and uploads must not be cut short
 
 
 class RustFSClient:
@@ -34,13 +34,13 @@ class RustFSClient:
         else:
             import boto3
             from botocore.config import Config
-            # Explicit timeouts: an unreachable store must fail fast, not hold the artifact adapter lock for minutes.
+            # A short connect timeout: an unreachable store must fail fast, not hold the artifact adapter lock for
+            # minutes. Reads/writes keep botocore's default timeout and retries (large uploads are slow, not hung).
             self._s3 = boto3.client(
                 "s3", endpoint_url=endpoint,
                 region_name=region,
                 aws_access_key_id=access_key, aws_secret_access_key=secret_key,
-                config=Config(connect_timeout=_CONNECT_TIMEOUT_S, read_timeout=_READ_TIMEOUT_S,
-                              retries={"max_attempts": 2, "mode": "standard"}),
+                config=Config(connect_timeout=_CONNECT_TIMEOUT_S, read_timeout=_READ_TIMEOUT_S),
             )
 
     def ensure_bucket(self) -> None:

@@ -11,7 +11,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - `POST /api/v1/artifacts` refuses a body over 256 MiB (413) or a malformed Content-Length (400) before reading it; `_read_json` refuses a negative or malformed Content-Length (400, connection closed) instead of reading to EOF.
 - Report blob uploads close the connection when they answer before reading the body.
 - Dashboard render routes answer `too_large` from the stored size without reading oversized blobs.
-- Retracting an artifact (or one version) now revokes its live share links (the response carries `shares_revoked`).
+- Retracting an artifact (or one version) now revokes its live share links (the response carries `shares_revoked`), and a retracted version can no longer be shared or approved (409), even when persisting the retraction failed.
+- ACL grants refuse a non-finite or out-of-range `expires_at` (400) before touching the maps, and the registry write runs under the ACL lock so concurrent grant/revoke persist in the order they apply.
+- Report routes that answer before reading a POST body (build status, build, unknown path, report creation) close the connection; `too_large` is answered only for an artifact with a stored file (a report with no current file stays 404); a 10+ digit Content-Length is 413, not 400.
+- S3 client: 5 s connect timeout, botocore's own 60 s read timeout and default retries (a 30 s read timeout cut large uploads short).
 
 ### Fix: assistant store snapshot loading, ordering and locking
 

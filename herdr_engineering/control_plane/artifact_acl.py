@@ -23,7 +23,12 @@ def normalize_expiry(value) -> float | None:
             return None
         raise ValueError("expires_at must be a number or null")
     if isinstance(value, (int, float)):
-        return float(value)
+        try:
+            seconds = float(value)
+            datetime.fromtimestamp(seconds, UTC)      # NaN, infinities and years outside 1..9999 cannot be stored
+        except (OverflowError, OSError, ValueError):
+            raise ValueError("expires_at must be a finite time within years 1 to 9999") from None
+        return seconds
     if isinstance(value, str):
         try:
             value = datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -56,16 +61,16 @@ class ArtifactAcl:
         with self._lock:
             self._grants[(artifact_id, principal_id)] = grant
             self._holders.setdefault(artifact_id, set()).add(principal_id)
-        if self.on_change:
-            self.on_change("grant", dict(grant))
+            if self.on_change:                      # under the lock: concurrent writes persist in the order they apply
+                self.on_change("grant", dict(grant))
         return dict(grant)
 
     def revoke(self, artifact_id: str, principal_id: str) -> None:
         with self._lock:
             self._grants.pop((artifact_id, principal_id), None)
             self._holders.get(artifact_id, set()).discard(principal_id)
-        if self.on_change:
-            self.on_change("revoke", {"artifact_id": artifact_id, "principal_id": principal_id})
+            if self.on_change:
+                self.on_change("revoke", {"artifact_id": artifact_id, "principal_id": principal_id})
 
     def can(self, artifact_id: str, principal_id: str, permission: str) -> bool:
         with self._lock:

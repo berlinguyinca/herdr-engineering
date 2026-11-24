@@ -265,7 +265,9 @@ def route_render(handler, server, parts, resource) -> bool:
                 return render_kind(rec.get("original_filename") or "", rec.get("mime_type")) in ("html", "text")
 
             def oversized(rec):
-                return route == "render" and renders(rec) and (rec.get("size_bytes") or 0) > MAX_RENDER_INPUT
+                # only a stored file can be too large: a report's size_bytes is the sum of its outputs
+                return (route == "render" and renders(rec) and bool(rec.get("storage_key") and rec.get("sha256"))
+                        and (rec.get("size_bytes") or 0) > MAX_RENDER_INPUT)
 
             def wanted(rec):
                 return route == "live" or (renders(rec) and not oversized(rec))

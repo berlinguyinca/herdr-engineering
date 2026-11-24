@@ -218,6 +218,14 @@ def test_upload_over_the_cap_is_refused_before_the_body_is_read(server):
     assert " 413 " in reply.split("\r\n", 1)[0] and "connection: close" in reply.lower()
 
 
+def test_upload_with_a_ten_digit_content_length_is_too_large_not_malformed(server):
+    base, _ = server
+    head = (f"POST /api/v1/artifacts?filename=big.bin HTTP/1.1\r\nHost: x\r\n"
+            f"Content-Length: {99_999_999_999}\r\n\r\n").encode()
+    reply = _raw(base, head)
+    assert " 413 " in reply.split("\r\n", 1)[0] and "connection: close" in reply.lower()
+
+
 def test_upload_with_a_malformed_content_length_is_refused(server):
     base, _ = server
     reply = _raw(base, b"POST /api/v1/artifacts?filename=a.bin HTTP/1.1\r\nHost: x\r\nContent-Length: -5\r\n\r\n", b"abc")

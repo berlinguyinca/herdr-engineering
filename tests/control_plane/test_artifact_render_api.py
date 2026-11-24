@@ -533,3 +533,13 @@ def test_a_record_size_over_the_cap_is_too_large_without_reading_the_blob(world)
     status, body, _ = envelope(base, "/api/v1/artifacts/h1/render")
     assert (status, body) == (200, {"kind": "html", "html": None, "too_large": True})
     assert store.blobs.reads == []
+
+
+def test_a_report_artifact_without_a_current_file_stays_404_whatever_its_summed_size(world):
+    base, store = world
+    # a report artifact's size_bytes is the sum of its output sizes; it has no stored file of its own to be too large
+    store.records["rep"] = {"artifact_id": "rep", "original_filename": "Report", "mime_type": "text/html",
+                            "artifact_type": "report", "status": "available",
+                            "size_bytes": share_render.MAX_RENDER_INPUT * 3}
+    store.acl.grant("rep", f"api-key:{OWNER}:operator", {"read"})
+    assert get(base, "/api/v1/artifacts/rep/render")[0] == 404

@@ -248,7 +248,9 @@ def _content_length(raw):
     """Non-negative int, or None when the header is malformed (never raises)."""
     if raw is None or raw == "":
         return 0
-    return int(raw) if raw.isascii() and raw.isdigit() and len(raw) <= 9 else None
+    if not (raw.isascii() and raw.isdigit()):
+        return None
+    return int(raw) if len(raw) <= 18 else 10 ** 18       # absurdly long: a size no cap admits, not a malformed header
 
 
 class _RateLimiter:

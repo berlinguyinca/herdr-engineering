@@ -1,3 +1,5 @@
+from datetime import UTC
+
 from herdr_engineering.control_plane.artifact_acl import ArtifactAcl
 
 
@@ -88,10 +90,10 @@ def test_room_user_principals_are_web_grants_but_agent_collaborators_stay_reserv
 
 def test_expiring_grants_survive_a_store_round_trip():
     """The store hands timestamps back as ISO strings (datetime or text); can/held/principals_with must still decide."""
-    from datetime import datetime, timezone
+    from datetime import datetime
     now = [100.0]
     acl = ArtifactAcl(now=lambda: now[0])
-    future = datetime.fromtimestamp(1000.0, tz=timezone.utc)
+    future = datetime.fromtimestamp(1000.0, tz=UTC)
     acl.load([{"artifact_id": "a1", "principal_id": "u1", "permissions": ["read"], "expires_at": future.isoformat()},
               {"artifact_id": "a1", "principal_id": "u2", "permissions": ["read"], "expires_at": future}])
     assert acl.can("a1", "u1", "read") and acl.held("a1", "u2") is not None
@@ -137,3 +139,48 @@ def test_concurrent_grants_and_reads_do_not_corrupt_the_maps():
     [t.start() for t in threads]
     [t.join() for t in threads]
     assert errors == []
+
+
+def test_expiry_that_is_not_a_finite_in_range_time_is_refused_before_the_map_is_touched():
+    import pytest
+    seen = []
+    acl = ArtifactAcl(on_change=lambda kind, grant: seen.append(kind))
+    for bad in (float("nan"), float("inf"), -float("inf"), 1e30, 10 ** 400, "9999999999999999999"):
+        with pytest.raises(ValueError, match="expires_at"):
+            acl.grant("a1", "agent:1", {"read"}, expires_at=bad)
+    assert acl.has_grants("a1") is False and seen == []
+
+
+def test_persisting_a_grant_is_serialised_with_the_map_update_per_key():
+    import threading
+    import time
+    active, overlaps, order = [0], [0], []
+
+    def on_change(kind, grant):
+        active[0] += 1
+        overlaps[0] = max(overlaps[0], active[0])
+        time.sleep(0.05)
+        order.append(kind)
+        active[0] -= 1
+
+    acl = ArtifactAcl(on_change=on_change)
+    workers = [threading.Thread(target=acl.grant, args=("a1", "agent:1", {"read"})),
+               threading.Thread(target=acl.revoke, args=("a1", "agent:1"))]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join()
+    assert overlaps[0] == 1                       # the registry write is never raced by a second one
+    # whichever persisted last is what the map holds
+    assert acl.can("a1", "agent:1", "read") is (order[-1] == "grant")
+
+
+def test_acl_route_answers_400_for_an_out_of_range_expiry_and_leaves_no_grant():
+    from tests.control_plane.test_artifact_access import call, principal, running
+    with running() as server:
+        server.artifact_acl.grant('private', principal('owner'), {'admin'})
+        for bad in (1e30, "NaN-not-a-time"):
+            status = call(server, 'POST', '/api/v1/artifacts/private/acl',
+                          {'principal_id': 'agent:9', 'permissions': ['read'], 'expires_at': bad})[0]
+            assert status == 400
+        assert server.artifact_acl.principals_with('private', 'read') == [principal('owner')]
