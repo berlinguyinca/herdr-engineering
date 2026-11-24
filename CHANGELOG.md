@@ -11,6 +11,48 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - Policy is the `handoff_reap` section of `~/.config/herdr-engineering/config.yaml`: `enabled` (default `false`), `interval_minutes` (default 15, must divide 60), `legacy_roots` (per-project `.herdr/handoffs` directories imported into the shared store first). The unit files are always installed but the timer is only started where `enabled: true`; a malformed section fails closed to disabled. No environment variables.
 - Covers the shared handoff store (`herdr-handoff` with no `--root`); `HERDR_HANDOFF_FILE`/`HERDR_HANDOFF_DIR` are removed from the job's environment so it cannot be redirected to one project's root. It never passes `--include-unrecorded` (tests pin this in the code, the units, the installer and the Ansible task).
 - Nothing is enabled by this change: each host opts in separately.
+### Agent rules: push work branches and open PRs autonomously
+
+- `AGENTS.md` and the managed `SessionStart` reminder no longer require an explicit per-message ask before pushing herdr-engineering or opening a PR. Agents push their own work branches and open PRs themselves; pushing `main` and force-pushing or pushing someone else's branch stay forbidden (the reminder says so). The managed `PreToolUse` guard matches: a plain herdr-engineering push of a non-main branch is allowed, while force/destructive pushes (`-f`, `--force*`, `--mirror`, `--delete`/`-d`, `--prune`, `+` or `:branch` refspecs) still need the one-shot human token, including in the untokenizable-command fallback. Push to main/master stays denied.
+### Fix: the control-plane inspector runs on the repo's clock
+
+- `ControlPlaneRepo` now hands its own clock to `InspectorStore`. The inspector clamped event times to its 30-day
+  retention ceiling around the wall clock, so with a fixed test clock (2026-10-24) four `tests/control_plane/test_llm_stats.py`
+  transcript tests started failing on 2026-11-23 and turned unit-gates shard 3 red on every PR.
+
+### Fix: Codex second-reviewer follow-ups from #820 (always-on-review.py)
+
+- Codex spend is counted when Codex fails: a non-zero exit, time cap or missing answer after it reported tokens logs a
+  `tier: codex` line with the priced `usage` (counts toward `daily_budget_usd`); with no tokens the line says
+  `usage_unknown: true` and no cost is invented.
+- A clean Opus approve is remembered per head in `state.json` (`opus_approved`, with the tier model) when only Codex
+  failed to run, so the retry runs Codex alone; a new head, another model or `--force` reruns Opus. Cooldown and
+  budget rules are unchanged; the entry is cleared once a verdict is posted.
+- Config: `risky: null` / `risky.codex: null` mean the defaults; non-list or non-string `risky.globs` raise a config
+  error naming the entry; a glob with a trailing `/` (`deploy/`) means `deploy/**`.
+- A failed reviewer's `why` falls back to the first 300 characters of stdout (control characters stripped) when stderr is
+  empty (claude prints its errors to stdout). A usage-limit message logs `why: usage-limit: ...`, is not a cooldown
+  strike (state `limit_sha` lets the next poll retry), and stops the poll launching more reviews of that tier in the run.
+- Review fixes: Codex has its own usage-limit bucket (a Codex limit skips only later risky PRs, before Opus; an Opus
+  limit still stops Opus for the poll; a PR stuck on a limit is polled after the others). Codex limit detection scans
+  only stderr and the `error` / `turn.failed` events, never command output. `opus_approved` also records the base sha
+  (a retarget reruns Opus). A glob of only `**` / `**/` is refused.
+- Rollback: revert this PR. The extra `state.json` keys (`opus_approved`, `limit_sha`) are ignored by older code;
+  `risky: null` then fails the old config check, so restore a mapping (or remove the key) first.
+
+### Fix: `fleet join` works from the installed copy (inventory import, verify step)
+
+- The private-inventory helper moved into the package as `herdr_engineering/fleet_inventory.py`; `scripts/fleet_inventory.py` is now a thin shim that re-exports it (and still runs as a file for `scripts/fleet-join.sh`). The wheel ships only `herdr_engineering*`, so the installed venv could not import it, silently skipped the inventory, and the provision step then failed with "Could not match supplied host pattern". `herdr_engineering.fleet` no longer rewrites `sys.path` and the silent stub fallback is gone.
+- `fleet join` step 4 (verify registration) read the leases through the native `herdr` binary, which has no `devfabric` command, so it always failed. It now runs `herdr-eng devfabric list --json` via this interpreter (`fleet.devfabric_leases`). `NativeHerdrAdapter.devfabric_list` and `devfabric_register` (same mistake, no other callers) are removed.
+### Fix(ci): main push pipeline records green in the shared CI store (#931)
+
+- `.woodpecker/unit-gates-main.yml` now exports `HERDR_CI_STATE` from the runner's `WPCI_CI_DIR` before `main-cron-gates.sh --record-green`, as `main-cron.yml` does. Without it every main push failed after a fully green suite with `HERDR_CI_STATE is not set`, and the cron never learned the commit was already green.
+- `tests/test_ci_integrate_main.py` checks that every pipeline step calling `main-cron-gates.sh` exports the state dir first, and that the main push step passes it to `--record-green`.
+### Chore(ci): drop the Woodpecker `opus-review` workflow; the always-on timer posts the status
+
+- Removed `.woodpecker/opus-review.yaml`, `scripts/ci/opus-review.sh`, `tests/ci_review/test_per_pr_opus_review.py` and `docs/operations/per-pr-opus-review.md`.
+- Why: the workflow needed an agent labelled `review-host=true` and `/usr/local/bin/herdr-opus-review`; neither ever existed, so `ci/woodpecker/pr/opus-review` stayed pending on every PR.
+- The `herdr-always-on-review` systemd user timer is the only path and posts `Opus agent review`; docs and timer header updated to say so.
 
 ### Chore: bump herdr-handoff to 0.6.0 (c16c2dfd), `reap` required by the capability gate
 

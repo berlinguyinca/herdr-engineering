@@ -344,10 +344,8 @@ def _scan(proc: Path = Path("/proc"), *, paths_only: bool = False) -> list[Hold]
                         values.extend(_mapped(holder))
                 except (FileNotFoundError, ProcessLookupError):
                     continue
-                except PermissionError as exc:
-                    if holder != pid:  # a live thread of a zombie leader that cannot be read: unverifiable
-                        raise OSError(f"Cannot inspect thread {holder}") from exc
-                    raise
+                # A PermissionError (an unreadable live thread of a zombie leader included) propagates to the handler below:
+                # it skips another user's or a non-Herdr process and raises for a Herdr descendant.
             holds.extend((number, name, "uses", Path(v.removesuffix(" (deleted)")), ids)
                          for v, ids in values if v.startswith("/"))
             if _cargo_family(name) and not paths_only:

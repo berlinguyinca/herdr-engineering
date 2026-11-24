@@ -80,6 +80,9 @@ if [ -z "${HERDR_UNIT_SHARD:-}" ] || [ "${HERDR_UNIT_SHARD%%/*}" = 1 ]; then
   # proving exclusion; the install is idempotent (content-addressed, GC disabled), so a lost race costs time, not correctness.
   flock "$cache_root/playwright-install.lock" npx playwright install chromium
   node --test --test-timeout=300000 packages/herdr-web-client/*.test.js packages/herdr-web-components/*.test.js packages/*.test.js
+  # Per-module coverage gates (ported from the retired GitHub Actions workflows); also shard 1 only. scripts/ci/module-gates.sh.
+  echo "== module gates =="
+  bash scripts/ci/module-gates.sh
 else
   echo "== client tests: run in shard 1 (this is shard $HERDR_UNIT_SHARD) =="
 fi

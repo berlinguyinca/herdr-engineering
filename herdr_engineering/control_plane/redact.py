@@ -53,6 +53,27 @@ _PATTERNS = [
 
 _REDACTED = "[REDACTED]"
 
+# Per-pattern prefilter, same order and length as _PATTERNS: a pattern can only match text that contains at least one of
+# its literals (lowercase). Nearly all strings hold no secret, so skipping the patterns that cannot match is the hot path
+# of a snapshot rebuild. A literal that is too broad only costs speed; a wrong one leaks a secret, so each is a literal
+# substring every alternative of the regex must contain.
+_LITERALS: tuple[tuple[str, ...], ...] = (
+    ("sk-",),                                                      # sk-...
+    ("sk-",),                                                      # sk-... (key-length run)
+    ("akia", "asia"),                                              # (AKIA|ASIA)...
+    ("aws",),                                                      # (?i)aws...
+    ("ghp_", "gho_", "ghu_", "ghs_", "ghr_"),                      # gh[pousr]_
+    ("github_pat_",),
+    ("xox",),                                                      # xox[abprse]-
+    ("bearer",),                                                   # (?i)Bearer
+    ("eyj",),                                                      # eyJ...
+    ("passw", "secret", "token", "apikey", "api_key", "authorization", "x-api-key", "auth_token"),
+    ("pass", "secret", "apikey", "api_key", "api-key", "privatekey", "private_key", "private-key", "pwd"),
+    ("token", "secret", "apikey", "api_key", "api-key"),           # api[_-]?key; access[_-]?token holds "token"
+    ("://",),                                                      # scheme://user:pass@
+)
+_FILTERED = tuple(zip(_PATTERNS, _LITERALS, strict=True))
+
 #: Keys whose values are redacted wholesale (lowercased substring match).
 _SECRET_KEY_HINTS = (
     "password", "passwd", "pass", "pwd", "secret", "token", "apikey",
@@ -107,8 +128,13 @@ def redact_text(text: str) -> str:
     if not text:
         return text
     out = _redact_private_keys(text)
-    for pattern in _PATTERNS:
-        out = pattern.sub(_REDACTED, out)
+    # Non-ASCII text: re.IGNORECASE folds characters str.lower() does not (U+017F -> s, U+212A -> k), so run everything.
+    # The literals are checked against the text before any substitution, which is sound: a substitution only inserts
+    # "[REDACTED]", which contains none of the literals, so it cannot create one across its "[" / "]" boundaries.
+    low = out.lower() if out.isascii() else None
+    for pattern, literals in _FILTERED:
+        if low is None or any(lit in low for lit in literals):
+            out = pattern.sub(_REDACTED, out)
     return out
 
 
