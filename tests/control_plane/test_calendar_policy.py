@@ -48,6 +48,13 @@ def test_primary_alias_and_real_id_are_blocked_together():
     assert CalendarPolicy(set(), resolve).allows("primary") and len(calls) == 3
 
 
+def test_blocking_both_primary_and_its_real_id_leaves_other_calendars_open():
+    pol = CalendarPolicy({"primary", "ann@x.org"}, lambda: "ann@x.org")
+    assert not pol.allows("primary") and not pol.allows("ann@x.org")
+    assert pol.allows("team@x.org")
+    assert [c["id"] for c in pol.filter([{"id": "ann@x.org", "primary": True}, {"id": "team@x.org"}])] == ["team@x.org"]
+
+
 def test_list_free_busy_read_and_create_all_refuse_a_blocked_calendar(store):
     w, g = ws(store, blocked={("default", "u1"): ["secret@x.org", "ann@x.org"]})
     assert [c["id"] for c in w.list_calendars("default", "u1")] == ["team@x.org"]
