@@ -29,9 +29,7 @@ LOG_PER_MINUTE = 20  # log lines per reason per minute
 MAX_CONNECTIONS = 128
 MAX_RAW_PATH = 8192
 SESSION_PER_SHARE_PER_MINUTE = 30  # session attempts per share per minute (blunts token guessing)
-SESSION_GLOBAL_PER_MINUTE = (
-    600  # verified session attempts across all lab shares per minute (bounds JWT work)
-)
+SESSION_GLOBAL_PER_MINUTE = 300  # verified exchanges across all shares per minute (half the attempts cap below, so it can trip)
 SESSION_PER_CLIENT_PER_MINUTE = (
     15  # FAILED session attempts per client per minute (checked before any token check)
 )
@@ -246,6 +244,14 @@ class RateLimiter:
             self._windows[key] = (start, count + 1)
             self._windows.move_to_end(key)
             return True
+
+    def release(self, key: str) -> None:
+        """Give back one unit of ``key`` in its current window (a reservation that turned out not to be a charge)."""
+        now = self.now()
+        with self._lock:
+            start, count = self._windows.get(key, (now, 0))
+            if count > 0 and 0 <= now - start < self.window:
+                self._windows[key] = (start, count - 1)
 
     def _evict(self, now: float) -> None:
         """Make room: drop the least-recently-used keys that are not blocked; blocked ones are kept."""

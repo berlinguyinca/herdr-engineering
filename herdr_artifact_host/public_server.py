@@ -965,22 +965,29 @@ class PublicSurface:
             return str(ipaddress.ip_network(f"{address}/64", strict=False))
         return client
 
+    def _failure_key(self, request: web.Request, share_id: str) -> str:
+        """Failures are counted per (client, share): junk sent to one link costs people behind the same address only
+        that link. The table is bounded by ``RateLimiter.max_keys`` (least-recently-used eviction)."""
+        return f"{self._limiter_client(request)}\0{share_id}"
+
     def session_open(self, request: web.Request, share_id: str) -> bool:
-        """Whether a session exchange may be tried. Only consults the budgets: failures are charged by
-        ``session_failed``, the JWT work by ``session_work`` and a verified exchange by ``session_charge``, so a
-        successful sign-in never uses up the client's or the share's failure budget."""
-        return not (
+        """Whether a session exchange may be tried, and RESERVE its failure budget now: the unit is charged to the
+        sender and the share before any await, so parallel requests cannot overshoot, and ``session_release`` gives it
+        back when the exchange succeeds. A refusal after verification (budget spent, token expired, ...) keeps it."""
+        if (
             self.session_per_share.blocked(share_id)
             or self.session_global.blocked("*")
-            or self.session_failed_per_share.blocked(share_id)
-            or self.session_per_client.blocked(self._limiter_client(request))
             or self.session_attempts.blocked("*")
-        )
+        ):
+            return False
+        return self.session_per_client.allow(
+            self._failure_key(request, share_id)
+        ) and self.session_failed_per_share.allow(share_id)
 
-    def session_failed(self, request: web.Request, share_id: str) -> None:
-        """Charge one failed attempt to the sender and to the share."""
-        self.session_per_client.allow(self._limiter_client(request))
-        self.session_failed_per_share.allow(share_id)
+    def session_release(self, request: web.Request, share_id: str) -> None:
+        """Give back the failure budget reserved by ``session_open``: the exchange succeeded."""
+        self.session_per_client.release(self._failure_key(request, share_id))
+        self.session_failed_per_share.release(share_id)
 
     def session_work(self) -> bool:
         """Charge the all-clients cap, once the headers and nonce passed their shape checks (the JWT work follows)."""
@@ -1017,12 +1024,10 @@ class PublicSurface:
             return await self.deny("rate_limited", share_id)
         tokens = await self.verify_tokens(request, lab)
         if tokens is None:
-            self.session_failed(request, share_id)
             return await self.deny("bad_headers", share_id)
         access_token, id_token = tokens
         nonce = _single(request, "X-Nonce")
         if not nonce or len(nonce) > 256 or not nonce.isascii():
-            self.session_failed(request, share_id)
             return await self.deny(
                 "bad_nonce", share_id
             )  # the page's own sign-in attempt, as for member sessions
@@ -1054,7 +1059,6 @@ class PublicSurface:
             or not isinstance(email, str)
             or not email
         ):
-            self.session_failed(request, share_id)
             return await self.deny(
                 "bad_access_token" if not isinstance(user, str) else "bad_id_token", share_id
             )
@@ -1077,6 +1081,7 @@ class PublicSurface:
             f"{CLAIM_COOKIE}={session}; Max-Age={until_int - int(now)}; Path=/s/{token}/; HttpOnly; Secure; "
             "SameSite=Lax"
         )
+        self.session_release(request, share_id)
         return self.json_ok({"landing": f"/s/{token}/", "expires_at": until_int}, cookie)
 
     async def lab_session(
@@ -1090,11 +1095,9 @@ class PublicSurface:
             return await self.deny("rate_limited", share_id)
         tokens = await self.verify_tokens(request, lab)
         if tokens is None:
-            self.session_failed(request, share_id)
             return await self.deny("bad_headers", share_id)
         nonce = _single(request, "X-Nonce")
         if not nonce or len(nonce) > 256 or not nonce.isascii():
-            self.session_failed(request, share_id)
             return await self.deny("bad_nonce", share_id)  # the page's own sign-in attempt
         if not self.session_work():
             return await self.deny("rate_limited", share_id)
@@ -1102,7 +1105,6 @@ class PublicSurface:
             authorise, state, tokens[0], tokens[1], lab.authenticator, nonce
         )
         if grant is None:
-            self.session_failed(request, share_id)
             return await self.deny(reason, share_id, identity or "public")
         if not self.session_charge(share_id, grant["identity"]):
             return await self.deny("rate_limited", share_id, grant["identity"])
@@ -1131,6 +1133,7 @@ class PublicSurface:
         kind = "f" if content_type_for(entry).split(";")[0].strip() == "text/html" else "v"
         landing = f"/s/{token}/k/{session}/{kind}/{quote(entry, safe='/')}"
         cookie = write_cookie_header(lab.secret, share_id, token, session, exp_int - int(now))
+        self.session_release(request, share_id)
         return self.json_ok({"landing": landing, "expires_at": exp_int}, cookie)
 
     @staticmethod

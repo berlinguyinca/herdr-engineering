@@ -114,8 +114,15 @@ def test_ipv6_clients_are_limited_by_their_64(host: Host) -> None:
 def test_one_user_with_valid_tokens_cannot_use_up_the_share_budget(host: Host) -> None:
     """The per-user budget is smaller than the per-share one, so one signed-in user cannot lock out the rest."""
     s = lab(host, emails=("alice@lab.example", "bob@lab.example"))
-    assert 404 in {sign_in(host, s).status for _ in range(40)}
-    bob = sign_in(host, s, access("bob"), ident("bob", email="bob@lab.example", nonce="n-0"))
+    alice = {"X-Forwarded-For": "203.0.113.5"}
+    assert 404 in {sign_in(host, s, extra=alice).status for _ in range(40)}
+    bob = sign_in(
+        host,
+        s,
+        access("bob"),
+        ident("bob", email="bob@lab.example", nonce="n-0"),
+        extra={"X-Forwarded-For": "198.51.100.5"},
+    )
     assert bob.status == 200
 
 
@@ -164,6 +171,34 @@ def test_successful_sign_ins_behind_one_address_are_not_throttled(host: Host) ->
         )
         codes.append(sign_in(host, s, acc, idt, extra=nat).status)
     assert set(codes) == {200}
+
+
+def test_replaying_a_valid_token_pair_cannot_spend_the_global_cap(host: Host) -> None:
+    """A replay refused by the per-user budget counts as a failure for that client and share, so it stops after 15."""
+    a = lab(host)
+    b = lab(host, emails=("bob@lab.example",))
+    replayer = {"X-Forwarded-For": "203.0.113.77"}
+    for _ in range(SESSION_ATTEMPTS_GLOBAL_PER_MINUTE + 100):
+        sign_in(host, a, extra=replayer)
+    other = sign_in(
+        host,
+        b,
+        access("bob"),
+        ident("bob", email="bob@lab.example", nonce="n-0"),
+        extra={"X-Forwarded-For": "198.51.100.9"},
+    )
+    assert other.status == 200
+
+
+def test_failures_on_one_link_do_not_block_the_same_address_on_other_links(host: Host) -> None:
+    """Colleagues behind one NAT lose only the link the junk was sent to."""
+    a, b = lab(host), lab(host)
+    nat = {"X-Forwarded-For": "203.0.113.50"}
+    for _ in range(SESSION_PER_CLIENT_PER_MINUTE + 2):
+        junk = {"Content-Length": "0", **nat}
+        assert host.request("POST", f"/s/{a.token}/session", junk).status == 404
+    assert sign_in(host, a, extra=nat).status == 404
+    assert sign_in(host, b, extra=nat).status == 200
 
 
 def test_group_allow_list(host: Host) -> None:

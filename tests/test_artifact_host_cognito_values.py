@@ -10,8 +10,9 @@ from pathlib import Path
 
 import pytest
 
+from herdr_artifact_host import cognito as runtime_cognito
 from herdr_artifact_host import cognito_values as host_side
-from herdr_artifact_host import host_config
+from herdr_artifact_host import host_config, share_http
 from herdr_engineering import cognito_values as deploy_side
 from herdr_engineering import fleet_config_cli as fcc
 from herdr_engineering.fleet_config import FleetConfigError, load_fleet_config
@@ -69,3 +70,11 @@ def test_deploy_check_and_host_load_refuse_the_same_values(
 
 def test_the_two_copies_of_the_rule_are_identical() -> None:
     assert Path(host_side.__file__).read_bytes() == Path(deploy_side.__file__).read_bytes()
+
+
+def test_the_shape_rules_are_the_runtimes_own_patterns() -> None:
+    assert host_side.CLIENT_ID.pattern == share_http._CLIENT_ID.pattern
+    assert (
+        f"^({host_side.POOL_ID.pattern.split('_')[0]})_[A-Za-z0-9]+$"
+        == runtime_cognito._POOL_RE.pattern
+    )
