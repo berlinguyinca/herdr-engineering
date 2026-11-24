@@ -115,7 +115,7 @@ h2 { font-size: 1.25rem; letter-spacing: -0.012em; }
 h3 { font-size: 1.0625rem; letter-spacing: -0.008em; }
 .hd-btn, .hd-tabs > button, .hd-tabs > label { transition: background-color var(--motion-fast) var(--ease-ui), border-color var(--motion-fast) var(--ease-ui), color var(--motion-fast) var(--ease-ui), box-shadow var(--motion-fast) var(--ease-ui); }
 .hd-btn { border-radius: 8px; font-weight: 600; letter-spacing: 0; }
-.hd-btn:not(.hd-btn--secondary):not(.hd-btn--ghost):not(.hd-btn--quiet):not(.hd-btn--danger) { box-shadow: 0 1px 1px rgba(16, 24, 40, 0.12); }
+.hd-btn:not(.hd-btn--secondary):not(.hd-btn--ghost):not(.hd-btn--quiet):not(.hd-btn--danger):not(:focus-visible) { box-shadow: 0 1px 1px rgba(16, 24, 40, 0.12); }
 .hd-btn--secondary, .hd-btn--ghost, .hd-btn--danger { border-color: var(--border); }
 .hd-tabs { gap: 8px; }
 .hd-tabs > button, .hd-tabs > label { border-radius: 8px; }

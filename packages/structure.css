@@ -9,7 +9,8 @@
 #view input:not([type=checkbox]):not([type=radio]), #view select, #view textarea { min-height: 28px; box-sizing: border-box; }
 #view input[type=checkbox], #view input[type=radio] { width: 24px; height: 24px; }
 
-#view #session-terminal .hd-btn, #view #pa-panel .hd-btn, #view #pa-generic .hd-btn { color: var(--text); background: var(--surface); border-color: var(--border); box-shadow: none; }
+#view #session-terminal .hd-btn, #view #pa-panel .hd-btn, #view #pa-generic .hd-btn { color: var(--text); background: var(--surface); border-color: var(--border); }
+#view #session-terminal .hd-btn:not(:focus-visible), #view #pa-panel .hd-btn:not(:focus-visible), #view #pa-generic .hd-btn:not(:focus-visible) { box-shadow: none; }
 #view #session-terminal .hd-btn:hover:not(:disabled), #view #pa-panel .hd-btn:hover:not(:disabled), #view #pa-generic .hd-btn:hover:not(:disabled) { background: var(--surface-hover); }
 #view #pa-panel .hd-btn:disabled, #view #pa-panel .hd-btn[aria-disabled="true"] { opacity: .6; }
 

@@ -40,11 +40,6 @@ const KNOWN = {   // light-theme colour-contrast and focus-indicator-contrast fi
     'desktop dark': {'color-contrast': 1},
     'phone (375px) light': {},
   },
-  'dashboard-assistant-approvals': {
-    'desktop light': {'color-contrast': 1, 'focus-visible': 9},
-    'desktop dark': {'color-contrast': 1, 'focus-visible': 9},
-    'phone (375px) light': {'color-contrast': 1, 'focus-visible': 8},
-  },
   // Apps, blocked calendars, Drafts, Reminders and the generic connector list (measured 2026-10-30). Same page-level findings as the other
   // assistant tabs (the unlabelled chat input, h1 then h3, the shared button focus ring and muted-text contrast); nothing of its own.
   'dashboard-assistant-connectors': {
