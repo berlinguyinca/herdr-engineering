@@ -8,6 +8,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 ### Agent rules: push work branches and open PRs autonomously
 
 - `AGENTS.md` and the managed `SessionStart` reminder no longer require an explicit per-message ask before pushing herdr-engineering or opening a PR. Agents push their own work branches and open PRs themselves; pushing `main` and force-pushing or pushing someone else's branch stay forbidden (the reminder says so). The managed `PreToolUse` guard matches: a plain herdr-engineering push of a non-main branch is allowed, while force/destructive pushes (`-f`, `--force*`, `--mirror`, `--delete`/`-d`, `--prune`, `+` or `:branch` refspecs) still need the one-shot human token, including in the untokenizable-command fallback. Push to main/master stays denied.
+### Fix: the control-plane inspector runs on the repo's clock
+
+- `ControlPlaneRepo` now hands its own clock to `InspectorStore`. The inspector clamped event times to its 30-day
+  retention ceiling around the wall clock, so with a fixed test clock (2026-10-24) four `tests/control_plane/test_llm_stats.py`
+  transcript tests started failing on 2026-11-23 and turned unit-gates shard 3 red on every PR.
+
 ### Fix: Codex second-reviewer follow-ups from #820 (always-on-review.py)
 
 - Codex spend is counted when Codex fails: a non-zero exit, time cap or missing answer after it reported tokens logs a
