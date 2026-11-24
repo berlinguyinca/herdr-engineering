@@ -40,6 +40,7 @@ from .envelope import EnvelopeConflict
 from .events import SequenceCollision
 from .federation import kind_for_role
 from .graph import read_graph
+from .host_literal import is_ip_or_localhost
 from .ingest import INGEST_ENTITY_TYPES
 from .redact import redact_delivery, redact_ingest_body, redact_payload
 from .review_quorum import pr_review_quorum
@@ -230,18 +231,11 @@ class _DaemonThreadingServerV6(_DaemonThreadingServer):
 def _dashboard_host_ok(host_header, extra_hosts):
     """A Host an attacker cannot make point here: an IP literal, localhost, or a configured name.
     DNS rebinding needs a DNS name, so a bare name is refused unless the operator listed it."""
-    import ipaddress
     host = host_header.strip().lower()
     if host in extra_hosts:
         return True
     name = host[1:host.index("]")] if host.startswith("[") and "]" in host else host.rsplit(":", 1)[0] if host.count(":") == 1 else host
-    if name == "localhost":
-        return True
-    try:
-        ipaddress.ip_address(name)
-    except ValueError:
-        return False
-    return True
+    return is_ip_or_localhost(name)
 
 def _content_length(raw):
     """Non-negative int, or None when the header is malformed (never raises)."""
