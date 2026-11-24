@@ -1,0 +1,423 @@
+[
+ {
+  "headRefName": "feat/handoff-harness-adapters",
+  "mergedAt": null,
+  "number": 890,
+  "state": "OPEN",
+  "statusCheckRollup": [
+   {
+    "__typename": "CheckRun",
+    "completedAt": "2026-11-19T02:06:05Z",
+    "conclusion": "SUCCESS",
+    "detailsUrl": "https://github.com/berlinguyinca/herdr-engineering/actions/runs/44440714803/job/135280563821",
+    "name": "verify",
+    "startedAt": "2026-11-19T01:57:15Z",
+    "status": "COMPLETED",
+    "workflowName": "Agent communications"
+   },
+   {
+    "__typename": "CheckRun",
+    "completedAt": "2026-11-19T01:59:10Z",
+    "conclusion": "SUCCESS",
+    "detailsUrl": "https://github.com/berlinguyinca/herdr-engineering/actions/runs/44440714809/job/135280563926",
+    "name": "verify (macos-15)",
+    "startedAt": "2026-11-19T01:57:16Z",
+    "status": "COMPLETED",
+    "workflowName": "Agent scratch retention"
+   },
+   {
+    "__typename": "CheckRun",
+    "completedAt": "2026-11-19T01:58:53Z",
+    "conclusion": "SUCCESS",
+    "detailsUrl": "https://github.com/berlinguyinca/herdr-engineering/actions/runs/44440714805/job/135280563447",
+    "name": "verify",
+    "startedAt": "2026-11-19T01:57:15Z",
+    "status": "COMPLETED",
+    "workflowName": "Host Cargo cache"
+   },
+   {
+    "__typename": "CheckRun",
+    "completedAt": "2026-11-19T01:58:40Z",
+    "conclusion": "SUCCESS",
+    "detailsUrl": "https://github.com/berlinguyinca/herdr-engineering/actions/runs/44440714809/job/135280563458",
+    "name": "verify (ubuntu-24.04)",
+    "startedAt": "2026-11-19T01:57:14Z",
+    "status": "COMPLETED",
+    "workflowName": "Agent scratch retention"
+   },
+   {
+    "__typename": "CheckRun",
+    "completedAt": "2026-11-19T01:57:14Z",
+    "conclusion": "SUCCESS",
+    "detailsUrl": "https://dashboard.gitguardian.com",
+    "name": "GitGuardian Security Checks",
+    "startedAt": "2026-11-19T01:57:14Z",
+    "status": "COMPLETED",
+    "workflowName": ""
+   },
+   {
+    "__typename": "StatusContext",
+    "context": "ci/woodpecker/pr/artifact-handoff",
+    "startedAt": "2026-11-19T01:58:12Z",
+    "state": "SUCCESS",
+    "targetUrl": "https://ci.metabolomics.us/repos/120/pipeline/1728/1"
+   },
+   {
+    "__typename": "StatusContext",
+    "context": "ci/woodpecker/pr/structural-gates",
+    "startedAt": "2026-11-19T01:57:48Z",
+    "state": "SUCCESS",
+    "targetUrl": "https://ci.metabolomics.us/repos/120/pipeline/1728/2"
+   },
+   {
+    "__typename": "StatusContext",
+    "context": "ci/woodpecker/pr/unit-gates",
+    "startedAt": "2026-11-19T02:21:37Z",
+    "state": "SUCCESS",
+    "targetUrl": "https://ci.metabolomics.us/repos/120/pipeline/1728/3"
+   }
+  ],
+  "title": "feat(handoff): per-harness adapters for automatic handoff (plan 0)",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/890"
+ },
+ {
+  "headRefName": "fix/scratch-reaper-cargo-1-100",
+  "mergedAt": null,
+  "number": 889,
+  "state": "OPEN",
+  "statusCheckRollup": [
+   {
+    "__typename": "CheckRun",
+    "completedAt": "2026-11-19T04:28:22Z",
+    "conclusion": "SUCCESS",
+    "detailsUrl": "https://github.com/berlinguyinca/herdr-engineering/actions/runs/44457600548/job/135336326444",
+    "name": "verify",
+    "startedAt": "2026-11-19T04:20:12Z",
+    "status": "COMPLETED",
+    "workflowName": "Agent communications"
+   },
+   {
+    "__typename": "CheckRun",
+    "completedAt": "2026-11-19T04:22:28Z",
+    "conclusion": "SUCCESS",
+    "detailsUrl": "https://github.com/berlinguyinca/herdr-engineering/actions/runs/44457600414/job/135336326313",
+    "name": "verify (macos-15)",
+    "startedAt": "2026-11-19T04:20:11Z",
+    "status": "COMPLETED",
+    "workflowName": "Agent scratch retention"
+   },
+   {
+    "__typename": "CheckRun",
+    "completedAt": "2026-11-19T04:21:55Z",
+    "conclusion": "SUCCESS",
+    "detailsUrl": "https://github.com/berlinguyinca/herdr-engineering/actions/runs/44457600574/job/135336326710",
+    "name": "verify",
+    "startedAt": "2026-11-19T04:20:12Z",
+    "status": "COMPLETED",
+    "workflowName": "Host Cargo cache"
+   },
+   {
+    "__typename": "CheckRun",
+    "completedAt": "2026-11-19T04:21:12Z",
+    "conclusion": "SUCCESS",
+    "detailsUrl": "https://github.com/berlinguyinca/herdr-engineering/actions/runs/44457600414/job/135336325968",
+    "name": "verify (ubuntu-24.04)",
+    "startedAt": "2026-11-19T04:20:11Z",
+    "status": "COMPLETED",
+    "workflowName": "Agent scratch retention"
+   },
+   {
+    "__typename": "StatusContext",
+    "context": "ci/woodpecker/pr/unit-gates",
+    "startedAt": "2026-11-19T04:37:27Z",
+    "state": "FAILURE",
+    "targetUrl": "https://ci.metabolomics.us/repos/120/pipeline/1745/4"
+   },
+   {
+    "__typename": "CheckRun",
+    "completedAt": "2026-11-19T04:20:08Z",
+    "conclusion": "SUCCESS",
+    "detailsUrl": "https://dashboard.gitguardian.com",
+    "name": "GitGuardian Security Checks",
+    "startedAt": "2026-11-19T04:20:05Z",
+    "status": "COMPLETED",
+    "workflowName": ""
+   },
+   {
+    "__typename": "StatusContext",
+    "context": "Opus agent review",
+    "startedAt": "2026-11-19T04:37:22Z",
+    "state": "SUCCESS",
+    "targetUrl": "https://github.com/berlinguyinca/herdr-engineering/pull/889#issuecomment-6999844596"
+   },
+   {
+    "__typename": "StatusContext",
+    "context": "ci/woodpecker/pr/artifact-handoff",
+    "startedAt": "2026-11-19T04:21:22Z",
+    "state": "SUCCESS",
+    "targetUrl": "https://ci.metabolomics.us/repos/120/pipeline/1745/1"
+   },
+   {
+    "__typename": "StatusContext",
+    "context": "ci/woodpecker/pr/structural-gates",
+    "startedAt": "2026-11-19T04:22:13Z",
+    "state": "SUCCESS",
+    "targetUrl": "https://ci.metabolomics.us/repos/120/pipeline/1745/2"
+   },
+   {
+    "__typename": "StatusContext",
+    "context": "ci/woodpecker/pr/ui-gates",
+    "startedAt": "2026-11-19T04:22:07Z",
+    "state": "SUCCESS",
+    "targetUrl": "https://ci.metabolomics.us/repos/120/pipeline/1745/3"
+   }
+  ],
+  "title": "fix(scratch-reaper): recognise cargo 1.100 build-dir layout",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/889"
+ },
+ {
+  "headRefName": "feat/automatic-handoff-triggers",
+  "mergedAt": null,
+  "number": 884,
+  "state": "OPEN",
+  "statusCheckRollup": [
+   {
+    "__typename": "CheckRun",
+    "completedAt": "2026-11-19T05:43:07Z",
+    "conclusion": "SUCCESS",
+    "detailsUrl": "https://github.com/berlinguyinca/herdr-engineering/actions/runs/44466073003/job/135364045284",
+    "name": "verify",
+    "startedAt": "2026-11-19T05:34:19Z",
+    "status": "COMPLETED",
+    "workflowName": "Agent communications"
+   },
+   {
+    "__typename": "CheckRun",
+    "completedAt": "2026-11-19T05:36:08Z",
+    "conclusion": "SUCCESS",
+    "detailsUrl": "https://github.com/berlinguyinca/herdr-engineering/actions/runs/44466072919/job/135364044608",
+    "name": "verify (macos-15)",
+    "startedAt": "2026-11-19T05:34:19Z",
+    "status": "COMPLETED",
+    "workflowName": "Agent scratch retention"
+   },
+   {
+    "__typename": "CheckRun",
+    "completedAt": "2026-11-19T05:35:39Z",
+    "conclusion": "SUCCESS",
+    "detailsUrl": "https://github.com/berlinguyinca/herdr-engineering/actions/runs/44466072767/job/135364044154",
+    "name": "verify",
+    "startedAt": "2026-11-19T05:34:19Z",
+    "status": "COMPLETED",
+    "workflowName": "Host Cargo cache"
+   },
+   {
+    "__typename": "CheckRun",
+    "completedAt": "2026-11-19T05:35:29Z",
+    "conclusion": "SUCCESS",
+    "detailsUrl": "https://github.com/berlinguyinca/herdr-engineering/actions/runs/44466072919/job/135364045130",
+    "name": "verify (ubuntu-24.04)",
+    "startedAt": "2026-11-19T05:34:18Z",
+    "status": "COMPLETED",
+    "workflowName": "Agent scratch retention"
+   },
+   {
+    "__typename": "StatusContext",
+    "context": "ci/woodpecker/pr/unit-gates",
+    "startedAt": "2026-11-19T05:35:12Z",
+    "state": "PENDING",
+    "targetUrl": "https://ci.metabolomics.us/repos/120/pipeline/1754/4"
+   },
+   {
+    "__typename": "CheckRun",
+    "completedAt": "2026-11-19T05:34:17Z",
+    "conclusion": "SUCCESS",
+    "detailsUrl": "https://dashboard.gitguardian.com",
+    "name": "GitGuardian Security Checks",
+    "startedAt": "2026-11-19T05:34:15Z",
+    "status": "COMPLETED",
+    "workflowName": ""
+   },
+   {
+    "__typename": "StatusContext",
+    "context": "Opus agent review",
+    "startedAt": "2026-11-19T05:56:45Z",
+    "state": "SUCCESS",
+    "targetUrl": "https://github.com/berlinguyinca/herdr-engineering/pull/884#issuecomment-7001091885"
+   },
+   {
+    "__typename": "StatusContext",
+    "context": "ci/woodpecker/pr/artifact-handoff",
+    "startedAt": "2026-11-19T05:35:16Z",
+    "state": "SUCCESS",
+    "targetUrl": "https://ci.metabolomics.us/repos/120/pipeline/1754/1"
+   },
+   {
+    "__typename": "StatusContext",
+    "context": "ci/woodpecker/pr/structural-gates",
+    "startedAt": "2026-11-19T05:36:06Z",
+    "state": "SUCCESS",
+    "targetUrl": "https://ci.metabolomics.us/repos/120/pipeline/1754/2"
+   },
+   {
+    "__typename": "StatusContext",
+    "context": "ci/woodpecker/pr/ui-gates",
+    "startedAt": "2026-11-19T05:51:21Z",
+    "state": "SUCCESS",
+    "targetUrl": "https://ci.metabolomics.us/repos/120/pipeline/1754/3"
+   }
+  ],
+  "title": "feat(handoff): arm automatic handoffs at the context limit",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/884"
+ },
+ {
+  "headRefName": "feat/pretooluse-guard-hooks",
+  "mergedAt": "2026-11-18T16:36:01Z",
+  "number": 862,
+  "state": "MERGED",
+  "statusCheckRollup": [
+   {
+    "__typename": "CheckRun",
+    "completedAt": "2026-11-18T15:14:28Z",
+    "conclusion": "SUCCESS",
+    "detailsUrl": "https://github.com/berlinguyinca/herdr-engineering/actions/runs/44332782292/job/134901339163",
+    "name": "verify",
+    "startedAt": "2026-11-18T15:11:50Z",
+    "status": "COMPLETED",
+    "workflowName": "Agent communications"
+   },
+   {
+    "__typename": "CheckRun",
+    "completedAt": "2026-11-18T15:13:10Z",
+    "conclusion": "SUCCESS",
+    "detailsUrl": "https://github.com/berlinguyinca/herdr-engineering/actions/runs/44332781758/job/134901334573",
+    "name": "verify",
+    "startedAt": "2026-11-18T15:11:50Z",
+    "status": "COMPLETED",
+    "workflowName": "Host Cargo cache"
+   },
+   {
+    "__typename": "StatusContext",
+    "context": "Independent AI review",
+    "startedAt": "2026-11-18T16:02:38Z",
+    "state": "ERROR",
+    "targetUrl": "https://github.com/berlinguyinca/herdr-engineering/pull/862"
+   },
+   {
+    "__typename": "CheckRun",
+    "completedAt": "2026-11-18T15:12:00Z",
+    "conclusion": "SUCCESS",
+    "detailsUrl": "https://dashboard.gitguardian.com",
+    "name": "GitGuardian Security Checks",
+    "startedAt": "2026-11-18T15:11:49Z",
+    "status": "COMPLETED",
+    "workflowName": ""
+   },
+   {
+    "__typename": "StatusContext",
+    "context": "Opus agent review",
+    "startedAt": "2026-11-18T15:27:09Z",
+    "state": "SUCCESS",
+    "targetUrl": "https://github.com/berlinguyinca/herdr-engineering/pull/862#issuecomment-6983037295"
+   },
+   {
+    "__typename": "StatusContext",
+    "context": "ci/woodpecker/pr/artifact-handoff",
+    "startedAt": "2026-11-18T15:12:47Z",
+    "state": "SUCCESS",
+    "targetUrl": "https://ci.metabolomics.us/repos/120/pipeline/1679/1"
+   },
+   {
+    "__typename": "StatusContext",
+    "context": "ci/woodpecker/pr/structural-gates",
+    "startedAt": "2026-11-18T15:12:26Z",
+    "state": "SUCCESS",
+    "targetUrl": "https://ci.metabolomics.us/repos/120/pipeline/1679/2"
+   },
+   {
+    "__typename": "StatusContext",
+    "context": "ci/woodpecker/pr/unit-gates",
+    "startedAt": "2026-11-18T15:33:43Z",
+    "state": "SUCCESS",
+    "targetUrl": "https://ci.metabolomics.us/repos/120/pipeline/1679/3"
+   }
+  ],
+  "title": "feat(workflow): blocking PreToolUse guard hooks for /tmp writes and pushes",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/862"
+ },
+ {
+  "headRefName": "fix/cli-cwd-and-tailscale-doctor",
+  "mergedAt": "2026-11-19T04:18:53Z",
+  "number": 891,
+  "state": "MERGED",
+  "statusCheckRollup": [
+   {
+    "__typename": "CheckRun",
+    "completedAt": "2026-11-19T03:56:47Z",
+    "conclusion": "SUCCESS",
+    "detailsUrl": "https://github.com/berlinguyinca/herdr-engineering/actions/runs/44454649034/job/135326609839",
+    "name": "verify",
+    "startedAt": "2026-11-19T03:54:30Z",
+    "status": "COMPLETED",
+    "workflowName": "Agent communications"
+   },
+   {
+    "__typename": "CheckRun",
+    "completedAt": "2026-11-19T03:56:18Z",
+    "conclusion": "SUCCESS",
+    "detailsUrl": "https://github.com/berlinguyinca/herdr-engineering/actions/runs/44454648971/job/135326609350",
+    "name": "verify",
+    "startedAt": "2026-11-19T03:54:31Z",
+    "status": "COMPLETED",
+    "workflowName": "Host Cargo cache"
+   },
+   {
+    "__typename": "CheckRun",
+    "completedAt": "2026-11-19T03:54:25Z",
+    "conclusion": "SUCCESS",
+    "detailsUrl": "https://dashboard.gitguardian.com",
+    "name": "GitGuardian Security Checks",
+    "startedAt": "2026-11-19T03:54:25Z",
+    "status": "COMPLETED",
+    "workflowName": ""
+   },
+   {
+    "__typename": "StatusContext",
+    "context": "Opus agent review",
+    "startedAt": "2026-11-19T04:12:02Z",
+    "state": "SUCCESS",
+    "targetUrl": "https://github.com/berlinguyinca/herdr-engineering/pull/891#issuecomment-6999447877"
+   },
+   {
+    "__typename": "StatusContext",
+    "context": "ci/woodpecker/pr/artifact-handoff",
+    "startedAt": "2026-11-19T03:55:40Z",
+    "state": "SUCCESS",
+    "targetUrl": "https://ci.metabolomics.us/repos/120/pipeline/1740/1"
+   },
+   {
+    "__typename": "StatusContext",
+    "context": "ci/woodpecker/pr/structural-gates",
+    "startedAt": "2026-11-19T03:55:25Z",
+    "state": "SUCCESS",
+    "targetUrl": "https://ci.metabolomics.us/repos/120/pipeline/1740/2"
+   },
+   {
+    "__typename": "StatusContext",
+    "context": "ci/woodpecker/pr/ui-gates",
+    "startedAt": "2026-11-19T03:55:22Z",
+    "state": "SUCCESS",
+    "targetUrl": "https://ci.metabolomics.us/repos/120/pipeline/1740/3"
+   },
+   {
+    "__typename": "StatusContext",
+    "context": "ci/woodpecker/pr/unit-gates",
+    "startedAt": "2026-11-19T04:17:52Z",
+    "state": "SUCCESS",
+    "targetUrl": "https://ci.metabolomics.us/repos/120/pipeline/1740/4"
+   }
+  ],
+  "title": "fix: fleet status and doctor no longer depend on the cwd; gateway-monitor timer fires again",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/891"
+ }
+]

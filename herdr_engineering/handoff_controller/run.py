@@ -200,6 +200,15 @@ def default_locate(adapter: HarnessAdapter, pane: AgentPane) -> SessionRef | Non
     return adapter.locate(pane.pane_id, pane.cwd) if pane.cwd else None
 
 
+class SidePaneUnavailable(RuntimeError):
+    """The side pane could not be ensured now (Herdr did not answer, another process holds the tab's lock, or `herdr-eng` is
+    not found). The tick's failure count applies: it is tried again, and said once after `_MAX_ENSURE_FAILURES` in a row."""
+
+
+_ENSURE_BUDGET_S = 5.0  # the whole call into `side_pane.ensure`; the controller's tick never waits longer
+_RETRY_OUTCOMES = frozenset({"unavailable", "locked", "runner_missing"})  # created, exists, dismissed, too_narrow are final
+
+
 def default_ensure_side_pane(tab_id: str) -> None:
     """Create the tab's side pane through `herdr_engineering.side_pane` (plan 4). Silent only while that module itself
     does not exist yet; a failure inside it, or inside what it imports, is reported."""
@@ -212,7 +221,10 @@ def default_ensure_side_pane(tab_id: str) -> None:
     except ImportError as exc:
         _warn(f"side pane module failed to import: {type(exc).__name__}: {exc}")
         return
-    module.ensure(tab_id)
+    result = module.ensure(tab_id, lock_timeout_s=0, budget_s=_ENSURE_BUDGET_S)  # never waits on the lock, bounded in time
+    outcome = str(getattr(result, "outcome", ""))
+    if outcome in _RETRY_OUTCOMES:
+        raise SidePaneUnavailable(f"side pane for {tab_id}: {outcome}")
 
 
 def default_is_side_pane(pane: AgentPane) -> bool:

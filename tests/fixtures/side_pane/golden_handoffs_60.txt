@@ -1,0 +1,12 @@
+ Summary [Handoffs ●] CI ● 
+────────────────────────────────────────────────────────────
+2 handoffs · 3 sessions
+3h 19m total
+● #1 brainstorm the guard now
+│ → handed off
+● #2 guard PR and CI
+│ 1h 40m
+│ → handed off
+▶ #3 Filter chips become single-select toggles
+  1h 39m  [█████████░] 88%
+  … waiting for 2 subagents

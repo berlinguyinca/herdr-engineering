@@ -1,0 +1,166 @@
+"""The side pane's calls to Herdr: the controller's `HerdrCli` (agents, send-keys) plus panes, layout, split and close.
+
+`HerdrCli._run` is the one place a `herdr` subprocess is started (timeout, environment, no exception); the methods here
+only shape its JSON. No method raises: None or False means Herdr did not answer or refused.
+"""
+from __future__ import annotations
+
+import json
+import subprocess
+import time
+from collections.abc import Mapping
+from dataclasses import dataclass
+
+from ..handoff_controller.herdr_cli import HerdrCli, _text
+
+_QUICK_S = 15.0
+
+
+@dataclass(frozen=True)
+class PaneRow:
+    pane_id: str
+    tab_id: str
+    terminal_id: str  # not reused after a Herdr restart, unlike the pane id
+    focused: bool  # focus of the whole Herdr, not of the pane's tab (see `Layout.focused_pane_id`)
+
+
+@dataclass(frozen=True)
+class Rect:
+    x: int
+    y: int
+    width: int
+    height: int
+
+
+@dataclass(frozen=True)
+class Layout:
+    """One tab's layout: the focused pane of that tab and the cells every pane has."""
+    tab_id: str
+    focused_pane_id: str | None
+    rects: Mapping[str, Rect]
+
+
+def _int(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _row(raw: object) -> PaneRow | None:
+    if not isinstance(raw, dict):
+        return None
+    pane, tab, terminal = _text(raw.get("pane_id")), _text(raw.get("tab_id")), _text(raw.get("terminal_id"))
+    return PaneRow(pane, tab, terminal, raw.get("focused") is True) if pane and tab and terminal else None
+
+
+def _result(text: str) -> dict[str, object] | None:
+    """The `result` object of one `herdr ... ` JSON reply, or None when it is not one."""
+    try:
+        reply = json.loads(text)["result"]
+    except (ValueError, KeyError, TypeError):
+        return None
+    return reply if isinstance(reply, dict) else None
+
+
+def parse_panes(text: str) -> list[PaneRow] | None:
+    """The rows of a `herdr pane list` reply; one that cannot be read is skipped."""
+    reply = _result(text)
+    rows = reply.get("panes") if reply else None
+    return [row for row in map(_row, rows) if row] if isinstance(rows, list) else None
+
+
+def parse_pane(text: str) -> PaneRow | None:
+    """The row of a `herdr pane get` or `pane split` reply."""
+    reply = _result(text)
+    return _row(reply.get("pane")) if reply else None
+
+
+def parse_layout(text: str) -> Layout | None:
+    """The layout of a `herdr pane layout` reply: the focused pane of the tab and every pane's cells."""
+    reply = _result(text)
+    raw = reply.get("layout") if reply else None
+    if not isinstance(raw, dict) or not _text(raw.get("tab_id")) or not isinstance(raw.get("panes"), list):
+        return None
+    rects: dict[str, Rect] = {}
+    for entry in raw["panes"]:
+        rect = entry.get("rect") if isinstance(entry, dict) else None
+        pane = _text(entry.get("pane_id")) if isinstance(entry, dict) else None
+        cells = [_int(rect.get(k)) for k in ("x", "y", "width", "height")] if isinstance(rect, dict) else []
+        if pane and len(cells) == 4 and None not in cells:
+            rects[pane] = Rect(*cells)  # type: ignore[arg-type]
+    return Layout(str(raw["tab_id"]), _text(raw.get("focused_pane_id")), rects)
+
+
+class SideHerdr(HerdrCli):
+    """With `deadline` set (a `time.monotonic()` value), every call gets at most the time left and an expired budget answers
+    None without starting a process; `hard_deadline` is where `release_reserve` moves it, for cleanup after the work ran out."""
+    deadline: float | None = None
+    hard_deadline: float | None = None
+
+    def _run(self, args: list[str], timeout_s: float) -> subprocess.CompletedProcess[str] | None:
+        if self.deadline is not None:
+            timeout_s = min(timeout_s, self.deadline - time.monotonic())
+            if timeout_s <= 0:
+                return None
+        return super()._run(args, timeout_s)
+
+    def allow(self, seconds: float) -> None:
+        """Give the calls that follow `seconds` of their own, whatever the budget did: cleanup of what the work left behind."""
+        self.deadline = self.hard_deadline = time.monotonic() + seconds
+
+    def release_reserve(self) -> None:
+        """Let the calls that must not be skipped (recording or removing what the work left) use the whole budget."""
+        if self.hard_deadline is not None:
+            self.deadline = self.hard_deadline
+
+    def _stdout(self, args: list[str]) -> str | None:
+        done = self._run(args, _QUICK_S)
+        return done.stdout if done is not None and done.returncode == 0 else None
+
+    def panes(self) -> list[PaneRow] | None:
+        """Every pane Herdr lists, or None when it cannot be asked."""
+        text = self._stdout(["pane", "list"])
+        return parse_panes(text) if text is not None else None
+
+    def pane(self, pane_id: str) -> PaneRow | None:
+        text = self._stdout(["pane", "get", pane_id])
+        return parse_pane(text) if text is not None else None
+
+    def tab_of(self, pane_id: str) -> str | None:
+        row = self.pane(pane_id)
+        return row.tab_id if row else None
+
+    def layout(self, pane_id: str) -> Layout | None:
+        """The layout of the tab that holds `pane_id`; None when the pane or Herdr is gone."""
+        text = self._stdout(["pane", "layout", "--pane", pane_id])
+        return parse_layout(text) if text is not None else None
+
+    def split(self, target: str, ratio: float, env: Mapping[str, str] | None = None) -> PaneRow | None:
+        """A new pane to the right of `target`, without taking focus; `ratio` is the share `target` keeps."""
+        args = ["pane", "split", target, "--direction", "right", "--ratio", f"{ratio:.4f}", "--no-focus"]
+        for key, value in (env or {}).items():
+            args += ["--env", f"{key}={value}"]
+        text = self._stdout(args)
+        return parse_pane(text) if text is not None else None
+
+    def run_in(self, pane_id: str, command: str) -> bool:
+        """Type `command` into the pane's shell and press enter."""
+        done = self._run(["pane", "run", pane_id, command], _QUICK_S)
+        return done is not None and done.returncode == 0
+
+    def close(self, pane_id: str) -> bool:
+        done = self._run(["pane", "close", pane_id], _QUICK_S)
+        return done is not None and done.returncode == 0
+
+    def neighbor(self, pane_id: str, direction: str) -> str | None:
+        """The pane next to `pane_id` in `direction` (left, right, up, down), or None."""
+        text = self._stdout(["pane", "neighbor", "--pane", pane_id, "--direction", direction])
+        reply = _result(text) if text is not None else None
+        found = reply.get("neighbor") if reply else None
+        return _text(found.get("neighbor_pane_id")) if isinstance(found, dict) else None
+
+    def focus_toward(self, pane_id: str, direction: str) -> str | None:
+        """Move the focus one pane from `pane_id` in `direction` (Herdr has no focus-by-id); the pane that holds it
+        afterwards, or None when Herdr refused. This is the only focus call, and only `placement.settle_focus` uses it."""
+        text = self._stdout(["pane", "focus", "--pane", pane_id, "--direction", direction])
+        reply = _result(text) if text is not None else None
+        found = reply.get("focus") if reply else None
+        return _text(found.get("focused_pane_id")) if isinstance(found, dict) else None

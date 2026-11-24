@@ -356,13 +356,7 @@ class WoodpeckerProvider:
         except OSError:
             raise CIProviderError("unavailable") from None
 
-    def public_pipelines(self, repository: str) -> list[PipelineView] | None:
-        """The recent pipelines of a PUBLIC repository read without any credential, or None when the configured CI
-        address is not a safe place to read from (so the caller treats CI as unverified).  Raises CIProviderError on
-        any failure; never returns data it could not parse."""
-        base = self._public_base()
-        if base is None:
-            return None
+    def _public_repo_id(self, base: str, repository: str) -> str:
         parts = repository.split("/") if isinstance(repository, str) else []
         if len(parts) != 2 or not all(re.fullmatch(r"[A-Za-z0-9_.-]+", p) and p not in (".", "..") for p in parts):
             raise InvalidError("CI repository must be owner/name")
@@ -370,6 +364,16 @@ class WoodpeckerProvider:
         rid = _positive_id(info.get("id")) if isinstance(info, dict) else None
         if rid is None:
             raise CIProviderError("invalid_response")
+        return rid
+
+    def public_pipelines(self, repository: str) -> list[PipelineView] | None:
+        """The recent pipelines of a PUBLIC repository read without any credential, or None when the configured CI
+        address is not a safe place to read from (so the caller treats CI as unverified).  Raises CIProviderError on
+        any failure; never returns data it could not parse."""
+        base = self._public_base()
+        if base is None:
+            return None
+        rid = self._public_repo_id(base, repository)
         rows = _items(self._public_get(base, f"/api/repos/{rid}/pipelines"))
         return [PipelineView(
             pipeline_id=str(item.get("id", "")), run_number=item.get("number", 0),
@@ -377,6 +381,19 @@ class WoodpeckerProvider:
             state=item.get("status", "unknown"), event=item.get("event", "pipeline"),
             created_at=_timestamp(item.get("created")), started_at=_timestamp(item.get("started")),
             finished_at=_timestamp(item.get("finished")), ref=item.get("ref")) for item in rows[:50]]
+
+    def public_workflows(self, repository: str, number: int) -> list[dict[str, str]] | None:
+        """The workflows (name, state) of one pipeline of a PUBLIC repository, read without any credential; None
+        when the configured CI address is not a safe place to read from.  Raises CIProviderError on any failure."""
+        base = self._public_base()
+        if base is None:
+            return None
+        rid = self._public_repo_id(base, repository)
+        data = self._public_get(base, f"/api/repos/{rid}/pipelines/{_positive_id(number)}")
+        if not isinstance(data, dict):
+            raise CIProviderError("invalid_response")
+        return [{"name": str(wf.get("name") or ""), "state": str(wf.get("state") or "unknown")}
+                for wf in data.get("workflows") or [] if isinstance(wf, dict)]
 
     @staticmethod
     def _page_path(path: str, page: int, per_page: int) -> str:
