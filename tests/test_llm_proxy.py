@@ -428,7 +428,7 @@ def test_guard_rejects_missing_registration_and_foreign_project_before_dispatch(
         with pytest.raises(urllib.error.HTTPError) as forbidden:
             _summary_post(proxy, foreign)
         assert forbidden.value.code == 403
-        assert gpu == cpu == calls == []
+        assert gpu == cpu == []     # the catalog is read first, to see whether the name shadows a gateway model
     finally:
         _teardown(proxy, srvs)
 
@@ -490,7 +490,7 @@ def test_registration_project_scope_applies_without_guard_header_too():
         with pytest.raises(urllib.error.HTTPError) as error:
             _post(proxy, foreign, {"model": "summary"})
         assert error.value.code == 403
-        assert gpu == cpu == calls == []
+        assert gpu == cpu == []     # the catalog is read to see whether the name shadows a gateway model
     finally:
         _teardown(proxy, srvs)
 
@@ -551,8 +551,10 @@ def test_a_registered_models_project_is_enforced_with_or_without_the_guard_heade
     # registered model, so a foreign key now gets 403 whichever way it asks.
     repo, _, proxy, upstream, custom, srvs = _setup()
     try:
+        repo.delete_custom_model("my-model")        # ownership never changes in place: the operator deletes first
         repo.upsert_custom_model("my-model", f"http://127.0.0.1:{srvs[1].server_address[1]}",
                                  "real-name", project="proj-a")
+        _serve_catalog(srvs[0], ["other"])          # a project-owned name routes once a catalog has been read
         foreign = repo.create_project_key("proj-b")["key"]
         proxy.RequestHandlerClass.state.refresh(force=True)
         for extra in ({}, {"X-Herdr-Require-Registered-Model": "true"}):
@@ -1075,5 +1077,49 @@ def test_a_stored_base_url_is_validated_again_when_used(base_url):
         assert refused.value.code == 403
         assert b"model_endpoint_refused" in refused.value.read()
         assert custom == [] and upstream == []
+    finally:
+        _teardown(proxy, srvs)
+
+
+def test_a_shadowed_name_registered_by_another_project_still_routes_upstream_for_everyone_else():
+    repo, key, proxy, upstream, custom, srvs = _setup()
+    try:
+        _serve_catalog(srvs[0], ["qwen"])
+        repo.upsert_custom_model("qwen", f"http://127.0.0.1:{srvs[1].server_address[1]}", "stolen", project="proj-b")
+        proxy.RequestHandlerClass.state.refresh(force=True)
+        assert _post(proxy, key, {"model": "qwen", "messages": []})[0] == 200      # proj-a, not the owner: no 403
+        assert custom == [] and [s["body"]["model"] for s in upstream] == ["qwen"]
+    finally:
+        _teardown(proxy, srvs)
+
+
+def test_a_project_owned_registration_is_refused_until_a_catalog_has_been_read():
+    repo, key, proxy, upstream, custom, srvs = _setup()
+    try:
+        # The fake upstream serves no catalog (501), so whether the name shadows a gateway model is unknown.
+        repo.upsert_custom_model("owned", f"http://127.0.0.1:{srvs[1].server_address[1]}", "x", project="proj-a")
+        proxy.RequestHandlerClass.state.refresh(force=True)
+        with pytest.raises(urllib.error.HTTPError) as refused:
+            _post(proxy, key, {"model": "owned", "messages": []})
+        assert refused.value.code == 503 and custom == []
+        _serve_catalog(srvs[0], ["other"])
+        proxy.RequestHandlerClass.state._catalog_last = float("-inf")
+        assert _post(proxy, key, {"model": "owned", "messages": []})[0] == 200
+        assert len(custom) == 1
+    finally:
+        _teardown(proxy, srvs)
+
+
+def test_a_named_endpoint_is_connected_by_its_validated_address_with_the_original_host_header():
+    repo, key, proxy, upstream, custom, srvs = _setup()
+    try:
+        port = srvs[1].server_address[1]
+        repo.upsert_custom_model("named", f"http://localhost:{port}", "x")
+        proxy.RequestHandlerClass.state.refresh(force=True)
+        assert _post(proxy, key, {"model": "named", "messages": []})[0] == 200
+        assert custom[0]["headers"]["host"] == f"localhost:{port}"
+        state = proxy.RequestHandlerClass.state
+        assert set(state.pinned_addresses(f"http://localhost:{port}")) <= {"127.0.0.1", "::1"}
+        assert state.pinned_addresses(f"http://127.0.0.1:{port}") == ()
     finally:
         _teardown(proxy, srvs)

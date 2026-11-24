@@ -130,3 +130,28 @@ def test_the_github_webhook_is_exempt_by_name(server):
                     {"Content-Type": "application/x-www-form-urlencoded", "Origin": "https://github.com"}):
         status, body = call(server, "POST", "/api/v1/intelligence/webhooks/github", headers)
         assert not refused(status, body), (status, body)
+
+
+def test_an_origin_must_match_the_host_port_not_just_the_name(server):
+    # dev.lan is configured, but only as a bare name (default port): another port is another origin.
+    status, body = call(server, "POST", "/api/v1/llm/keys",
+                        {**JSON, "Origin": "http://dev.lan:8081", "Host": "dev.lan:8080"}, body=b'{"project": "p"}')
+    assert status == 403 and "cross-origin" in json.dumps(body)
+    status, body = call(server, "POST", "/api/v1/llm/keys",
+                        {**JSON, "Origin": "http://dev.lan:8080", "Host": "dev.lan:8080"}, body=b'{"project": "p"}')
+    assert status == 200, body
+
+
+def test_the_bound_name_reaches_the_collab_and_deployment_routes():
+    # The main-listener guard accepts the bound name; the collab proxy and deployment actions must agree.
+    svr = ControlPlaneServer(ControlPlaneRepo(), collab_operator_url="http://127.0.0.1:9")
+    svr.allowed_hosts = svr.allowed_hosts | {"hub.internal"}
+    threading.Thread(target=svr.serve, daemon=True).start()
+    svr.wait_until_ready()
+    try:
+        status, body = call(svr, "GET", "/api/v1/collab/rooms", {"Host": "hub.internal"})
+        assert "not found" not in json.dumps(body), (status, body)
+        status, body = call(svr, "POST", "/api/v1/deployments/force", {**JSON, "Host": "hub.internal"})
+        assert "dashboard host" not in json.dumps(body), (status, body)
+    finally:
+        svr.shutdown()

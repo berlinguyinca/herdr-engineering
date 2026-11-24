@@ -52,11 +52,12 @@ def validate_model_endpoint(url, *, resolve: bool = False) -> str:
     if host in _METADATA_NAMES:
         raise ValueError(f"base_url host {host} is a cloud metadata name")
     try:
-        _check_ip(ipaddress.ip_address(host), host)
+        literal = ipaddress.ip_address(host)
+    except ValueError:
+        literal = None
+    if literal is not None:
+        _check_ip(literal, host)
         return url
-    except ValueError as exc:
-        if "base_url" in str(exc):
-            raise
     # Not an IP literal. A name whose last label is a number is an IPv4 address in another spelling
     # (2852039166, 0xa9fea9fe, 169.254.43518): refuse it rather than guess how a resolver reads it.
     if _NUMERIC_LABEL.fullmatch(host.rsplit(".", 1)[-1]):
@@ -69,3 +70,21 @@ def validate_model_endpoint(url, *, resolve: bool = False) -> str:
         for info in infos:
             _check_ip(ipaddress.ip_address(info[4][0].split("%")[0]), f"{host} ({info[4][0]})")
     return url
+
+
+def resolve_model_endpoint(url) -> tuple[str, ...]:
+    """Validate ``url`` and return every address it resolves to (all checked), so the connection cannot be pointed elsewhere between
+    the check and the connect (DNS rebinding). An empty tuple for an IP literal, which needs no lookup. A name that does not
+    resolve raises OSError: the caller must not fall back to a second, unchecked lookup."""
+    validate_model_endpoint(url)
+    parts = urlsplit(url)
+    host = (parts.hostname or "").rstrip(".").lower()
+    try:
+        ipaddress.ip_address(host)
+        return ()
+    except ValueError:
+        pass
+    infos = socket.getaddrinfo(host, parts.port or (443 if parts.scheme == "https" else 80), type=socket.SOCK_STREAM)
+    for info in infos:
+        _check_ip(ipaddress.ip_address(info[4][0].split("%")[0]), f"{host} ({info[4][0]})")
+    return tuple(dict.fromkeys(info[4][0].split("%")[0] for info in infos))

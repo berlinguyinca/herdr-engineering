@@ -65,3 +65,11 @@ def test_a_name_owned_by_another_project_cannot_be_taken_over(server):
     assert post(server, "/api/v1/llm/models/m/delete", {})[0] == 200
     assert post(server, "/api/v1/llm/models",
                 {"name": "m", "base_url": "http://127.0.0.1:9002", "project": "b"})[0] == 200
+
+
+def test_a_shared_model_cannot_be_claimed_by_a_project(server):
+    assert post(server, "/api/v1/llm/models", {"name": "s", "base_url": "http://127.0.0.1:9000"})[0] == 200
+    status, body = post(server, "/api/v1/llm/models", {"name": "s", "base_url": "http://127.0.0.1:9999", "project": "a"})
+    assert status == 400 and "ownership" in json.dumps(body), body
+    assert models(server)["s"]["base_url"] == "http://127.0.0.1:9000"
+    assert post(server, "/api/v1/llm/models", {"name": "s", "base_url": "http://127.0.0.1:9001"})[0] == 200

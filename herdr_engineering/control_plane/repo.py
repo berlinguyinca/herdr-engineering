@@ -3578,10 +3578,11 @@ class ControlPlaneRepo:
         if base_url:
             validate_model_endpoint(base_url, resolve=True)
         existing = self.list_custom_models().get(name)
-        if existing and existing.get("project") and existing["project"] != project:
-            # A name is how traffic finds its route: taking over one a project owns would capture its prompts.
-            # The owner updates it, or an operator deletes it first.
-            raise ValueError(f"custom model {name!r} is owned by another project")
+        if existing and existing.get("project") != project:
+            # A name is how traffic finds its route: taking over one (a project's, or a shared one) would capture
+            # its prompts. Ownership never changes through this call; there is no operator identity here, so an
+            # operator deletes the model first and registers it again.
+            raise ValueError(f"custom model {name!r} is owned by another project; ownership cannot change")
         payload = {"name": name, "upstream_model": upstream_model or name, "project": project, "deleted": False}
         if base_url:
             payload["base_url"] = base_url.rstrip("/")

@@ -41,16 +41,18 @@ def host_ok(host_header, extra_hosts):
 def browser_write_refusal(headers, extra_hosts=()):
     """``(status, message)`` when a state-changing request must be refused as a browser attack, else None.
 
-    An Origin is accepted when it equals the Host the request used, or names a host the operator configured. With no
+    An Origin is accepted when its host and port equal the Host the request used, or exactly equal an entry the
+    operator configured (a bare name allows only the default port). With no
     Origin, ``Sec-Fetch-Site`` must be same-origin or none. A request carrying either header (a browser) and a body
     must be JSON."""
     origin = headers.get("Origin")
     site = headers.get("Sec-Fetch-Site")
     if origin is not None:
         parts = urlsplit(origin)
-        same = parts.netloc == headers.get("Host") and parts.scheme in {"http", "https"}
-        if not same and not (parts.scheme in {"http", "https"} and parts.netloc.lower() in extra_hosts
-                             or parts.scheme in {"http", "https"} and (parts.hostname or "") in extra_hosts):
+        netloc = parts.netloc.lower()
+        same = (parts.scheme in {"http", "https"} and bool(netloc)
+                and (netloc == (headers.get("Host") or "").strip().lower() or netloc in extra_hosts))
+        if not same:
             return 403, "cross-origin request refused"
     elif site is not None and site.strip().lower() not in _SAME_SITE:
         return 403, "cross-site request refused"

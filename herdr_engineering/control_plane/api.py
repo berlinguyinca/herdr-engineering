@@ -228,7 +228,6 @@ class _DaemonThreadingServerV6(_DaemonThreadingServer):
 
 
 
-_dashboard_host_ok = host_ok
 
 # Main-listener routes the browser defences do NOT apply to, by exact path. Each is called by something that is not a
 # browser and authenticates itself, so a browser-oriented check would only break it.
@@ -2207,7 +2206,6 @@ def _make_handler(server, public=False, operator=False, fabric=False):
             if self._path_only() in _BROWSER_GUARD_EXEMPT:
                 return False
             if not host_ok(self.headers.get("Host", ""), server.allowed_hosts):
-                self.close_connection = True
                 return self._deny(403, "host not allowed: add it to control_plane.collab.dashboard_hosts")
             if writes:
                 refusal = browser_write_refusal(self.headers, server.allowed_hosts)
@@ -2761,17 +2759,8 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                     or (res in {"ci", "review-gate"} and len(segs) > 4) or _SUMMARY_FIX.match(dpath)
                     or _TERMINAL_ATTACH.match(dpath) or _HOST_TERMINAL_OUT.match(dpath) or _STEER_ACK.match(dpath)
                     or _is_rereview(path)):
-                origin = self.headers.get("Origin")
-                if origin and (urlsplit(origin).netloc != self.headers.get("Host")
-                               or urlsplit(origin).scheme not in {"http", "https"}):
-                    return self._deny(403, "cross-origin integration mutation refused")
                 if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != "application/json":
                     return self._deny(415, "integration mutations require application/json")
-            if res in {"artifacts", "artifact-reports", "artifact-jobs", "artifact-reviews", "publications"}:
-                origin = self.headers.get("Origin")
-                if origin and (urlsplit(origin).netloc != self.headers.get("Host")
-                               or urlsplit(origin).scheme not in {"http", "https"}):
-                    return self._deny(403, "cross-origin artifact mutation refused")
             if _HOST_TERMINAL_OUT.match(dpath):      # host token, not X-API-Key (like the fleet routes above)
                 return self._host_terminal(unquote(dpath.split("/")[5]), post=True)
             min_role = ("ingest" if path == "/api/v1/ingest" or _STEER_ACK.match(path) or _is_rereview(path)
@@ -2909,10 +2898,6 @@ def _make_handler(server, public=False, operator=False, fabric=False):
             if resource in ("assistant-apps", "assistant-reminders", "assistant-workers",
                             "assistant-action-requests", "assistant-grants", "assistant-judges",
                             "assistant-slack", "assistant-deploys"):
-                origin = self.headers.get("Origin")
-                if origin and (urlsplit(origin).netloc != self.headers.get("Host")
-                               or urlsplit(origin).scheme not in {"http", "https"}):
-                    return self._deny(403, "cross-origin app connection mutation refused")
                 if self.command == "PUT" and self.headers.get("Content-Type", "").split(";", 1)[0].strip() != "application/json":
                     return self._deny(415, "app connection mutations require application/json")
             return self._route_api()
@@ -3086,7 +3071,7 @@ def _make_handler(server, public=False, operator=False, fabric=False):
 
             # Browser defences (the key could be in a page's hands): a Host a rebinding name
             # cannot reach, no cross-site fetch, and an Origin equal to the Host.
-            if not _dashboard_host_ok(self.headers.get("Host", ""), server.collab_dashboard_hosts):
+            if not host_ok(self.headers.get("Host", ""), server.allowed_hosts):
                 return refuse(403, "deployment actions need a dashboard host")
             fetch_site = self.headers.get("Sec-Fetch-Site")
             if fetch_site is not None and fetch_site.strip().lower() not in {"same-origin", "none"}:
@@ -3194,7 +3179,7 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                 return err
             # This path acts as the owner without any credential, so it needs the same browser
             # defences as the operator listener: no DNS-rebound names, no cross-site writes.
-            if not _dashboard_host_ok(self.headers.get("Host", ""), server.collab_dashboard_hosts):
+            if not host_ok(self.headers.get("Host", ""), server.allowed_hosts):
                 return self._deny(404, "not found")
             if self.command == "POST":
                 origin = self.headers.get("Origin")
