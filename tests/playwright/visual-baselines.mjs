@@ -176,7 +176,7 @@ async function settled(page, quietMs = 500, maxMs = 5000) {
 export async function capture(browser, info, surface, viewport, scheme, { extraCss = '', regions = viewport === 'desktop', size = null, dpr = 1, strictFonts = true } = {}) {
   // `size` ({width,height}) and `dpr` let capture-matrix.mjs take sizes outside ui-gates.yaml (the Screenwright matrix, the host's own screen)
   const vp = size || CFG.viewports[viewport];
-  const ctxOpts = { viewport: vp, colorScheme: scheme, reducedMotion: 'reduce', deviceScaleFactor: dpr, bypassCSP: true };
+  const ctxOpts = { viewport: vp, timezoneId: 'UTC', locale: 'en-US', colorScheme: scheme, reducedMotion: 'reduce', deviceScaleFactor: dpr, bypassCSP: true };
   const dashboard = surface.app === 'dashboard';
   const { ctx, page } = dashboard ? await openDashboard(browser, surface.hash, ctxOpts, surface.apiLog) : await openReal(browser, info, 'alice', ctxOpts);
   try {
