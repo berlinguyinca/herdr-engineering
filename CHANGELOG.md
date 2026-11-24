@@ -9,6 +9,11 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 - `herdr_artifact_host` housekeeping gains a `versions` duty: superseded versions (once a newer one is `version_grace`, default 1 h, old) and every version of a retracted or tombstoned artifact are marked `purged`, and the blobs only they used are deleted (row and file) under publish's per-sha lock. The current version of a live artifact, `legal_hold` artifacts, versions a pending or live share points at, and blobs a kept version still names are never touched. Before this, publishing repeatedly or deleting an artifact left every old blob on the volume while the quota counted only the current version, so one member could fill the disk. The orphan-blob sweep now ignores purged versions' manifests. `SweepReport` gains `versions_purged`.
 - `SyncedDirectory.groups` returns no groups for an account listed under `disabled` in `members.json` (the sync still lists it under its group), so a disabled account's member session and agent tokens are refused on the next recheck instead of waiting for housekeeping's revocation pass.
+### Fix: assistant store snapshot loading, ordering and locking
+
+- `PostgresStoreBackend.load()` no longer turns a failed read into "no snapshot": it raises `StoreLoadError`, so a control plane that boots while Postgres is unreachable fails startup instead of running with an empty store whose first mutation overwrote the stored snapshot.
+- Backend snapshot writes are numbered under the store lock and written one at a time; a slow older write can no longer land after a newer snapshot.
+- The store's list/search methods, `request_tool_action`'s idempotency scan and `list_approvals` read the shared dicts under the store lock (no more `dictionary changed size during iteration`), and `decide_approval` is atomic, so two concurrent decisions on one approval cannot both pass the pending check.
 ### Fix: Slack approval of unseen text, calendar block-list alias, Rakazo first-bot cache
 
 - Slack ask: the Approve buttons are only offered when the command is shown in full; a long (truncated) command gets Deny only and a "cannot be approved from Slack" note, and an approve tap on such an ask is refused (`not_fully_shown`).
