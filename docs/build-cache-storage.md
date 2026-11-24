@@ -194,7 +194,7 @@ toolchain digest only unit-tested), the tailnet endpoint, concurrent builders.
 
 ## Tailnet endpoint (fixed in code; active after the agent restarts)
 
-`100.104.39.6:9000` is held by the fabric agent (`herdr-eng devfabric agent`), whose
+`100.64.8.6:9000` is held by the fabric agent (`herdr-eng devfabric agent`), whose
 HTTP-aware forwarder rewrote `Host:` to `127.0.0.1:<port>` for requests addressed to a
 fabric-owned name. AWS SigV4 signs the `Host` header, so every signed S3 request through the
 tailnet address got `SignatureDoesNotMatch` (`credentials_rejected` in the build event) while

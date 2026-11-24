@@ -66,7 +66,7 @@
         HERDR_FABRIC_AGENT_NO_RESTART: "{{ '1' if (fabric_agent_defer_restart | default(false) | bool) else '' }}"
         HOME: "{{ fleet_home }}"
         USER: "{{ fleet_user }}"
-        XDG_RUNTIME_DIR: "/run/user/{{ ansible_user_uid }}"
+        XDG_RUNTIME_DIR: "/run/user/{{ ansible_facts['user_uid'] }}"
         PATH: "{{ fleet_home }}/.venvs/herdr-engineering/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:{{ fleet_home }}/.local/bin"
       register: fabric_agent_result
       changed_when: false

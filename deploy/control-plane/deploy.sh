@@ -26,9 +26,14 @@
 #   3. renders the variables docker compose itself needs (images' passwords, ports,
 #      bind address) from the central file into a transient 0600 env file inside a
 #      0700 directory (`herdr-eng fleet config render-compose`), removed on exit
-#   4. recreates control-plane-web, control-plane-worker and llm-proxy on that one
-#      image tag (postgres, rustfs, coredns, gateway, herdr-web untouched) using the
-#      compose files from that same commit; the central file's DIRECTORY is
+#   4. recreates control-plane-web, control-plane-worker, llm-proxy, fabric-gateway and herdr-web
+#      on that one image tag (postgres, rustfs, coredns untouched) using the
+#      compose files from that same commit. Recreating fabric-gateway drops its in-memory
+#      port leases for the restart window; the fabric agents re-register them on their next
+#      keepalive (herdr_engineering/fabric_agent.py, _keepalive: a heartbeat for an unknown
+#      lease, or a failed one, re-registers the same target and lease id), so dev:<port> URLs
+#      return without operator action, but expect a short gap in every forwarded service.
+#      The central file's DIRECTORY is
 #      mounted read-only at /etc/herdr/fleet/ (a single-file mount would keep the old
 #      inode after a rename-replace, so edits would never reach the server).
 #      With the collaboration marker it also renders control_plane.collab (and only
@@ -685,7 +690,7 @@ export HERDR_CP_WEB_EGRESS_CIDR="$MEMORY_PRIVATE_EGRESS_CIDR"
 export HERDR_CP_WEB_EGRESS_GENERATION="$WEB_EGRESS_GENERATION"
 # Every service of ours that runs the herdr-engineering image and reads the fleet
 # config: rolled forward (and back) together on one tag.
-APP_SERVICES=(control-plane-web control-plane-worker llm-proxy)
+APP_SERVICES=(control-plane-web control-plane-worker llm-proxy fabric-gateway herdr-web)
 
 if [ "$DRY" = 1 ]; then
   echo "[dry-run] rendered the compose variables to a 0600 file in a 0700 temp dir (removed on exit)"
@@ -1078,7 +1083,7 @@ healthy_commit() {
 container_of() {
   case "$1" in
     control-plane-web) echo herdr-cp-web ;; control-plane-worker) echo herdr-cp-worker ;;
-    llm-proxy) echo herdr-llm-proxy ;; collab-public) echo herdr-collab-public ;;
+    llm-proxy) echo herdr-llm-proxy ;; fabric-gateway) echo herdr-fabric-gateway ;; collab-public) echo herdr-collab-public ;;
     collab-edge) echo herdr-collab-edge ;; fabric-whois) echo herdr-collab-fabric-whois ;; share-public) echo herdr-share-public ;; *) echo "$1" ;;
   esac
 }

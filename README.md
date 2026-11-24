@@ -338,7 +338,7 @@ deploy/control-plane/deploy.sh         # renders compose variables from it, buil
 Deployed on **bender**, the control-plane stack serves the HerdR UI at
 `http://dev.lan` (Tailnet IP `:80`) with durable Postgres + MinIO:
 
-- The web bind address (the Tailnet interface, e.g. `100.104.39.6`) and public port
+- The web bind address (the Tailnet interface, e.g. `100.64.8.6`) and public port
   (`80`) are `control_plane.compose.HERDR_CP_WEB_BIND` / `HERDR_CP_WEB_PUBLIC_PORT`
   in the central file (answers to `fleet config init`).
 - The Postgres DSN is `control_plane.pg_dsn` in the central file, which the web reads

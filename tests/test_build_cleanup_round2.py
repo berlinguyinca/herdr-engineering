@@ -56,8 +56,10 @@ def _poisoned(root: Path, marker: str) -> tuple[Path, int]:
     holds a file: a walk that stops at its first bytes over the cap never gets that deep."""
     target = project(root)
     deep = target / "debug"
+    # Random bytes, then a sync: the cap measures allocated blocks, and a compressing or delayed-allocation
+    # filesystem (ZFS) reports next to nothing for repeated or still-dirty data, so the capped walk would never stop.
     for level in range(20):
-        (deep / f"filler{level}.bin").write_bytes(b"x" * 200_000)
+        (deep / f"filler{level}.bin").write_bytes(os.urandom(200_000))
         deep = deep / f"d{level}"
         deep.mkdir()
     if marker == ".git":
@@ -68,6 +70,7 @@ def _poisoned(root: Path, marker: str) -> tuple[Path, int]:
         (deep / "link").symlink_to("/etc")
     elif marker == "fifo":
         os.mkfifo(deep / "pipe")
+    os.sync()
     for path in [*target.rglob("*"), target]:
         os.utime(path, (time.time() - 48 * 3600,) * 2, follow_symlinks=False)
     return target, 100_000

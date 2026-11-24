@@ -134,6 +134,23 @@ and `git -C <path> status --short` plus `git -C <path> log @{u}..HEAD --oneline`
 
 To keep the old pane instead of handing over, pass `--keep-source` (or use `launch` directly).
 
+### Live pane checks and `reap` (herdr-handoff 0.6.0)
+
+A close made after the takeover (`confirm`, `reap`) first looks at the live pane and refuses with
+`source_working` (the source agent is still working), `source_is_caller` (it is the pane the command runs
+in), `source_pane_reused` (the pane id now holds a different terminal than the takeover recorded, from
+`close_options.source_terminal_id`) or `successor_gone` (the successor pane no longer exists). The reason is
+recorded in the handoff's takeover block. `takeover` itself is unchanged. Successor panes are named
+`<project>: <goal summary>`.
+
+`herdr-handoff reap` closes the panes that confirmed handoffs replaced and that are still open (the backlog,
+and any handoff whose `confirm` could not close). It is a dry run: it prints `would_close`, `closed`,
+`already_closed` or `skipped` with the reason per handoff and changes nothing until `--apply` is given. Each
+close goes through the same gate as a confirm-side close. A record written before close options were stored
+is skipped. `--include-unrecorded` closes those too, and is dangerous: an old record cannot detect pane-id
+reuse and its `--keep-source` choice is unknown, so always review the dry run first. `herdr-eng doctor`
+requires a CLI that offers `reap` (0.6.0 or newer).
+
 ## Optional `memory_context`
 
 Packages may carry an optional, additive `memory_context` block (Herdr Unified

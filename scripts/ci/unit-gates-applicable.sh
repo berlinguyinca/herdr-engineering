@@ -30,7 +30,8 @@ tests/
 packages/
 scripts/ci/
 deploy/
-lock/'
+lock/
+.coveragerc-'
     COVERED_FILES='pyproject.toml
 .woodpecker/unit-gates.yml
 .woodpecker/unit-gates-shard-1.yml

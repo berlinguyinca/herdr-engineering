@@ -23,7 +23,7 @@
   hosts: herdr_fleet
   gather_facts: false
   # become is evaluated before fact gathering, so use the connection user /
-  # controller env USER rather than the ansible_user_id fact. Override with
+  # controller env USER rather than the ansible_facts['user_id'] fact. Override with
   # -e herdr_engineering_become=false for hosts where every task is
   # user-scoped and passwordless sudo is not available (e.g. macOS fleet
   # hosts: home dirs, Homebrew and git clones never need root).
@@ -32,11 +32,11 @@
   # Homebrew prefix is missing from PATH and every brew/tailscale lookup
   # fails ("command -v brew" -> MISSING even though brew is installed).
   # Prepend the standard Homebrew prefixes for all tasks, plus the fleet
-  # user's ~/.local/bin (where herdr is installed). Note ansible_env is
+  # user's ~/.local/bin (where herdr is installed). Note ansible_facts['env'] is
   # only available after the fact-gather task, so the setup task itself
   # runs with the defaults — fine, it needs nothing from PATH.
   environment:
-    PATH: "/opt/homebrew/bin:/usr/local/bin:{{ ansible_env.HOME | default('~', true) }}/.local/bin:{{ ansible_env.PATH | default('/usr/bin:/bin:/usr/sbin:/sbin') }}"
+    PATH: "/opt/homebrew/bin:/usr/local/bin:{{ ansible_facts['env']['HOME'] | default('~', true) }}/.local/bin:{{ ansible_facts['env']['PATH'] | default('/usr/bin:/bin:/usr/sbin:/sbin') }}"
   vars:
     # State/config live in the FLEET user's home (the user who runs herdr-eng),
     # not root's — captured via a no-become fact gather below (fleet_home).
@@ -70,8 +70,8 @@
 
     - name: "Record the fleet user's home + uid for paths/ownership"
       ansible.builtin.set_fact:
-        fleet_home: "{{ ansible_env.HOME }}"
-        fleet_user: "{{ ansible_user_id }}"
+        fleet_home: "{{ ansible_facts['env']['HOME'] }}"
+        fleet_user: "{{ ansible_facts['user_id'] }}"
 
     # Join/verify the tailnet BEFORE the platform role so herdr/pi can use it.
     # Hosts already logged in are left alone; the auth key comes from Ansible
