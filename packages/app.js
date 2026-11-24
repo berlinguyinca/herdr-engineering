@@ -65,19 +65,10 @@ import { mountBuildCache, mountBuildDetail } from './build-cache-view.js';
 import { classifyDashboardError, dashboardErrorMessage } from './dashboard-load-state.js';
 import { mountEventHistory } from './event-history.js';
 import { mountCommunications } from './communications-view.js';
+import { createMissionTitles } from './mission-titles.js';
 
-// Cache of { [mission_id]: title } so activity/session text can resolve
-// cryptic mission ids to their human names. Fetched lazily, best-effort.
-let missionTitleCache = null;
-async function missionTitles() {
-  if (missionTitleCache) return missionTitleCache;
-  try {
-    const { missions } = await client.listMissions();
-    missionTitleCache = {};
-    for (const m of missions) missionTitleCache[m.mission_id] = m.title;
-  } catch { missionTitleCache = {}; }
-  return missionTitleCache;
-}
+// { [mission_id]: title } so activity/session text can resolve cryptic mission ids to their human names (see mission-titles.js).
+const missionTitles = createMissionTitles(() => client.listMissions());
 const titles = (cache) => cache || {};
 
 // Non-herdr-sourced missions are keyed by mission_key (e.g. 'pi:MSN-1'); the
