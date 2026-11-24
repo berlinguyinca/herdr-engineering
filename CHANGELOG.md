@@ -5,6 +5,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: Slack approval of unseen text, calendar block-list alias, Rakazo first-bot cache
+
+- Slack ask: the Approve buttons are only offered when the command is shown in full; a long (truncated) command gets Deny only and a "cannot be approved from Slack" note, and an approve tap on such an ask is refused (`not_fully_shown`).
+- `CalendarPolicy`: blocking both `primary` and the primary's real id no longer blocks every other calendar.
+- Rakazo bridge: the first-bot cache is keyed by `(tenant, user)`, so two spaces of one account no longer share a cached bot id.
+
 ### Feature: periodic `herdr-handoff reap --apply` timer (opt-in, off by default)
 
 - `herdr-eng handoff-reap {run,status}` and `scripts/install-handoff-reap.sh` install a systemd user timer (Linux) or LaunchAgent (macOS) that closes panes replaced by confirmed handoffs, including those whose `confirm` was refused because the source pane was still working. Wired into `scripts/install.sh` (step 7f2) and, for Linux fleet hosts, `ansible/tasks/handoff-reap.yml` (`site.yml`, `fleet-sync.yml`).

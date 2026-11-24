@@ -37,7 +37,7 @@ class CalendarPolicy:
             return False
         if cid == PRIMARY or PRIMARY in self.normalized:       # the alias and the real id are one calendar
             real = self._real_primary()
-            return not (real in self.normalized or (cid == real and PRIMARY in self.normalized))
+            return not ((cid == PRIMARY and real in self.normalized) or (cid == real and PRIMARY in self.normalized))
         return True
 
     def filter(self, calendars: list[dict]) -> list[dict]:
