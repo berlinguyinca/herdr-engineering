@@ -12,6 +12,11 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - The fabric image base (`python:3.12-slim`), `postgres:16-alpine`, `coredns:1.11.4` and the memory-client base are pinned by digest, and the runtime image installs under `deploy/fabric-stack/constraints.txt` exported from `uv.lock`. A test keeps the file equal to `uv export --locked` (so a pin bumped only in `pyproject.toml`, without `uv lock`, fails CI); `uv==0.13.7` joins the dev extra so CI, which builds a pip venv, has it. Versions are unchanged. `minio/minio` stays pinned by exact tag only (its digest cannot be resolved from Docker Hub).
 - Operator-visible: the digest-form image strings differ from the old tags, so the first full `docker compose up -d` (`scripts/fabric-stack.sh up`) recreates `postgres` and `coredns` once, and `postgres` may come up on a newer 16.x patch release than the one it ran before.
 
+### Fix: assistant store snapshot loading, ordering and locking
+
+- `PostgresStoreBackend.load()` no longer turns a failed read into "no snapshot": it raises `StoreLoadError`, so a control plane that boots while Postgres is unreachable fails startup instead of running with an empty store whose first mutation overwrote the stored snapshot.
+- Backend snapshot writes are numbered under the store lock and written one at a time; a slow older write can no longer land after a newer snapshot.
+- The store's list/search methods, `request_tool_action`'s idempotency scan and `list_approvals` read the shared dicts under the store lock (no more `dictionary changed size during iteration`), and `decide_approval` is atomic, so two concurrent decisions on one approval cannot both pass the pending check.
 ### Fix: Slack approval of unseen text, calendar block-list alias, Rakazo first-bot cache
 
 - Slack ask: the Approve buttons are only offered when the command is shown in full; a long (truncated) command gets Deny only and a "cannot be approved from Slack" note, and an approve tap on such an ask is refused (`not_fully_shown`).
