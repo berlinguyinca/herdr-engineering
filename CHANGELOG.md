@@ -15,6 +15,11 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - `/healthz` needs no token: unauthenticated callers (the container healthcheck) get `{"ok": ...}` only; authenticated callers get the full payload. `FabricClient.healthz()` treats the minimal payload as "reachable but token not accepted" and raises, so the CLI probes and the HA peer check do not read a wrong token as healthy.
 - `deploy/control-plane/compose.yaml` mounts `~/.config/herdr-engineering/fabric-gateway` read-only at `/run/fabric` into `fabric-gateway` and `herdr-web` (both call the control API) and keeps `--allow-open` on the gateway for the rollout; `deploy.sh` creates the directory 0700. See the PR for the order.
 
+### Fix: assistant store snapshot loading, ordering and locking
+
+- `PostgresStoreBackend.load()` no longer turns a failed read into "no snapshot": it raises `StoreLoadError`, so a control plane that boots while Postgres is unreachable fails startup instead of running with an empty store whose first mutation overwrote the stored snapshot.
+- Backend snapshot writes are numbered under the store lock and written one at a time; a slow older write can no longer land after a newer snapshot.
+- The store's list/search methods, `request_tool_action`'s idempotency scan and `list_approvals` read the shared dicts under the store lock (no more `dictionary changed size during iteration`), and `decide_approval` is atomic, so two concurrent decisions on one approval cannot both pass the pending check.
 ### Fix: Slack approval of unseen text, calendar block-list alias, Rakazo first-bot cache
 
 - Slack ask: the Approve buttons are only offered when the command is shown in full; a long (truncated) command gets Deny only and a "cannot be approved from Slack" note, and an approve tap on such an ask is refused (`not_fully_shown`).
