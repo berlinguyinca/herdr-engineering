@@ -83,18 +83,23 @@ stop_old_host_services() {
     fi
 }
 
+preflight() {
+    # compose.yaml requires variables only deploy.sh renders (HERDR_CP_IMAGE_TAG, GATEWAY_BIND ...). Without them
+    # every compose call fails at interpolation, so find out BEFORE anything is stopped or rebuilt.
+    local err
+    err="$("${COMPOSE[@]}" config -q 2>&1)" || {
+        echo "$err" >&2
+        echo "compose cannot render deploy/control-plane/compose.yaml with this env file: it needs the variables deploy.sh" >&2
+        echo "renders, so bring the stack up and recreate gateway services with deploy/control-plane/deploy.sh." >&2
+        exit 1
+    }
+}
+
 up() {
-    write_env
-    gen_coredns
+    # Only this script's own services, never --remove-orphans: collab-public, collab-edge, share-public, fabric-whois
+    # and the Hindsight containers live in overlay files / profiles that deploy.sh manages, and would be removed.
     "${COMPOSE[@]}" build fabric-gateway
-    # The optional Hindsight memory containers belong to compose profile `memory`, managed by deploy.sh --with-memory.
-    # While they exist, never ask compose to remove "orphans": this script's env file carries no memory variables.
-    local orphans=(--remove-orphans)
-    if docker inspect herdr-hindsight >/dev/null 2>&1 || docker inspect herdr-hindsight-db >/dev/null 2>&1; then
-        orphans=()
-        warn "Hindsight memory containers present: not using --remove-orphans (managed by deploy.sh --with-memory)"
-    fi
-    "${COMPOSE[@]}" up -d ${orphans[@]+"${orphans[@]}"}
+    "${COMPOSE[@]}" up -d coredns fabric-gateway herdr-web
     "${COMPOSE[@]}" ps
 }
 
@@ -129,7 +134,7 @@ memory_route() {
 }
 
 status() {
-    "${COMPOSE[@]}" ps 2>/dev/null || { echo "stack not running"; exit 0; }
+    "${COMPOSE[@]}" ps || { echo "docker compose failed (see the error above); the stack state is unknown" >&2; exit 1; }
     say "hindsight memory (optional profile):"
     memory_status
     say "gateway healthz:"
@@ -148,13 +153,16 @@ down() { "${COMPOSE[@]}" stop coredns fabric-gateway herdr-web; }  # not the con
 cmd="${1:-up}"
 case "$cmd" in
     up)
+        write_env; gen_coredns; preflight
         up
         ;;
     up-replace)
+        write_env; gen_coredns; preflight   # before anything is stopped: a failure here leaves the old services up
         stop_old_host_services   # must free ports 8787/29999/18000+ first
         up
         ;;
     down)
+        preflight
         down
         ;;
     status)

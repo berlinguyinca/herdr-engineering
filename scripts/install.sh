@@ -314,11 +314,14 @@ if command -v tailscale >/dev/null 2>&1; then
         SUDO=""
       fi
       if [ -n "$SUDO" ] || [ "$(id -u)" = "0" ]; then
-        if $SUDO tailscale up --authkey="$TS_KEY" >/dev/null 2>&1; then
+        # The key goes to tailscale as a 0600 file (file:), never in argv: argv is world-readable in /proc and sudo logs it.
+        TS_KEY_TMP="$(mktemp)"; chmod 600 "$TS_KEY_TMP"; printf '%s' "$TS_KEY" > "$TS_KEY_TMP"
+        if $SUDO tailscale up --auth-key="file:$TS_KEY_TMP" >/dev/null 2>&1; then
           printf '  enrolled on tailnet (tailscale up)\n'
         else
           warn "tailscale up failed — run manually: sudo tailscale up --authkey=***"
         fi
+        rm -f "$TS_KEY_TMP"
       else
         warn "no sudo available to run 'tailscale up'. Run manually: sudo tailscale up --authkey=***"
       fi

@@ -34,7 +34,7 @@ GATEWAY_CPU="n/a"; LOADCORE="n/a"; GATE_SLOTS="n/a"; GATE_USED=0
 
 if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER}$"; then
   CONTAINER_STATUS=$(docker inspect -f '{{.State.Status}} ({{.State.Health.Status}})' "$CONTAINER" 2>/dev/null)
-  case "$CONTAINER_STATUS" in *healthy*) HEALTHY=1;; esac
+  case "$CONTAINER_STATUS" in *'(healthy)'*) HEALTHY=1;; esac   # not *healthy*: that also matches '(unhealthy)'
   # CPU% = average over 1s of the container's cpu.usage deltas / host cores.
   GATEWAY_CPU=$(docker stats --no-stream --format '{{.CPUPerc}}' "$CONTAINER" 2>/dev/null)
   if docker exec "$CONTAINER" sh -c "test -f $STORE_IN_CONTAINER" >/dev/null 2>&1; then
@@ -71,7 +71,8 @@ GATE_USED=$(find "$STATE_DIR/build-gates" -name 'gate.*' -mmin -5 2>/dev/null | 
 TELE="$STATE_DIR/build-gates/telemetry.jsonl"
 GATE_CONT_1H=0; GATE_CONT_24H=0
 if [ -f "$TELE" ]; then
-  GATE_CONT_24H=$(grep -c '"event": *"contention"' "$TELE" 2>/dev/null || echo 0)
+  GATE_CONT_24H=$(grep -c '"event": *"contention"' "$TELE" 2>/dev/null || true)   # grep -c prints 0 itself (exit 1)
+  GATE_CONT_24H=${GATE_CONT_24H:-0}
   CUTOFF=$(date -u -d '-1 hour' +%FT%T 2>/dev/null)
   if [ -n "$CUTOFF" ]; then
     GATE_CONT_1H=$(awk -v c="$CUTOFF" '$0>c' "$TELE" 2>/dev/null | wc -l)

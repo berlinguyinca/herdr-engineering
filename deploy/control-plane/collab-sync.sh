@@ -93,7 +93,9 @@ once() {
   fi
   provision
   mkdir -p "$DIR"; chmod 755 "$DIR"
-  local tmp; tmp="$(mktemp -d "$DIR/.tmp.XXXXXX")"; trap 'rm -rf "$tmp"' RETURN
+  # Scratch dirs of earlier runs that died (a RETURN trap does not fire when set -e exits the script) go first.
+  rm -rf "$DIR"/.tmp.* 2>/dev/null || true
+  local tmp; tmp="$(mktemp -d "$DIR/.tmp.XXXXXX")"; ONCE_TMP="$tmp"; trap 'rm -rf "${ONCE_TMP:-}"' EXIT
   curl -fsS -m 10 "https://cognito-idp.${REGION}.amazonaws.com/${POOL}/.well-known/jwks.json" -o "$tmp/jwks.json"
   python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["keys"]' "$tmp/jwks.json"
   aws cognito-idp list-users-in-group --region "$REGION" --user-pool-id "$POOL" --group-name "$GROUP" \

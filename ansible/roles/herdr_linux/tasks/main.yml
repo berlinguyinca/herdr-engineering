@@ -26,28 +26,23 @@
       - curl
     state: present
 
-- name: "Install Herdr (pinned compatible version) if not present"
+- name: "Verify Herdr (pinned compatible version) is present"
   ansible.builtin.shell: |
     set -e
     if ! command -v herdr >/dev/null 2>&1 || ! herdr --version 2>/dev/null | grep -q "{{ herdr_pinned_version }}"; then
       echo "herdr install required: {{ herdr_pinned_version }}" >&2
-      # Replace with the official installer for the pinned version.
-      # curl -fsSL https://herdr.dev/install.sh | sh
-      exit 0
+      exit 1   # nothing here installs it (staging does): a missing or mismatched runtime must fail the host, not report changed
     fi
-  register: herdr_install
-  changed_when: "'herdr install required' in (herdr_install.stderr | default(''))"
+  changed_when: false
 
-- name: "Install Pi if not present"
+- name: "Verify Pi is present"
   ansible.builtin.shell: |
     set -e
     if ! command -v pi >/dev/null 2>&1; then
       echo "pi install required" >&2
-      # Replace with the official Pi installer.
-      exit 0
+      exit 1   # nothing here installs it (staging does): a missing runtime must fail the host, not report changed
     fi
-  register: pi_install
-  changed_when: "'pi install required' in (pi_install.stderr | default(''))"
+  changed_when: false
 
 - name: "Clone berlinguyinca/pi-engineering"
   ansible.builtin.git:

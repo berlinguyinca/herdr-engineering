@@ -79,12 +79,15 @@ audit worker_start agent="$NAME" sandbox="${SANDBOX:+yes}" cmd="${HERDR_AGENT_CM
 echo "waiting for tasks as $NAME..."
 while :; do
   call tasks_wait '{"seconds":20}' > "$TMP/r.json" || { sleep 5; continue; }
-  python3 - "$TMP/r.json" "$TMP" <<'PY'
+  python3 - "$TMP/r.json" "$TMP" <<'PY' || { sleep 5; continue; }   # an error reply (no result) must not end the worker
 import sys, json
 reply = json.load(open(sys.argv[1]))
 import re
 tasks = json.loads(reply["result"]["content"][0]["text"]).get("tasks", [])
 for t in tasks:
+    # the id becomes a file name: only a plain token may, never a path
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", str(t.get("task_id", ""))):
+        continue
     # The room keeps the literal text. The harness gets it without ONE leading "@<this agent>" (address,
     # name or old name) so the request reads as written to it; any other text stays exactly as typed.
     text, own = t["text"], {n for n in [t.get("target_address"), t.get("target_name"), *(t.get("target_aliases") or [])] if n}
