@@ -2658,6 +2658,37 @@ def test_live_pi_row_outside_the_native_inventory_blocks_the_empty_host_settle(t
     assert not wire.mutations
 
 
+def _only_row(wire, **changes):
+    base = wire.row("bender")
+    base.update(changes)
+    wire.sessions = lambda target, root: [copy.deepcopy(base)]
+
+
+def test_unresponsive_but_live_pi_row_also_blocks_the_empty_host_settle(tmp_path):
+    """A Pi that is alive but did not answer (not provably gone) is not 'nothing to reload'."""
+    store, plan = setup_rollout(tmp_path)
+    wire = Wire()
+    wire.offline.clear()
+    wire.native = lambda target: []
+    _only_row(wire, reachable=False, error="control socket timed out")
+    result = apply(store, plan, wire)
+    state = result["hosts"]["bender"]
+    assert state["status"] == "blocked"
+    assert "expected coverage unverified" in state["error"]
+    assert not wire.mutations
+
+
+def test_provably_dead_pi_row_does_not_block_the_empty_host_settle(tmp_path):
+    store, plan = setup_rollout(tmp_path)
+    wire = Wire()
+    wire.offline.clear()
+    wire.native = lambda target: []
+    _only_row(wire, reachable=False, error="session_process_gone")
+    result = apply(store, plan, wire)
+    assert result["hosts"]["bender"]["status"] == "complete"
+    assert "nothing to reload" in result["hosts"]["bender"]["statusReason"]
+
+
 def test_no_pi_sessions_does_not_hide_a_still_tracked_session(tmp_path):
     store, plan = setup_rollout(tmp_path)
     wire = Wire()

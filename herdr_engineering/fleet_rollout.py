@@ -1424,10 +1424,13 @@ def apply_rollout(store, rollout_id, *, transport=None, stage=None):
                     if s.get("status") == "retired"
                 ]
                 nothing_to_do = not agents and not host_state["sessions"] and not session_errors
-                if nothing_to_do and any(r.get("reachable") is True for r in rows):
+                if nothing_to_do and any(
+                    r.get("reachable") is True or r.get("error") != _PROCESS_GONE for r in rows
+                ):
                     # A Pi outside a herdr pane, or one herdr never tagged 'pi', answers on its
                     # control socket yet is absent from the native inventory: it may still be
-                    # on the old revision, so "nothing to reload" cannot be claimed.
+                    # on the old revision, so "nothing to reload" cannot be claimed. A row counts as absent
+                    # only when its process is provably gone; an unresponsive one may be alive.
                     raise ValueError("no native Pi sessions; expected coverage unverified")
                 if nothing_to_do:
                     host_state["statusReason"] = (
