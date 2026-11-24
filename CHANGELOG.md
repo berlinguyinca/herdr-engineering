@@ -14,6 +14,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - The in-order replay keeps a packed 28-byte key per row instead of a tuple with the event_id (2-3 GB on a 10M-row log, now about 280 MB). The order cannot move into SQL: the store's key clamps the receive time to its clock and falls back to parsed timestamps.
 - A row present in both `fabric_events` and `fabric_events_archive` (an interrupted archive run) is replayed and counted once, so the snapshot is written instead of refused.
 
+### Fix: required `unit-gates` no longer skips PRs that touch untested-by-list paths; Rust module gates fail in CI without cargo
+
+- `scripts/ci/unit-gates-applicable.sh unit` is now default-run with a short exempt list instead of an allow-list, so `herdr_artifact_host/`, `ansible/`, `skills/`, `scripts/*.sh`, `package.json`, `package-lock.json` and any new top-level path run the suite (they previously passed the required check with no tests; `main-moved-check.sh` shared the gap). A test checks every tracked file against the matcher.
+- `scripts/ci/module-gates.sh` no longer silently skips the scratch-retention and cargo-host gates when cargo is absent in CI: new `scripts/ci/require-cargo.sh` fails there unless `HERDR_ALLOW_NO_CARGO=1` is set explicitly.
 ### Fix: assistant store snapshot loading, ordering and locking
 
 - `PostgresStoreBackend.load()` no longer turns a failed read into "no snapshot": it raises `StoreLoadError`, so a control plane that boots while Postgres is unreachable fails startup instead of running with an empty store whose first mutation overwrote the stored snapshot.
