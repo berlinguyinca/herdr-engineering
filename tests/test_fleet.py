@@ -1,7 +1,12 @@
 """Tests for the one-command fleet onboarding (herdr_engineering/fleet.py)."""
 import hashlib
+import json
+import os
+import sys
 from pathlib import Path
 from unittest.mock import patch
+
+import pytest
 
 from herdr_engineering import fleet
 from herdr_engineering.fleet import LAUNCHD_LABEL
@@ -42,17 +47,6 @@ def _fake_repo(tmp_path):
     return tmp_path
 
 
-def test_devfabric_list_unwraps_leases():
-    from herdr_engineering.herdr_adapter import NativeHerdrAdapter
-    ad = NativeHerdrAdapter()
-    ad._run_json = lambda *a, **k: {"leases": [{"target": {"machine_id": "beast"}}]}
-    assert ad.devfabric_list() == [{"target": {"machine_id": "beast"}}]
-    ad._run_json = lambda *a, **k: [{"id": "x"}]
-    assert ad.devfabric_list() == [{"id": "x"}]
-    ad._run_json = lambda *a, **k: {"leases": []}
-    assert ad.devfabric_list() == []
-
-
 @patch("herdr_engineering.fleet._run")
 def test_fleet_join_attaches_provisions_verifies(mock_run, tmp_path, monkeypatch):
     repo = _fake_repo(tmp_path)
@@ -66,10 +60,10 @@ def test_fleet_join_attaches_provisions_verifies(mock_run, tmp_path, monkeypatch
             pass
         def add_machine(self, **kw):
             self.called = kw
-        def devfabric_list(self):
-            return [{"machine_id": "newbox", "target": "newbox"}]
 
-    with patch("herdr_engineering.fleet.NativeHerdrAdapter", FakeAdapter):
+    with patch("herdr_engineering.fleet.NativeHerdrAdapter", FakeAdapter), \
+            patch("herdr_engineering.fleet.devfabric_leases",
+                  return_value=[{"machine_id": "newbox", "target": "newbox"}]):
         rep = fleet.fleet_join(ssh_target="newbox.tail.ts.net", label="newbox",
                                ansible_host="newbox.tail.ts.net", user="alice")
 
@@ -113,10 +107,9 @@ def test_fleet_join_idempotent_inventory(mock_run, tmp_path, monkeypatch):
             pass
         def add_machine(self, **kw):
             pass
-        def devfabric_list(self):
-            return []
 
-    with patch("herdr_engineering.fleet.NativeHerdrAdapter", FakeAdapter):
+    with patch("herdr_engineering.fleet.NativeHerdrAdapter", FakeAdapter), \
+            patch("herdr_engineering.fleet.devfabric_leases", return_value=[]):
         r1 = fleet.fleet_join(ssh_target="newbox", label="newbox")
         r2 = fleet.fleet_join(ssh_target="newbox", label="newbox")
     assert r1["steps"]["inventory"]["added"] is True
@@ -207,7 +200,10 @@ def test_update_refreshes_enabled_local_cleanup(tmp_path, monkeypatch):
     monkeypatch.setattr(fleet, 'fleet_status', lambda **kwargs: STATUS)
     result = fleet.fleet_update(pull_controller=False, reinstall_local=False)
     assert result['ok']
-    assert any(str(repo / 'scripts/build-cleanup.sh') in cmd for cmd in calls)
+    # build-hygiene alone writes the cleanup job (the old systemd script is no longer run)
+    assert not any('build-cleanup.sh' in str(part) for cmd in calls for part in cmd)
+    hygiene = next(cmd for cmd in calls if 'build-hygiene' in cmd)
+    assert '--skip-cleanup-job' not in hygiene
 
 
 def test_update_status_failure_is_not_success(tmp_path, monkeypatch):
@@ -559,3 +555,126 @@ def test_fleet_status_reports_summary_skill_state_without_gating(tmp_path, monke
         host = fleet.fleet_status()['hosts'][0]
         assert host['summary'] == expected
         assert host['build_gate'] == 'b' * 32 and host['pi_path'] == '/p'
+
+
+def _repo_with_handoff_installer(tmp_path, body):
+    (tmp_path / 'scripts').mkdir()
+    (tmp_path / 'scripts/install-handoff.sh').write_text(body)
+    return tmp_path
+
+
+def test_a_failed_handoff_refresh_is_a_warning_not_a_fleet_outage(tmp_path):
+    # herdr-handoff is a required dependency pinned in lock/upstreams.yaml; a controller update that
+    # only reinstalls herdr-eng leaves the handoff CLI on whatever revision was cloned at install time.
+    # A host with a stale handoff still syncs: blocking the fleet on it would trade a reportable gap
+    # for an outage.  Runs a real installer script that fails.
+    root = _repo_with_handoff_installer(tmp_path, 'echo "cannot fetch the pinned revision" >&2\nexit 1\n')
+    report = {'steps': {}}
+    fleet._refresh_controller_handoff(root, report)
+    assert report['steps']['controller_handoff_refresh']['ok'] is False
+    assert report['steps']['controller_handoff_refresh']['rc'] == 1
+    assert 'cannot fetch' in report['steps']['controller_handoff_refresh']['stderr']
+    assert any('herdr-handoff' in warning for warning in report['warnings'])
+    assert 'error' not in report
+
+
+def test_the_handoff_refresh_names_the_interpreter_it_installs_into(tmp_path):
+    # Without HERDR_HANDOFF_PYTHON the installer falls back to whatever `python3` means in the caller's
+    # environment, installing the CLI into an interpreter nobody chose while reporting the refresh as done.
+    seen = tmp_path / 'seen'
+    root = _repo_with_handoff_installer(tmp_path, f'printf %s "$HERDR_HANDOFF_PYTHON" > {seen}\n')
+    report = {'steps': {}}
+    fleet._refresh_controller_handoff(root, report)
+    assert seen.read_text() == sys.executable
+    step = report['steps']['controller_handoff_refresh']
+    assert step['ok'] is True and step['env']['HERDR_HANDOFF_PYTHON'] == sys.executable
+    assert 'warnings' not in report
+
+
+def test_no_handoff_installer_means_no_handoff_step(tmp_path):
+    report = {'steps': {}}
+    fleet._refresh_controller_handoff(tmp_path, report)
+    assert report == {'steps': {}}
+
+
+def test_env_included_in_the_environment_extends_it(tmp_path):
+    # A caller that pins one variable must not strip PATH out from under the command it runs.
+    from herdr_engineering.fleet import _run
+    rc, out, err = _run(['sh', '-c', 'printf %s "$PATH"'], env={'HERDR_HANDOFF_PYTHON': 'x'})
+    assert rc == 0, err
+    assert out == os.environ['PATH']
+
+
+# --- repo_root: no silent cwd fallback; status tells "no inventory" from "hosts failed" -----------------
+
+def test_repo_root_finds_checkout_from_a_subdirectory(tmp_path, monkeypatch):
+    monkeypatch.delenv("HERDR_ENGINEERING_REPO", raising=False)
+    (tmp_path / "ansible" / "inventory").mkdir(parents=True)
+    (tmp_path / "ansible" / "inventory" / "hosts.yml").write_text("all: {}\n")
+    sub = tmp_path / "a" / "b"
+    sub.mkdir(parents=True)
+    monkeypatch.chdir(sub)
+    assert fleet.repo_root() == tmp_path
+
+
+def test_repo_root_accepts_a_checkout_without_private_inventory(tmp_path, monkeypatch):
+    monkeypatch.delenv("HERDR_ENGINEERING_REPO", raising=False)
+    (tmp_path / "ansible" / "playbooks").mkdir(parents=True)
+    (tmp_path / "ansible" / "playbooks" / "fleet-status.yml").write_text("[]\n")
+    monkeypatch.chdir(tmp_path)
+    assert fleet.repo_root() == tmp_path
+
+
+def test_repo_root_outside_a_checkout_raises_naming_what_was_searched(tmp_path, monkeypatch):
+    monkeypatch.delenv("HERDR_ENGINEERING_REPO", raising=False)
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(fleet.FleetError) as exc:
+        fleet.repo_root()
+    assert str(tmp_path / "ansible" / "inventory" / "hosts.yml") in str(exc.value)
+    assert "HERDR_ENGINEERING_REPO" in str(exc.value)
+
+
+def test_fleet_status_without_inventory_is_an_error_not_a_host_failure(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERDR_ENGINEERING_REPO", str(tmp_path))
+    status = fleet.fleet_status()
+    assert status["error_kind"] == "no_inventory"
+    assert status["error"] == f"no inventory at {tmp_path / 'ansible' / 'inventory' / 'hosts.yml'}"
+    assert status["hosts"] == []
+
+
+def test_fleet_status_outside_a_checkout_reports_no_checkout(tmp_path, monkeypatch):
+    monkeypatch.delenv("HERDR_ENGINEERING_REPO", raising=False)
+    monkeypatch.chdir(tmp_path)
+    status = fleet.fleet_status()
+    assert status["error_kind"] == "no_inventory"
+    assert str(tmp_path / "ansible" / "inventory" / "hosts.yml") in status["error"]
+
+
+def test_cli_fleet_status_exit_codes(tmp_path, monkeypatch, capsys):
+    from herdr_engineering import cli
+    monkeypatch.delenv("HERDR_ENGINEERING_REPO", raising=False)
+    monkeypatch.chdir(tmp_path)
+    rc = cli.main(["fleet", "status"])
+    assert rc == 2
+    assert "no inventory at" in capsys.readouterr().err
+    # inventory present but the playbook run itself fails (no playbook / no ansible here): hosts-failed, rc=1
+    (tmp_path / "ansible" / "inventory").mkdir(parents=True)
+    (tmp_path / "ansible" / "inventory" / "hosts.yml").write_text("all: {}\n")
+    monkeypatch.setenv("HERDR_ENGINEERING_REPO", str(tmp_path))
+    rc = cli.main(["fleet", "status"])
+    assert rc == 1
+    assert "no inventory" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("argv", [
+    ["fleet", "rollout", "plan", "--pi-revision", "a" * 40],
+    ["fleet", "recover", "plan"],
+])
+def test_cli_fleet_planning_outside_a_checkout_reports_the_missing_inventory(argv, tmp_path, monkeypatch, capsys):
+    from herdr_engineering import cli
+    monkeypatch.delenv("HERDR_ENGINEERING_REPO", raising=False)
+    monkeypatch.delenv("HERDR_PI_RECOVERY_INVENTORY", raising=False)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.chdir(tmp_path)
+    assert cli.main(argv) == 1
+    assert "no inventory at" in json.loads(capsys.readouterr().out)["error"]

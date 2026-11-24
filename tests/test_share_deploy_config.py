@@ -40,7 +40,7 @@ SHARE_URL = "https://artifacts.example.test/"
 SHARE_HOST = "artifacts.example.test"
 
 
-def _central(tmp_path, share=None, collab=COLLAB):
+def _central(tmp_path, share=None, collab=COLLAB, extra=None):
     central = tmp_path / "fleet" / "fleet-config.yaml"
     central.parent.mkdir(parents=True)
     fcc.init_config(central, dict(_ds.ANSWERS))
@@ -51,6 +51,7 @@ def _central(tmp_path, share=None, collab=COLLAB):
         cpv["collab"] = dict(collab)
     if share is not None:
         cpv["share"] = dict(share)
+    cpv.update(extra or {})
     central.unlink()
     fcc.write_private_file(central, yaml.safe_dump(data, sort_keys=False))
     return central
@@ -262,7 +263,7 @@ def test_disabled_share_renders_the_edge_conf_unchanged():
 def test_enabled_share_adds_a_share_host_server_with_only_s_locations():
     template = EDGE.read_text()
     conf = fcc.render_edge_conf(template, share=True, share_host=SHARE_HOST)
-    mcp = _server_block(conf, "server_name localdev.mcp.metabolomics.us;")
+    mcp = _server_block(conf, MCP_SERVER_NAME)
     assert "/s/" not in mcp and "proxy_pass http://share" not in mcp and "return 308" not in mcp
     assert "location ^~ /s/" not in conf
     share = _server_block(conf, f"server_name {SHARE_HOST};")
@@ -303,7 +304,7 @@ def test_annotations_location_is_flat_and_the_only_one_that_takes_a_body():
     assert share.count("proxy_pass_request_body on") == 1
     assert re.search(r"limit_req_zone \$remote_addr zone=share_annotate:10m rate=5r/s;", conf)
     assert "share_annotate" not in "".join(ln for ln in conf.splitlines() if "hcn_" in ln or "/mcp" in ln)
-    assert "zone=share_annotate" not in _server_block(conf, "server_name localdev.mcp.metabolomics.us;")
+    assert "zone=share_annotate" not in _server_block(conf, MCP_SERVER_NAME)
 
 
 def test_share_host_proxy_hygiene_and_headers():
@@ -328,7 +329,7 @@ def test_share_host_proxy_hygiene_and_headers():
 def test_share_and_mcp_servers_present_the_same_certificate():
     conf = fcc.render_edge_conf(EDGE.read_text(), share=True, share_host=SHARE_HOST)
     paths = []
-    for listen in ("server_name localdev.mcp.metabolomics.us;", f"server_name {SHARE_HOST};"):
+    for listen in (MCP_SERVER_NAME, f"server_name {SHARE_HOST};"):
         blk = _server_block(conf, listen)
         paths.append((re.search(r"ssl_certificate\s+(\S+);", blk).group(1),
                       re.search(r"ssl_certificate_key\s+(\S+);", blk).group(1)))
@@ -338,7 +339,7 @@ def test_share_and_mcp_servers_present_the_same_certificate():
 
 def test_mcp_server_keeps_its_mcp_limits_when_shares_are_on():
     conf = fcc.render_edge_conf(EDGE.read_text(), share=True, share_host=SHARE_HOST)
-    mcp = _server_block(conf, "server_name localdev.mcp.metabolomics.us;")
+    mcp = _server_block(conf, MCP_SERVER_NAME)
     for needle in ("limit_conn mcpconn 32;", "limit_conn mcptotal 128;", "limit_conn_status 429;",
                    "limit_req zone=hcn_mcp burst=100 nodelay;", "limit_req_status 429;"):
         assert needle in mcp, needle
@@ -421,6 +422,7 @@ TOKEN = "A" * 43
 SESSION = "sess-1"
 ANN = f"/s/{TOKEN}/k/{SESSION}/annotations"
 MCP_HOST = "localdev.mcp.metabolomics.us"
+MCP_SERVER_NAME = "server_name mcp.local.metabolomics.us localdev.mcp.metabolomics.us;"
 
 
 @pytest.fixture(scope="module")
@@ -656,7 +658,7 @@ def test_operator_listener_refuses_the_share_network(share):
     rules = re.findall(r"^\s*(allow|deny)\s+([^;]+);", operator, re.M)
     assert rules and rules[0] == ("deny", str(subnet)), rules
     # the public listener: only the LAN SNI edge's TCP address passes (never a PROXY-header claim)
-    public = _server_block(conf, "server_name localdev.mcp.metabolomics.us;")
+    public = _server_block(conf, MCP_SERVER_NAME)
     assert "if ($hcn_from_edge = 0) { return 444; }" in public
     assert re.search(r"map \$realip_remote_addr \$hcn_from_edge \{ default 0; 192\.168\.137\.250 1; \}", conf)
     assert re.findall(r"set_real_ip_from\s+([^;]+);", conf) == ["192.168.137.250"]
@@ -1050,3 +1052,13 @@ def test_deploy_with_shares_probes_the_share_host_and_only_warns(env):
     assert r.returncode == 0, r.stdout + r.stderr          # the stub curl answers no 404: a warning, not a failure
     assert f"curl https://{SHARE_HOST}/s/probe/" in env["log"].read_text()
     assert f"probe of https://{SHARE_HOST}/s/probe/" in r.stderr
+
+
+@pytest.mark.parametrize("share", [False, True])
+def test_mcp_block_serves_both_names_and_unknown_names_are_rejected(share):
+    conf = fcc.render_edge_conf(EDGE.read_text(), share=share, share_host=SHARE_HOST if share else None)
+    mcp = _server_block(conf, MCP_SERVER_NAME)
+    assert "server_name mcp.local.metabolomics.us localdev.mcp.metabolomics.us;" in mcp
+    assert "/s/" not in mcp
+    default = _server_block(conf, "ssl_reject_handshake on;")
+    assert "default_server" in default and "server_name" not in default

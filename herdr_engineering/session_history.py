@@ -16,6 +16,7 @@ import shutil
 import sqlite3
 import subprocess
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -229,13 +230,33 @@ def _ev(kind: str, text: Any = "", ts: Any = None, **extra: Any) -> dict:
     return {"kind": kind, "ts": ts, "text": _clip(text), **extra}
 
 
+def _num(value: Any) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+
+def _usage_row(ts: Any, fresh: int, cached: int) -> dict | None:
+    """One usage row, or None when the record counted nothing (an absent figure is never turned into a zero row)."""
+    return {"ts": normalize_ts(ts), "fresh": fresh, "cached": cached} if fresh or cached else None
+
+
 def _claude(path: str) -> tuple[list[dict], dict]:
     events: list[dict] = []
-    meta = {"child_records": 0, "child_detail": False}
+    meta = {"child_records": 0, "child_detail": False, "usage": []}
     names: dict[str, str] = {}
+    counted: set[str] = set()
     for d in _jsonl(path):
         ts = d.get("timestamp")
         msg = d.get("message") if isinstance(d.get("message"), dict) else {}
+        u = msg.get("usage")
+        if d.get("type") == "assistant" and not d.get("isSidechain") and isinstance(u, dict):
+            mid = msg.get("id")
+            if not (isinstance(mid, str) and mid in counted):      # one message is repeated on each of its content blocks
+                if isinstance(mid, str):
+                    counted.add(mid)
+                row = _usage_row(ts, _num(u.get("input_tokens")) + _num(u.get("cache_creation_input_tokens"))
+                                 + _num(u.get("output_tokens")), _num(u.get("cache_read_input_tokens")))
+                if row:
+                    meta["usage"].append(row)
         if d.get("type") == "system" and "compact" in str(d.get("subtype", "")):
             events.append(_ev("compaction", d.get("content") or d.get("subtype"), ts))
             continue
@@ -276,6 +297,7 @@ def _claude(path: str) -> tuple[list[dict], dict]:
 
 def _pi(path: str) -> tuple[list[dict], dict]:
     events: list[dict] = []
+    usage: list[dict] = []
     names: dict[str, str] = {}
     for d in _jsonl(path):
         ts = d.get("timestamp")
@@ -286,6 +308,12 @@ def _pi(path: str) -> tuple[list[dict], dict]:
         if d.get("type") != "message" or not isinstance(m, dict):
             continue
         role = m.get("role")
+        u = m.get("usage")
+        if role == "assistant" and isinstance(u, dict):
+            row = _usage_row(ts, _num(u.get("input")) + _num(u.get("cacheWrite")) + _num(u.get("output")),
+                             _num(u.get("cacheRead")))
+            if row:
+                usage.append(row)
         if role in ("user", "assistant"):
             c = m.get("content")
             if isinstance(c, str):
@@ -304,17 +332,29 @@ def _pi(path: str) -> tuple[list[dict], dict]:
         elif role == "toolResult":
             events.append(_ev("tool_result", _blocks_text(m.get("content")), ts,
                               tool=m.get("toolName") or names.get(m.get("toolCallId")), ok=not m.get("isError")))
-    return events, {"child_records": 0, "child_detail": False}
+    return events, {"child_records": 0, "child_detail": False, "usage": usage}
 
 
 def _codex(path: str) -> tuple[list[dict], dict]:
     events: list[dict] = []
-    meta = {"child_records": 0, "child_detail": False}
+    meta = {"child_records": 0, "child_detail": False, "usage": []}
     pending: list[str] = []
+    last_total = None
     for d in _jsonl(path):
         ts = d.get("timestamp")
         p = d.get("payload") if isinstance(d.get("payload"), dict) else {}
         t = p.get("type")
+        if t == "token_count" and isinstance(p.get("info"), dict):
+            info = p["info"]
+            last = info.get("last_token_usage")
+            # total_token_usage is a running sum; only the per-turn figure is added, and a repeated total is the same turn
+            if isinstance(last, dict) and info.get("total_token_usage") != last_total:
+                last_total = info.get("total_token_usage")
+                cached = _num(last.get("cached_input_tokens"))
+                row = _usage_row(ts, max(_num(last.get("input_tokens")) - cached, 0) + _num(last.get("output_tokens")), cached)
+                if row:
+                    meta["usage"].append(row)
+            continue
         if d.get("type") == "compacted" or t == "compacted":
             events.append(_ev("compaction", p.get("message") or "context compacted", ts))
         elif d.get("type") == "inter_agent_communication_metadata":
@@ -341,7 +381,7 @@ def _codex(path: str) -> tuple[list[dict], dict]:
 
 def _opencode(db: str, sid: str | None) -> tuple[list[dict], dict]:
     events: list[dict] = []
-    meta = {"child_records": 0, "child_detail": False}
+    meta = {"child_records": 0, "child_detail": False, "usage": []}
     try:
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
     except sqlite3.Error:
@@ -354,8 +394,18 @@ def _opencode(db: str, sid: str | None) -> tuple[list[dict], dict]:
             return events, meta
         kids = con.execute("select count(*) from session where parent_id = ?", (sid,)).fetchone()[0]
         meta.update(child_records=kids, child_detail=bool(kids))
-        roles = {r[0]: json.loads(r[1]).get("role") for r in
-                 con.execute("select id, data from message where session_id = ? order by time_created", (sid,))}
+        roles = {}
+        for mid, data in con.execute("select id, data from message where session_id = ? order by time_created", (sid,)):
+            m = json.loads(data)
+            roles[mid] = m.get("role")
+            tk = m.get("tokens")
+            if m.get("role") == "assistant" and isinstance(tk, dict):
+                cache = tk.get("cache") if isinstance(tk.get("cache"), dict) else {}
+                when = (m.get("time") or {}).get("completed") or (m.get("time") or {}).get("created")
+                row = _usage_row(when, _num(tk.get("input")) + _num(cache.get("write")) + _num(tk.get("output"))
+                                 + _num(tk.get("reasoning")), _num(cache.get("read")))
+                if row:
+                    meta["usage"].append(row)
         for mid, data, created in con.execute(
                 "select message_id, data, time_created from part where session_id = ? order by time_created", (sid,)):
             p = json.loads(data)
@@ -407,6 +457,63 @@ def _record_cwds(res: Resolution, limit: int = 8) -> list[str]:
 
 # --- public entry -----------------------------------------------------------
 
+# --- real user prompts: the same rules for every harness ---------------------------------------------
+# None of the four readers marks injected content (task notifications, system reminders, hook output, pasted
+# context); all emit it as ordinary ``user`` events, so one classifier decides what a person actually typed.
+_INJECTED_PREFIXES = ("<task-notification", "<system-reminder", "<environment_context", "<command-",
+                      "<local-command", "<pasted_content")
+PROMPT_TEXT_CLIP = 120
+PROMPT_TEXT_HEAD = PROMPT_TEXT_TAIL = 50
+
+
+def is_human_prompt(text: str) -> bool:
+    """True for text a person typed; false for empty text and wrapper-tagged injected content."""
+    stripped = (text or "").lstrip()
+    return bool(stripped) and not stripped.startswith(_INJECTED_PREFIXES)
+
+
+def normalize_ts(value: Any) -> str | None:
+    """Any recorded timestamp (ISO text, epoch seconds or milliseconds) as UTC ``YYYY-MM-DDTHH:MM:SSZ``, else None."""
+    try:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            when = datetime.fromtimestamp(value / 1000 if value > 1e11 else value, tz=timezone.utc)
+        elif isinstance(value, str) and value.strip():
+            when = datetime.fromisoformat(value.strip())
+            when = when.replace(tzinfo=timezone.utc) if when.tzinfo is None else when.astimezone(timezone.utc)
+        else:
+            return None
+    except (ValueError, OverflowError, OSError):
+        return None
+    return when.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def build_prompts(events: list[dict], *, text_limit: int = 400) -> tuple[list[dict], int]:
+    """Every real user prompt as ``{n, ts, text}`` (n counts from 1), plus the true total.
+
+    Past ``text_limit`` prompts only some keep their text: the first and last 50 and evenly spaced ones between.
+    Every prompt keeps ``n`` and ``ts`` so counts and times are exact whatever was sampled.
+    """
+    real = [e for e in events if e.get("kind") == "user" and is_human_prompt(e.get("text", ""))]
+    total = len(real)
+    if total <= text_limit:
+        keep = set(range(total))
+    else:
+        head, tail = PROMPT_TEXT_HEAD, PROMPT_TEXT_TAIL
+        middle = total - head - tail
+        want = max(text_limit - head - tail, 0)
+        keep = set(range(head)) | set(range(total - tail, total))
+        keep |= {head + (i * middle) // want for i in range(want)} if want else set()
+    prompts = []
+    for i, e in enumerate(real):
+        prompt = {"n": i + 1, "ts": normalize_ts(e.get("ts"))}
+        if i in keep:
+            prompt["text"] = e["text"][:PROMPT_TEXT_CLIP]
+        prompts.append(prompt)
+    return prompts, total
+
+
 def read_history(res: Resolution, *, home: Path | None = None, max_events: int = 400) -> dict:
     home = home or Path.home()
     gaps: list[str] = []
@@ -438,6 +545,9 @@ def read_history(res: Resolution, *, home: Path | None = None, max_events: int =
     verdict = "limited" if (not events or res.method.startswith(("newest", "none"))) else (
         "partial" if gaps else "complete")
     cwds = _record_cwds(res) if res.path and res.agent else []
+    prompts, prompts_total = build_prompts(events)
+    activity_ts = [normalize_ts(e.get("ts")) for e in events]
+    dispatch_ts = [normalize_ts(e.get("ts")) for e in events if e["kind"] == "child_dispatch"]
     omitted = max(0, len(events) - max_events)
     shown = events if not omitted else events[:60] + events[-(max_events - 60):]
     return {
@@ -445,6 +555,8 @@ def read_history(res: Resolution, *, home: Path | None = None, max_events: int =
         "cwd": (cwds[-1] if cwds else None), "cwds": cwds,
         "events_total": len(events), "events_omitted_from_middle": omitted, "events": shown,
         "compactions": len(compactions), "child_records": meta["child_records"],
+        "prompts": prompts, "prompts_total": prompts_total, "dispatch_ts": dispatch_ts,
+        "activity_ts": activity_ts, "usage": meta.get("usage", []),
         "coverage": {"verdict": verdict, "gaps": gaps},
         "read_only": True,
     }

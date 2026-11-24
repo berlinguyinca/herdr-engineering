@@ -40,12 +40,12 @@ def test_cleanup_is_linux_user_service_and_never_overwrites_policy():
     assert "restarted" in services[0]["state"]
     assert "stopped" in services[0]["state"]
     assert "build_cleanup_policy.stdout" in services[0]["enabled"]
-    assert block["environment"]["XDG_RUNTIME_DIR"] == "/run/user/{{ ansible_user_uid }}"
+    assert block["environment"]["XDG_RUNTIME_DIR"] == "/run/user/{{ ansible_facts['user_uid'] }}"
 
 
 @pytest.mark.parametrize("policy,expected", [
-    ({}, False),
-    ({"enabled": True}, False),
+    ({}, True),
+    ({"enabled": True}, True),
     ({"enabled": False, "roots": ["/projects"]}, False),
     ({"enabled": "false", "roots": ["/projects"]}, False),
     ({"enabled": True, "roots": "/projects"}, False),

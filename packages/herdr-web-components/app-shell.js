@@ -169,13 +169,13 @@ const SHARED = `
   background: var(--surface); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); cursor: pointer; }
 .hd-shell__nav { display: flex; flex-direction: column; gap: 8px; padding: 8px 8px; flex: 1; }
 .hd-shell__group { display: flex; flex-direction: column; gap: 1px; }
-.hd-shell__group-label { padding: 0 10px 3px; font-size: .6875rem; letter-spacing: .06em; text-transform: uppercase; color: var(--text-muted); font-weight: 600; }
+.hd-shell__group-label { padding: 0 10px 3px; font-size: .6875rem; letter-spacing: .06em; text-transform: uppercase; color: var(--text-secondary); font-weight: 600; }
 .hd-shell__link { display: flex; padding: calc(var(--density-row-padding, 8px) - 4px) 10px; line-height: 1.3; border-radius: var(--radius-sm);
   color: var(--text-secondary); text-decoration: none; font-size: 0.875rem; }
 .hd-shell__badge { margin-left: auto; min-width: 20px; padding: 0 6px; border-radius: 10px; font-size: .75rem; line-height: 20px; text-align: center; background: var(--accent-weak); color: var(--accent); font-weight: 600; }
 .hd-shell__badge[data-tone=critical] { background: var(--status-failed); color: #fff; }
 .hd-shell__link:hover { background: var(--surface-hover); text-decoration: none; }
-.hd-shell__link.active { background: var(--accent-weak); color: var(--accent); font-weight: 600; box-shadow: inset 3px 0 0 var(--accent); }
+.hd-shell__link.active { background: var(--accent-weak); color: var(--accent-ink); font-weight: 600; box-shadow: inset 3px 0 0 var(--accent); }
 .hd-shell__link { transition: background-color var(--motion-fast), color var(--motion-fast); }
 .hd-shell__link:hover { color: var(--text); }
 .hd-shell__brand { font-size: 1rem; letter-spacing: -0.01em; padding: 18px 16px; }

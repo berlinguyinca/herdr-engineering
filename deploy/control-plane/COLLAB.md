@@ -125,7 +125,7 @@ edge (nginx, the share host's own server: /s/ only) -> herdr-share-public:8083 (
 - Certificate: the edge presents ONE certificate for both hosts (`/etc/acme`); `collab-sync.sh` is unchanged and
   still manages one lineage. Before enabling shares, add the share host to the existing lineage once, on the
   certbot host, with the same DNS-01 plugin and flags the lineage was created with:
-  `certbot certonly --cert-name localdev.mcp.metabolomics.us --expand -d localdev.mcp.metabolomics.us -d <share host>`
+  `certbot certonly --cert-name localdev.mcp.metabolomics.us --expand -d localdev.mcp.metabolomics.us -d mcp.local.metabolomics.us -d artifacts.local.metabolomics.us -d <share host>`
   (every name the lineage already has must be repeated). Renewals then cover both names. The router and SNI front
   must also send the share host's name to the edge's port.
 - Edge limits (trade-off): `/s/` allows 100 requests/s per client address with a burst of 300 (parquet range
@@ -151,6 +151,203 @@ first with `describe-user-pool-client` and send every existing attribute back wi
 links need no Cognito change. Keep the previous host's `/s/callback` registered until the deploy is verified: a
 rollback to the previous release signs in there. Existing links on the old host stop working at the cutover
 (re-issue them); see docs/operations/collaboration-network.md.
+
+## Member artifacts (`artifacts.metabolomics.us`)
+
+Members (the Cognito group `control_plane.collab.members.group`) own artifacts, upload and publish them in the
+browser, and can create public or lab share links for them. One host, `control_plane.share.public_host`, serves it all:
+`/s/` (share-public, as above), `/api/member/` and the member page `/` and `/my/` (collab-public). Off unless
+`share.public_host` is set; the member locations also need `control_plane.collab.members.enabled: true`.
+
+```
+edge (nginx, server_name <public_host>): /s/ -> share-public:8083
+                                         /api/member/, /, /my/ -> collab-public:8081 (own zones member_req / member_conn)
+```
+
+- Edge: `collab-edge/member-http.conf` is spliced into the host's server only when members are enabled, and its two
+  zones (`member_req` 10 r/s, `member_conn`) into the http block. `PUT /api/member/artifacts/<id>/uploads/<id>/runs/<n>`
+  alone gets `client_max_body_size 17m` and `proxy_request_buffering off` (32 chunks x 512 KiB + slack); everything
+  else under `/api/member/` is 1 MiB. No access log on `/s/` and `/api/member/` (tokens and the session exchange).
+  `X-Frame-Options: DENY` and HSTS are set by the edge (the app's copy is hidden so it is sent once); the page's CSP is
+  the app's. The MCP host serves no `/s/` and the new host serves no `/mcp`.
+- Operator steps, **not done by `deploy.sh`**:
+  1. DNS: `artifacts.metabolomics.us` to the public edge.
+  2. Add the hostname to cubert's SNI stream edge (`networking/cubert-ansible`, stream map to the collab edge backend)
+     and run its playbook.
+  3. Certificate: the collab edge's ACME lineage must name the new host (`certbot certonly --cert-name ... --expand
+     -d <existing names> -d artifacts.metabolomics.us`); `deploy.sh` refuses a certificate that does not.
+  4. Cognito: add `https://artifacts.metabolomics.us/s/callback` AND `https://artifacts.metabolomics.us/my/callback` to
+     both CallbackURLs and LogoutURLs of the `herdr-collab-web` app client. `update-user-pool-client` replaces the
+     whole client, so read it first with `describe-user-pool-client` and send every existing attribute back with the
+     new URLs added. Careful: that output may contain `ClientSecret` (never paste or log it; redirect the JSON to a
+     0600 file) and read-only fields (`ClientId`, `UserPoolId`, `CreationDate`, `LastModifiedDate`, `ClientSecret`)
+     that `update-user-pool-client` rejects: strip them (for example `jq 'del(.UserPoolClient.CreationDate,
+     .UserPoolClient.LastModifiedDate, .UserPoolClient.ClientSecret)'`) and pass `ClientId`/`UserPoolId` as options.
+     Changing `public_host` later means registering both callbacks on the new host first; keep the old host's until
+     verified.
+  5. Fleet YAML: set `control_plane.share.public_host`, `control_plane.collab.members.enabled: true`,
+     `control_plane.collab.members.group`, `control_plane.collab.members.session_secret` (`openssl rand -hex 32`,
+     pasted in; never committed, printed or passed as a flag) and, if collab-public does not run as the default uid,
+     `control_plane.collab.members.secrets_gid` (the gid collab-public runs as). The worker gets
+     `HERDR_COLLAB_CERT_UID` (default 1000, as collab-public) from compose; if neither is available the worker REFUSES
+     to start members (fail closed) with a message naming `control_plane.collab.members.secrets_gid`.
+  6. Verify: `curl -s https://artifacts.metabolomics.us/api/member/config` returns 200, then a sign-in round-trip at
+     `/`. Run `WORKER_CONTAINER=<worker> deploy/control-plane/member-secret-smoke.sh /tmp <collab-public-uid>` as root on the worker
+     host once (it checks the worker's own gid against the uid, refuses uid 0/65534; PYTHON/PYTHONPATH must give a
+     checkout both users can import).
+  7. Rollback: remove `public_host` / `members.enabled` and redeploy (the edge returns to the share-only server or
+     the previous conf; rows, blobs and bundles stay). Members' public links stop with the host.
+- Group-readability caveat: any process whose gid is the secrets gid can read a pending share URL for up to 60 s
+  (until collab-public takes it or the worker's sweep deletes it) and can delete it (denial only). The default gid is
+  collab-public's uid, usually the deploying operator's own login group; prefer a dedicated group (set
+  `control_plane.collab.members.secrets_gid` and run collab-public as it) over the operator's login group.
+- Secret hand-off between uids (important): the worker (root) writes the read-once share URL to
+  `<outbox>/secrets/<ticket>.json` and collab-public (uid `HERDR_COLLAB_CERT_UID`) reads and deletes it. The worker
+  therefore sets that directory to group `control_plane.collab.members.secrets_gid` (default: the worker's
+  `HERDR_COLLAB_CERT_UID`, which compose passes with collab-public's default), mode 0770, files 0640; others get
+  nothing. With no gid the worker refuses to start members rather than issue links nobody can receive.
+- Approving a share link is a human action: `member.share_approve` accepts user actors only and the agent tool
+  `artifact_share_approve` no longer exists; an agent can only create a pending share that the owner approves in the web page.
+- A `share` grant is not read-protected: a grantee holding only `share` can create and approve a link, receives the
+  read-once URL, and so can open it and read the bytes. The member API (head, history, view tools) stays gated on
+  `read`; do not hand out `share` expecting it to hide content.
+- Public links by members (D3): members can create public links to their artifacts. The operator sees them in the
+  Members panel and with `herdr-eng artifacts members links --audience public`; revoke there.
+- Limits and behaviours to know:
+  - The provenance banner on member links is best-effort: the page's own CSS/JS can hide it; the containment is the
+    sandbox CSP, opaque origin, group/expiry and revoke. Public links get the bar on HTML only.
+  - Member HTML is capped at 2 MiB; svg, pdf, xhtml and xml are refused for member links, and HTML whose markup
+    cannot be proven to render the bar (for example scripts containing `a <!b`, or content before `<body>` beyond
+    head elements) is refused rather than labelled.
+  - The operator-API approve path shows the user id, not the display name; the member web path shows the name.
+  - Removing a member from the group takes effect after the claim TTL (`members.groups_ttl`, 24 h) and then a grace
+    (`members.removed_grace`, default 3600 s of continuous removed observation) before their shares are revoked.
+    Group REMOVAL is only observed at a sign-in: a member who never signs in again keeps the last seen groups. A
+    DISABLED account is different: it reports `disabled` at any claim age (the TTL only ages group membership), and
+    the sweep revokes their links.
+  - Effective upload limits are the smaller of the member setting and the collab_artifacts bridge limit
+    (`max_upload_bytes` vs `max_file_bytes`; `staging_bytes_per_member` vs the bridge staging caps). `null` for
+    `max_upload_bytes` or `staging_bytes_per_member` means "only the 1 TiB structural bound".
+  - `members.enabled` needs `share.enabled`, `collab_artifacts.enabled: true` and at least one `api_keys` entry;
+    `herdr-eng fleet-config check` names the missing key. With no API keys the open listener makes every caller an
+    operator, so the member routes would be reachable by anyone on that listener.
+  - Orphan blobs left by conflicting publishes stay counted against the member's quota until an operator purge.
+  - Purge refuses held tombstones and tombstones without a purge date; it anonymises annotations, share events and
+    feedback of third parties, and blanks file names in `output_manifest`, `provenance.message`/`entry` and
+    `artifact_shares.entry` (migrations 0048, 0049 and 0050; renumber at merge if another branch took the number).
+    Storage keys and hashes are kept. The append-only jsonl event files on disk are written by a separate process and
+    are NOT rewritten by purge; they keep the old names until the retention window of that log removes them.
+  - Purge also blanks the message and conflict file names of collaborator merge attempts. Lifecycle event reasons are
+    server-fixed strings (`member delete`, `member purge`), so nothing member-written remains there.
+  - A shared blob survives the deletion of one owner while another artifact (including a held or restorable
+    tombstone) still references it.
+  - `share_creates_per_hour` (default 20) is counted per process in memory.
+- Verifying the rendered edge: `docker run --rm --add-host collab-public:127.0.0.1 --add-host share-public:127.0.0.1
+  -v <conf>:/etc/nginx/nginx.conf:ro -v <certdir>:/etc/acme:ro nginx:1.29-alpine nginx -t` (a test does this when
+  Docker is available).
+
+## Artifact host (`control_plane.artifact_host`)
+
+The dedicated artifact host (`herdr_artifact_host`, image `herdr-artifact-host`) replaces share-public for member
+artifacts. It is enabled with `control_plane.artifact_host.enabled: true` (needs the collab marker; refused together
+with `control_plane.share.enabled`, since both want the edge's `/s/`). `deploy.sh` renders the slice with
+`herdr-eng fleet config render-artifact-host`, builds the image, runs `migrate`, brings the host up with `--wait`
+BEFORE the control plane and the edge, and stops it again when the section is disabled. `--dry-run` renders and
+validates the slice and the compose files without printing any secret.
+
+- Services (`deploy/artifact-host/compose.yaml`): `artifact-host-db`, `artifact-host-migrate` (one-shot),
+  `artifact-host-public` (8090), `artifact-host-internal` (8091) and `artifact-host-relay` (a pinned, hardened nginx).
+  No host ports are published. Each role has its own compose healthcheck (`herdr-artifact-host healthcheck <role>`,
+  loopback port 8092 on public).
+- Database roles (three, none a superuser; `artifact_admin` is only the bootstrap account and is used by `deploy.sh`
+  for roles, backup and restore): `artifact_owner` runs migrations (DDL), `artifact_public` has DML only,
+  `artifact_internal` has SELECT only and `default_transaction_read_only`. Each service gets only its own slice
+  (`public.json`, `internal.json`, `migrate.json`) and its own password, derived by HMAC from `db_password`.
+  `roles.sql` is idempotent and is applied through the local socket on every deploy. Rotating `db_password` and
+  redeploying changes all role passwords (the roles step runs before the services restart). `db_user` is not a setting.
+- Networks: every host network is `internal: true` with `gateway_mode_ipv4: isolated`, so a container has neither a
+  route out nor a host-side gateway to dial, and external names do not resolve.
+  - The public role needs no egress. Cognito keys and group membership arrive through the synced `jwks.json` and
+    `members.json` (mounted read-only from `HERDR_COLLAB_SYNC_DIR`), and the browser exchanges the sign-in code with
+    Cognito itself.
+  - The edge reaches public over `<prefix>-edge` (fixed subnet 172.31.252.0/28, also denied on the `:8082` operator
+    listener). `control-plane-web` is NOT on a host network that reaches the internal role: it joins only
+    `<prefix>-relay`, where the relay (GET-only `/v1/`, everything else 405/404) forwards to the internal role on
+    `<prefix>-internal` (172.31.252.16/28, internal role at the fixed address .18). Set
+    `control_plane.artifact_library.host_url: http://artifact-host-relay:8091` (fleet validation refuses any other value
+    while the host is enabled). The relay streams (`proxy_buffering off`), so a blob larger than its tmpfs still arrives whole.
+  - The database sits on its own network with the public, internal and migrate roles; db and internal cannot
+    reach each other except through their own roles, and public and internal share no network.
+- Fixed names and addresses: the compose project (`herdr-artifact-host`), network prefix, both subnets and the
+  internal address are not deploy settings. `deploy.sh` exits 2 if `HERDR_ARTIFACT_HOST_PROJECT`,
+  `HERDR_ARTIFACT_NET_PREFIX`, `HERDR_ARTIFACT_EDGE_SUBNET`, `HERDR_ARTIFACT_INTERNAL_SUBNET`,
+  `HERDR_ARTIFACT_INTERNAL_IP`, `HERDR_ARTIFACT_HOST_DIR` or `HERDR_ARTIFACT_HOST_TAG` is set in its environment.
+  `public_host` must not equal an `mcp_public_hosts` name or the dashboard's name, and the secrets need real entropy.
+- Config secret: Compose file secrets are bind mounts and ignore `uid`/`gid`/`mode`. `deploy.sh` therefore installs
+  the slices and the db admin password as 0644 files inside a 0700 directory
+  (`~/.config/herdr-engineering/artifact-host/`); `roles.sql` stays 0600. The directory mode is the access control.
+- Deploy order and safety: certificate check (the edge certificate must name `public_host`, as for share), image
+  build, database up (never force-recreated on a routine deploy), roles, `pg_dump` backup to
+  `artifact-host/backups/pre-<tag>-<time>.dump` (0600; a failed backup stops the deploy before migrating), migrate,
+  public/internal/relay recreated with `--wait`, then the control plane and edge, then a probe of
+  `https://<public_host>/s/probe/` through the edge.
+- Rollback: the deploy records the previous state (`artifact-host.state`: `enabled` or `disabled`). A failed deploy
+  rolls the control plane back with the overlay only if the previous release ran the host. If the host was off before,
+  it is stopped again and the files this deploy installed are removed. If it was on and this deploy had not yet
+  changed the schema (the applied-migration count did not move and the migration did not fail), the previous host
+  release is brought back from the rollback worktree and the previous roles.sql is re-applied. If a migration ran or
+  failed, the host is not silently reverted (the previous code may not run against the changed schema): the
+  deploy exits 3 and prints the exact manual steps (stop the roles, `pg_restore` of the backup, redeploy the previous
+  ref).
+- Python: `deploy.sh` runs the fleet commands with the repo's `.venv/bin/python` (override with
+  `HERDR_DEPLOY_PYTHON`), falling back to `python3`.
+- Membership: the host reads `members.json` and `jwks.json` from the synced directory (`SyncedDirectory`).
+  `collab-sync.sh` writes the optional `disabled` list into `members.json`; the host treats a stale or empty listing as
+  no evidence (sign-in fails closed) and denies accounts on the `disabled` list.
+- Edge (`artifact-host-http.conf`, `artifact-host-mcp.conf`, rendered in place of the share snippets): the artifact
+  host name routes `/s/`, `/api/member/`, `/` and `/my/` to `artifact-host-public:8090` (run-time DNS via the
+  `resolver`); `mcp.` routes `POST /mcp/artifacts` there too. Nothing routes to the internal role. Each route class
+  has its own upstream (`share`, `member`, `upload`, `mcp`) with its own `max_conns`, so a flood on one cannot
+  starve the others (limits are in `artifact-host-http.conf`). `X-Forwarded-For`
+  is overwritten with `$remote_addr`; on `/mcp/artifacts` `Forwarded`, `X-Real-IP` and `X-Forwarded-Host` are also
+  stripped; `/healthz` and `/internal/` answer 404 at the edge. Body caps: `/s/` 1k,
+  annotations 32k, `/api/member/` 1m, run uploads 17m, `/mcp/artifacts` 768k. Existing room routes are unchanged.
+- Member UI on its own origin (`control_plane.artifact_host.member_host`, optional, off by default). Moving the member
+  page from `artifacts.metabolomics.us` to `my.artifacts.metabolomics.us` separates it from the untrusted `/s/` content
+  origin. Phased:
+  - Phase 1 (this change, safe to deploy before DNS or Cognito exist): when `member_host` is set the host serves `/`,
+    `/my/` and `/api/member/` on that name too, building `redirect_uri`, `logout_uri` and the page CSP from it, adding
+    `Cross-Origin-Opener-Policy: same-origin`, and answering 404 for everything else (never `/s/`). Cookies stay
+    host-only. The old host keeps working unchanged. The edge renders a second server block (same listen, TLS and
+    limits, no access log) only when it is set; `deploy.sh` refuses a certificate that does not name it and probes it.
+    Unset, the rendered edge and behavior are unchanged. The key must be a DNS name distinct from `public_host` and
+    `mcp_public_hosts`.
+  - Owner-only steps, in order: (1) DNS: `my.artifacts.metabolomics.us` to the same edge as `artifacts.metabolomics.us`;
+    (2) the front proxy's SNI stream map: add the name; (3) certbot `--expand` so the certificate names it;
+    (4) Cognito app client `herdr-collab-web`: add callback `https://my.artifacts.metabolomics.us/my/callback` and
+    sign-out `https://my.artifacts.metabolomics.us/` (keep the old ones); (5) set `member_host` in the fleet config;
+    (6) deploy.
+  - Phase 2 (follow-up, not in this change): redirect the old host's member pages to the new origin.
+  - Phase 3 (follow-up): remove the member routes from the old host and the old Cognito URLs.
+  - Legacy share path: `control_plane.share.member_host` does the same for the share-public path (collab-public's
+    `MemberWeb`), for example `my.artifacts.local.metabolomics.us` next to a `share.public_host` of
+    `artifacts.local.metabolomics.us`. It needs `control_plane.collab.members.enabled: true`, is validated as a lowercase
+    DNS name distinct from `share.public_host` and the collab host, and is copied into the collab slice and the share
+    slice (never authored under `collab.members`). Behaviour matches the artifact host: the member routes use the
+    member origin for `redirect_uri`, `logout_uri` and the CSP, COOP is `same-origin` there, the Host must match exactly
+    (other spellings, a second Host header and `X-Forwarded-Host` get 404; the member server blocks forward the client's
+    `Host` as sent via `$http_host`, since `$host` would lowercase it and drop the port), and `/s/` is 404 on it. The old share host
+    keeps serving the member routes unchanged. The edge renders one extra server block (member locations only,
+    everything else 404, same listen/TLS/limits/headers) only when it is set; `deploy.sh` refuses a certificate that
+    does not name it and probes `/s/probe/` on it (expects 404). Unset, the render and behavior are byte-identical.
+    Owner steps already done for that name: DNS A record, certificate SAN, and Cognito callback
+    `https://my.artifacts.local.metabolomics.us/my/callback` plus sign-out `https://my.artifacts.local.metabolomics.us/`
+    (the old ones are kept). The front proxy routes by an explicit SNI list, so the name also needs its own entry in
+    the front proxy's SNI stream map (next to the share host's entry), applied with its playbook, before the deploy;
+    without it the edge never sees the name and the post-deploy probe only warns. Then set
+    `control_plane.share.member_host` and deploy.
+- Check: `tests/test_artifact_host_compose.py` parses the files and, when Docker is available (required under CI or
+  `HERDR_REQUIRE_DOCKER=1`), starts the stack and runs `nginx -t` on the rendered edge.
 
 ## Artifact collaborator bridge (`control_plane.collab_artifacts`)
 
@@ -306,12 +503,33 @@ Agent ids starting with `room:` are refused by every collaborator route (grant, 
 before that rule cannot be revoked by id any more: use `collab restrict <artifact_id>` (it revokes every collaborator
 grant of the artifact).
 
+## Fabric listener (optional)
+
+Set `control_plane.collab.fabric_trust.listen_host` (a tailnet address) and `listen_port` (and `whois_socket: /run/fabric-whois/whois.sock`)
+and `deploy.sh` layers `compose.collab-fabric.yaml`: a `fabric-whois` sidecar (no network, tailscaled's socket directory read-only, its own
+socket directory) and a port published from `collab-public` on that tailnet address only. Without those keys nothing changes. Before relying
+on it, check that Docker preserves the caller's source address, and read the rollback caveat: `docs/operations/fabric-trust.md` section 9.
+
+Three host steps `deploy.sh` cannot do for you (it warns while they are missing):
+
+- **Firewall (required).** The `fabric` network is not internal (Docker cannot publish a port from an internal network) and masquerade-off does not remove
+  its default route, so `collab-public` could reach the host's own addresses, other containers' ports and the LAN. As root:
+  `deploy/control-plane/collab-fabric-firewall.sh --install` (`--check`, `--remove`); it drops NEW connections from `172.30.213.0/24` in `DOCKER-USER`
+  and `INPUT`. Re-apply at boot.
+- **Boot order.** Install `deploy/control-plane/docker-after-tailscale.conf` as `/etc/systemd/system/docker.service.d/after-tailscale.conf`
+  (`systemctl daemon-reload`): docker then starts after tailscaled and waits for the tailnet address, otherwise the port bind can fail at boot and the
+  PUBLIC site stays down.
+- **The collab host trusts itself.** A local process, `ssh -L`/`socat` relay or host-network container reaches the listener as the host's own tailnet IP and is
+  accepted as that machine if the host is in `machines`. Run no relays or L4 fronts on the collab host and omit it from `machines` unless its own agents need it.
+
 ## Verify
 
+The MCP URL is `https://mcp.local.metabolomics.us`. `localdev.mcp.metabolomics.us` is a deprecated alias the edge serves on the same server block during the overlap (the certbot lineage keeps that name).
+
 ```
-curl -s https://localdev.mcp.metabolomics.us/api/v1/collab/config        # 200
-curl -s -o /dev/null -w '%{http_code}' https://localdev.mcp.metabolomics.us/api/v1/collab/rooms   # 401
-curl -s -o /dev/null -w '%{http_code}' https://localdev.mcp.metabolomics.us/api/v1/hosts          # 404
+curl -s https://mcp.local.metabolomics.us/api/v1/collab/config        # 200
+curl -s -o /dev/null -w '%{http_code}' https://mcp.local.metabolomics.us/api/v1/collab/rooms   # 401
+curl -s -o /dev/null -w '%{http_code}' https://mcp.local.metabolomics.us/api/v1/hosts          # 404
 curl -s http://<tailnet-ip>:9482/api/v1/collab/config                    # operator block present
-curl -s -o /dev/null -w '%{http_code}' https://localdev.mcp.metabolomics.us/s/unknown/           # 404 (the MCP host serves no /s/)
+curl -s -o /dev/null -w '%{http_code}' https://mcp.local.metabolomics.us/s/unknown/           # 404 (the MCP host serves no /s/)
 ```

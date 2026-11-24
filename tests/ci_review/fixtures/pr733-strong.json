@@ -1,0 +1,46 @@
+{
+ "findings": [
+  {
+   "file": "tests/control_plane/test_stall_watch.py",
+   "line": 97,
+   "severity": "blocking",
+   "category": "tests",
+   "why": "test_tune_gc_without_freeze_keeps_heap_collectable is order dependent: it asserts the default threshold (700, 10, 1000) and a zero freeze count that earlier tests change"
+  },
+  {
+   "file": "tests/control_plane/test_stall_watch.py",
+   "line": 81,
+   "severity": "note",
+   "category": "tests",
+   "why": "The web tests leak gc thresholds and freeze state to later tests"
+  },
+  {
+   "file": "herdr_engineering/control_plane/stall_watch.py",
+   "line": 89,
+   "severity": "blocking",
+   "category": "code",
+   "why": "The default gen0 of 700 is hardcoded and only right for python3.12; other versions differ"
+  },
+  {
+   "file": "CHANGELOG.md",
+   "line": null,
+   "severity": "note",
+   "category": "docs",
+   "why": "The default gen2 changed from 10 to 1000 and the changelog does not document it"
+  },
+  {
+   "file": "herdr_engineering/control_plane/stall_watch.py",
+   "line": 98,
+   "severity": "blocking",
+   "category": "code",
+   "why": "parse_gc_config has no upper bound on gc values, so a huge value crashes after serving starts"
+  },
+  {
+   "file": "herdr_engineering/control_plane/stall_watch.py",
+   "line": 300,
+   "severity": "blocking",
+   "category": "code",
+   "why": "Possible race in the watcher thread shutdown path"
+  }
+ ]
+}

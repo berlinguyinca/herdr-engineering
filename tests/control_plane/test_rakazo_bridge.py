@@ -19,6 +19,7 @@ from herdr_engineering.control_plane import rakazo_events as ev
 from herdr_engineering.control_plane.api import ControlPlaneServer
 from herdr_engineering.control_plane.assistant import AssistantService, assistant_config
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
+from tests.io_timeouts import HTTP_TIMEOUT
 
 PW_A, PW_B = "correct horse battery A", "correct horse battery B"
 FAST = dict(n=2 ** 14)                       # the smallest N the parser accepts: keeps the suite quick
@@ -42,7 +43,7 @@ class Api:
         data = body if isinstance(body, bytes) else (json.dumps(body).encode() if body is not None else None)
         req = urllib.request.Request(self.base + path, data=data, headers=h, method=method)
         try:
-            with urllib.request.urlopen(req, timeout=10) as r:
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
                 return r.status, r.read(), dict(r.headers)
         except urllib.error.HTTPError as e:
             return e.code, e.read(), dict(e.headers)
@@ -221,7 +222,7 @@ def test_the_open_owner_session_is_off_unless_configured(srv):
 
 def test_open_owner_gives_the_first_operator_a_session_from_loopback_or_the_tailnet(make_server):
     _, api = make_server(bridge_section(open_owner=True))
-    for ip in ("127.0.0.1", "::1", "100.104.39.6", "100.64.0.1", "fd7a:115c:a1e0::1", "::ffff:100.64.1.1"):
+    for ip in ("127.0.0.1", "::1", "100.64.8.6", "100.64.0.1", "fd7a:115c:a1e0::1", "::ffff:100.64.1.1"):
         status, body, hdrs = api.raw("POST", "/api/auth/open", {}, {"X-Forwarded-For": ip})
         assert status == 200, (ip, body)
         token = json.loads(body)["token"]
@@ -254,6 +255,38 @@ def test_open_owner_only_answers_the_app_not_a_web_page(make_server):
     _, api = make_server(bridge_section(open_owner=True))
     for origin in ("https://evil.example", "http://localhost:3000", ""):
         assert api.raw("POST", "/api/auth/open", {}, {"origin": origin})[0] == 403, origin
+
+
+def test_open_owner_origins_default_accepts_only_the_rakazo_app(make_server):
+    _, api = make_server(bridge_section(open_owner=True))
+    assert api.raw("POST", "/api/auth/open", {}, {"origin": "rakazo://", "X-Forwarded-For": "100.64.1.1"})[0] == 200
+    assert api.raw("POST", "/api/auth/open", {}, {"origin": "shepherd://", "X-Forwarded-For": "100.64.1.2"})[0] == 403
+
+
+def test_open_owner_origins_adds_a_second_app_with_the_same_network_guards(make_server):
+    _, api = make_server(bridge_section(open_owner=True, open_owner_origins=["rakazo://", "shepherd://"]))
+    assert api.raw("POST", "/api/auth/open", {}, {"origin": "shepherd://", "X-Forwarded-For": "100.64.1.3"})[0] == 200
+    assert api.raw("POST", "/api/auth/open", {}, {"origin": "shepherd://", "X-Forwarded-For": "192.168.1.20"})[0] == 403
+    assert api.raw("POST", "/api/auth/open", {}, {"origin": "https://shepherd.example", "X-Forwarded-For": "100.64.1.4"})[0] == 403
+    assert api.raw("POST", "/api/auth/open", {}, {"origin": "other://", "X-Forwarded-For": "100.64.1.5"})[0] == 403
+
+
+@pytest.mark.parametrize("bad", [
+    "rakazo://", "x", "", "http://", "https://host", "HTTPS://", "shep*://", "*", "a b://", "shepherd:// ", "shepherd://ho st",
+    5, None, "://", "shepherd://a/b"])
+def test_open_owner_origins_rejects_invalid_entries(bad):
+    entries = ["rakazo://", bad]   # "rakazo://" itself is the duplicate case
+    with pytest.raises(ValueError, match="open_owner_origins"):
+        rb.rakazo_bridge_config({"enabled": True, "open_owner_origins": entries, "accounts": ACCOUNTS})
+
+
+def test_open_owner_origins_must_be_a_short_nonempty_list():
+    for bad in ("rakazo://", [], {"a": 1}, [f"app{i}://" for i in range(9)]):
+        with pytest.raises(ValueError, match="open_owner_origins"):
+            rb.rakazo_bridge_config({"enabled": True, "open_owner_origins": bad, "accounts": ACCOUNTS})
+    ok = rb.rakazo_bridge_config({"enabled": True, "open_owner_origins": [f"app{i}://" for i in range(8)], "accounts": ACCOUNTS})
+    assert len(ok["open_owner_origins"]) == 8
+    assert rb.rakazo_bridge_config({"enabled": True, "accounts": ACCOUNTS})["open_owner_origins"] == ("rakazo://",)
 
 
 def test_open_owner_is_rate_limited_per_address_so_it_cannot_evict_the_owners_sessions(make_server):
@@ -381,11 +414,11 @@ def test_100_failures_from_one_address_do_not_block_a_correct_sign_in_from_anoth
 
 
 def test_client_address_trusts_forwarded_for_only_from_loopback_or_configured_proxies():
-    cfg = rb.rakazo_bridge_config(bridge_section(trusted_proxies=["172.18.0.0/16", "100.104.39.6"]))
+    cfg = rb.rakazo_bridge_config(bridge_section(trusted_proxies=["172.18.0.0/16", "100.64.8.6"]))
     bridge = rb.RakazoBridge(cfg, assistant=None, version="x")
     assert bridge.client_address("127.0.0.1", "100.64.0.9") == "100.64.0.9"
     assert bridge.client_address("172.18.0.1", "9.9.9.9, 100.64.0.9") == "100.64.0.9"      # the last (the gateway's) entry
-    assert bridge.client_address("100.104.39.6", "100.64.0.9") == "100.64.0.9"
+    assert bridge.client_address("100.64.8.6", "100.64.0.9") == "100.64.0.9"
     assert bridge.client_address("100.64.0.77", "1.2.3.4") == "100.64.0.77"              # an ordinary device cannot choose
     assert bridge.client_address("172.19.0.1", "1.2.3.4") == "172.19.0.1"
     assert bridge.client_address("127.0.0.1", "not-an-ip") == "127.0.0.1"                # junk never becomes a key
@@ -588,6 +621,16 @@ def test_bots_map_to_assistants_with_one_thread_each(srv, alice):
     assert space["isDefault"] is True and space["hasContent"] is True and space["bots"][0]["id"] == bot["id"]
     assert api.rpc("bots/get", {"botId": "missing"}, alice)[0] == 404
     assert api.rpc("bots/create", {"name": ""}, alice)[0] == 400
+
+
+@pytest.mark.parametrize("proc", ["threads/send", "threads/head", "threads/get", "threads/messages"])
+def test_an_unknown_bot_id_is_a_plain_404_not_a_logged_bug(srv, alice, caplog, proc):
+    # the Shepherd TUI sends a herdr agent id as botId; that is a normal not-found (its terminal-input fallback trigger)
+    _, api = srv
+    with caplog.at_level(logging.WARNING):
+        status = api.rpc(proc, {"botId": "not-an-assistant", "text": "hi", "clientNonce": "n1"}, alice)[0]
+    assert status == 404
+    assert "KeyError" not in caplog.text
 
 
 def test_an_assistant_made_elsewhere_for_the_same_principal_shows_up_with_its_existing_thread(srv, alice):
@@ -1451,3 +1494,66 @@ def test_slow_calls_are_logged_by_name_and_duration_only(monkeypatch, caplog):
     text = " ".join(r.getMessage() for r in caplog.records)
     assert "spaces/list took" in text and "status 200" in text
     assert "s3cr3t" not in text and "secret-body" not in text and "token=abc" not in text
+
+
+# --------------------------------------------------------------------------------------------- open owner latency
+def _open_audits(svr):
+    return [e for e in list(svr.assistant.store.audit) if e["action"] == "rakazo.bridge.open_owner"]
+
+
+def test_open_owner_does_not_wait_for_a_contended_audit_write(make_server):
+    """The store lock is the real contention point of an audit write (it is held across the durable write and the
+    snapshot persist); hold it from here and the session must still come back, with the audit entry landing after."""
+    svr, api = make_server(bridge_section(open_owner=True))
+    store = svr.assistant.store
+    holding, release = threading.Event(), threading.Event()
+
+    def hold():
+        with store._lock:
+            holding.set()
+            release.wait(HTTP_TIMEOUT)
+
+    t = threading.Thread(target=hold, daemon=True)
+    t.start()
+    assert holding.wait(5)
+    try:
+        started = time.monotonic()
+        status, body, _ = api.raw("POST", "/api/auth/open", {}, {"X-Forwarded-For": "100.64.0.1"})
+        assert status == 200 and json.loads(body)["token"]
+        assert time.monotonic() - started < 2.0
+    finally:
+        release.set()
+        t.join(5)
+    deadline = time.monotonic() + 10
+    while not _open_audits(svr) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert len(_open_audits(svr)) == 1
+
+
+def test_open_owner_audit_lands_in_the_normal_case_and_on_close(make_server):
+    svr, api = make_server(bridge_section(open_owner=True))
+    assert api.raw("POST", "/api/auth/open", {}, {"X-Forwarded-For": "100.64.0.1"})[0] == 200
+    svr.rakazo.close()                                  # flushes what is queued
+    assert len(_open_audits(svr)) == 1
+
+
+def test_open_owner_audit_queue_is_bounded_and_drops_with_a_log(make_server, caplog):
+    svr, api = make_server(bridge_section(open_owner=True))
+    bridge = svr.rakazo
+    store = svr.assistant.store
+    account = bridge.accounts[0]
+    caplog.set_level(logging.WARNING)
+    with store._lock:                                   # the worker stalls on the first entry
+        for _ in range(bridge.AUDIT_QUEUE_MAX + 20):
+            bridge._audit_later(account, "rakazo.bridge.open_owner")
+        assert bridge._audit_q.qsize() <= bridge.AUDIT_QUEUE_MAX
+    assert "audit queue full" in caplog.text
+
+
+def test_slow_open_owner_log_names_the_phases(make_server, caplog, monkeypatch):
+    monkeypatch.setattr(rb, "SLOW_CALL_MS", 0)
+    svr, api = make_server(bridge_section(open_owner=True))
+    caplog.set_level(logging.INFO)
+    assert api.raw("POST", "/api/auth/open", {}, {"X-Forwarded-For": "100.64.0.1"})[0] == 200
+    line = next(r.getMessage() for r in caplog.records if "auth/open took" in r.getMessage())
+    assert "mint " in line and "audit " in line

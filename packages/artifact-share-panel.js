@@ -9,6 +9,7 @@ import { CollabApi } from './herdr-web-client/collab.js';
 import { mountCollaborators } from './artifact-collaborators.js';
 import { mountActivity } from './artifact-activity.js';
 import { mountFeedbackPanel } from './artifact-feedback-panel.js';
+import { hasSingleHtmlAsset } from './artifact-rich-view.js';
 
 export const AUDIENCES = [['private', 'Private'], ['lab', 'Group (lab)'], ['public', 'Public']];
 const AUDIENCE_LABEL = Object.fromEntries(AUDIENCES);
@@ -36,9 +37,14 @@ const audienceLabel = audience => AUDIENCE_LABEL[audience] || String(audience ??
 const message = error => String(error?.message || 'The request could not be completed.');
 const splitList = value => String(value || '').split(/[,\n]/).map(item => item.trim()).filter(Boolean);
 const wrap = 'overflow-wrap:anywhere';
+// The server's internal pending-share entry for "preview.html plus the author's page"; it is never shown.
+export const PENDING_MARK = 'preview.html+author-html';
+const PREVIEW_ENTRY = 'preview.html';
+const displayEntry = entry => (entry === PENDING_MARK ? PREVIEW_ENTRY : entry);
+const authorBadge = '<span class="hd-note" data-share-author-badge style="border:1px solid currentColor;border-radius:4px;padding:0 .4em">Includes author page</span>';
 
 export function defaultForm(headVersionId) {
-  return { versionId: headVersionId || '', audience: 'private', emails: '', groups: '', publicDays: PUBLIC_DEFAULT_DAYS, labDays: '', title: '', entry: '' };
+  return { versionId: headVersionId || '', audience: 'private', emails: '', groups: '', publicDays: PUBLIC_DEFAULT_DAYS, labDays: '', title: '', entry: '', includeAuthorHtml: false };
 }
 
 const shareableVersions = versions => (versions || []).filter(version => version && version.version_id && (!version.state || version.state === 'ready'));
@@ -61,12 +67,13 @@ const days = (value, low, high, label) => {
 };
 
 // The create body for the current form; throws an Error whose message is shown to the user.
-export function buildShareRequest(form, { allowEntry = true } = {}) {
+export function buildShareRequest(form, { allowEntry = true, allowAuthorHtml = false } = {}) {
   if (form.audience === 'private') throw new Error('Private: No link is created.');
   if (!form.versionId) throw new Error('Choose a ready version to share.');
   const body = { version_id: form.versionId, audience: form.audience };
   if (form.audience === 'public') {
     body.expires_in_days = days(form.publicDays, 1, 90, 'A public link expiry');
+    if (allowAuthorHtml && form.includeAuthorHtml === true) body.include_author_html = true;
   } else if (form.audience === 'lab') {
     const emails = splitList(form.emails), groups = splitList(form.groups);
     if (!emails.length && !groups.length) throw new Error('A group link needs at least one email or group.');
@@ -83,6 +90,13 @@ export function buildShareRequest(form, { allowEntry = true } = {}) {
   return body;
 }
 
+// Whether the author's own page can be offered: a public share of a version with exactly one HTML asset.
+export const authorHtmlEligible = state => state.form.audience === 'public' && state.authorHtml?.get(state.form.versionId) === true;
+
+const authorHtmlOption = state => (authorHtmlEligible(state)
+  ? `<div data-share-author-html><label style="display:flex;align-items:center;gap:.5em;min-height:32px"><input type="checkbox" style="flex:none;width:18px;height:18px" data-share-field="includeAuthorHtml" aria-describedby="share-author-html-note"${state.form.includeAuthorHtml ? ' checked' : ''}> Include the author's HTML page (Rich view)</label><p class="hd-note" id="share-author-html-note">Anyone with the link can view this page. It is shown without scripts.</p></div>`
+  : '');
+
 export function renderShareForm(state) {
   const { form } = state;
   const disabled = formButtons(state);
@@ -93,12 +107,12 @@ export function renderShareForm(state) {
   if (form.audience === 'private') {
     fields = '<p data-share-private>Private: No link is created. Only people with access to this artifact here can see it.</p>';
   } else if (form.audience === 'public') {
-    fields = `<label style="display:block">Expires after (days, 1–90)<input class="hd-input" type="number" inputmode="numeric" data-share-field="publicDays" min="1" max="90" step="1" required value="${esc(form.publicDays)}"></label><p class="hd-note">Anyone with the link can open it until it expires.</p>`;
+    fields = `<label>Expires after (days, 1–90)<input class="hd-input" style="min-height:28px;box-sizing:border-box" type="number" inputmode="numeric" data-share-field="publicDays" min="1" max="90" step="1" required value="${esc(form.publicDays)}"></label><p class="hd-note">Anyone with the link can open it until it expires.</p>${authorHtmlOption(state)}`;
   } else {
-    fields = `<label style="display:block">Emails (comma or new line separated)<textarea class="hd-input" rows="2" data-share-field="emails" style="width:100%">${esc(form.emails)}</textarea></label><label style="display:block">Groups (comma or new line separated)<textarea class="hd-input" rows="2" data-share-field="groups" style="width:100%">${esc(form.groups)}</textarea></label><label style="display:block">Expires after (days, optional, 1–${MAX_LAB_DAYS})<input class="hd-input" type="number" inputmode="numeric" data-share-field="labDays" min="1" max="${MAX_LAB_DAYS}" step="1" placeholder="No expiry" value="${esc(form.labDays)}"></label>`;
+    fields = `<label>Emails (comma or new line separated)<textarea class="hd-input" rows="2" data-share-field="emails" style="width:100%">${esc(form.emails)}</textarea></label><label>Groups (comma or new line separated)<textarea class="hd-input" rows="2" data-share-field="groups" style="width:100%">${esc(form.groups)}</textarea></label><label>Expires after (days, optional, 1–${MAX_LAB_DAYS})<input class="hd-input" style="min-height:28px;box-sizing:border-box" type="number" inputmode="numeric" data-share-field="labDays" min="1" max="${MAX_LAB_DAYS}" step="1" placeholder="No expiry" value="${esc(form.labDays)}"></label>`;
   }
-  const extra = form.audience === 'private' ? '' : `<label style="display:block">Title (optional)<input class="hd-input" data-share-field="title" maxlength="240" value="${esc(form.title)}" style="width:100%"></label>${state.allowEntry ? `<label style="display:block">Entry file (optional)<input class="hd-input" data-share-field="entry" value="${esc(form.entry)}" style="width:100%"></label>` : ''}`;
-  return `<form data-share-form novalidate><div class="hd-inline" style="flex-wrap:wrap"><label>Version<select class="hd-input" data-share-field="versionId">${versionOptions || '<option value="">No ready version</option>'}</select></label><label>Audience<select class="hd-input" data-share-field="audience">${audience}</select></label></div>${fields}${extra}<div class="hd-inline" style="flex-wrap:wrap"><button type="button" class="hd-btn" data-share-action="review"${disabled.review ? ' disabled' : ''}>Review</button><button type="button" class="hd-btn" data-share-action="generate"${disabled.generate ? ' disabled' : ''}>Generate link</button></div></form>`;
+  const extra = form.audience === 'private' ? '' : `<label>Title (optional)<input class="hd-input" data-share-field="title" maxlength="240" value="${esc(form.title)}" style="width:100%;min-height:28px;box-sizing:border-box"></label>${state.allowEntry ? `<label>Entry file (optional)<input class="hd-input" data-share-field="entry" value="${esc(form.entry)}" style="width:100%;min-height:28px;box-sizing:border-box"></label>` : ''}`;
+  return `<form data-share-form novalidate><div class="hd-inline" style="flex-wrap:wrap"><label style="display:inline-flex;flex-direction:column;gap:4px">Version<select class="hd-input" style="min-height:28px;box-sizing:border-box" data-share-field="versionId">${versionOptions || '<option value="">No ready version</option>'}</select></label><label style="display:inline-flex;flex-direction:column;gap:4px">Audience<select class="hd-input" style="min-height:28px;box-sizing:border-box" data-share-field="audience">${audience}</select></label></div>${fields}${extra}<div class="hd-inline" style="flex-wrap:wrap"><button type="button" class="hd-btn" data-share-action="review"${disabled.review ? ' disabled' : ''}>Review</button><button type="button" class="hd-btn" data-share-action="generate"${disabled.generate ? ' disabled' : ''}>Generate link</button></div></form>`;
 }
 
 export function renderSummary(summary) {
@@ -107,7 +121,7 @@ export function renderSummary(summary) {
   const count = Number.isSafeInteger(summary.file_count) ? summary.file_count : files.length;
   const more = count - files.length;
   const warnings = Array.isArray(summary.warnings) ? summary.warnings : [];
-  return `<div data-share-summary style="${wrap}"><p><strong>${esc(count)}</strong> file(s), ${esc(humanSize(summary.total_bytes))} in total${summary.audience ? ` · ${esc(audienceLabel(summary.audience))}` : ''}${summary.expires_at ? ` · expires ${esc(summary.expires_at)}` : ''}${summary.entry ? ` · opens <code>${esc(summary.entry)}</code>` : ''}</p>${files.length ? `<ul data-share-files>${files.map(file => `<li><code>${esc(file.name)}</code> · ${esc(humanSize(file.size_bytes))}</li>`).join('')}</ul>` : ''}${more > 0 ? `<p>…and ${esc(more)} more file${more === 1 ? '' : 's'}.</p>` : ''}${warnings.length ? `<ul data-share-warnings role="note">${warnings.map(warning => `<li>Warning: ${esc(warning)}</li>`).join('')}</ul>` : ''}</div>`;
+  return `<div data-share-summary style="${wrap}"><p><strong>${esc(count)}</strong> file(s), ${esc(humanSize(summary.total_bytes))} in total${summary.audience ? ` · ${esc(audienceLabel(summary.audience))}` : ''}${summary.expires_at ? ` · expires ${esc(summary.expires_at)}` : ''}${summary.entry ? ` · opens <code>${esc(displayEntry(summary.entry))}</code>` : ''}${summary.author_html === true || summary.entry === PENDING_MARK ? ` · ${authorBadge}` : ''}</p>${files.length ? `<ul data-share-files>${files.map(file => `<li><code>${esc(file.name)}</code> · ${esc(humanSize(file.size_bytes))}</li>`).join('')}</ul>` : ''}${more > 0 ? `<p>…and ${esc(more)} more file${more === 1 ? '' : 's'}.</p>` : ''}${warnings.length ? `<ul data-share-warnings role="note">${warnings.map(warning => `<li>Warning: ${esc(warning)}</li>`).join('')}</ul>` : ''}</div>`;
 }
 
 export function eventCounts(events) {
@@ -146,7 +160,7 @@ export function renderShareRow(share, eventsEntry, { busy = false } = {}) {
   if (eventsEntry?.open) {
     drawer = `<div data-share-events>${eventsEntry.loading ? '<p role="status">Loading events…</p>' : eventsEntry.error ? `<p role="alert">Events unavailable: ${esc(eventsEntry.error)}</p>` : renderEvents(eventsEntry.events)}</div>`;
   }
-  return `<li data-share-row data-share-id="${id}" style="${wrap}"><p><strong>${esc(share.title || share.share_id)}</strong> · ${esc(audienceLabel(share.audience))} · <span data-share-state>${esc(share.state || 'unknown')}</span></p><p>Recipients: ${recipients.map(item => esc(item)).join(', ') || 'none'} · Version <code>${esc(share.version_id || '')}</code> · Expires: ${share.expires_at ? esc(share.expires_at) : 'Never'}</p><p data-share-counts>${counts ? `${counts.opened} opened · ${counts.denied} denied` : 'Open the events to see opened/denied counts.'}</p><div class="hd-inline" style="flex-wrap:wrap"><button type="button" class="hd-btn" data-share-action="events" data-share-id="${id}" aria-expanded="${eventsEntry?.open ? 'true' : 'false'}">${eventsEntry?.open ? 'Hide events' : 'Events'}</button>${share.state === 'pending' ? `<button type="button" class="hd-btn" data-share-action="continue" data-share-id="${id}"${off}>Review &amp; generate</button>` : ''}${REVOCABLE.has(share.state) ? `<button type="button" class="hd-btn" data-share-action="revoke" data-share-id="${id}"${off}>Revoke</button>` : ''}</div>${drawer}</li>`;
+  return `<li data-share-row data-share-id="${id}" style="${wrap}"><p><strong>${esc(share.title || share.share_id)}</strong> · ${esc(audienceLabel(share.audience))} · <span data-share-state>${esc(share.state || 'unknown')}</span>${share.entry ? ` · opens <code>${esc(displayEntry(share.entry))}</code>` : ''}${share.entry === PENDING_MARK ? ` · ${authorBadge}` : ''}</p><p>Recipients: ${recipients.map(item => esc(item)).join(', ') || 'none'} · Version <code>${esc(share.version_id || '')}</code> · Expires: ${share.expires_at ? esc(share.expires_at) : 'Never'}</p><p data-share-counts>${counts ? `${counts.opened} opened · ${counts.denied} denied` : 'Open the events to see opened/denied counts.'}</p><div class="hd-inline" style="flex-wrap:wrap"><button type="button" class="hd-btn" data-share-action="events" data-share-id="${id}" aria-expanded="${eventsEntry?.open ? 'true' : 'false'}">${eventsEntry?.open ? 'Hide events' : 'Events'}</button>${share.state === 'pending' ? `<button type="button" class="hd-btn" data-share-action="continue" data-share-id="${id}"${off}>Review &amp; generate</button>` : ''}${REVOCABLE.has(share.state) ? `<button type="button" class="hd-btn" data-share-action="revoke" data-share-id="${id}"${off}>Revoke</button>` : ''}</div>${drawer}</li>`;
 }
 
 export function renderShareList(state) {
@@ -172,7 +186,7 @@ export function createShareController(client, artifactId, { versions = [], headV
     form: defaultForm(head), versions, headVersionId, allowEntry,
     shares: null, listError: null, listUnavailable: false, listLoading: false,
     busy: false, pending: null, link: null, error: null, notice: '',
-    events: new Map(),
+    events: new Map(), authorHtml: new Map(),
   };
   const aborter = new AbortController();
   let listGeneration = 0, actionGeneration = 0;
@@ -204,6 +218,26 @@ export function createShareController(client, artifactId, { versions = [], headV
     changed('events');
     return entry.loading;
   };
+
+  // Whether a report version has exactly one HTML asset, read once per version from its descriptor. Only report
+  // versions are asked; a failed read just leaves the option hidden.
+  const probeAuthorHtml = versionId => {
+    const summary = (state.versions || []).find(version => version?.version_id === versionId);
+    if (!versionId || state.authorHtml.has(versionId) || !(summary?.is_report === true || summary?.report_descriptor) || typeof client.artifactReport !== 'function') return Promise.resolve();
+    state.authorHtml.set(versionId, false);
+    return (async () => {
+      try {
+        const report = await client.artifactReport(artifactId, versionId, { signal: read() });
+        if (!live()) return;
+        state.authorHtml.set(versionId, hasSingleHtmlAsset(report?.report_descriptor?.assets));
+      } catch {
+        if (live()) state.authorHtml.set(versionId, false);
+      }
+      if (state.authorHtml.get(versionId) === true) changed('form');
+    })();
+  };
+  // Drop a checked box that no longer applies, so a stale choice can never reach a request.
+  const settleAuthorHtml = () => { if (!authorHtmlEligible(state)) state.form.includeAuthorHtml = false; };
 
   ctrl.refresh = async () => {
     if (!live()) return;
@@ -249,7 +283,10 @@ export function createShareController(client, artifactId, { versions = [], headV
 
   ctrl.setField = (name, value) => {
     if (!live() || !(name in state.form)) return;
-    state.form[name] = String(value ?? '');
+    if (name === 'includeAuthorHtml') state.form[name] = value === true || value === 'true';
+    else state.form[name] = String(value ?? '');
+    if (name === 'versionId') { state.form.includeAuthorHtml = false; void probeAuthorHtml(state.form.versionId); }
+    if (name === 'audience') settleAuthorHtml();
     if (name === 'audience' && state.form.audience === 'public' && !state.form.publicDays) state.form.publicDays = PUBLIC_DEFAULT_DAYS;
     // The reviewed summary no longer describes the form. The share stays pending on the server and can be resumed
     // from its row ("Review & generate").
@@ -262,7 +299,7 @@ export function createShareController(client, artifactId, { versions = [], headV
   ctrl.review = async () => {
     if (!live() || state.busy || state.form.audience === 'private') return;
     let body;
-    try { body = buildShareRequest(state.form, { allowEntry }); }
+    try { body = buildShareRequest(state.form, { allowEntry, allowAuthorHtml: authorHtmlEligible(state) }); }
     catch (error) { state.error = message(error); changed('error'); return; }
     state.link = null; state.pending = null;
     await action(async current => {
@@ -341,6 +378,7 @@ export function createShareController(client, artifactId, { versions = [], headV
     if (!nextReady.some(version => version.version_id === state.form.versionId)) {
       state.form.versionId = (nextReady.some(version => version.version_id === nextHead) ? nextHead : nextReady[0]?.version_id) || '';
     }
+    void probeAuthorHtml(state.form.versionId);
     changed('versions');
   };
 
@@ -353,17 +391,23 @@ export function createShareController(client, artifactId, { versions = [], headV
   };
 
   if (signal?.aborted) ctrl.dispose(); else signal?.addEventListener?.('abort', ctrl.dispose, { once: true });
+  void probeAuthorHtml(state.form.versionId);
   return ctrl;
 }
 
 // ------------------------------------------------------------------------------------------------ mount
 
 const TABS = [['links', 'Links'], ['collaborators', 'Collaborators'], ['activity', 'Activity'], ['feedback', 'Feedback']];
-const TAB_BAR = `<div role="tablist" aria-label="Sharing" data-panel-tabs>${TABS.map(([key, label], i) => `<button type="button" role="tab" class="hd-btn" data-panel-tab="${key}" aria-selected="${i === 0}">${label}</button>`).join('')}</div>`;
+// ARIA tabs pattern: one tab stop (roving tabindex), Arrow/Home/End move and select, each panel is labelled by its tab.
+// Ids are per mount (several artifacts' panels can exist at once); the design system's .hd-tabs marks the selected tab.
+let mounts = 0;
+const tabBar = uid => `<div role="tablist" aria-label="Sharing" class="hd-tabs" data-panel-tabs>${TABS.map(([key, label], i) => `<button type="button" role="tab" id="${uid}-tab-${key}" data-panel-tab="${key}" aria-controls="${uid}-pane-${key}" aria-selected="${i === 0}" tabindex="${i === 0 ? 0 : -1}">${label}</button>`).join('')}</div>`;
+const paneAttrs = (uid, key) => `id="${uid}-pane-${key}" role="tabpanel" aria-labelledby="${uid}-tab-${key}" data-panel-pane="${key}"`;
 
 // `collabApi` defaults to the same-origin, token-less mode: the dashboard proxy authenticates the call.
 export function mountSharePanel(container, client, artifactId, { versions = [], headVersionId, signal, allowEntry = true, collabApi = new CollabApi(null) } = {}) {
-  container.innerHTML = TAB_BAR + '<div role="tabpanel" data-panel-pane="links"><section data-share-panel><p class="hd-note">Viewer links give people outside this dashboard read-only access to one pinned version.</p><div data-share-form-region></div><div role="status" data-share-status></div><div data-share-review-region></div><div data-share-link-region></div><h3>Links</h3><div data-share-list-region></div></section></div><div role="tabpanel" data-panel-pane="collaborators" hidden></div><div role="tabpanel" data-panel-pane="activity" hidden></div><div role="tabpanel" data-panel-pane="feedback" hidden></div>';
+  const uid = `share-panel-${++mounts}`;
+  container.innerHTML = tabBar(uid) + `<div ${paneAttrs(uid, 'links')}><section data-share-panel><p class="hd-note">Viewer links give people outside this dashboard read-only access to one pinned version.</p><div data-share-form-region></div><div role="status" data-share-status></div><div data-share-review-region></div><div data-share-link-region></div><h3>Links</h3><div data-share-list-region></div></section></div><div ${paneAttrs(uid, 'collaborators')} hidden></div><div ${paneAttrs(uid, 'activity')} hidden></div><div ${paneAttrs(uid, 'feedback')} hidden></div>`;
   const region = name => container.querySelector(`[data-share-${name}-region]`);
   const status = container.querySelector('[data-share-status]');
   let formKey = null, shownLink = null;
@@ -371,8 +415,13 @@ export function mountSharePanel(container, client, artifactId, { versions = [], 
   const render = () => {
     if (ctrl.disposed || !container.isConnected) return;
     const { state } = ctrl;
-    const key = state.form.audience;
-    if (key !== formKey) { region('form').innerHTML = renderShareForm(state); formKey = key; }
+    const key = `${state.form.audience}|${authorHtmlEligible(state)}`;
+    if (key !== formKey) {
+      // A rebuild must not strand keyboard focus: put it back on the same field.
+      const focused = container.ownerDocument?.activeElement?.dataset?.shareField;
+      region('form').innerHTML = renderShareForm(state); formKey = key;
+      if (focused) region('form').querySelector?.(`[data-share-field="${focused}"]`)?.focus?.();
+    }
     else {
       const disabled = formButtons(state);
       for (const name of ['review', 'generate']) {
@@ -416,7 +465,9 @@ export function mountSharePanel(container, client, artifactId, { versions = [], 
       const shown = name === key;
       const element = pane(name);
       if (element) element.hidden = !shown;
-      container.querySelector(`[data-panel-tab="${name}"]`)?.setAttribute('aria-selected', String(shown));
+      const tabEl = container.querySelector(`[data-panel-tab="${name}"]`);
+      tabEl?.setAttribute('aria-selected', String(shown));
+      tabEl?.setAttribute('tabindex', shown ? '0' : '-1');
     }
   };
 
@@ -447,13 +498,24 @@ export function mountSharePanel(container, client, artifactId, { versions = [], 
       default: break;
     }
   };
+  const onTabKey = event => {
+    const tab = event.target.closest?.('[data-panel-tab]');
+    if (!tab || !container.contains(tab)) return;
+    const keys = TABS.map(([key]) => key), at = keys.indexOf(tab.dataset.panelTab);
+    const to = { ArrowRight: (at + 1) % keys.length, ArrowLeft: (at - 1 + keys.length) % keys.length, Home: 0, End: keys.length - 1 }[event.key];
+    if (to === undefined || event.altKey || event.ctrlKey || event.metaKey) return;
+    event.preventDefault();
+    showTab(keys[to]);
+    container.querySelector(`[data-panel-tab="${keys[to]}"]`)?.focus?.();
+  };
   const onField = event => {
     const field = event.target.closest?.('[data-share-field]');
     if (!field || !container.contains(field)) return;
-    ctrl.setField(field.dataset.shareField, field.value);
+    ctrl.setField(field.dataset.shareField, field.type === 'checkbox' ? field.checked : field.value);
   };
   const onSubmit = event => { if (event.target.closest?.('[data-share-form]')) event.preventDefault(); };
   container.addEventListener('click', onClick);
+  container.addEventListener('keydown', onTabKey);
   container.addEventListener('input', onField);
   container.addEventListener('change', onField);
   container.addEventListener('submit', onSubmit);
@@ -462,6 +524,7 @@ export function mountSharePanel(container, client, artifactId, { versions = [], 
     ctrl.dispose();
     for (const handle of Object.values(mounted)) handle.dispose();
     container.removeEventListener('click', onClick);
+    container.removeEventListener('keydown', onTabKey);
     container.removeEventListener('input', onField);
     container.removeEventListener('change', onField);
     container.removeEventListener('submit', onSubmit);

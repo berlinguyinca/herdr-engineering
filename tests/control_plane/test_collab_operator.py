@@ -15,12 +15,13 @@ from herdr_engineering.control_plane.collab import (
 )
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 from tests.control_plane.test_collab import TOKENS, _digest
+from tests.io_timeouts import HTTP_TIMEOUT
 
 HOST = "100.64.0.9:8082"
 
 
 def call(port, method, path, body=None, *, host=HOST, headers=None):
-    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=HTTP_TIMEOUT)
     h = {"Host": host, **(headers or {})}
     data = None
     if body is not None:
@@ -184,7 +185,7 @@ def test_dashboard_proxy_refuses_dns_rebound_host(stack):
 
 def test_dashboard_proxy_still_serves_ip_literal_host_and_same_origin(stack):
     s, _ = _dash(stack, "POST", "/api/v1/collab/projects", {"name": "ok"},
-                 headers={"Host": "100.104.39.6", "Origin": "http://100.104.39.6",
+                 headers={"Host": "100.64.8.6", "Origin": "http://100.64.8.6",
                           "Content-Type": "application/json"})
     assert s == 201
     s, _ = _dash(stack, "GET", "/api/v1/collab/rooms", headers={"Host": "[::1]:80"})

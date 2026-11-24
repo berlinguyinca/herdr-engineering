@@ -89,7 +89,7 @@ async def _sweep_orphans(store, shares_root: Path, now: float) -> int:
 
 
 async def share_housekeeping(store, shares_root: Path, events_path: Path, now: float, *,
-                             marker_path: Path | None = None) -> dict:
+                             marker_path: Path | None = None, members=None) -> dict:
     """Expire due shares, ingest the share container's audit events, and remove orphaned projections/bundles."""
     shares_root, events_path = Path(shares_root), Path(events_path)
     result = {"expired": 0, "ingested": 0, "orphans_removed": 0}
@@ -97,7 +97,9 @@ async def share_housekeeping(store, shares_root: Path, events_path: Path, now: f
     try:
         # reads events.jsonl (and a pending events.jsonl.1) to the end and rotates it past EVENTS_ROTATE_BYTES:
         # share-public drops lines once the file reaches its cap, so an unrotated file would silence audit
-        result["ingested"] = await store.ingest_and_rotate_events(events_path, marker_path=marker_path, now=now)
+        # ``members`` (actor -> member id) lets ``claimed`` events through for approved members only
+        extra = {} if members is None else {"members": members}
+        result["ingested"] = await store.ingest_and_rotate_events(events_path, marker_path=marker_path, now=now, **extra)
     except Exception:  # noqa: BLE001
         log.exception("share events ingest failed")
     try:
@@ -110,10 +112,24 @@ async def share_housekeeping(store, shares_root: Path, events_path: Path, now: f
 class ShareHousekeeper:
     """Runs ``share_housekeeping`` at most once per ``interval`` seconds; never raises out of the worker pass."""
 
-    def __init__(self, shares_root, events_dir, marker_dir, *, interval: float = SHARE_INTERVAL, clock=time.time):
+    def __init__(self, shares_root, events_dir, marker_dir, *, interval: float = SHARE_INTERVAL, clock=time.time,
+                 member_runtime=None):
         self.shares_root, self.events_dir, self.marker_dir = Path(shares_root), Path(events_dir), Path(marker_dir)
         self.interval, self._clock = interval, clock
+        self.member_runtime = member_runtime      # ``MemberRuntime`` or None: without it no claim is kept
         self._last: float | None = None
+
+    async def _claim_resolver(self):
+        """actor -> member id from the fresh member directory, or None when members are off (claims are then dropped)."""
+        rt = self.member_runtime
+        if rt is None or not getattr(rt, "enabled", False):
+            return None
+        import asyncio
+
+        from .artifact_member_intents import load_directory
+        from .artifact_members import claim_resolver
+        directory = await asyncio.to_thread(load_directory, rt)
+        return claim_resolver(directory, rt.group)
 
     async def tick(self, conn) -> dict | str:
         from .artifact_shares import ShareStore
@@ -127,8 +143,12 @@ class ShareHousekeeper:
             except OSError:
                 log.exception("share marker dir %s not creatable", self.marker_dir)
             store = conn if hasattr(conn, "live_expired") else ShareStore(conn)
+            extra = {}
+            resolver = await self._claim_resolver()
+            if resolver is not None:
+                extra["members"] = resolver
             return await share_housekeeping(store, self.shares_root, self.events_dir / "events.jsonl", now,
-                                            marker_path=self.marker_dir / "events.marker.json")
+                                            marker_path=self.marker_dir / "events.marker.json", **extra)
         except Exception:  # noqa: BLE001
             log.exception("share housekeeping failed")
             return "error"
@@ -333,7 +353,8 @@ async def run_one_pass(conn, *, mission_store=None, session_store=None,
                        artifact_job_runner=None, max_artifact_jobs=1,
                        inspector_snapshotter=None, fabric_compactor=None,
                        share_housekeeper=None, artifact_reconciler=None,
-                       annotation_housekeeper=None) -> dict:
+                       annotation_housekeeper=None,
+                       inspector_archiver=None) -> dict:
     summary: dict[str, Any] = {}
 
     # Stale services -> unavailable (never delete).
@@ -387,6 +408,8 @@ async def run_one_pass(conn, *, mission_store=None, session_store=None,
         summary["inspector_snapshot"] = await inspector_snapshotter.tick(conn)
     if conn is not None and fabric_compactor is not None:
         summary["fabric_compaction"] = await fabric_compactor.tick(conn)
+    if conn is not None and inspector_archiver is not None:
+        summary["inspector_archive"] = await inspector_archiver.tick(conn)
     if conn is not None and share_housekeeper is not None:
         summary["share_housekeeping"] = await share_housekeeper.tick(conn)
     if conn is not None and annotation_housekeeper is not None:
@@ -484,7 +507,9 @@ async def _close_quietly(conn) -> None:
 
 
 class CollabBridgeLoop:
-    """The fast side of the collaborator bridge: three independent tasks beside the 30 s worker pass.
+    """The fast side of the collaborator bridge: up to four independent tasks beside the 30 s worker pass.
+    The optional fourth, **members**, rewrites the member views and sweeps disabled members every ``members_every`` and
+    at once when the grants task saw a grant change (``notify_members``).
 
     * **grants** (own connection, every ``interval``): refreshes the shared retraction gate every
       ``retractions_every``, resolves invite grants from the fresh ``agents.json`` and publishes ``grants.json``
@@ -500,8 +525,10 @@ class CollabBridgeLoop:
 
     def __init__(self, dsn_connect, mirror, applier, *, interval: float = 1.0, mirror_every: float = 30.0,
                  retractions_every: float = 30.0, heartbeat: float = 30.0, sweep_every: float | None = None,
-                 reconnect_delay: float = BRIDGE_RECONNECT, close_timeout: float = 10.0):
+                 reconnect_delay: float = BRIDGE_RECONNECT, close_timeout: float = 10.0,
+                 members_publisher=None, members_every: float = 60.0):
         self.dsn_connect, self.mirror, self.applier = dsn_connect, mirror, applier
+        self.members_publisher, self.members_every = members_publisher, members_every
         self.interval, self.mirror_every, self.retractions_every = interval, mirror_every, retractions_every
         self.heartbeat = heartbeat
         self.sweep_every = mirror_every if sweep_every is None else sweep_every
@@ -509,12 +536,14 @@ class CollabBridgeLoop:
         self.gate = applier.gate
         self.rustfs = mirror.rustfs
         self._force: set[str] = set()                    # artifacts the grants task saw change, for the mirror task
+        self._members_wake: asyncio.Event | None = None  # set by notify_members; bound to the running loop lazily
 
     # -- lifecycle ----------------------------------------------------------------------------------------------
     async def run(self, stop: asyncio.Event) -> None:
         pool = _ConnPool(self.dsn_connect, self.mirror.limits.apply_concurrency + 1)
         tasks = [asyncio.create_task(self._supervise(name, body, stop, pool), name=name) for name, body in (
-            ("collab-grants", self._grants), ("collab-mirror", self._mirror), ("collab-applier", self._applier))]
+            ("collab-grants", self._grants), ("collab-mirror", self._mirror), ("collab-applier", self._applier),
+            *((("collab-members", self._members),) if self.members_publisher is not None else ()))]
         try:
             await asyncio.gather(*tasks)
         finally:
@@ -551,6 +580,28 @@ class CollabBridgeLoop:
         except TimeoutError:
             pass
 
+    # -- members ------------------------------------------------------------------------------------------------
+    def notify_members(self) -> None:
+        """Ask the members task for an early pass (a grant changed, so the views may be out of date). Loop thread only."""
+        if self._members_wake is not None:
+            self._members_wake.set()
+
+    async def _members(self, conn, stop: asyncio.Event, _pool) -> None:
+        """Every ``members_every`` or when notified: rewrite the member views and revoke the shares of members no longer
+        admitted."""
+        if self._members_wake is None:
+            self._members_wake = asyncio.Event()
+        wake = self._members_wake
+        while not stop.is_set():
+            wake.clear()
+            await self.members_publisher(conn)
+            waiting = {asyncio.ensure_future(stop.wait()), asyncio.ensure_future(wake.wait())}
+            try:
+                await asyncio.wait(waiting, timeout=self.members_every, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                for task in waiting:
+                    task.cancel()
+
     # -- grants -------------------------------------------------------------------------------------------------
     async def _grants(self, conn, stop: asyncio.Event, _pool) -> None:
         store = ArtifactStore(conn, self.rustfs)
@@ -576,6 +627,7 @@ class CollabBridgeLoop:
             published = await self.mirror.publish_grants(grants, store, heartbeat=self.heartbeat, gate=self.gate)
             if published.changed:
                 self._force |= published.changed           # the mirror task syncs them on its next pass
+                self.notify_members()                      # and the member views (shared with me) are redone now
             await self._wait(stop, self.interval)
 
     def _invite_joins(self) -> dict[str, dict]:

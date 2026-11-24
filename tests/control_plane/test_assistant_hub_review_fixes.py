@@ -77,8 +77,8 @@ def test_judge_stale_active_grant_is_replaced_and_can_be_activated(tmp_path: Pat
         v2 = judge_version(jcfg)
         assert v1 != v2
         later = NOW + timedelta(hours=1)
-        for i in range(2):
-            d = decide(store, cfg, _worker(), PUSH, f"s{i}", f"t{i}", later)
+        asked = [decide(store, cfg, _worker(), PUSH, f"s{i}", f"t{i}", later) for i in range(2)]
+        for d in asked:
             assert d.request_id is not None
             record_owner_decision(store, cfg, later, T, U, d.request_id, True, "owner", judge_version=v2)
         proposed = [g for g in store.list_action_grants(T, U) if g.state is GrantState.PROPOSED]

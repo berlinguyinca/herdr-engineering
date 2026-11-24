@@ -359,3 +359,45 @@ def exit_unavailable(exc: HostConfigUnavailable) -> int:
     """Daemon startup: message to stderr, exit status 2, no traceback."""
     print(f"herdr-eng: {exc}", file=sys.stderr)
     return 2
+
+
+# --------------------------------------------------------------------------
+# optional X-API-Key for control-plane callers (absent key = no header = open posture)
+# --------------------------------------------------------------------------
+
+def read_key_file(path: str | Path) -> str:
+    """The key in ``path``. Refuses a symlink, a non-regular file or any mode wider than 0600
+    (``ValueError``; the message names the path, never the key). An empty file is an error too."""
+    import stat as _stat
+    p = Path(path).expanduser()
+    try:
+        st = os.lstat(p)
+    except OSError as exc:
+        raise ValueError(f"api key file {p}: {exc.strerror or 'unreadable'}") from None
+    if _stat.S_ISLNK(st.st_mode) or not _stat.S_ISREG(st.st_mode):
+        raise ValueError(f"api key file {p}: not a regular file")
+    if _stat.S_IMODE(st.st_mode) & 0o077:
+        raise ValueError(f"api key file {p}: unsafe mode {_stat.S_IMODE(st.st_mode):04o} (want 0600)")
+    try:
+        key = p.read_text(encoding="utf-8").strip()
+    except (OSError, ValueError):
+        raise ValueError(f"api key file {p}: unreadable") from None
+    if not key:
+        raise ValueError(f"api key file {p}: empty")
+    return key
+
+
+def resolve_api_key(base: str, key_file: str | None = None, *, explicit_url: bool = False) -> str | None:
+    """The key to send to ``base``: the key file when given, else this host's agent/ingest key from the
+    fleet config. The host key is used only when ``base`` is the host's own control plane, so it never goes
+    to a URL the operator typed. ``None`` = send no header."""
+    if key_file:
+        return read_key_file(key_file)
+    if explicit_url:
+        cfg = host_config_or_none()
+        if cfg is None or cfg.control_plane_url.rstrip("/") != base.rstrip("/"):
+            return None
+    cfg = host_config_or_none()
+    if cfg is None:
+        return None
+    return cfg.get("agent.api_key") or cfg.get("ingest.api_key") or None

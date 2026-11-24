@@ -124,7 +124,7 @@ def test_prompt_uses_explicit_target_and_literal_text(target):
     runner = NativeRunner()
     text = "--wait $(touch /tmp/unsafe); `whoami`\nsecond line"
     result = NativeHerdrAdapter(runner=runner).send_input(target, text, machine="beast", session="eng")
-    assert runner.calls == [["--machine", "beast", "--session", "eng", "agent", "prompt", "--", target, text]]
+    assert runner.calls == [["--machine", "beast", "--session", "eng", "agent", "prompt", target, text]]
     assert result["status"] == "delivered"
     assert result["mission_progress_verified"] is False
 

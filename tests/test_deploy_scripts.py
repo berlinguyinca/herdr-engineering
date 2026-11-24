@@ -2,6 +2,7 @@
 on PATH (nothing real is ever built, started or contacted)."""
 import json
 import os
+import re
 import stat
 import subprocess
 from pathlib import Path
@@ -134,6 +135,17 @@ PY
 fi
 if [ "$1" = build ] && [ -n "${{FAIL_BUILD:-}}" ]; then exit 1; fi
 if [ "$1" = compose ]; then
+  case " $* " in *"/deploy/artifact-host/compose.yaml "*)   # the artifact host's own project: logged, never the control plane's
+    echo "$@" >> {log}
+    # STUB_FAIL_AH="<word>": a host-project call containing that word (e.g. migrate, pg_dump) fails
+    [ -z "${{STUB_FAIL_AH:-}}" ] || case " $* " in *" $STUB_FAIL_AH "*) exit 1 ;; esac
+    # the migrate service marks the schema as moved; a schema_migrations count query answers the value before / after it
+    case " $* " in *" artifact-host-migrate "*) touch {log}.migrated ;; esac
+    case " $* " in *schema_migrations*)
+      # STUB_AH_COUNT_FAIL=1: the count query fails (no output, non-zero), before and after the migration alike
+      if [ -n "${{STUB_AH_COUNT_FAIL:-}}" ]; then exit 1; fi
+      if [ -f {log}.migrated ]; then echo "${{STUB_AH_SCHEMA_AFTER:-3}}"; else echo "${{STUB_AH_SCHEMA_BEFORE:-3}}"; fi ;; esac
+    exit 0 ;; esac
   echo "composeenv fleetdir=${{HERDR_CP_FLEET_DIR:-}} tag=${{HERDR_CP_IMAGE_TAG:-}} collabdir=${{HERDR_COLLAB_CONFIG_DIR:-}} llmdir=${{HERDR_LLM_SLICE_DIR:-}} githubappdir=${{HERDR_CP_GITHUB_APP_DIR:-}}" >> {log}
   if [ -n "${{HERDR_LLM_SLICE_DIR:-}}" ]; then echo "llmslice $(cat "$HERDR_LLM_SLICE_DIR/llm-config.json" | tr -d '\n')" >> {log}; fi
   prev=""; files=""; up=0; pins=""
@@ -150,6 +162,11 @@ if [ "$1" = compose ]; then
     prev="$a"
   done
   echo "composefiles tag=${{HERDR_CP_IMAGE_TAG:-}}$files" >> {log}
+  if [ "$up" = 1 ]; then   # like compose: an up naming fabric-whois needs the overlay that defines it
+    case " $* " in *" fabric-whois "*)
+      case "$files" in *compose.collab-fabric.yaml*) ;; *)
+        echo "no such service: fabric-whois" >&2; exit 1 ;; esac ;; esac
+  fi
   lock="$HOME/.local/share/herdr-engineering/collab-sync.lock"
   if [ "$up" = 1 ] && [ -e "$lock" ]; then
     if flock -n "$lock" true; then echo "collablock free" >> {log}; else echo "collablock held" >> {log}; fi
@@ -360,12 +377,20 @@ def test_compose_runs_every_app_service_on_the_deploy_tag():
     assert collab["services"]["collab-public"]["image"] == "herdr-engineering:${HERDR_CP_IMAGE_TAG:?run deploy.sh}"
 
 
+def test_deploy_rolls_the_gateway_and_herdr_web_with_the_app_services():
+    text = (ROOT / "deploy/control-plane/deploy.sh").read_text()
+    rolled = re.search(r"^APP_SERVICES=\(([^)]*)\)", text, re.M).group(1).split()
+    assert "fabric-gateway" in rolled and "herdr-web" in rolled
+    # health checks look the container up by name; the gateway's differs from its service name
+    assert "fabric-gateway) echo herdr-fabric-gateway" in text
+
+
 def test_deploy_recreates_web_worker_and_proxy_on_one_tag(env):
     env["env"]["FAIL_COMPOSE"] = "1"
     deploy(env)
     log = env["log"].read_text().splitlines()
     up = [ln for ln in log if ln.startswith("docker compose") and " up " in ln]
-    assert up and up[0].endswith("up -d --no-deps --no-build control-plane-web control-plane-worker llm-proxy")
+    assert up and up[0].endswith("up -d --no-deps --no-build control-plane-web control-plane-worker llm-proxy fabric-gateway herdr-web")
     sha = _head()
     assert any(ln.startswith("composeenv ") and f" tag={sha} " in ln for ln in log)
     assert any(ln.startswith("docker build") and f"herdr-engineering:{sha}" in ln for ln in log)
@@ -415,7 +440,9 @@ def test_compose_web_has_no_env_file_and_mounts_central_file_read_only():
     assert "FABRIC_LLM_UPSTREAM_KEY" not in (proxy.get("environment") or {})
     assert proxy["command"][proxy["command"].index("--fleet-config") + 1] == "/etc/herdr/llm/llm-config.json"
     # only the llm slice directory: never the central file's directory
-    assert proxy["volumes"] == ["${HERDR_LLM_SLICE_DIR:?run deploy.sh}:/etc/herdr/llm:ro"]
+    assert proxy["volumes"] == ["${HERDR_LLM_SLICE_DIR:?run deploy.sh}:/etc/herdr/llm:ro",
+                                   # optional client key for a keyed control plane (unset = /dev/null, no flag value)
+                                   "${HERDR_CP_CLIENT_KEY_FILE:-/dev/null}:/run/secrets/cp-client-key:ro"]
 
 
 def test_collab_overlay_reads_only_the_collab_slice():
@@ -1194,6 +1221,145 @@ def test_full_collab_rollback_pins_edge_without_replacing_command_overlay(env):
     assert "collab-public collab-edge" in log
 
 
+FABRIC_TRUST = {"enabled": True, "tailnet_suffix": "tail1234.ts.net", "machines": ["beast"],
+                "listen_host": "100.64.0.7", "listen_port": 8484, "whois_socket": "/run/fabric-whois/whois.sock"}
+
+
+def _overlay_free_layout_commit():
+    """A rollback target that has the collab overlay and layout marker but predates the fabric overlay."""
+    for c in _git("log", "--format=%H", "-S", "x-herdr-deploy-layout: 2", "--",
+                  "deploy/control-plane/compose.yaml").splitlines():
+        have = subprocess.run(["git", "cat-file", "-e", f"{c}:deploy/control-plane/compose.collab-fabric.yaml"],
+                              cwd=ROOT, capture_output=True).returncode == 0
+        collab = subprocess.run(["git", "cat-file", "-e", f"{c}:deploy/control-plane/compose.collab.yaml"],
+                                cwd=ROOT, capture_output=True).returncode == 0
+        if collab and not have and c != _git("rev-parse", "HEAD"):
+            return c
+    pytest.skip("no older layout-2 commit without the fabric overlay")
+
+
+def test_forward_deploy_with_the_listener_starts_the_sidecar_even_when_the_slice_changed(env):
+    _with_collab(env, dict(COLLAB, fabric_trust=FABRIC_TRUST))
+    _seed_previous(env, _layout_commit(), {"collab_slice_sha256": "0" * 64})
+    r = deploy(env)
+    assert r.returncode == 0, r.stderr
+    ups = [ln for ln in env["log"].read_text().splitlines() if ln.startswith("docker compose") and " up " in ln]
+    assert any("fabric-whois" in ln for ln in ups), ups
+
+
+def test_dry_run_with_the_listener_warns_non_fatally_about_firewall_and_boot_order(env):
+    _with_collab(env, dict(COLLAB, fabric_trust=FABRIC_TRUST))
+    _shim(env, "iptables", "exit 1")
+    r = deploy(env, "--dry-run")
+    assert r.returncode == 0, r.stderr
+    assert "WARNING: fabric network firewall" in r.stderr and "collab-fabric-firewall.sh --install" in r.stderr
+    if not Path("/etc/systemd/system/docker.service.d/after-tailscale.conf").exists():
+        assert "WARNING: docker is not ordered after tailscaled" in r.stderr and "docker-after-tailscale.conf" in r.stderr
+
+
+def _shim(env, name, body):
+    path = Path(env["env"]["PATH"].split(os.pathsep)[0]) / name
+    path.write_text(f"#!/usr/bin/env bash\n{body}\n")
+    path.chmod(0o755)
+
+
+def _fabric_deploy_with_iptables(env, iptables_exit, unit_enabled=True):
+    _with_collab(env, dict(COLLAB, fabric_trust=FABRIC_TRUST))
+    _shim(env, "iptables", f"exit {iptables_exit}")
+    _shim(env, "systemctl", "exit 0" if unit_enabled else "echo disabled; exit 1")
+    return deploy(env, "--dry-run")
+
+
+def _note(stderr):
+    return next(ln for ln in stderr.splitlines() if ln.startswith("NOTE: fabric network firewall"))
+
+
+def test_fabric_firewall_rules_absent_keeps_the_strong_install_warning(env):
+    r = _fabric_deploy_with_iptables(env, 1)
+    assert r.returncode == 0, r.stderr
+    assert "WARNING: fabric network firewall is not confirmed present" in r.stderr
+    assert "collab-fabric-firewall.sh --install" in r.stderr
+
+
+def test_fabric_firewall_unexpected_check_exit_code_still_warns(env):
+    _with_collab(env, dict(COLLAB, fabric_trust=FABRIC_TRUST))
+    # the iptables shim kills its parent (the firewall script), so deploy.sh sees an exit code (137) the script never returns
+    _shim(env, "iptables", 'kill -9 "$PPID"')
+    _shim(env, "systemctl", "exit 0")
+    r = deploy(env, "--dry-run")
+    assert r.returncode == 0, r.stderr
+    assert "WARNING: fabric network firewall is not confirmed present" in r.stderr
+    assert "NOTE: fabric network firewall" not in r.stderr
+
+
+# Guards the missing-binary path end to end (script maps 127 to 3, deploy.sh treats 3 like absent); the deploy.sh arm alone
+# is also covered by the unexpected-exit-code test above.
+def test_fabric_firewall_missing_iptables_keeps_the_strong_install_warning(env):
+    r = _fabric_deploy_with_iptables(env, 127)
+    assert r.returncode == 0, r.stderr
+    assert "WARNING: fabric network firewall is not confirmed present" in r.stderr
+    assert "NOTE: fabric network firewall" not in r.stderr
+
+
+def test_fabric_firewall_rules_present_prints_no_firewall_message(env):
+    r = _fabric_deploy_with_iptables(env, 0)
+    assert r.returncode == 0, r.stderr
+    assert "fabric network firewall" not in r.stderr
+
+
+def test_fabric_firewall_unreadable_without_root_is_a_note_not_the_install_warning(env):
+    r = _fabric_deploy_with_iptables(env, 4)
+    assert r.returncode == 0, r.stderr
+    assert "WARNING: fabric network firewall" not in r.stderr
+    note = _note(r.stderr)
+    assert "without root" in note and "sudo " in note and "collab-fabric-firewall.sh --check" in note
+    assert "--install" not in note
+    assert "herdr-collab-fabric-firewall.service is enabled" in note
+
+
+def test_fabric_firewall_unreadable_and_boot_unit_not_enabled_does_not_claim_enabled(env):
+    r = _fabric_deploy_with_iptables(env, 4, unit_enabled=False)
+    assert r.returncode == 0, r.stderr
+    assert "is enabled" not in _note(r.stderr)
+
+
+def test_rollback_to_a_checkout_without_the_fabric_overlay_drops_the_sidecar_service(env):
+    _with_collab(env, dict(COLLAB, fabric_trust=FABRIC_TRUST))
+    prev_full, prev_tag = _seed_previous(env, _overlay_free_layout_commit())
+    env["env"]["STUB_UNHEALTHY_TAGS"] = _head()
+    r = deploy(env)
+    assert r.returncode == 1, r.stderr
+    assert "NOT rolled back" not in r.stderr and "FAILED TO ROLL BACK" not in r.stderr, r.stderr
+    assert f"rolled back to herdr-engineering:{prev_tag}" in r.stderr and "and healthy" in r.stderr
+    log = env["log"].read_text().splitlines()
+    fwd = [ln for ln in log if ln.startswith("docker compose") and " up " in ln and "fabric-whois" in ln]
+    assert fwd, "the forward deploy did start the sidecar"
+    files = [ln for ln in log if ln.startswith(f"composefiles tag={prev_tag} ")]
+    assert files and not any("compose.collab-fabric.yaml" in ln for ln in files)
+    after = log[log.index(files[0]):]
+    assert not any(ln.startswith("docker compose") and "fabric-whois" in ln for ln in after)
+    assert "docker stop herdr-collab-fabric-whois" in after                       # the orphan sidecar is stopped
+    assert "all of: control-plane-web control-plane-worker llm-proxy fabric-gateway herdr-web collab-public collab-edge)" in r.stderr
+
+
+def test_rollback_to_a_checkout_with_the_fabric_overlay_keeps_the_sidecar(env):
+    _with_collab(env, dict(COLLAB, fabric_trust=FABRIC_TRUST))
+    _, prev_tag = _seed_previous(env, _head_parent_with_overlay())
+    env["env"]["STUB_UNHEALTHY_TAGS"] = _head()
+    r = deploy(env)
+    assert r.returncode == 1, r.stderr
+    assert "and healthy" in r.stderr and "fabric-whois" in r.stderr.split("all of:")[1]
+    assert "docker stop herdr-collab-fabric-whois" not in env["log"].read_text()
+
+
+def _head_parent_with_overlay():
+    parent = _git("rev-parse", "HEAD~1")
+    if subprocess.run(["git", "cat-file", "-e", f"{parent}:deploy/control-plane/compose.collab-fabric.yaml"],
+                      cwd=ROOT, capture_output=True).returncode != 0:
+        pytest.skip("HEAD~1 has no fabric overlay")
+    return parent
+
+
 def _collab_ups(e):
     return [ln for ln in e["log"].read_text().splitlines()
             if ln.startswith("docker compose") and "--force-recreate collab-public" in ln]
@@ -1709,7 +1875,7 @@ def test_changed_slice_recreates_collab_public_exactly_once_and_reloads_the_edge
     assert len(ups) == 1 and "--force-recreate collab-public" in ups[0]
     rest = [ln for ln in env["log"].read_text().splitlines()
             if ln.startswith("docker compose") and " up " in ln and ln not in ups]
-    assert len(rest) == 1 and rest[0].endswith("control-plane-web control-plane-worker llm-proxy collab-edge")
+    assert len(rest) == 1 and rest[0].endswith("control-plane-web control-plane-worker llm-proxy fabric-gateway herdr-web collab-edge")
     assert "docker exec herdr-collab-edge nginx -s reload" in env["log"].read_text()
 
 
@@ -1991,3 +2157,239 @@ def test_a_bad_apps_dir_is_refused_before_anything_runs(env, fault, needle):
     r = deploy(env, "--dry-run")
     assert r.returncode != 0 and needle in r.stderr
     assert not env["log"].exists()
+
+
+def _dashboard_memory_policy(e):
+    from herdr_engineering.fleet_memory import init_memory
+    init_memory(e["central"], enable=True, endpoint="https://memory.example.test",
+                model_dir=str(e["tmp"] / "model"))
+    data = yaml.safe_load(e["central"].read_text())
+    data["sections"]["control_plane"]["values"]["memory"]["viewers"] = {
+        "open-listener": {"projects": ["canary"], "scopes": []}}
+    e["central"].write_text(yaml.safe_dump(data))
+    e["central"].chmod(0o600)
+
+
+def _dashboard_memory_client(e):
+    from herdr_engineering.memory_install import PINNED_CLIENT_VERSION
+    directory = e["tmp"] / "operator-profile"
+    directory.mkdir(mode=0o700)
+    key = directory / "project.key"
+    key.write_text("private-client-fixture-value")
+    key.chmod(0o600)
+    profile = directory / "config.json"
+    profile.write_text(json.dumps({
+        "url": "https://memory.example.test", "default_project": "canary",
+        "cache_dir": str(e["tmp"] / "operator-cache"),
+        "projects": {"canary": {"credentials": {"codex": str(key)}}}}))
+    profile.chmod(0o600)
+    executable = Path(e["env"]["PATH"].split(os.pathsep)[0]) / "herdr-memory"
+    executable.write_text("#!/usr/bin/env python3\nimport json,sys\n"
+                          f"print(json.dumps({{'valid':True,'contract':1,'client':{PINNED_CLIENT_VERSION!r}}}))\n")
+    executable.chmod(0o755)
+    return profile
+
+
+def test_memory_dashboard_viewers_require_explicit_profile_before_build(env):
+    _dashboard_memory_policy(env)
+    result = deploy(env, "--dry-run")
+    assert result.returncode != 0
+    assert "explicit client profile" in result.stderr
+    assert "docker build" not in (env["log"].read_text() if env["log"].exists() else "")
+
+
+def test_memory_client_profile_dry_run_is_secret_safe_and_preserves_user_state(env):
+    _dashboard_memory_policy(env)
+    profile = _dashboard_memory_client(env)
+    before = profile.read_bytes()
+    result = deploy(env, "--dry-run", "--memory-client-config", str(profile))
+    assert result.returncode == 0, result.stderr
+    assert "private-client-fixture-value" not in result.stdout + result.stderr + env["log"].read_text()
+    assert profile.read_bytes() == before
+    assert not (env["tmp"] / "operator-cache").exists()
+    assert not list(env["home"].rglob("profile.tar"))
+    assert "docker build" not in env["log"].read_text()
+
+
+def test_memory_client_flag_does_not_read_source_with_no_viewer_grants(env):
+    result = deploy(env, "--dry-run", "--memory-client-config", str(env["tmp"] / "missing.json"))
+    assert result.returncode == 0, result.stderr
+    assert "docker build" not in env["log"].read_text()
+
+
+def _egress_inspection_stubs(env):
+    """Only host/Docker metadata reads; the real deploy + policy code still run."""
+    bindir = Path(env['env']['PATH'].split(os.pathsep)[0])
+    docker = bindir / 'docker'
+    body = docker.read_text()
+    facts = {'Id':'a'*64,'Config':{'Labels':{'com.docker.compose.project':'herdr-control-plane',
+                'com.docker.compose.service':'control-plane-web'}},
+             'NetworkSettings':{'Networks':{'herdr-control-plane_default':{'GwPriority':0}}}}
+    extra = f'''if [ "$1 ${{2:-}}" = "network ls" ]; then exit 0; fi
+if [ "$1" = inspect ] && [[ "$*" == *NetworkSettings.Networks* ]]; then
+  printf '%s\\n' '{json.dumps(facts)}'; exit 0
+fi
+'''
+    docker.write_text(body.replace('\n', '\n' + extra, 1))
+    ip = bindir / 'ip'
+    ip.write_text('''#!/bin/bash
+case "$*" in
+  *address*) echo '[{"addr_info":[{"local":"100.64.8.6","family":"inet"}]}]' ;;
+  *) echo '[]' ;;
+esac
+''')
+    ip.chmod(0o755)
+    # A test failure if any root executor is reached during a dry run.
+    sudo = bindir / 'sudo'
+    sudo.write_text(f'''#!/bin/bash
+case "$*" in
+  "-n -- /usr/sbin/ufw status")
+    echo root-read-status >> "{env['log']}"
+    case "${{STUB_UFW_PREFLIGHT:-active}}" in
+      missing) exit 127 ;; sudo-password) exit 1 ;; inactive) echo 'Status: inactive'; exit 0 ;;
+    esac
+    echo 'Status: active'; exit 0 ;;
+  "-n -- /usr/sbin/ufw show added") echo root-read-added >> "{env['log']}"; exit 0 ;;
+esac
+echo ROOT-EXECUTOR-FORBIDDEN >> "{env['log']}"
+exit 99
+''')
+    sudo.chmod(0o755)
+
+
+def test_private_egress_real_deploy_dry_run_adds_overlay_without_root_or_network_changes(env):
+    _egress_inspection_stubs(env)
+    result = deploy(env, '--dry-run', '--memory-private-egress',
+                    '--memory-private-egress-gateway', '100.64.8.6/32')
+    assert result.returncode == 0, result.stderr
+    calls = env['log'].read_text()
+    assert 'compose.web-egress.yaml' in calls
+    assert 'ROOT-EXECUTOR-FORBIDDEN' not in calls
+    assert 'network create' not in calls and 'network connect' not in calls
+    assert not (env['home']/'.local/state/herdr-engineering/deploys/web-egress').exists()
+
+
+def test_private_egress_requires_explicit_gateway_before_dry_run_can_activate(env):
+    _egress_inspection_stubs(env)
+    result = deploy(env, '--dry-run', '--memory-private-egress')
+    assert result.returncode != 0
+    assert 'explicit assigned private' in result.stderr
+    assert not env['log'].exists()
+
+
+def test_disabled_deploy_dry_run_has_no_egress_overlay_or_executor(env):
+    _egress_inspection_stubs(env)
+    result = deploy(env, '--dry-run')
+    assert result.returncode == 0, result.stderr
+    assert 'compose.web-egress.yaml' not in env['log'].read_text()
+    assert 'ROOT-EXECUTOR-FORBIDDEN' not in env['log'].read_text()
+
+
+@pytest.mark.parametrize('failure', ['missing', 'sudo-password', 'inactive'])
+def test_private_egress_root_preflight_refuses_before_recreate_or_profile(env, failure):
+    _egress_inspection_stubs(env)
+    env['env']['STUB_UFW_PREFLIGHT'] = failure
+    result = deploy(env, '--dry-run', '--memory-private-egress',
+                    '--memory-private-egress-gateway', '100.64.8.6/32')
+    assert result.returncode != 0
+    assert 'preflight' in result.stderr
+    calls = env['log'].read_text()
+    assert 'ROOT-EXECUTOR-FORBIDDEN' not in calls
+    assert ' up ' not in calls and 'docker build' not in calls
+    assert not (env['home']/'.local/state/herdr-engineering/deploys/web-egress').exists()
+
+
+def test_explicit_permission_recovery_uses_existing_lock_and_no_fleet_or_compose(env):
+    """The real coordinator runs the real restrictive executor against a root stub."""
+    from herdr_engineering.web_egress_runtime import make_record, private_json
+    state=env['home']/'.local/state/herdr-engineering/deploys'
+    state.mkdir(parents=True,mode=0o700)
+    attempt=state/'attempt-recovery'
+    record=make_record('172.31.252.0/29','100.64.8.6/32','a'*32)
+    record['network_id']='c'*64
+    record['rule_may_exist']=True
+    private_json(attempt/'web-egress/candidate.json',record)
+    private_json(attempt/'web-egress/previous.json',{'enabled':False})
+    private_json(state/'web-egress/pending.json',{'attempt':str((attempt/'web-egress').resolve()),'direction':'forward'})
+    bindir=Path(env['env']['PATH'].split(os.pathsep)[0])
+    sudo=bindir/'sudo'
+    sudo.write_text(f'''#!/bin/bash
+case "$*" in
+  "-n -- /usr/sbin/ufw status") echo 'Status: inactive'; exit 0 ;;
+  "-n -- /usr/sbin/ufw show added")
+    echo 'ufw allow in on br-herdr-cp-eg proto tcp from 172.31.252.0/29 to 100.64.8.6 port 443 comment herdr-cp-web-egress-v1'; exit 0 ;;
+  "-n -- /usr/sbin/ufw --force delete allow in on br-herdr-cp-eg proto tcp from 172.31.252.0/29 to 100.64.8.6/32 port 443 comment herdr-cp-web-egress-v1")
+    echo owned-root-delete >> "{env['log']}"; exit 0 ;;
+esac
+exit 99
+''')
+    sudo.chmod(0o755)
+    result=run(DEPLOY,env,'--no-fetch','--memory-private-egress-recover',str(attempt),
+               '--fleet-config',str(env['tmp']/'missing-fleet-config'))
+    assert result.returncode==3,result.stderr
+    assert 'restoration is NOT completed' in result.stderr
+    calls=env['log'].read_text()
+    assert 'owned-root-delete' in calls
+    assert 'compose ' not in calls and 'docker build' not in calls
+    assert (state/'web-egress/pending.json').exists()
+    assert (state/'rollout.lock').exists()
+
+
+def _approved_private_egress(env):
+    """Existing approved network and receipt, with no real Docker/UFW calls."""
+    from herdr_engineering import web_egress as policy
+    from herdr_engineering.web_egress_runtime import make_record, private_json
+    _egress_inspection_stubs(env)
+    record=make_record('172.30.254.0/29','100.71.1.7/32','e'*32)
+    record.update(network_id='c'*64,rule_may_exist=True)
+    current=env['home']/'.local/state/herdr-engineering/deploys/web-egress/current.json'
+    private_json(current,record)
+    web={'Id':'a'*64,'Config':{'Labels':{'com.docker.compose.project':policy.PROJECT,
+          'com.docker.compose.service':'control-plane-web'}},'NetworkSettings':{'Networks':{
+          policy.DEFAULT:{'GwPriority':0},policy.NETWORK:{'NetworkID':'c'*64,'IPAddress':'172.30.254.2',
+          'IPPrefixLen':29,'Gateway':'172.30.254.1','GwPriority':100}}}}
+    network={'Id':'c'*64,'Name':policy.NETWORK,'Driver':'bridge','Internal':False,'EnableIPv6':False,
+         'Labels':{**policy.LABELS,'io.herdr.web-egress.generation':'e'*32},
+         'Options':{'com.docker.network.bridge.name':policy.BRIDGE},
+         'IPAM':{'Config':[{'Subnet':record['cidr'],'Gateway':'172.30.254.1'}]},
+         'Containers':{'a'*64:{'Name':'herdr-cp-web','IPv4Address':'172.30.254.2/29'}}}
+    bindir=Path(env['env']['PATH'].split(os.pathsep)[0])
+    docker=bindir/'docker'
+    prefix=f'''if [ "$1 ${{2:-}}" = "network ls" ]; then echo owned-network; exit 0; fi
+if [ "$1 ${{2:-}}" = "network inspect" ]; then printf '%s\\n' '{json.dumps([network])}'; exit 0; fi
+if [ "$1" = inspect ] && [[ "$*" == *NetworkSettings.Networks* ]]; then
+  printf '%s\\n' '{json.dumps(web)}'; exit 0
+fi
+if [ "$1" = compose ]; then echo "egress-env:$HERDR_CP_WEB_EGRESS_CIDR:$HERDR_CP_WEB_EGRESS_GENERATION" >> "{env['log']}"; fi
+'''
+    docker.write_text(docker.read_text().replace('\n','\n'+prefix,1))
+    ip=bindir/'ip'
+    ip.write_text('''#!/bin/bash
+case "$*" in *address*) echo '[{"addr_info":[{"family":"inet","local":"100.71.1.7"}]}]' ;; *) echo '[]' ;; esac
+''')
+    return current
+
+
+def test_ordinary_deploy_preserves_last_owned_egress_selection_without_flags(env):
+    current=_approved_private_egress(env)
+    before=current.read_bytes()
+    result=deploy(env,'--dry-run')
+    assert result.returncode==0,result.stderr
+    calls=env['log'].read_text()
+    assert 'compose.web-egress.yaml' in calls
+    assert 'egress-env:172.30.254.0/29:'+('e'*32) in calls
+    assert 'ROOT-EXECUTOR-FORBIDDEN' not in calls
+    assert current.read_bytes()==before
+
+
+def test_explicit_no_egress_removes_selector_and_accepts_inactive_cleanup(env):
+    current=_approved_private_egress(env)
+    before=current.read_bytes()
+    env['env']['STUB_UFW_PREFLIGHT']='inactive'
+    result=deploy(env,'--dry-run','--no-memory-private-egress')
+    assert result.returncode==0,result.stderr
+    calls=env['log'].read_text()
+    assert 'compose.web-egress.yaml' not in calls
+    assert 'root-read-status' in calls
+    assert 'ROOT-EXECUTOR-FORBIDDEN' not in calls
+    assert current.read_bytes()==before  # dry-run never revokes or rewrites policy

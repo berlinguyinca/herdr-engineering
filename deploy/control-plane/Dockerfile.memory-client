@@ -1,0 +1,9 @@
+# CLI-only base: no Hindsight engine, ML dependencies, profiles or runtime data.
+FROM python:3.12-slim
+WORKDIR /opt/herdr-memory-client
+COPY pyproject.toml README.md ./
+COPY src/ ./src/
+RUN pip install --no-cache-dir --no-deps . \
+ && rm -rf /opt/herdr-memory-client
+WORKDIR /
+ENV HERDR_MEMORY_CONFIG=/run/herdr-memory-client/config.json

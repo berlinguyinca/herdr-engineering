@@ -1,7 +1,7 @@
 {
   "generatedFrom": "packages/app.js + tests/playwright/dashboard-routes.mjs",
-  "routeCount": 47,
-  "surfaceCount": 61,
+  "routeCount": 54,
+  "surfaceCount": 68,
   "navGroups": [
     "Monitor",
     "Agents",
@@ -168,7 +168,7 @@
         "label": "Collaboration",
         "entry": "/collab",
         "listedInSidebar": true,
-        "capability": null
+        "capability": "collab_v1"
       },
       "sectionTabs": null,
       "params": {},
@@ -259,6 +259,76 @@
         {
           "slug": "dashboard-deployments",
           "hash": "/deployments"
+        }
+      ]
+    },
+    {
+      "route": "/build-cache",
+      "hash": "#/build-cache",
+      "title": "Build cache",
+      "view": "viewBuildCache",
+      "nav": {
+        "group": "Fabric",
+        "label": "Hosts",
+        "entry": "/hosts",
+        "listedInSidebar": false,
+        "capability": null
+      },
+      "sectionTabs": {
+        "label": "Build cache",
+        "siblings": [
+          "/hosts",
+          "/scheduling",
+          "/ai-sync",
+          "/build-cache",
+          "/diagnostics"
+        ]
+      },
+      "params": {},
+      "query": {},
+      "subviews": [],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#build-cache",
+      "surfaces": [
+        {
+          "slug": "dashboard-build-cache",
+          "hash": "/build-cache"
+        }
+      ]
+    },
+    {
+      "route": "/build-cache/:id",
+      "hash": "#/build-cache/b-1",
+      "title": "Build",
+      "view": "viewBuildDetail",
+      "nav": {
+        "group": "Fabric",
+        "label": "Hosts",
+        "entry": "/hosts",
+        "listedInSidebar": false,
+        "capability": null
+      },
+      "sectionTabs": null,
+      "params": {
+        "id": {
+          "example": "b-1",
+          "how": "a build id from the build cache list"
+        }
+      },
+      "query": {},
+      "subviews": [],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#build-cache",
+      "surfaces": [
+        {
+          "slug": "dashboard-build-detail",
+          "hash": "/build-cache/b-1"
         }
       ]
     },
@@ -433,7 +503,8 @@
         "siblings": [
           "/herd",
           "/missions",
-          "/handoffs"
+          "/handoffs",
+          "/communications"
         ]
       },
       "params": {},
@@ -608,7 +679,8 @@
         "siblings": [
           "/herd",
           "/missions",
-          "/handoffs"
+          "/handoffs",
+          "/communications"
         ]
       },
       "params": {},
@@ -898,7 +970,9 @@
         "siblings": [
           "/hosts",
           "/scheduling",
-          "/ai-sync"
+          "/ai-sync",
+          "/build-cache",
+          "/diagnostics"
         ]
       },
       "params": {},
@@ -1018,6 +1092,36 @@
       ]
     },
     {
+      "route": "/agent-ops",
+      "hash": "#/agent-ops",
+      "title": "Agent Operations",
+      "view": "viewAgentOps",
+      "nav": {
+        "group": "Agents",
+        "label": "Agent Operations",
+        "entry": "/agent-ops",
+        "listedInSidebar": true,
+        "capability": "agent_ops_v1"
+      },
+      "sectionTabs": null,
+      "params": {},
+      "query": {
+        "task": ""
+      },
+      "subviews": [],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#agent-ops",
+      "surfaces": [
+        {
+          "slug": "dashboard-agent-ops",
+          "hash": "/agent-ops"
+        }
+      ]
+    },
+    {
       "route": "/services/:id",
       "hash": "#/services/svc-1",
       "title": "Service",
@@ -1067,7 +1171,9 @@
         "siblings": [
           "/hosts",
           "/scheduling",
-          "/ai-sync"
+          "/ai-sync",
+          "/build-cache",
+          "/diagnostics"
         ]
       },
       "params": {},
@@ -1113,12 +1219,21 @@
       "view": "viewDiagnostics",
       "nav": {
         "group": "Fabric",
-        "label": "Diagnostics",
-        "entry": "/diagnostics",
-        "listedInSidebar": true,
+        "label": "Hosts",
+        "entry": "/hosts",
+        "listedInSidebar": false,
         "capability": null
       },
-      "sectionTabs": null,
+      "sectionTabs": {
+        "label": "Diagnostics",
+        "siblings": [
+          "/hosts",
+          "/scheduling",
+          "/ai-sync",
+          "/build-cache",
+          "/diagnostics"
+        ]
+      },
       "params": {},
       "query": {},
       "subviews": [],
@@ -1387,6 +1502,42 @@
         {
           "slug": "dashboard-activity",
           "hash": "/activity"
+        }
+      ]
+    },
+    {
+      "route": "/communications",
+      "hash": "#/communications",
+      "title": "Agent communications",
+      "view": "inline",
+      "nav": {
+        "group": "Agents",
+        "label": "Agents",
+        "entry": "/herd",
+        "listedInSidebar": false,
+        "capability": null
+      },
+      "sectionTabs": {
+        "label": "Communications",
+        "siblings": [
+          "/herd",
+          "/missions",
+          "/handoffs",
+          "/communications"
+        ]
+      },
+      "params": {},
+      "query": {},
+      "subviews": [],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "h1",
+      "surfaces": [
+        {
+          "slug": "dashboard-communications",
+          "hash": "/communications"
         }
       ]
     },
@@ -1670,6 +1821,7 @@
         "label": "Artifacts",
         "siblings": [
           "/artifacts",
+          "/library",
           "/publications"
         ]
       },
@@ -1708,6 +1860,7 @@
         }
       },
       "query": {
+        "at": "",
         "version": "a version id"
       },
       "subviews": [],
@@ -1720,6 +1873,78 @@
         {
           "slug": "dashboard-artifact-detail",
           "hash": "/artifacts/art-1"
+        }
+      ]
+    },
+    {
+      "route": "/library",
+      "hash": "#/library",
+      "title": "Library",
+      "view": "viewLibrary",
+      "nav": {
+        "group": "Code",
+        "label": "Artifacts",
+        "entry": "/artifacts",
+        "listedInSidebar": false,
+        "capability": null
+      },
+      "sectionTabs": {
+        "label": "Library",
+        "siblings": [
+          "/artifacts",
+          "/library",
+          "/publications"
+        ]
+      },
+      "params": {},
+      "query": {
+        "folder": ""
+      },
+      "subviews": [],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#artifact-library",
+      "surfaces": [
+        {
+          "slug": "dashboard-library",
+          "hash": "/library"
+        }
+      ]
+    },
+    {
+      "route": "/library/:id",
+      "hash": "#/library/item-1",
+      "title": "Library item",
+      "view": "viewLibraryItem",
+      "nav": {
+        "group": "Code",
+        "label": "Artifacts",
+        "entry": "/artifacts",
+        "listedInSidebar": false,
+        "capability": null
+      },
+      "sectionTabs": null,
+      "params": {
+        "id": {
+          "example": "item-1",
+          "how": "an item id from the library list"
+        }
+      },
+      "query": {
+        "version": ""
+      },
+      "subviews": [],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#library-item",
+      "surfaces": [
+        {
+          "slug": "dashboard-library-item",
+          "hash": "/library/item-1"
         }
       ]
     },
@@ -1739,6 +1964,7 @@
         "label": "Publications",
         "siblings": [
           "/artifacts",
+          "/library",
           "/publications"
         ]
       },
@@ -1774,7 +2000,9 @@
         "siblings": [
           "/hosts",
           "/scheduling",
-          "/ai-sync"
+          "/ai-sync",
+          "/build-cache",
+          "/diagnostics"
         ]
       },
       "params": {},
@@ -1809,7 +2037,8 @@
         "siblings": [
           "/herd",
           "/missions",
-          "/handoffs"
+          "/handoffs",
+          "/communications"
         ]
       },
       "params": {},
@@ -1859,6 +2088,34 @@
           "slug": "dashboard-memory-detail",
           "hash": "/memory?q=gateway",
           "step": "memory-open"
+        }
+      ]
+    },
+    {
+      "route": "/settings",
+      "hash": "#/settings",
+      "title": "Settings",
+      "view": "viewSettings",
+      "nav": {
+        "group": "Fabric",
+        "label": "Settings",
+        "entry": "/settings",
+        "listedInSidebar": true,
+        "capability": null
+      },
+      "sectionTabs": null,
+      "params": {},
+      "query": {},
+      "subviews": [],
+      "fixture": {
+        "status": "pending",
+        "reason": ""
+      },
+      "proof": "#settings",
+      "surfaces": [
+        {
+          "slug": "dashboard-settings",
+          "hash": "/settings"
         }
       ]
     }

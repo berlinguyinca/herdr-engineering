@@ -1,0 +1,12 @@
+# Audit checklist (write `AUDIT.md`)
+- Show repository root, branch, commit SHA, working tree status and untracked files; do not reset changes.
+- Find central cache work already merged or in local branches. Compare specifications with actual code.
+- Read full build_coord.py, build_cleanup.py, build_maintenance.py, Pi build-gate, CLI, config, fleet/Ansible and tests.
+- Reconcile `docs/build-gate.md` contradictory auto-slot text against source and tests.
+- Enumerate existing auth, policies, API routes, SSE envelopes, dashboard components and Grafana exporters.
+- Enumerate Slurm adapter capabilities: read-only capacity vs actual submitted execution; verify which cluster it targets.
+- Inventory storage endpoints by live configuration, not names; report compatibility and retention policy.
+- Verify sccache and Rust versions and supported local, S3, multilayer, dist features before designing config.
+- Identify allowed build hosts and filesystem; do not assume macOS and Linux toolchain compatibility.
+- Locate Pi Engineering and woodpecker-slurm repos if actually available; audit only, respect separate ownership.
+- Produce concise reuse/gap table, dependency graph, baseline plan, hazards, and go/no-go decisions.

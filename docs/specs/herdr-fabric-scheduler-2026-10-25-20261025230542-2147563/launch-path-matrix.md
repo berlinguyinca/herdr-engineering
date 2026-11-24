@@ -1,5 +1,9 @@
 # Launch-path matrix
 
+Historical planned coverage, not a verified enforcement inventory. Decision-point
+names below may refer to earlier local work. See
+[the current reconciliation](reconciliation-2026-11-04.md) before implementation.
+
 | Test ID | Launch source | Current decision point | Remote launcher | Identity/linkage | Required policy enforcement |
 | --- | --- | --- | --- | --- | --- |
 | LP-01 | Dashboard create agent/session | `api.py:_api_post` and existing native integration handlers | `NativeHerdrAdapter.machine_targeted`, workspace/pane commands | session/mission/host fields plus events | scheduler reservation before native launch |
@@ -12,5 +16,10 @@
 | LP-08 | remote external peer/A2A | collab auth/A2A service | no automatic host launch | graph identity only | external peer never becomes eligible owned host |
 | LP-09 | scheduled jobs/builds | existing control-plane job/CI adapters | existing host/native runners | mission/project/artifact links | scheduler only for Herdr local work; InferWeave remains GPU owner |
 
-Every row is covered by the P04 adapter contract tests. A route is not considered migrated until its request enters `PlacementRequest` and the bind path re-checks policy/telemetry generation.
+The earlier claim that every row was covered by P04 contract tests was incorrect.
+The generic registry tests do not prove integration of these creation paths.
+A route is accepted only with evidence that its real launch enters admission,
+rechecks policy and telemetry, and safely handles uncertain submission. Native
+placement is deferred under the newer recorded integration decision; none of
+these rows should be marked migrated from this table alone.
 

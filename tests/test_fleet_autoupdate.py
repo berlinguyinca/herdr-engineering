@@ -14,8 +14,9 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def isolated_state(tmp_path, monkeypatch):
-    """An unattended-update test must never record into the developer's real state dir."""
+    """An unattended-update test must never read or record the developer's real state."""
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))  # never read the real pin file
 
 
 @pytest.fixture
@@ -138,13 +139,11 @@ def test_run_update_refuses_the_sentinel_form_python_m_actually_produces(checkou
     update.assert_not_called()
 
 
-def test_entry_captures_the_path_before_fleet_rewrites_it():
-    """`herdr_engineering.fleet` inserts `<checkout>/scripts` at `sys.path[0]` when it imports.
+def test_importing_fleet_leaves_sys_path_zero_alone():
+    """`herdr_engineering.fleet` no longer inserts `<checkout>/scripts` into `sys.path`.
 
-    A guard reading `sys.path[0]` at call time therefore never sees the cwd sentinel - the mistake
-    that let bender's `python -m` invocation through (#584). `_entry` is imported before `.fleet`, so
-    its value is what the interpreter started with. Proven in a fresh interpreter: in-process the
-    order depends on which test imported the package first.
+    The shadowing guard reads `_entry.PATH_ZERO` (captured at start-up); it must still name where
+    the interpreter began after `.fleet` is imported. Proven in a fresh interpreter.
     """
     from pathlib import Path
 
@@ -154,11 +153,11 @@ def test_entry_captures_the_path_before_fleet_rewrites_it():
     probe = subprocess.run(
         [sys.executable, "-c",
          "import herdr_engineering._entry as e, herdr_engineering.fleet, sys;"
-         "print(e.PATH_ZERO or '<cwd-sentinel>'); print(sys.path[0])"],
+         "print(e.PATH_ZERO or '<cwd-sentinel>'); print(sys.path[0] or '<cwd-sentinel>')"],
         cwd=str(checkout), capture_output=True, text=True, check=True)
     captured, after = probe.stdout.split()
-    assert captured != after
-    assert after.endswith("scripts")
+    assert captured == after
+    assert not after.endswith("scripts")
 
 
 def test_every_run_records_which_code_executed_it(checkout, capsys, monkeypatch):
@@ -356,3 +355,233 @@ def test_a_failure_with_no_detail_at_all_still_says_so(checkout, capsys, monkeyp
         assert fleet_autoupdate.main() == 1
     capsys.readouterr()
     assert fleet_autoupdate.read_state()["reason"] == "fleet update failed without reporting a reason"
+
+
+# --- #844: the daily unit drains the Pi runtime rollout ----------------------
+
+PIN = "1" * 40
+PLAN_ID = "2" * 32
+
+
+def test_daily_unit_resumes_unfinished_rollout_for_pinned_revision(checkout, monkeypatch, capsys):
+    from contextlib import ExitStack
+
+    from herdr_engineering import fleet_autoupdate, fleet_rollout
+
+    plan = {"id": PLAN_ID, "revision": PIN, "status": "pending"}
+    monkeypatch.setenv("HERDR_PI_ROLLOUT_REVISION", PIN)
+    started = []
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(
+            fleet_autoupdate, "fleet_update", return_value={"ok": True, "steps": {}}))
+        stack.enter_context(patch.object(fleet_rollout, "read_pin", return_value=PIN))
+        stack.enter_context(patch.object(fleet_rollout, "latest_unfinished", return_value=plan))
+        stack.enter_context(patch.object(fleet_rollout, "create_rollout"))
+        stack.enter_context(patch.object(fleet_rollout, "inventory_targets"))
+        stack.enter_context(patch.object(fleet_rollout, "prune_settled", return_value=[]))
+        stack.enter_context(patch.object(
+            fleet_rollout, "run_rollout",
+            side_effect=lambda store, rollout_id, **kw: started.append((rollout_id, kw))
+            or {"id": rollout_id, "status": "pending", "runner": {"status": "max_passes"}}))
+        assert fleet_autoupdate.main() == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is True
+    assert out["pi_rollout"]["id"] == PLAN_ID
+    assert out["pi_rollout"]["runner"] == "max_passes"
+    assert started == [(PLAN_ID, {"interval_seconds": 30, "max_passes": 3})]
+    recorded = fleet_autoupdate.read_state()
+    assert recorded["outcome"] == "updated"
+    assert recorded["detail"]["pi_rollout"]["id"] == PLAN_ID
+
+
+def test_daily_unit_skips_pi_rollout_without_pin(checkout, monkeypatch, capsys):
+    from herdr_engineering import fleet_autoupdate, fleet_rollout
+
+    monkeypatch.delenv("HERDR_PI_ROLLOUT_REVISION", raising=False)
+    with patch.object(fleet_rollout, "read_pin", return_value=None) as read_pin, \
+         patch.object(fleet_rollout, "latest_unfinished") as latest, \
+         patch.object(fleet_rollout, "run_rollout") as run, \
+         patch.object(fleet_rollout, "create_rollout") as create:
+        with patch.object(fleet_autoupdate, "fleet_update", return_value={"ok": True, "steps": {}}):
+            assert fleet_autoupdate.main() == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is True
+    assert out["pi_rollout"]["status"] == "skipped"
+    assert "pi-rollout-revision" in out["pi_rollout"]["reason"]
+    read_pin.assert_called_once()
+    latest.assert_not_called()
+    run.assert_not_called()
+    create.assert_not_called()
+    recorded = fleet_autoupdate.read_state()
+    assert recorded["outcome"] == "updated" and recorded["detail"]["pi_rollout"]["status"] == "skipped"
+
+
+def test_daily_unit_skips_pi_rollout_on_pin_mismatch(checkout, monkeypatch, capsys):
+    from herdr_engineering import fleet_autoupdate, fleet_rollout
+
+    monkeypatch.setenv("HERDR_PI_ROLLOUT_REVISION", PIN)
+    other = {"id": "3" * 32, "revision": "4" * 40, "status": "pending"}
+    with patch.object(fleet_rollout, "latest_unfinished", return_value=other), \
+         patch.object(fleet_rollout, "run_rollout") as run, \
+         patch.object(fleet_rollout, "create_rollout") as create:
+        with patch.object(fleet_autoupdate, "fleet_update", return_value={"ok": True, "steps": {}}):
+            assert fleet_autoupdate.main() == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is True
+    assert out["pi_rollout"]["status"] == "skipped"
+    assert other["id"] in out["pi_rollout"]["reason"]
+    assert "abandon" in out["pi_rollout"]["reason"]
+    run.assert_not_called()
+    create.assert_not_called()
+
+
+def test_daily_unit_mints_plan_for_pin_when_nothing_unfinished(checkout, monkeypatch, capsys):
+    from herdr_engineering import fleet_autoupdate, fleet_rollout
+
+    monkeypatch.setenv("HERDR_PI_ROLLOUT_REVISION", PIN)
+    started = []
+    with patch.object(fleet_rollout, "latest_unfinished", return_value=None), \
+         patch.object(fleet_rollout, "list_rollouts", return_value=[]), \
+         patch.object(fleet_rollout, "prune_settled", return_value=[]), \
+         patch.object(fleet_rollout, "run_rollout",
+                      side_effect=lambda store, rollout_id, **kw: started.append(rollout_id)
+                      or {"id": rollout_id, "status": "pending", "runner": {"status": "running"}}) as run, \
+         patch.object(fleet_rollout, "create_rollout",
+                      return_value={"id": PLAN_ID, "revision": PIN, "status": "planned"}) as create, \
+         patch.object(fleet_rollout, "inventory_targets",
+                      return_value=[{"host": "bender", "sshTarget": "bender", "port": 22, "local": True}]) as targets:
+        with patch.object(fleet_autoupdate, "fleet_update", return_value={"ok": True, "steps": {}}):
+            assert fleet_autoupdate.main() == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is True and out["pi_rollout"]["id"] == PLAN_ID
+    assert started == [PLAN_ID]
+    run.assert_called_once()
+    create.assert_called_once()
+    assert create.call_args.args[1] == PIN
+    assert create.call_args.kwargs["inventory"] == checkout / "ansible" / "inventory" / "hosts.yml"
+    targets.assert_called_once_with(checkout / "ansible" / "inventory" / "hosts.yml", None)
+
+
+def test_daily_unit_skips_pi_step_when_controller_update_not_ok(checkout, capsys):
+    from herdr_engineering import fleet_autoupdate, fleet_rollout
+
+    with patch.object(fleet_autoupdate, "fleet_update",
+                      return_value={"ok": False, "error": "parity failed", "steps": {}}), \
+         patch.object(fleet_rollout, "read_pin") as read_pin:
+        assert fleet_autoupdate.main() == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is False
+    assert out["pi_rollout"]["status"] == "skipped"
+    assert "controller update not ok" in out["pi_rollout"]["reason"]
+    read_pin.assert_not_called()
+    recorded = fleet_autoupdate.read_state()
+    assert recorded["outcome"] == "failed"
+    assert recorded["detail"]["pi_rollout"]["status"] == "skipped"
+
+
+def test_daily_unit_skips_when_another_driver_holds_the_rollout_lock(checkout, monkeypatch, capsys):
+    """Lock contention from a concurrent `fleet rollout run` is time, not a failure (#844)."""
+    from herdr_engineering import fleet_autoupdate, fleet_rollout
+
+    monkeypatch.setenv("HERDR_PI_ROLLOUT_REVISION", PIN)
+    plan = {"id": PLAN_ID, "revision": PIN, "status": "pending"}
+    with patch.object(fleet_rollout, "latest_unfinished", return_value=plan), \
+         patch.object(fleet_rollout, "run_rollout",
+                      side_effect=BlockingIOError(11, "Resource temporarily unavailable")), \
+         patch.object(fleet_autoupdate, "fleet_update",
+                      return_value={"ok": True, "revision": "d" * 40, "steps": {}}):
+        assert fleet_autoupdate.main() == 0  # the run stays green
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is True
+    assert out["pi_rollout"]["status"] == "skipped"
+    assert "holds the lock" in out["pi_rollout"]["reason"]
+    recorded = fleet_autoupdate.read_state()
+    assert recorded["outcome"] == "updated"
+
+
+def test_daily_unit_keeps_controller_update_when_rollout_drain_errors(checkout, monkeypatch, capsys):
+    """A drain error goes red but never discards the successful controller update (#844)."""
+    from herdr_engineering import fleet_autoupdate, fleet_rollout
+
+    monkeypatch.setenv("HERDR_PI_ROLLOUT_REVISION", PIN)
+    with patch.object(fleet_rollout, "latest_unfinished",
+                      side_effect=ValueError("corrupt rollout record")), \
+         patch.object(fleet_autoupdate, "fleet_update",
+                      return_value={"ok": True, "revision": "d" * 40, "steps": {}}):
+        assert fleet_autoupdate.main() == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is False  # the drain error turns the run red
+    assert out["revision"] == "d" * 40  # ...but the controller update is preserved
+    assert out["pi_rollout"]["status"] == "error"
+    assert "corrupt rollout record" in out["pi_rollout"]["reason"]
+    recorded = fleet_autoupdate.read_state()
+    assert recorded["outcome"] == "failed"
+    assert recorded["revision"] == "d" * 40
+    assert "pi rollout step failed" in recorded["reason"]
+
+
+def test_daily_unit_fails_closed_on_broken_pin(checkout, monkeypatch, capsys):
+    """A mangled pin drains nothing; the run goes red but the update's revision survives."""
+    from herdr_engineering import fleet_autoupdate, fleet_rollout
+
+    monkeypatch.setenv("HERDR_PI_ROLLOUT_REVISION", "not-a-sha")
+    with patch.object(fleet_rollout, "read_pin",
+                      side_effect=ValueError("HERDR_PI_ROLLOUT_REVISION must be a full lowercase 40-character commit SHA")):
+        with patch.object(fleet_autoupdate, "fleet_update",
+                          return_value={"ok": True, "revision": "d" * 40, "steps": {}}):
+            assert fleet_autoupdate.main() == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is False
+    assert out["revision"] == "d" * 40  # the controller update is preserved, not discarded
+    assert out["pi_rollout"]["status"] == "error"
+    assert "40-character" in out["pi_rollout"]["reason"]
+    recorded = fleet_autoupdate.read_state()
+    assert recorded["outcome"] == "failed"
+    assert recorded["revision"] == "d" * 40
+    assert "pi rollout step failed" in recorded["reason"]
+
+
+@pytest.mark.parametrize("settled_status", ["complete", "abandoned"])
+def test_daily_unit_never_remints_a_settled_pinned_revision(checkout, monkeypatch, capsys,
+                                                            settled_status):
+    """Night 2 after convergence must be a reported skip, not a nightly re-rollout (#844)."""
+    from herdr_engineering import fleet_autoupdate, fleet_rollout
+
+    monkeypatch.setenv("HERDR_PI_ROLLOUT_REVISION", PIN)
+    settled = {"id": PLAN_ID, "revision": PIN, "status": settled_status,
+               "createdAt": "2026-11-01T00:00:00+00:00"}
+    with patch.object(fleet_rollout, "latest_unfinished", return_value=None), \
+         patch.object(fleet_rollout, "list_rollouts", return_value=[settled]), \
+         patch.object(fleet_rollout, "run_rollout") as run, \
+         patch.object(fleet_rollout, "create_rollout") as create, \
+         patch.object(fleet_rollout, "prune_settled") as prune:
+        with patch.object(fleet_autoupdate, "fleet_update", return_value={"ok": True, "steps": {}}):
+            assert fleet_autoupdate.main() == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is True
+    assert out["pi_rollout"]["status"] == "skipped"
+    assert out["pi_rollout"]["id"] == PLAN_ID
+    assert settled_status in out["pi_rollout"]["reason"]
+    run.assert_not_called()
+    create.assert_not_called()
+    prune.assert_not_called()  # nothing drained, nothing to prune
+
+
+def test_daily_unit_keeps_drain_result_when_prune_is_locked(checkout, monkeypatch, capsys):
+    """A busy rollout lock at prune time must not discard the pass that just succeeded."""
+    from herdr_engineering import fleet_autoupdate, fleet_rollout
+
+    monkeypatch.setenv("HERDR_PI_ROLLOUT_REVISION", PIN)
+    plan = {"id": PLAN_ID, "revision": PIN, "status": "complete"}
+    with patch.object(fleet_rollout, "latest_unfinished", return_value=plan), \
+         patch.object(fleet_rollout, "run_rollout",
+                      return_value={"id": PLAN_ID, "status": "complete",
+                                    "runner": {"status": "complete"}}), \
+         patch.object(fleet_rollout, "prune_settled",
+                      side_effect=BlockingIOError("another rollout driver holds the lock")):
+        with patch.object(fleet_autoupdate, "fleet_update", return_value={"ok": True, "steps": {}}):
+            assert fleet_autoupdate.main() == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is True
+    assert out["pi_rollout"]["status"] == "complete"
+    assert "lock" in out["pi_rollout"]["prunedError"]

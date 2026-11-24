@@ -28,7 +28,7 @@ export function readRouteTable(src = fs.readFileSync(APP, 'utf8')) {
   const nav = evalLiteral(block(src, 'NAV', '[', ']'));
   const tabs = evalLiteral(block(src, 'SECTION_TABS', '[', ']'));
   const routesText = src.slice(src.indexOf('const ROUTES = {'), src.indexOf('\n};', src.indexOf('const ROUTES = {')));
-  const routes = [...routesText.matchAll(/^\s*'([^']+)':\s*(\w+),?\s*$/gm)].map(([, route, view]) => ({ route, view }));
+  const routes = [...routesText.matchAll(/^\s*'([^']+)':\s*(\w+|\(\)\s*=>\s*[^\n]*?),?\s*$/gm)].map(([, route, view]) => ({ route, view: /^\w+$/.test(view) ? view : 'inline' }));
   if (!routes.length) throw new Error('app.js ROUTES block not found');
   // query parameters: every query.get('x') / q.get('x') / route().query.get('x') inside the view function's body
   const bodies = new Map();

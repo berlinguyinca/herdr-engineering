@@ -232,7 +232,7 @@ def test_archive_restore_tombstone_and_purge_respect_sharing_and_keep_evidence(r
         with pytest.raises(ArtifactError, match="purged"):
             await store.restore_artifact(a, actor="o")
         # c's hold is cleared, so its unshared bytes are deleted but the version row and hashes remain.
-        await connection.execute("UPDATE artifacts SET purge_after=now() - interval '1 day' WHERE artifact_id=$1", c)
+        await connection.execute("UPDATE artifacts SET legal_hold=false, purge_after=now() - interval '1 day' WHERE artifact_id=$1", c)   # the operator releases the hold
         assert [r["artifact_id"] for r in await store.purge_due()] == [c]
         assert not blobs.head(vc["output_manifest"][0]["storage_key"])
         assert (await store.get_version(vc["version_id"]))["output_manifest"] == vc["output_manifest"]

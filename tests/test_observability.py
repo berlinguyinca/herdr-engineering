@@ -44,3 +44,11 @@ def test_detect_listeners_no_public():
     # loopback-only environment should not flag public listeners
     public = [f for f in detect_listeners() if f.public]
     assert public == []
+
+
+def test_ipv4_mapped_loopback_and_private_addresses_are_not_public():
+    from herdr_engineering.observability import _is_public_ip
+    assert _is_public_ip("::ffff:127.0.0.1") is False
+    assert _is_public_ip("::ffff:10.1.2.3") is False
+    assert _is_public_ip("::ffff:100.64.0.1") is False
+    assert _is_public_ip("::ffff:8.8.8.8") is True

@@ -22,26 +22,26 @@ herdr-eng browser http://127.0.0.1:8787 --json
 
 ## Tailnet-interface dev fabric (cross-device reachability, spec 0110)
 Forwarder bound to bender's tailnet IP (NOT 0.0.0.0, NOT public):
-  ss: LISTEN 100.104.39.6:18000  (herdr-eng)
-curl http://100.104.39.6:18000/ -> HTTP 200 '<h1>dev fabric demo</h1>'
+  ss: LISTEN 100.64.8.6:18000  (herdr-eng)
+curl http://100.64.8.6:18000/ -> HTTP 200 '<h1>dev fabric demo</h1>'
 Any tailnet device (beast, iphone171, ipad157) can open that address.
 
 ---
 Fabric gateway live drill (2026-09-24, host bender)
 ---
 gateway: herdr-eng devfabric gateway --control-port 29999
-  control: 100.104.39.6:29999 (tailnet only; loopback view via same local addr)
+  control: 100.64.8.6:29999 (tailnet only; loopback view via same local addr)
   router: loopback + tailnet per-lease binds
-healthz: {"bound_ports": [], "ok": true, "url_base": "bender.tail0c50da.ts.net"}
+healthz: {"bound_ports": [], "ok": true, "url_base": "bender.<tailnet>.ts.net"}
 
-register: HERDR_ENGINEERING_FABRIC_URL=http://100.104.39.6:29999
+register: HERDR_ENGINEERING_FABRIC_URL=http://100.64.8.6:29999
   herdr-eng devfabric register --machine bender --host auto --port 18999 --label final-drill
-  → external_port 18000, url http://bender.tail0c50da.ts.net:18000, target 100.104.39.6:18999
+  → external_port 18000, url http://bender.<tailnet>.ts.net:18000, target 100.64.8.6:18999
   (bound immediately: first curl succeeded 0.4s after register)
 
 front door:
-  curl http://bender.tail0c50da.ts.net:18000/ → "<h1>dev fabric drill</h1>" (HTTP 200)
-  curl http://100.104.39.6:18000/            → "<h1>dev fabric drill</h1>" (HTTP 200)
+  curl http://bender.<tailnet>.ts.net:18000/ → "<h1>dev fabric drill</h1>" (HTTP 200)
+  curl http://100.64.8.6:18000/            → "<h1>dev fabric drill</h1>" (HTTP 200)
 
 restart rebind:
   stopped gateway; restarted; healthz showed bound_ports [18001] auto-rebound
@@ -123,7 +123,7 @@ contract (13 tests). Full suite: 114 passed, ruff clean, CI green.
 ---
 Real Ansible convergence — macOS fleet host `mac` (2026-09-24)
 ---
-Host: mac.tail0c50da.ts.net (100.84.185.100, macOS, Darwin), SSH as the fleet
+Host: mac.<tailnet>.ts.net (100.64.8.100, macOS, Darwin), SSH as the fleet
   user over the tailnet. Inventory updated: `macbook-m4` -> `mac` (real
   tailnet name); connection details in ansible/inventory/host_vars/mac.yml
   (gitignored).
@@ -162,8 +162,8 @@ Remaining: fry, beast, bender convergence (operator go-ahead per host).
 ---
 Real Ansible convergence — `beast` and `bender` (2026-09-25)
 ---
-beast (Ubuntu 24.04.4, tailnet 100.96.156.65, Tailscale SSH with interactive
-  check approval, fleet user wohlgemuth, passwordless sudo):
+beast (Ubuntu 24.04.4, tailnet 100.64.8.65, Tailscale SSH with interactive
+  check approval, fleet user `<user>`, passwordless sudo):
   Run 1:  ok=15 changed=6  failed=0 (tailscale reported up)
   Run 2:  ok=15 changed=0  failed=0 (idempotent)
   Run 3:  ok=15 changed=1  failed=0 — the re-runs caught a REAL BUG: with
@@ -198,16 +198,16 @@ The persistent private web UI is now exposed tailnet-only via `tailscale
 serve`. Evidence:
 
 * Enablement: tailnet admin console used once to enable Serve;
-  `sudo tailscale set --operator=wohlgemuth` was needed once so the fleet
+  `sudo tailscale set --operator=<user>` was needed once so the fleet
   user could manage serve config (otherwise `tailscale serve` returned
   `Access denied: serve config denied`).
 * Serve: `tailscale serve --bg 8787` on bender maps
-  `https://bender.tail0c50da.ts.net/` -> `http://127.0.0.1:8787`.
+  `https://bender.<tailnet>.ts.net/` -> `http://127.0.0.1:8787`.
 * Reachability (tailnet-only, loopback-only bind preserved):
   - bender local:  HTTP 200
   - from BEAST (ssh + curl):    HTTP 200
   - from MAC (ssh + curl):      HTTP 200
-* The macOS host was renamed on the tailnet `mac` -> `gerts-macbook-pro`
-  (same IP 100.84.185.100); its `ansible_host` was updated to
-  `gerts-macbook-pro.tail0c50da.ts.net` (inventory label stays `mac`).
+* The macOS host was renamed on the tailnet `mac` -> `operator-laptop`
+  (same IP 100.64.8.100); its `ansible_host` was updated to
+  `operator-laptop.<tailnet>.ts.net` (inventory label stays `mac`).
   Post-rename mac re-run: `ok=17 changed=0 failed=0` (idempotent).

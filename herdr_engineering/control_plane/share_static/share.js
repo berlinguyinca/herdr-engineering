@@ -6,10 +6,14 @@
  * a URL, the console or the page. The share path travels in sessionStorage keyed to a random `state`, never to Cognito.
  * Any failure shows one neutral message and never says why. No HTML is ever built from data (textContent only).
  */
-(function () {
+import { sessionStore, validConfig, beginPkce, exchangeCode } from "/s/static/lab-signin.js";
+import { renderLandingBar, renderSigninCard, rememberReturn, takeReturn } from "/s/static/landing.js";
+
+{
   "use strict";
 
   var SHARE_PATH = /^\/s\/[A-Za-z0-9_-]{43}\/$/;
+  var SIGNIN_PATH = /^(\/s\/[A-Za-z0-9_-]{43}\/)signin$/;
   // /s/<token>/k/<session>/<f|v>/<entry>: the entry is one or more plain path segments (no backslash, query, fragment,
   // control or space character, no empty segment) so the browser cannot resolve it anywhere but under the share.
   var LANDING_PATH = /^\/s\/[A-Za-z0-9_-]{43}\/k\/[A-Za-z0-9_.-]{1,768}\/[fv]\/[^\/\\?#\x00-\x20\x7f]+(?:\/[^\/\\?#\x00-\x20\x7f]+)*$/;
@@ -17,20 +21,14 @@
   var ENCODED_SEPARATOR = /%(?:2f|5c|00|3f|23)/i;
 
   function safeLanding(landing, sharePath) {
+    if (landing === sharePath) return true;      // a public link: the share path itself, which redirects to the entry
     return typeof landing === "string" && LANDING_PATH.test(landing) && landing.indexOf(sharePath) === 0
       && !DOT_SEGMENT.test(landing) && !ENCODED_SEPARATOR.test(landing);
   }
-  var ORIGIN = /^https:\/\/[A-Za-z0-9.-]+(:[0-9]{1,5})?$/;
   var PENDING_KEY = "herdr-share-pkce";
   var TOKENS_KEY = "herdr-share-tokens";
 
-  function store() {
-    try {
-      return window.sessionStorage;
-    } catch (e) {
-      return null;
-    }
-  }
+  var store = sessionStore;
 
   function forget() {
     var s = store();
@@ -50,66 +48,18 @@
     }
   }
 
-  function b64url(bytes) {
-    var bin = "";
-    for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
-    return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-  }
-
-  function randomString(n) {
-    var bytes = new Uint8Array(n);
-    crypto.getRandomValues(bytes);
-    return b64url(bytes);
-  }
-
   async function loadConfig() {
     var r = await fetch("/s/static/config.json", { cache: "no-store", credentials: "omit" });
     if (!r.ok) throw new Error("config");
     var c = await r.json();
-    if (!c || typeof c.cognito_domain !== "string" || !ORIGIN.test(c.cognito_domain)
-        || typeof c.client_id !== "string" || !c.client_id
-        || typeof c.redirect_uri !== "string" || c.redirect_uri.indexOf("https://") !== 0) {
-      throw new Error("config");
-    }
+    if (!validConfig(c)) throw new Error("config");
     return c;
   }
 
   async function signIn(cfg, sharePath) {
-    var verifier = randomString(32);
-    var state = randomString(24);
-    var digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
-    store().setItem(PENDING_KEY, JSON.stringify({ state: state, verifier: verifier, share: sharePath }));
-    var query = new URLSearchParams({
-      response_type: "code",
-      client_id: cfg.client_id,
-      redirect_uri: cfg.redirect_uri,
-      scope: "openid email",
-      state: state,
-      code_challenge: b64url(new Uint8Array(digest)),
-      code_challenge_method: "S256"
-    });
-    location.assign(cfg.cognito_domain + "/oauth2/authorize?" + query.toString());
-  }
-
-  async function exchangeCode(cfg, code, verifier) {
-    var body = new URLSearchParams({
-      grant_type: "authorization_code",
-      client_id: cfg.client_id,
-      code: code,
-      redirect_uri: cfg.redirect_uri,
-      code_verifier: verifier
-    });
-    var r = await fetch(cfg.cognito_domain + "/oauth2/token", {
-      method: "POST",
-      cache: "no-store",
-      credentials: "omit",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: body.toString()
-    });
-    if (!r.ok) throw new Error("token");
-    var t = await r.json();
-    if (!t || typeof t.access_token !== "string" || typeof t.id_token !== "string") throw new Error("token");
-    return { access: t.access_token, id: t.id_token };
+    var p = await beginPkce(cfg);
+    store().setItem(PENDING_KEY, JSON.stringify({ state: p.state, verifier: p.verifier, share: sharePath }));
+    location.assign(p.url);
   }
 
   async function openShare(sharePath, tokens) {
@@ -126,7 +76,10 @@
     if (!got || !safeLanding(got.landing, sharePath)) {
       throw new Error("session");
     }
-    location.replace(got.landing);
+    // a public link returns to where the visitor was (kept in sessionStorage, validated on read); a lab session
+    // goes to its own landing
+    var back = got.landing === sharePath ? takeReturn(store()) : null;
+    location.replace(back && back.indexOf(sharePath) === 0 ? back : got.landing);
   }
 
   async function callback() {
@@ -148,13 +101,37 @@
     await openShare(pending.share, tokens);
   }
 
+  // The sign-in step of a public link: the card, one button. The way back is remembered in sessionStorage only.
+  function signinCard(cfg, sharePath) {
+    var main = document.querySelector("main");
+    var info = null;
+    var data = document.getElementById("herdr-landing");
+    try { info = data ? JSON.parse(data.textContent) : null; } catch (e) { info = null; }
+    var go = function () {
+      rememberReturn(store(), sharePath);
+      signIn(cfg, sharePath).catch(fail);
+    };
+    var card = renderSigninCard(document, go);
+    if (main && main.parentNode) {
+      if (info) {
+        info.now = Date.now() / 1000;
+        info.signedIn = false;
+        var bar = renderLandingBar(document, info, go);
+        main.parentNode.insertBefore(bar, main);
+      }
+      main.parentNode.replaceChild(card, main);
+    }
+  }
+
   async function main() {
     if (!store() || !window.crypto || !crypto.subtle) throw new Error("unsupported");
     var path = location.pathname;
     if (path === "/s/callback") return callback();
+    var signin = SIGNIN_PATH.exec(path);
+    if (signin) return signinCard(await loadConfig(), signin[1]);
     if (SHARE_PATH.test(path)) return signIn(await loadConfig(), path);
     throw new Error("route");
   }
 
   main().catch(fail);
-})();
+}

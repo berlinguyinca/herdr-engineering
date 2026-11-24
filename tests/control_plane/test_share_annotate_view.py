@@ -20,7 +20,8 @@ from tests.control_plane.test_share_annotate import (
     make_env,
     session,
 )
-from tests.control_plane.test_share_lab import NOW0
+from tests.control_plane.test_share_lab import NOW0, lab_config
+from tests.control_plane.test_share_public import Env
 
 CLOSE_TEMPLATE = "</" + "template>"
 CLOSE_STYLE = "</" + "style>"
@@ -69,6 +70,16 @@ def split_shadow(page):
     before, rest = page.split(opener)
     inside, after = rest.split(CLOSE_TEMPLATE)
     return before, inside, after
+
+
+def clobber_ids(text):
+    """The hostile `id=pwn`/`id=pwn2` markers in `text`, quoted or not.
+
+    The bare substring "pwn" is not a usable signal: the CSP nonce is random and can contain it, which
+    failed this suite in CI (pipeline 1218) on a page whose only "pwn" was `nonce="VhxkoHLpwnvg-P36DpklIZ9t"`.
+    An id clobbering attempt is an id, so that is what is matched.
+    """
+    return [m.group(0) for m in re.finditer(r'id\s*=\s*"?pwn2?"?', text)]
 
 
 def data_of(page):
@@ -147,14 +158,26 @@ def test_hostile_html_is_sanitised_and_contained_in_the_shadow_root(lab):
     assert page.count('id="herdr-view-data"') == 2 and before.count('id="herdr-view-data"') == 1
     assert after.count('id="herdr-view-data"') == 0 and "data-annotate-panel" in after
     assert 'id="annotate-panel"' in inside and 'id="annotate-panel"' not in before + after
-    assert "pwn" not in before + after
+    assert clobber_ids(before + after) == []
     # a style whose text holds a closer for the wrapper or the style element is dropped, never kept
-    assert "color:red" not in inside and "pwn" not in inside.replace('id="pwn2"', "")
+    assert "color:red" not in inside and clobber_ids(inside.replace('id="pwn2"', "")) == []
     assert "color:blue" in inside and inside.count("<style>") == inside.count(CLOSE_STYLE) == 2     # blue is a whole style
     # a host rule is allowed through (by design) but the page contains it: wrapper outside the host
     assert ":host{position:fixed!important" in inside
     outer = before.rindex('id="herdr-viewport"')
     assert outer < before.index('id="herdr-content"') and after.lstrip().startswith("</div>")
+
+
+def test_a_nonce_happening_to_spell_pwn_is_not_read_as_an_id_clobber():
+    """The exact shape that failed CI: the only "pwn" outside the shadow root is inside the CSP nonce."""
+    page = ('<head><meta http-equiv="Content-Security-Policy" content="script-src \'nonce-abc\'">'
+            '</head>\n<body data-mode="annotate">\n'
+            '<script type="application/json" id="herdr-view-data" '
+            'nonce="VhxkoHLpwnvg-P36DpklIZ9t">{"entry": "index.html"}</script>\n')
+    assert "pwn" in page                                  # the substring the old assertion keyed on
+    assert clobber_ids(page) == []                         # and the assertion that has to survive it
+    assert clobber_ids('<b id=pwn>x</b>') == ["id=pwn"]    # a real attempt is still caught
+    assert clobber_ids('<b id="pwn2">y</b>') == ['id="pwn2"']
 
 
 def test_stylesheet_contains_the_content_box(lab):
@@ -304,3 +327,85 @@ def test_sanitised_output_is_cached_per_share_file_hash_and_resolver(lab, monkey
     assert (share_id, name, version) == ("shr-1", "page2.html", share_render.RESOLVER_VERSION)
     assert re.fullmatch(r"[0-9a-f]{64}", sha) and re.fullmatch(r"[0-9a-f]{64}", fingerprint)
     assert first
+
+
+# ---------------------------------------------------------------------------- "Shared by" banner (plan 5, Task 8)
+
+BANNER_RE = re.compile(r'<aside class="herdr-shared-by" role="note">(.*?)</aside>', re.S)
+
+
+def banner_env(tmp_path, name, **over):
+    return make_env(tmp_path, files=FILES, state_extra={"shared_by": name}, **over)
+
+
+@pytest.mark.parametrize("kind", ["v", "a"])
+def test_member_link_views_show_the_banner(tmp_path, kind):
+    env = banner_env(tmp_path, "Alice Example")
+    try:
+        status, h, body = env.request("GET", base(kind=kind) + "notes.txt")
+        page = body.decode()
+        assert status == 200 and "{{" not in page
+        assert BANNER_RE.search(page).group(1) == "Shared by Alice Example — content was not reviewed by the operator"
+        assert page.index("herdr-shared-by") < page.index('<nav data-mode-switch')
+        assert "<script" not in BANNER_RE.search(page).group(0)
+        assert "'unsafe-inline'" not in h["content-security-policy"].split("script-src")[1].split(";")[0]
+    finally:
+        env.close()
+
+
+def test_hostile_name_renders_as_text(tmp_path):
+    hostile = "<img src=x onerror=alert(1)>&\"'"
+    env = banner_env(tmp_path, hostile)
+    try:
+        page = env.request("GET", base(kind="v") + "notes.txt")[2].decode()
+        shown = BANNER_RE.search(page).group(1)
+        assert "<img" not in page and "onerror=alert(1)>" not in page
+        assert "&lt;img src=x onerror=alert(1)&gt;" in shown
+    finally:
+        env.close()
+
+
+@pytest.mark.parametrize("kind", ["v", "a"])
+def test_operator_links_have_no_banner(lab, kind):
+    page = lab.request("GET", base(kind=kind) + "notes.txt")[2].decode()
+    assert "herdr-shared-by" not in page and "Shared by" not in page
+
+
+def test_banner_is_not_injected_into_non_html_raw_files(tmp_path):
+    env = banner_env(tmp_path, "Alice Example")
+    try:
+        for name in ("notes.txt", "pic.png"):
+            status, _, body = env.request("GET", base(kind="f") + name)
+            assert status == 200 and b"herdr-shared-by" not in body and b"Shared by" not in body
+    finally:
+        env.close()
+
+
+@pytest.mark.parametrize("bad", ["x" * 121, "", 5, ["a"], None])
+def test_invalid_shared_by_is_the_uniform_404(tmp_path, bad):
+    env = banner_env(tmp_path, bad)
+    try:
+        assert env.request("GET", base(kind="v") + "notes.txt")[0] == 404
+        assert env.request("GET", base(kind="a") + "notes.txt")[0] == 404
+    finally:
+        env.close()
+
+
+def test_a_120_char_name_is_accepted(tmp_path):
+    env = banner_env(tmp_path, "n" * 120)
+    try:
+        assert "n" * 120 in env.request("GET", base(kind="v") + "notes.txt")[2].decode()
+    finally:
+        env.close()
+
+
+def test_public_member_link_has_the_bar_on_html_but_no_annotation_ui(tmp_path):
+    env = Env(tmp_path, audience="public", files=FILES, config_extra=lab_config(tmp_path),
+              state_extra={"shared_by": "Alice Example"})
+    try:
+        status, h, body = env.request("GET", f"/s/{TOKEN}/f/index.html")
+        assert status == 200 and body.count(b"data-herdr-shared-by") == 1 and b"data-annotate-panel" not in body
+        assert env.request("GET", base(kind="a") + "notes.txt")[0] == 404
+        assert env.request("GET", base(kind="v") + "notes.txt")[0] == 404
+    finally:
+        env.close()

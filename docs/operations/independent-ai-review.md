@@ -1,6 +1,31 @@
 # Independent AI review
 
-The ruleset on `berlinguyinca/herdr-engineering` requires a commit status named exactly `Independent AI review`.
+## Current requirement (2026-11-13): `Opus agent review`
+
+Ruleset 25691548 on the default branch now requires a commit status named exactly `Opus agent review`. The review
+automation posts it, on the exact head SHA it reviewed, and nothing else should: `always-on-review.py review ... --post`
+runs `claude` with the Opus model against that head and posts `pending`, then `success` or `failure`.
+
+- **The `herdr-always-on-review` systemd user timer (the only path).** `deploy/ci-review/herdr-always-on-review.{service,timer}`
+  polls open PRs and reviews any head that has no terminal status. A head with a terminal status is never reviewed twice.
+  There is no per-PR Woodpecker workflow: it needed an agent and a wrapper that were never set up, so its check stayed pending on every PR.
+
+Never post the status by hand: a hand-posted `success` is a review nobody did.
+
+- The ruleset is still named "Independent AI review" in the GitHub UI, although the context it requires is now `Opus agent review`.
+- Anyone with push access can post a commit status, so the identity of the poster is a convention, not enforced. The
+  token that the automation uses is the host token file `~/.config/herdr-engineering/opus-review.token`.
+- Any push moves the head and makes the status stale. The new `synchronize` event starts a review of the new head.
+- The `Independent AI review` check below (`deploy/ci-review/ai-review.py`, a deepseek or qwen model) is **no
+  longer required**. The script and timer remain, but their status is advisory.
+- Trade-off: the old rule that the reviewer be a different model family from the author no longer holds, because
+  Opus reviews Claude-authored PRs. The rest of this page describes the advisory script.
+
+---
+
+# Independent AI review (advisory since 2026-11-13)
+
+The ruleset on `berlinguyinca/herdr-engineering` used to require a commit status named exactly `Independent AI review`.
 `deploy/ci-review/ai-review.py` posts it. The script sends the PR's diff to a model from a different family than
 the author, chosen from the models `llm.metabolomics.us` advertises. Today that means a deepseek or qwen model
 reviews Claude's PRs. The script, not the model, then decides the state. Details are in
@@ -28,7 +53,7 @@ Requirements:
 To see which models can be used, list them with `GET {baseUrl}/models`, and set `reviewer.model` to one of the
 exact ids.
 
-For unattended runs, install the example user units `deploy/ci-review/herdr-ai-review.{service,timer}`
+For unattended runs of this advisory script, install the example user units `deploy/ci-review/herdr-ai-review.{service,timer}`
 (`systemctl --user enable --now herdr-ai-review.timer`, and `loginctl enable-linger`). `poll` is idempotent: a
 head that already has a terminal status is not reviewed again. Re-run a head by hand with `review`; it posts a
 new status and updates the existing comment.
@@ -70,6 +95,32 @@ next poll.
   because the diff already holds them. A bug that spans files in different chunks can be missed.
 - **Not a human review.** It is no substitute for one, and it does not approve the PR in GitHub's review sense.
 
+## Always-on review (tier 1 and tier 2)
+
+The always-on process (`deploy/ci-review/always-on-review.py`) adds an advisory `Open-weight pre-review` (pi, open
+weights) and the `Opus agent review` (claude, run on every non-draft head without waiting for green checks; the operator approved removing the
+green-only gate. Set `gates.wait_for_green: true` in the YAML to restore it: Woodpecker gates, verify and GitGuardian
+must then be green, and a `gates.when_present` check such as `ui-gates` only if it exists). Both are configured in YAML only; see `deploy/ci-review/README.md` for backends, pi alias selection and the
+security posture.
+
+Operating rules:
+
+- A diff over GitHub's 20,000-line limit (`gh pr diff` fails with HTTP 406) is read locally from the review worktree
+  instead (merge base to the pinned head), so such PRs are still reviewed.
+- Dry-run is the default. Posting needs `post: true` in the config and `--post` on the command line.
+- Tier 1 never posts the required context. The ruleset already requires `Opus agent review`; turning on tier 2 posting
+  (`post: true` plus `--post`) is a separate operator step, taken after watching dry-run output in `reviews.jsonl`.
+- A review that cannot run (timeout, bad JSON, head moved, or gates not green when `gates.wait_for_green` is on) leaves the status `pending`; it is never
+  turned green or red by guesswork.
+- Install on any host with `gh`, `git`, the `claude` login and pi configured: copy the example config and the
+  `herdr-always-on-review.{service,timer}` units, then `systemctl --user enable --now` the timer. The interim host is
+  beast; a dedicated node later needs only the same files. Watch it with `herdr-review-pane.example.sh` in a herdr pane.
+- Cost: only tier 2 spends Opus tokens, once per head it reviews (every head by default, only green heads with `gates.wait_for_green`); `reviews.jsonl` records cost and duration.
+
+### Prompt v2, passes and replay
+
+Both tiers now get the operator's project rules and a review checklist (`deploy/ci-review/review-checklist.yaml`). A blocking finding must quote evidence that exists in the diff or the pinned file, otherwise the script downgrades it to a note. Tier 2 can run several focused passes (general, tests, security, migrations in the example config), which multiplies cost and time; `passes: []` restores one review. `always-on-review.py replay` scores a tier against a corpus of PRs with known outcomes, posts nothing, is resumable and runs one case at a time; the intended corpus is thousands of PRs across the org's repos, built with `corpus build`. Details: `deploy/ci-review/README.md`.
+
 ## Limits: advisory strength
 
 - **Prompt injection.** The diff, the PR title and body, and the file contents are untrusted. The model has no
@@ -87,8 +138,8 @@ next poll.
   as the `Authorization` header, to that provider's https `baseUrl` host. Redirects are not followed. The key is
   redacted from every message.
 - **Plain http to a tailnet node is an explicit opt-in.** `reviewer.allow_plain_http_hosts` takes exact IPv4
-  literals in `100.64.0.0/10`, for example `["100.104.39.6"]` for pi's `development` provider
-  (`http://100.104.39.6:8390/v1`). Hostnames, IPv6, public addresses and other private ranges are refused, and so
+  literals in `100.64.0.0/10`, for example `["100.64.8.6"]` for pi's `development` provider
+  (`http://100.64.8.6:8390/v1`). Hostnames, IPv6, public addresses and other private ranges are refused, and so
   is a tailnet IP that is not listed. The default is empty: https only. With a listed host:
   - the key, the diff and the verdict cross the tailnet as plain HTTP. WireGuard still encrypts the link between
     the two machines, but anything on either end can read them: a proxy or sniffer on the reviewing host, the
@@ -108,7 +159,7 @@ next poll.
   - routes sometimes ended mid-answer (`upstream_transport_error`), and qwen's single slot answered 429;
   - for a while the gateway advertised no models at all.
 
-  Route failures, 429s and 5xx responses are retried with backoff. A stream that closes unfinished (no `[DONE]`,
+  Route failures and 5xx responses are retried with backoff; 429s are waited out for up to `reviewer.busy_wait_s` (1800 s) without using the retries. A stream that closes unfinished (no `[DONE]`,
   no `finish_reason`) is retried the same way. A model that is not advertised fails the run before anything is
   posted.
 - **qwen on the `development` provider.** That provider sets `compat.thinkingFormat: qwen-chat-template`. pi then

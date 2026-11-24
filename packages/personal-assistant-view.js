@@ -61,7 +61,7 @@ export function mountPersonalAssistant(container, client, { onFreshness = () => 
   let loaded = false;
   const render = async () => {
     // Only the first load shows the placeholder: a refresh after unlink/archive/create keeps the page on screen until the new list lands.
-    if (!loaded) container.innerHTML = skeleton('Personal Assistant', { rows: 5, height: 64 });   // sized to the page that replaces it
+    if (!loaded) container.innerHTML = `<div class="pa-skeleton">${skeleton('Personal Assistant', { rows: 5, height: 64 })}</div>`;   // .pa-skeleton holds the height of the page that replaces it
     try {
       const { assistants = [] } = await client.listAssistants();
       if (disposed) return;

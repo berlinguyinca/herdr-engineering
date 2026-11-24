@@ -1,0 +1,14 @@
+# The only path that posts the required `Opus agent review` status (docs/operations/independent-ai-review.md).
+# Each run polls open PRs and reviews any head without a terminal status; a head with one is never reviewed twice.
+# The unit fires every OnUnitActiveSec (1h here, plus up to RandomizedDelaySec); a host may override the interval.
+[Unit]
+Description=Poll open pull request heads and post the Opus agent review status
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=1h
+RandomizedDelaySec=5min
+Unit=herdr-always-on-review.service
+
+[Install]
+WantedBy=timers.target

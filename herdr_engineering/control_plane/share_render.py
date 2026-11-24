@@ -71,7 +71,7 @@ RENDER_VERSION = 1
 RESOLVER_VERSION = 2          # bump whenever ``share_resolver`` output changes for the same input (cache key part)
 MAX_RENDER_INPUT = 2 * 1024 * 1024
 MAX_RENDER_OUTPUT = 4 * 1024 * 1024
-STATIC_NOTE = "Scripts, frames and embedded media are not shown in this static copy"
+STATIC_NOTE = "Scripts, frames, audio and video are not shown in this static copy"
 
 
 SANITIZE_DEADLINE_SECONDS = 3.0

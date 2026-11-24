@@ -73,7 +73,7 @@ def test_heartbeat_never_fabricates_progress(snapshot):
     assert payload["progress"] == 0
 
 
-@pytest.mark.parametrize("version", [1, 2, 3])
+@pytest.mark.parametrize("version", [1, 2, 3, 4])
 def test_supported_versions_with_absent_observability(version):
     doc = {"contractVersion": version, "missions": [{"id": "old", "status": "RUNNING"}]}
     envelope, = adapter.snapshot_to_envelopes(doc)
@@ -84,7 +84,7 @@ def test_supported_versions_with_absent_observability(version):
     assert adapter.snapshot_to_envelopes({"contractVersion": version, "missions": []}) == []
 
 
-@pytest.mark.parametrize("version", [4, 0, -1, None, "3", True, 3.0, [], {}])
+@pytest.mark.parametrize("version", [5, 0, -1, None, "3", True, 3.0, [], {}])
 def test_unsupported_versions(version):
     with pytest.raises(adapter.UnsupportedSnapshotVersion):
         adapter.snapshot_to_envelopes({"contractVersion": version, "missions": []})
@@ -198,3 +198,20 @@ def test_redirect_never_forwards_credentials_or_counts_as_accepted(snapshot, sta
     diagnostic = "".join(traceback.format_exception(error)) + output.out + output.err + caplog.text
     assert INGEST_KEY not in diagnostic
     assert "HERDR_CP_INGEST_KEY" in str(error)
+
+
+def test_real_pi_v4_golden_maps_like_v3_and_leaves_v4_fields_off_the_cli_envelope():
+    """G9: the trimmed copy of Pi's real mission-snapshot-v4.golden.json (additive created_at/completed_at/links).
+
+    This CLI converter has never carried times or links; v4 must map exactly as v3 does (the feed, not this
+    converter, forwards the v4 fields)."""
+    doc = json.loads((Path(__file__).parents[1] / "fixtures/pi-snapshot-v4-golden-trimmed.json").read_text())
+    assert doc["contractVersion"] == 4
+    nulls, full = adapter.snapshot_to_envelopes(doc)
+    assert full["entity_id"] == "MSN-golden-full" and full["payload"]["status"] == "NEW"
+    assert full["payload"]["next_action"] == "verify" and full["payload"]["progress"] == 40
+    assert full["occurred_at"] == "2026-10-14T12:00:00.000Z"
+    for envelope in (nulls, full):
+        assert not {"created_at", "completed_at", "links"} & set(envelope["payload"])
+    as_v3 = {**doc, "contractVersion": 3}
+    assert adapter.snapshot_to_envelopes(as_v3) == adapter.snapshot_to_envelopes(doc)

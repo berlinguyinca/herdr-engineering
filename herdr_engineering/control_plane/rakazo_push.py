@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import queue
+import re
 import threading
 import urllib.error
 import urllib.request
@@ -27,6 +28,7 @@ MAX_QUEUE = 64
 SEEN_LIMIT = 2000
 TIMEOUT_SECONDS = 10
 MAX_RESPONSE = 64 * 1024
+_TOKEN_RE = re.compile(r"(?:Exponent|Expo)PushToken\[[^\]\s;,]*\]?")
 
 
 class PostgresPushPersistence:
@@ -128,8 +130,9 @@ class ExpoSender:
             with self._open(req, TIMEOUT_SECONDS) as resp:
                 raw = resp.read(MAX_RESPONSE + 1)
         except urllib.error.HTTPError as exc:
+            detail = _error_detail(exc)
             exc.close()
-            raise OSError(f"expo push failed ({exc.code})") from None
+            raise OSError(f"expo push failed ({exc.code}){detail}") from None
         except urllib.error.URLError:
             raise OSError("expo push unreachable") from None
         if len(raw) > MAX_RESPONSE:
@@ -139,6 +142,18 @@ class ExpoSender:
         except (ValueError, AttributeError):
             raise OSError("expo push returned an invalid response") from None
         return [t for t in data if isinstance(t, dict)] if isinstance(data, list) else []
+
+
+def _error_detail(exc: urllib.error.HTTPError) -> str:
+    """Expo's own error codes and messages from a 4xx body (``errors[].code/message``), with anything shaped like a push
+    token removed, so the log says WHY Expo refused without ever carrying a device token."""
+    try:
+        errors = json.loads(exc.read(4096)).get("errors") or []
+        parts = [f"{e.get('code', 'error')}: {e.get('message', '')}" for e in errors[:3] if isinstance(e, dict)]
+    except (ValueError, AttributeError, OSError):
+        return ""
+    text = _TOKEN_RE.sub("[token]", "; ".join(parts))
+    return f" - {text[:300]}" if text else ""
 
 
 def _cap(text: str, n: int) -> str:
@@ -216,8 +231,10 @@ class PushNotifier:
         if not tokens or not target:
             return
         data = {"kind": kind, "deliveryId": uuid.uuid4().hex, **target}
-        messages = [{"to": t, "title": _cap(title, MAX_TITLE), "body": _cap(body, MAX_BODY), "data": data,
-                     "collapseId": collapse_id or target.get("threadId"), "sound": "default"} for t in tokens]
+        # Expo validates the whole batch: ONE null field (a missing collapseId) is an HTTP 400 for every message in it.
+        messages = [{k: v for k, v in {"to": t, "title": _cap(title, MAX_TITLE), "body": _cap(body, MAX_BODY),
+                                       "data": data, "collapseId": collapse_id or target.get("threadId"),
+                                       "sound": "default"}.items() if v is not None} for t in tokens]
         try:
             tickets = self._sender.send(messages)
         except OSError as exc:

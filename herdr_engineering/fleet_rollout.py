@@ -31,6 +31,40 @@ CAPABILITIES = {
 }
 IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:@-]{0,255}\Z")
 SHA = re.compile(r"[0-9a-f]{40}\Z")
+#: Everything the stable Pi Host loads once at extension load (import closure of
+#: ``src/runtime/host/entry.ts`` + ``extension.ts``, including its lazy diagnose imports,
+#: excluding runtime generations and the legacy fallback). Directories are listed whole on
+#: purpose: a Host import added later still lands in a covered directory, and an
+#: over-broad match only costs a bootstrap, never a false "current".
+HOST_CODE_PATHS = (
+    "scripts/diagnose-errors.ts",
+    "src/aps/fingerprint.ts",
+    "src/aps/types.ts",
+    "src/git",
+    "src/incidents",
+    "src/platform/eventstore",
+    "src/platform/processIncarnation.ts",
+    "src/platform/redact.ts",
+    "src/platform/runtimeDir.ts",
+    "src/runtime/host",
+    "src/runtime/isolation",
+    "src/runtime/migrations",
+    "src/runtime/rotateFile.ts",
+    "src/telemetry",
+    "src/update",
+)
+#: ``package.json`` is compared parsed, minus these keys only. The Host never reads them;
+#: everything else (``pi.extensions``, ``dependencies``, ``type``, ...) must be equal.
+PACKAGE_JSON_IGNORED_KEYS = ("devDependencies", "scripts")
+#: Git reads these before the working directory; a probe must not inherit them.
+GIT_ENV_UNSET = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+)
 REMOTE_EXEC_PREFIX = 'PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH" exec '
 
 
@@ -38,6 +72,16 @@ def _identifier(value):
     if not isinstance(value, str) or not IDENTIFIER.fullmatch(value):
         raise ValueError("invalid target identity")
     return value
+
+
+class MissingInstanceIdentity(ValueError):
+    """A registration is reachable and unique, but nothing in it names a live Pi instance.
+
+    This is not an *ambiguous* identity -- there is exactly one candidate, and it simply has
+    no instance identity to act on, so no pass can ever make progress on it. Fail-closed is
+    right; being un-recoverable is not. `retire_identityless` is the operator's supported way
+    to settle such a registration, and the rollout report keeps the evidence.
+    """
 
 
 def _target(target):
@@ -51,9 +95,21 @@ def _target(target):
         _identifier(target["session"])
 
 
+def _default_rollout_root() -> Path:
+    """Rollout state lives under XDG_STATE_HOME, like the fleet-auto-update state.
+
+    Honouring the same env var the unattended driver already uses (fleet_autoupdate)
+    keeps the two in one place and lets a test redirect both with one setenv instead
+    of silently writing to the operator's real ~/.local/state (#844).
+    """
+    base = os.environ.get("XDG_STATE_HOME", "").strip()
+    root = Path(base) if base else Path.home() / ".local" / "state"
+    return root / "herdr-engineering" / "rollouts"
+
+
 class RolloutStore:
     def __init__(self, root: Path | None = None):
-        self.root = root or Path.home() / ".local/state/herdr-engineering/rollouts"
+        self.root = root or _default_rollout_root()
 
     def _directory(self):
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -143,6 +199,152 @@ def create_rollout(store, revision, targets, *, inventory):
     return plan
 
 
+# --- #844: one pinned target, one resumable rollout, bounded state ------------
+
+PI_ROLLOUT_PIN_ENV = "HERDR_PI_ROLLOUT_REVISION"
+
+
+def default_pin_path() -> Path:
+    """Where the pinned Pi revision lives: one 40-hex line, next to the deployment pointer."""
+    return Path.home() / ".config" / "herdr-engineering" / "pi-rollout-revision"
+
+
+def read_pin(path: Path | None = None) -> str | None:
+    """The pinned Pi revision: the env override, then the pin file; None when unpinned.
+
+    An invalid pin fails closed: rolling out a mangled revision is worse than no rollout.
+    """
+    env = os.environ.get(PI_ROLLOUT_PIN_ENV, "").strip()
+    if env:
+        if not SHA.fullmatch(env):
+            raise ValueError(
+                f"{PI_ROLLOUT_PIN_ENV} must be a full lowercase 40-character commit SHA"
+            )
+        return env
+    pin_file = Path(path) if path else default_pin_path()
+    try:
+        revision = pin_file.read_text().strip()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ValueError(f"cannot read pi rollout pin {pin_file}: {exc.strerror or exc}") from exc
+    if not SHA.fullmatch(revision):
+        raise ValueError(
+            f"pi rollout pin {pin_file} must hold a full lowercase 40-character commit SHA"
+        )
+    return revision
+
+
+def write_pin(revision: str, path: Path | None = None) -> Path:
+    if not SHA.fullmatch(revision):
+        raise ValueError("pi rollout pin must be a full lowercase 40-character commit SHA")
+    pin_file = Path(path) if path else default_pin_path()
+    pin_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(dir=pin_file.parent, prefix=".pin-")
+    try:
+        with os.fdopen(fd, "w") as stream:
+            stream.write(revision + "\n")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, pin_file)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    return pin_file
+
+
+def resolve_plan_revision(explicit: str | None = None, pin: Path | None = None) -> str:
+    """The plan's target: an explicit SHA wins, then the pin, else fail closed."""
+    if explicit:
+        if not SHA.fullmatch(explicit):
+            raise ValueError("pi-revision must be a full lowercase 40-character commit SHA")
+        return explicit
+    pinned = read_pin(pin)
+    if pinned is None:
+        raise ValueError(
+            "no --pi-revision given and no pinned pi revision "
+            f"(write {default_pin_path()} to pin one)"
+        )
+    return pinned
+
+
+def list_rollouts(store) -> list:
+    """Every stored plan, validated. A corrupt record fails closed: the directory is the record."""
+    store._directory()  # the same privacy/ownership check the write paths demand
+    return [
+        store.read(entry.stem)
+        for entry in sorted(store.root.iterdir())
+        if entry.is_file() and re.fullmatch(r"[0-9a-f]{32}\.json", entry.name)
+    ]
+
+
+def latest_unfinished(store):
+    """The newest plan that has not settled (complete/abandoned), or None.
+
+    The selector the unattended driver uses to resume instead of minting: a rollout is
+    durable state, so the next attempt must continue it rather than start a parallel one (#844).
+    """
+    unfinished = [
+        plan
+        for plan in list_rollouts(store)
+        if plan.get("status") not in ("complete", "abandoned")
+    ]
+    if not unfinished:
+        return None
+    return max(unfinished, key=lambda plan: (plan.get("createdAt", ""), plan["id"]))
+
+
+def abandon_rollout(store, rollout_id, *, reason: str = "abandoned by operator"):
+    """Settle a rollout the operator no longer wants; settled plans are prunable and invisible."""
+    with store.lock():
+        plan = store.read(rollout_id)
+        if plan.get("status") == "complete":
+            raise ValueError("a complete rollout cannot be abandoned")
+        if plan.get("status") == "abandoned":
+            raise ValueError("rollout is already abandoned")
+        plan["status"] = "abandoned"
+        plan["abandonedAt"] = datetime.now(UTC).isoformat()
+        plan["abandonReason"] = reason[:500]
+        store.write(plan)
+    return plan
+
+
+def prune_settled(store, *, older_than_days: int = 30, now=None) -> list:
+    """Delete settled (complete/abandoned) plans older than the horizon; return what left.
+
+    Unsettled plans are never touched: a blocked rollout may be the operator's next action,
+    and only a deliberate abandon marks it done. A settled record whose settle time is
+    unreadable is kept, never guessed. The horizon is bounded: a negative one would delete
+    every settled record (losing the abandon audit trail), and an absurd one overflows.
+    """
+    if not 0 <= older_than_days <= 3650:
+        raise ValueError("prune horizon must be between 0 and 3650 days")
+    now = now or datetime.now(UTC)
+    cutoff = now - timedelta(days=older_than_days)
+    pruned = []
+    with store.lock():
+        for plan in list_rollouts(store):
+            if plan.get("status") not in ("complete", "abandoned"):
+                continue
+            # An abandoned plan's audit window starts when it was abandoned, not when it
+            # was created: judging it by createdAt would delete a freshly-abandoned old
+            # plan on the very next prune and lose its abandonReason.
+            settled = (
+                plan.get("abandonedAt")
+                or (plan.get("runner") or {}).get("lastPassAt")
+                or plan.get("createdAt")
+            )
+            try:
+                when = datetime.fromisoformat(settled)
+            except (TypeError, ValueError):
+                continue
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=UTC)
+            if when < cutoff:
+                (store.root / (plan["id"] + ".json")).unlink(missing_ok=True)
+                pruned.append({"id": plan["id"], "status": plan["status"], "settledAt": settled})
+    return pruned
+
+
 def _stderr_diagnostic(stderr):
     # Extract only known diagnostic categories, never echo arbitrary remote logs.
     # Even unexpected secret-bearing stderr therefore stays out of durable state.
@@ -216,9 +418,9 @@ class PiTransport:
             raise ValueError("native pane process identity unavailable or mismatched")
         return info
 
-    def _json(self, target, argv, *, allow_failed_receipt=False):
+    def _command(self, target, argv):
         _target(target)
-        command = (
+        return (
             argv
             if target["local"]
             else [
@@ -232,6 +434,72 @@ class PiTransport:
                 REMOTE_EXEC_PREFIX + shlex.join(argv),
             ]
         )
+
+    def _git(self, target, root, *args):
+        argv = ["env"]
+        for name in GIT_ENV_UNSET:
+            argv.extend(["-u", name])
+        argv.extend(["git", "-C", root, *args])
+        return self.runner(self._command(target, argv), capture_output=True, text=True, timeout=45)
+
+    def _package_json(self, target, root, commit):
+        shown = self._git(target, root, "show", commit + ":package.json")
+        if shown.returncode:
+            return None
+        try:
+            value = json.loads(shown.stdout)
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(value, dict):
+            return None
+        return {k: v for k, v in value.items() if k not in PACKAGE_JSON_IGNORED_KEYS}
+
+    def host_code_unchanged(self, target, root, host_commit, revision):
+        """True/False when the staged release can compare Host code; None when it cannot.
+
+        Runs on the target host through the same transport as ``sessions list``. Any
+        failure to compare (missing objects, no ``.git``, git or transport error) is None.
+        """
+        if not SHA.fullmatch(str(host_commit)) or not SHA.fullmatch(str(revision)):
+            return None
+        try:
+            if self._git(target, root, "cat-file", "-e", revision + "^{commit}").returncode:
+                return None
+            if self._git(target, root, "cat-file", "-e", host_commit + "^{commit}").returncode:
+                # Releases are depth-1 clones; the old Host's own staged release, if still
+                # on this machine, supplies its commit without any network access.
+                sibling = root.rsplit("/", 1)[0] + "/" + host_commit
+                if (
+                    self._git(
+                        target,
+                        root,
+                        "fetch",
+                        "--quiet",
+                        "--no-tags",
+                        "--depth=1",
+                        sibling,
+                        host_commit,
+                    ).returncode
+                    or self._git(
+                        target, root, "cat-file", "-e", host_commit + "^{commit}"
+                    ).returncode
+                ):
+                    return None
+            code = self._git(
+                target, root, "diff", "--quiet", host_commit, revision, "--", *HOST_CODE_PATHS
+            ).returncode
+            if code != 0:
+                return {1: False}.get(code)
+            old = self._package_json(target, root, host_commit)
+            new = self._package_json(target, root, revision)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if old is None or new is None:
+            return None
+        return old == new
+
+    def _json(self, target, argv, *, allow_failed_receipt=False):
+        command = self._command(target, argv)
         result = self.runner(command, capture_output=True, text=True, timeout=45)
         try:
             reply = json.loads(result.stdout)
@@ -408,6 +676,36 @@ def _foreground_identity(transport, target, agent, rows):
     }
 
 
+class TransientlyUnreachable(ValueError):
+    """No registration for the session answered, but none reported a terminal failure.
+
+    Pi's `sessions list` waits a bounded time per session, so on a loaded host every live session
+    can miss its reply in the same pass. That says nothing about the session itself, so the
+    rollout keeps the session's previous status instead of blocking it.
+    """
+
+
+class SessionGone(ValueError):
+    """Every registration for the session reports its process exited (`session_process_gone`)."""
+
+
+#: Error the Pi control socket reports when a registration's process no longer exists.
+_PROCESS_GONE = "session_process_gone"
+#: Pause before each in-pass re-list when a session is transiently unreachable. The number of
+#: entries is the number of retries.
+_UNREACHABLE_BACKOFF_SECONDS = (0.5, 1.0)
+
+
+def _unreachable_kind(rows, session_id):
+    """Classify a session with no reachable row: "gone", "transient" or "none" (no rows)."""
+    mine = [r for r in rows if r["descriptor"].get("sessionId") == session_id]
+    if not mine:
+        return "none"
+    if all(r.get("error") == _PROCESS_GONE for r in mine):
+        return "gone"
+    return "transient"
+
+
 def _rows(transport, target, root):
     rows = transport.sessions(target, root)
     if not isinstance(rows, list) or any(
@@ -423,11 +721,32 @@ def _live(rows, session_id, pid=None):
         for r in rows
         if r["descriptor"].get("sessionId") == session_id and r.get("reachable") is True
     ]
+    if not matches:
+        kind = _unreachable_kind(rows, session_id)
+        if kind == "gone":
+            raise SessionGone(f"session {session_id} process exited ({_PROCESS_GONE})")
+        if kind == "transient":
+            errors = sorted(
+                {
+                    str(r.get("error"))
+                    for r in rows
+                    if r["descriptor"].get("sessionId") == session_id
+                }
+            )
+            raise TransientlyUnreachable(
+                f"session {session_id} did not answer the list ({', '.join(errors)[:200]})"
+            )
     if len(matches) != 1:
         raise ValueError("session identity missing or ambiguous")
     row = matches[0]
     descriptor = row["descriptor"]
-    _identifier(descriptor.get("instanceId"))
+    try:
+        _identifier(descriptor.get("instanceId"))
+    except ValueError as exc:
+        raise MissingInstanceIdentity(
+            "session identity missing or ambiguous: registration "
+            f"{session_id} has no instanceId to act on (instanceId={descriptor.get('instanceId')!r})"
+        ) from exc
     if (
         type(descriptor.get("pid")) is not int
         or descriptor["pid"] <= 0
@@ -438,6 +757,19 @@ def _live(rows, session_id, pid=None):
     if reply.get("ok") is not True or not isinstance(reply.get("data"), dict):
         raise ValueError("invalid session status reply")
     return descriptor, reply["data"]
+
+
+def _live_with_retry(transport, target, root, session_id, pid=None, rows=None):
+    """`_live`, re-listing with a short backoff while the session is only transiently unreachable."""
+    attempts = len(_UNREACHABLE_BACKOFF_SECONDS)
+    for attempt in range(attempts + 1):
+        current = rows if attempt == 0 and rows is not None else _rows(transport, target, root)
+        try:
+            return _live(current, session_id, pid)
+        except TransientlyUnreachable:
+            if attempt == attempts:
+                raise
+            time.sleep(_UNREACHABLE_BACKOFF_SECONDS[attempt])
 
 
 def _operation(plan, state, key, action, fields, transport, target, root, save):
@@ -487,10 +819,26 @@ def _operation(plan, state, key, action, fields, transport, target, root, save):
 
 
 def _retryable_skip(receipt):
+    """A skip the next pass can retry instead of an operator-level block.
+
+    The Pi runtime reports not-yet as `status: busy` (runtime_not_ready, mission planning
+    or recovering, custody changed, no local resumable controller - orchestrator.ts /
+    runtimeMaintenance.ts) and the interactive session being busy as the
+    `INTERACTIVE_BUSY` code. Both are time, not attention: retrying with a fresh
+    operation is the only thing that can converge them (#844).
+    """
     result = receipt.get("result") or {}
     return receipt["status"] == "skipped" and (
-        result.get("status") == "busy" or result.get("code") == "STALE_MISSION_FENCE"
+        result.get("status") == "busy"
+        or result.get("code") in ("STALE_MISSION_FENCE", "INTERACTIVE_BUSY")
     )
+
+
+def _update_lock_busy(receipt):
+    """A failed reload that never started because another runtime update held the lock."""
+    result = receipt.get("result") or {}
+    text = str(receipt.get("error") or result.get("error") or "")
+    return receipt["status"] == "failed" and "runtime update already in progress" in text
 
 
 def _archive_operation(state, key):
@@ -508,7 +856,7 @@ def _receipt_reason(receipt):
 
 
 def _session(plan, state, transport, target, root, save):
-    descriptor, data = _live(_rows(transport, target, root), state["sessionId"], state["pid"])
+    descriptor, data = _live_with_retry(transport, target, root, state["sessionId"], state["pid"])
     state["instanceId"] = descriptor["instanceId"]
     runtime = data.get("runtime") or {}
     if not CAPABILITIES.issubset(set(runtime.get("capabilities") or [])):
@@ -545,14 +893,17 @@ def _session(plan, state, transport, target, root, save):
             save,
         )
         if receipt["status"] != "succeeded":
-            if _retryable_skip(receipt):
+            if _retryable_skip(receipt) or _update_lock_busy(receipt):
+                # The install-root update lock is transient; retry with a new operation.
                 _archive_operation(state, "reload")
                 state["status"] = "pending"
             else:
                 state["status"] = "pending" if receipt["status"] == "running" else "blocked"
                 state["error"] = _receipt_reason(receipt)
             return
-        descriptor, data = _live(_rows(transport, target, root), state["sessionId"], state["pid"])
+        descriptor, data = _live_with_retry(
+            transport, target, root, state["sessionId"], state["pid"]
+        )
         state["instanceId"] = descriptor["instanceId"]
         runtime = data.get("runtime") or {}
         missions = data.get("missions")
@@ -561,9 +912,26 @@ def _session(plan, state, transport, target, root, save):
             return
     state["loaded"] = {k: runtime.get(k) for k in ("commit", "hostCommit", "generation")}
     if runtime.get("hostCommit") != plan["revision"]:
-        state["status"] = "bootstrap_required"
-        state["error"] = "Runtime activated, but stable Host still needs the selected release"
-        return
+        # A hot reload never changes hostCommit; unchanged Host code is as good as the commit.
+        if transport.host_code_unchanged(target, root, runtime.get("hostCommit"), plan["revision"]):
+            state["hostAcceptance"] = {
+                "mode": "code-equivalence",
+                "hostCommit": runtime["hostCommit"],
+                "revision": plan["revision"],
+                "paths": list(HOST_CODE_PATHS),
+                "packageJsonIgnoredKeys": list(PACKAGE_JSON_IGNORED_KEYS),
+            }
+        else:
+            state["status"] = "bootstrap_required"
+            state["error"] = "Runtime activated, but stable Host still needs the selected release"
+            # A hot reload never changes hostCommit, so no pass can fix this: record the
+            # operator-facing step in durable state, not just the report (#844).
+            state["nextStep"] = (
+                f"restart the stable Pi Host on {target['host']} so it loads release "
+                f"{plan['revision']} (e.g. `herdr` restart / new terminal on that host), "
+                "then resume this rollout"
+            )
+            return
     if not isinstance(missions, list) or any(not isinstance(m, dict) for m in missions):
         raise ValueError("missing owned mission inventory after activation")
     outcomes = state.setdefault("missions", {})
@@ -672,11 +1040,31 @@ def _session(plan, state, transport, target, root, save):
         )
 
 
+def _note_unreachable(state, note):
+    state["lastUnreachableAt"] = datetime.now(UTC).isoformat()
+    state["note"] = note[:500]
+
+
+def _mark_ended(state, note):
+    """The process exited: terminal and non-failing, but never a success."""
+    state.pop("error", None)
+    if state.get("status") == "ended":
+        # Later passes keep the status it exited from and when it exited.
+        state["note"] = note[:500]
+        return
+    state["lastStatus"] = state.get("status")
+    state.update(status="ended", endedAt=datetime.now(UTC).isoformat(), note=note[:500])
+
+
 def apply_rollout(store, rollout_id, *, transport=None, stage=None):
     transport = transport or PiTransport()
     stage = stage or fleet.stage_pi_runtime
     with store.lock():
         plan = store.read(rollout_id)
+        if plan.get("status") == "abandoned":
+            # Abandon is the operator's settle decision; acting anyway would reopen the
+            # rollout without the selector ever seeing it (#844).
+            raise ValueError("rollout is abandoned; plan a fresh one for the pinned revision")
 
         def save():
             store.write(plan)
@@ -684,6 +1072,7 @@ def apply_rollout(store, rollout_id, *, transport=None, stage=None):
         for host, host_state in plan["hosts"].items():
             target = host_state["target"]
             host_state.pop("error", None)
+            host_state.pop("hostLevelError", None)
             try:
                 if not host_state.get("sourceRoot"):
                     if inventory_targets(Path(plan["inventory"]), host) != [target]:
@@ -746,47 +1135,168 @@ def apply_rollout(store, rollout_id, *, transport=None, stage=None):
                     raise ValueError("ambiguous native conversation identity")
                 if not agents:
                     raise ValueError("no native Pi sessions; expected coverage unverified")
-                if set(host_state["sessions"]) - set(identities):
+                # A retired husk is expected to leave the native inventory; its absence is the
+                # settled end state, not a fresh blocker no later pass could ever clear (#798 review).
+                # An ended session (process exited) is likewise settled.
+                settled_ids = {
+                    session_id
+                    for session_id, state in host_state["sessions"].items()
+                    if state.get("status") in ("retired", "ended")
+                }
+                missing_ids = sorted(set(host_state["sessions"]) - set(identities) - settled_ids)
+                lost = False
+                for session_id in missing_ids:
+                    state = host_state["sessions"][session_id]
+                    if any(
+                        r.get("reachable") is True
+                        and r["descriptor"].get("sessionId") == session_id
+                        for r in rows
+                    ):
+                        lost = True
+                    elif _unreachable_kind(rows, session_id) == "transient":
+                        _note_unreachable(state, f"session {session_id} did not answer the list")
+                    else:
+                        _mark_ended(state, "gone from the native inventory and the session list")
+                if lost:
                     coverage_errors.append(
                         {"error": "previously discovered session is missing from native inventory"}
                     )
                 session_errors = [error["error"] for error in coverage_errors]
+                # Host-level reasons (coverage, ambiguity, a missing session) are recorded apart from
+                # per-session ones, so settling a session can never be mistaken for settling them.
+                host_level_errors = list(session_errors)
                 for agent, session_id, identity_proof in identified:
                     state = host_state["sessions"].setdefault(
                         session_id,
                         {"sessionId": session_id, "native": agent, "status": "discovered"},
                     )
-                    state.pop("error", None)
+                    previous_error = state.get("error")
+                    if state.get("status") != "retired":
+                        # A retired session keeps the refusal that justified retiring it.
+                        state.pop("error", None)
+                        state.pop("blockReason", None)
+                        state.pop("note", None)
                     if identity_proof is not None:
                         state["identityProof"] = identity_proof
                     try:
-                        descriptor, _ = _live(rows, session_id)
-                        if "pid" not in state:
+                        descriptor, _ = _live_with_retry(
+                            transport, target, root, session_id, rows=rows
+                        )
+                        if state.get("status") == "ended":
+                            # The conversation answers again, possibly in a new process on an
+                            # old runtime. Nothing per-process carries over (receipts, prepared,
+                            # loaded, missions, hostAcceptance); only the history does.
+                            history = [
+                                *state.get("previousIncarnations", []),
+                                {
+                                    key: state.get(key)
+                                    for key in ("pid", "instanceId", "endedAt", "lastStatus")
+                                },
+                            ]
+                            keep = ("sessionId", "native", "identityProof")
+                            for key in [k for k in state if k not in keep]:
+                                del state[key]
+                            state.update(
+                                status="discovered",
+                                pid=descriptor["pid"],
+                                instanceId=descriptor["instanceId"],
+                                previousIncarnations=history,
+                            )
+                        if "pid" not in state or state.get("status") == "retired":
+                            # `_live` only returns a descriptor with a real identity, so for a
+                            # retired husk these replace the stale values.
                             state.update(pid=descriptor["pid"], instanceId=descriptor["instanceId"])
+                        if state.get("status") == "retired":
+                            state.pop("error", None)
+                            state.pop("blockReason", None)
+                            # The identity resolved after the operator retired the registration,
+                            # so the retirement was wrong: pick the session back up and say so.
+                            state["unretiredAt"] = datetime.now(UTC).isoformat()
+                            state["status"] = "discovered"
+                            host_state["retiredSessions"] = [
+                                entry
+                                for entry in host_state.get("retiredSessions", [])
+                                if entry.get("sessionId") != session_id
+                            ]
                         save()
                         _session(plan, state, transport, target, root, save)
                     except (ConnectionError, OSError, subprocess.SubprocessError) as exc:
+                        state.pop("blockReason", None)
                         state.update(status="pending", error=str(exc)[:500])
+                    except SessionGone as exc:
+                        state.pop("blockReason", None)
+                        _mark_ended(state, str(exc))
+                    except TransientlyUnreachable as exc:
+                        # Never block on a missed reply: keep the previous status and error.
+                        if previous_error is not None and state.get("status") != "retired":
+                            state["error"] = previous_error
+                        if state.get("status") == "discovered":
+                            state["status"] = "pending"
+                        _note_unreachable(state, str(exc))
+                    except MissingInstanceIdentity as exc:
+                        # A retired registration stays retired and stays out of the blocking set:
+                        # the operator settled it, and the evidence stays in the report.
+                        if state.get("status") == "retired":
+                            coverage_errors.append(
+                                {
+                                    "error": f"retired identity-less registration {session_id} "
+                                    "is still present and still has no instance identity"
+                                }
+                            )
+                        else:
+                            state.update(
+                                status="blocked",
+                                error=str(exc)[:500],
+                                blockReason=_BLOCK_IDENTITY_MISSING,
+                            )
+                            session_errors.append(str(exc)[:500])
                     except (ValueError, TypeError, KeyError) as exc:
+                        # Any other block replaces the reason too: a stale identity_missing here
+                        # would let retire_identityless settle a real disagreement as a husk.
+                        state.pop("blockReason", None)
                         state.update(status="blocked", error=str(exc)[:500])
                         session_errors.append(str(exc)[:500])
                     finally:
                         save()
+                host_state["retiredSessions"] = [
+                    {
+                        "sessionId": s.get("sessionId"),
+                        "pid": s.get("pid"),
+                        "terminalId": (s.get("native") or {}).get("terminal_id"),
+                        "error": s.get("error"),
+                        "retiredAt": s.get("retiredAt"),
+                        "settledBy": s.get("settledBy"),
+                    }
+                    for s in host_state["sessions"].values()
+                    if s.get("status") == "retired"
+                ]
                 host_state["status"] = (
                     "blocked"
                     if session_errors
                     or any(s["status"] == "blocked" for s in host_state["sessions"].values())
                     else "complete"
                     if host_state["sessions"]
-                    and all(s["status"] == "complete" for s in host_state["sessions"].values())
+                    and all(
+                        s["status"] in ("complete", "retired", "ended")
+                        for s in host_state["sessions"].values()
+                    )
                     else "pending"
                 )
+                host_state["endedSessions"] = sorted(
+                    sid for sid, s in host_state["sessions"].items() if s.get("status") == "ended"
+                )
+                if host_level_errors:
+                    host_state["hostLevelError"] = "; ".join(host_level_errors)[:1000]
+                else:
+                    host_state.pop("hostLevelError", None)
                 if session_errors:
                     host_state["error"] = "; ".join(session_errors)[:1000]
             except (ConnectionError, OSError, subprocess.SubprocessError) as exc:
                 host_state.update(status="pending", error=str(exc)[:500])
             except (ValueError, TypeError, KeyError) as exc:
-                host_state.update(status="blocked", error=str(exc)[:500])
+                host_state.update(
+                    status="blocked", error=str(exc)[:500], hostLevelError=str(exc)[:500]
+                )
             finally:
                 save()
         plan["status"] = (
@@ -796,6 +1306,118 @@ def apply_rollout(store, rollout_id, *, transport=None, stage=None):
         )
         save()
         return plan
+
+
+# The typed refusal names this marker; it is what makes a blocked session settle-able, so the
+# settlement and the refusal must agree on the text rather than each carrying its own copy.
+_IDENTITY_MISSING_MARKER = "no instanceId to act on"
+# Typed reason recorded on the session when the identity refusal is raised, so settling does not
+# depend on a message surviving truncation or being joined into a longer string.
+_BLOCK_IDENTITY_MISSING = "identity_missing"
+
+
+def retire_identityless(store, rollout_id, *, settled_by="operator"):
+    """Settle registrations a rollout can never act on, keeping the evidence in the report (#779).
+
+    A session whose registration carries no instance identity blocks its host permanently:
+    no pass can manufacture an identity for it, and `--max-passes` only repeats the same
+    refusal. Refusing to act is correct; being un-recoverable by design is not, so this is the
+    supported way for an operator to say "that registration is dead, stop waiting on it".
+
+    Only sessions blocked on a *missing* identity are retired. An ambiguous or conflicting one
+    stays blocked -- that is a real disagreement, not a stale husk. A retired session is picked
+    back up automatically by the next pass if its identity ever resolves.
+
+    A settled rollout is settled: like apply and run, retiring refuses an abandoned plan
+    rather than silently reopening it and handing it back to the nightly driver.
+    """
+    with store.lock():
+        plan = store.read(rollout_id)
+        if plan.get("status") == "abandoned":
+            raise ValueError("an abandoned rollout is settled; it cannot be retired")
+        retired, still_blocked = [], []
+        for host, host_state in (plan.get("hosts") or {}).items():
+            sessions = host_state.get("sessions") or {}
+            for session_id, state in sessions.items():
+                error = str(state.get("error") or "")
+                # Only the typed refusal is settle-able. A plain "identity missing or ambiguous"
+                # may be a genuine disagreement between two live registrations, which is never a
+                # stale husk and must stay blocked.
+                # Plans written before blockReason existed fall back to the refusal text.
+                identity_missing = (
+                    state.get("blockReason") == _BLOCK_IDENTITY_MISSING
+                    or _IDENTITY_MISSING_MARKER in error
+                )
+                if state.get("status") != "blocked" or not identity_missing:
+                    if state.get("status") == "blocked":
+                        still_blocked.append(f"{host}/{session_id}")
+                    continue
+                state["status"] = "retired"
+                state["retiredAt"] = datetime.now(UTC).isoformat()
+                state["settledBy"] = settled_by
+                retired.append(
+                    {
+                        "host": host,
+                        "sessionId": session_id,
+                        "pid": state.get("pid"),
+                        "terminalId": (state.get("native") or {}).get("terminal_id"),
+                        "error": error[:500],
+                        "retiredAt": state["retiredAt"],
+                    }
+                )
+            blocking = [s for s in sessions.values() if s.get("status") == "blocked"]
+            host_state["retiredSessions"] = [
+                {
+                    "sessionId": s.get("sessionId"),
+                    "pid": s.get("pid"),
+                    "terminalId": (s.get("native") or {}).get("terminal_id"),
+                    "error": s.get("error"),
+                    "retiredAt": s.get("retiredAt"),
+                    "settledBy": s.get("settledBy"),
+                }
+                for s in sessions.values()
+                if s.get("status") == "retired"
+            ]
+            # Only hosts this command actually settled something on are recomputed. Their
+            # host-level reasons (unverified native coverage, ambiguous native identity, a
+            # missing discovered session) were recorded separately by apply_rollout and are never
+            # this command's to clear (#798 review).
+            if any(entry["host"] == host for entry in retired):
+                host_level = str(host_state.get("hostLevelError") or "")
+                if host_level:
+                    host_state["error"] = host_level
+                else:
+                    host_state.pop("error", None)
+                host_state["status"] = (
+                    "blocked"
+                    if blocking or host_level
+                    else "complete"
+                    if sessions
+                    and all(
+                        s.get("status") in ("complete", "retired", "ended")
+                        for s in sessions.values()
+                    )
+                    else "pending"
+                )
+        plan["status"] = (
+            "complete"
+            if plan.get("hosts")
+            and all(h.get("status") == "complete" for h in plan["hosts"].values())
+            else "pending"
+        )
+        store.write(plan)
+        return {
+            "ok": True,
+            "rolloutId": rollout_id,
+            "retired": retired,
+            "stillBlocked": still_blocked,
+            "blockedHosts": [
+                h for h, hs in (plan.get("hosts") or {}).items() if hs.get("status") == "blocked"
+            ],
+            "status": plan["status"],
+            "note": "retired sessions are recorded in each host's retiredSessions and are "
+            "picked back up if their identity resolves",
+        }
 
 
 def _offline_failure(state):
@@ -830,6 +1452,10 @@ def _automatic_blocker(plan):
         if host_state.get("error") and not _offline_failure(host_state):
             return f"{host}: {host_state['error']}"
         for session_id, session in host_state["sessions"].items():
+            if session["status"] in ("retired", "ended"):
+                # Settled (by the operator, or the process exited): terminal for the runner,
+                # evidence kept in the report.
+                continue
             if session["status"] not in ("complete", "pending", "awaiting_progress", "discovered"):
                 return f"{host}/{session_id}: {session['status']}: {session.get('error', 'operator attention required')}"
             if session.get("error") and not _offline_failure(session):
@@ -871,7 +1497,7 @@ def _online_stall_budget(plan, previous, limit):
             continue
         for session_id, session in host_state["sessions"].items():
             key = host + "/" + session_id
-            if session["status"] == "complete":
+            if session["status"] in ("complete", "retired", "ended"):
                 budgets.pop(key, None)
                 continue
             if _offline_failure(session):
@@ -938,6 +1564,8 @@ def run_rollout(
 
     with store.lock(runner_id=rollout_id):
         plan = store.read(rollout_id)
+        if plan.get("status") == "abandoned":
+            raise ValueError("rollout is abandoned; plan a fresh one for the pinned revision")
         passes = 0
         try:
             previous = plan.get("runner", {})

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import errno
 import hashlib
 import http.client
 import json
@@ -20,8 +21,10 @@ import urllib.parse
 import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
+from typing import NamedTuple
 
 from .ci_report_upload import MAX_RESPONSE_BYTES, REQUEST_TIMEOUT, _endpoint, _NoRedirect
+from .control_plane.ci_monitor import REMOVED_RUN_ERRORS
 from .control_plane.ci_reports import MAX_XML_BYTES, parse_junit
 
 MAX_BUNDLE_BYTES = 2 * 1024 * 1024
@@ -43,7 +46,7 @@ root, known, batch = config['root'], config['known'], config['batch']
 pattern = re.compile(r'[1-9][0-9]{0,15}-[0-9a-f]{40}-hive-slurm\.json\Z')
 root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
 try:
-    entries, failures = [], 0
+    entries, failures, errors = [], 0, []
     with os.scandir(root_fd) as iterator:
         for index, entry in enumerate(iterator):
             if index >= 20000:
@@ -85,7 +88,9 @@ try:
         except OSError as exc:
             if exc.errno not in (errno.ENOENT, errno.ELOOP):
                 failures += 1
-    print(json.dumps({'files': results, 'read_failures': failures, 'cursor': cursor}, separators=(',', ':')))
+                errors.append([name, errno.errorcode.get(exc.errno, 'OSError')])
+    print(json.dumps({'files': results, 'read_failures': failures, 'read_errors': errors[:10],
+                      'cursor': cursor}, separators=(',', ':')))
 finally:
     os.close(root_fd)
 '''
@@ -169,11 +174,12 @@ def _run_reader(command, payload):
                         output.extend(chunk)
                         if len(output) > MAX_REMOTE_BYTES:
                             raise ValueError('Source response exceeds the batch limit')
-        if process.wait(timeout=max(0.1, deadline - time.monotonic())):
-            raise ValueError('Cannot read the configured source')
+        status = process.wait(timeout=max(0.1, deadline - time.monotonic()))
+        if status:
+            raise ValueError(f'Cannot read the configured source (reader exited with status {status})')
         return bytes(output)
-    except (OSError, subprocess.SubprocessError):
-        raise ValueError('Cannot read the configured source') from None
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValueError(f'Cannot read the configured source ({type(exc).__name__})') from None
     finally:
         if process.poll() is None:
             process.kill()
@@ -222,6 +228,55 @@ def read_source(source_dir, checkpoints, *, batch_size=MAX_BATCH, host=None, cur
         return result if with_status else files
     except (KeyError, TypeError, ValueError):
         raise ValueError('Source returned an invalid bounded bundle batch') from None
+
+
+class Outcomes(NamedTuple):
+    published: int
+    failed: int
+    skipped: int
+
+
+    def summary_line(self):
+        # Free of filenames, URLs and credentials; per-item reasons go to stderr.
+        return f'CI report relay: {self.published} published, {self.failed} failed, {self.skipped} skipped'
+
+    def exit_status(self):
+        return 1 if self.failed else 0  # skips are permanent decisions, never a failure
+
+
+class ProviderRunRemoved(Exception):
+    """The provider reports the run no longer exists: a permanent skip, never a failure or a publish."""
+
+
+SKIP_REASON = 'provider_run_removed'
+
+
+def describe_error(exc):
+    """Failure reason for logs: our own bounded ValueError messages, or the OSError type and errno."""
+    if isinstance(exc, OSError):
+        return f'{type(exc).__name__} ({errno.errorcode.get(exc.errno, exc.errno)})'
+    return str(exc)
+
+
+def log_failure(subject, reason):
+    # Only the bundle basename (fixed pattern) and a sanitized reason: never URLs, keys or contents.
+    print(f'CI report relay: failed {subject}: {reason}', file=sys.stderr, flush=True)
+
+
+def log_skip(subject):
+    print(f'CI report relay: skipped {subject}: provider run removed', file=sys.stderr, flush=True)
+
+
+def _read_errors(batch):
+    # Diagnostic-only field from the reader: tolerate any malformed shape (non-list, None or
+    # non-pair rows) by dropping what does not conform, never by raising out of the service loop.
+    rows = batch.get('read_errors', [])
+    if not isinstance(rows, list):
+        return []
+    return [(row[0], row[1]) for row in rows
+            if isinstance(row, (list, tuple)) and len(row) == 2
+            and isinstance(row[0], str) and BASENAME.fullmatch(row[0])
+            and isinstance(row[1], str) and re.fullmatch('[A-Za-z0-9_]{1,32}', row[1])]
 
 
 def _write_private(path, raw):
@@ -279,7 +334,9 @@ class Relay:
                 if (not BASENAME.fullmatch(name) or not isinstance(row, dict)
                         or not re.fullmatch('[0-9a-f]{64}', row.get('sha256', ''))
                         or type(row.get('size')) is not int or not 0 <= row['size'] <= MAX_BUNDLE_BYTES
-                        or type(row.get('mtime_ns')) is not int or row['mtime_ns'] < 0):
+                        or type(row.get('mtime_ns')) is not int or row['mtime_ns'] < 0
+                        or row.get('state', 'published') not in ('published', 'skipped')
+                        or row.get('state') == 'skipped' and row.get('reason') != SKIP_REASON):
                     raise ValueError()
             self.checkpoints = reports
         except (KeyError, TypeError, ValueError):
@@ -309,10 +366,12 @@ class Relay:
         except (json.JSONDecodeError, UnicodeDecodeError):
             raise ValueError('Control-plane response is invalid JSON') from None
 
-    def _checkpoint(self, name, digest, size, modified):
+    def _checkpoint(self, name, digest, size, modified, *, skipped=False):
         updated = {key: value for key, value in self.checkpoints.items() if key != name}
-        updated[name] = dict(sha256=digest, size=size, mtime_ns=modified,
-                             acknowledged_at=datetime.now(UTC).isoformat())
+        now = datetime.now(UTC).isoformat()
+        updated[name] = (dict(sha256=digest, size=size, mtime_ns=modified, state='skipped',
+                              reason=SKIP_REASON, skipped_at=now) if skipped else
+                         dict(sha256=digest, size=size, mtime_ns=modified, acknowledged_at=now))
         updated = dict(list(updated.items())[-MAX_CHECKPOINTS:])
         raw = json.dumps({'version': 1, 'reports': updated}).encode()
         if len(raw) > MAX_STATE_BYTES:
@@ -342,16 +401,22 @@ class Relay:
     def process_source(self, source_dir, *, host=None):
         batch = read_source(source_dir, self.checkpoints, host=host,
                             cursor=self._scan_cursor(), with_status=True)
-        published, failed = 0, batch['read_failures']
+        published, failed, skipped = 0, batch['read_failures'], 0
+        for name, code in _read_errors(batch):
+            log_failure(name, f'source file unreadable ({code})')
         for row in batch['files']:
             try:
                 published += self.consume(row['name'], row['content'], mtime_ns=row['mtime_ns'])
-            except (ValueError, OSError):
+            except ProviderRunRemoved:
+                skipped += 1
+                log_skip(row['name'])
+            except (ValueError, OSError) as exc:
                 failed += 1
+                log_failure(row['name'], describe_error(exc))
         # This cursor records scan position only, never successful delivery.
         _write_private(self.state_dir / 'scan-cursor.json', json.dumps(
             {'version': 1, 'after': batch['cursor']}).encode())
-        return published, failed
+        return Outcomes(published, failed, skipped)
 
     def consume(self, name, raw, *, mtime_ns=0):
         value = validate_bundle(name, raw)
@@ -359,10 +424,17 @@ class Relay:
         previous = self.checkpoints.get(name, {})
         if previous.get('sha256') == digest:
             if previous.get('mtime_ns') != mtime_ns:
-                self._checkpoint(name, digest, len(raw), mtime_ns)
+                # Keep a skipped row skipped: an mtime-only change must not record a delivery.
+                self._checkpoint(name, digest, len(raw), mtime_ns,
+                                 skipped=previous.get('state') == 'skipped')
             return False
         query = urllib.parse.urlencode({'repository': 116, 'number': value['run_number']})
         observed = self._request(self.endpoint.removesuffix('/reports') + '/pipeline?' + query)
+        if observed.get('available') is False and observed.get('error') in REMOVED_RUN_ERRORS:
+            # Only the provider's explicit "run removed" answers: HTTP, auth, timeout and malformed
+            # responses raise above or fall through to the identity check and stay failures.
+            self._checkpoint(name, digest, len(raw), mtime_ns, skipped=True)
+            raise ProviderRunRemoved(name)
         pipeline = observed.get('pipeline')
         if (observed.get('available') is not True or not isinstance(pipeline, dict)
                 or pipeline.get('number') != value['run_number']
@@ -391,17 +463,19 @@ def main(argv=None):
     parser.add_argument('--once', action='store_true')
     args = parser.parse_args(argv)
     while True:
-        published, failed = 0, 0
+        outcomes = Outcomes(0, 0, 0)
         try:
             relay = Relay(args.control_plane, args.state_dir,
                           key=os.environ.get('HERDR_ENGINEERING_API_KEY', ''), allow_open=args.allow_open)
-            published, failed = relay.process_source(args.source_dir, host=args.source_host)
-        except (ValueError, OSError):
-            failed += 1
-        # No filenames, URLs, credentials, source contents or server responses.
-        print(f'CI report relay: {published} published, {failed} failed', flush=True)
+            outcomes = relay.process_source(args.source_dir, host=args.source_host)
+        except (ValueError, OSError) as exc:
+            outcomes = Outcomes(outcomes.published, outcomes.failed + 1, outcomes.skipped)
+            log_failure('run', describe_error(exc))
+        # The counts line stays free of filenames, URLs and credentials; per-item
+        # reasons go to stderr above so a non-zero count is never unexplained.
+        print(outcomes.summary_line(), flush=True)
         if args.once:
-            return 1 if failed else 0
+            return outcomes.exit_status()
         time.sleep(120)
 
 

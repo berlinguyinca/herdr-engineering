@@ -1,6 +1,8 @@
 # ci-review: the `Independent AI review` status
 
-The repository ruleset requires a commit status named exactly `Independent AI review`. `ai-review.py` posts it.
+> As of 2026-11-13 the required status is `Opus agent review`, posted by `always-on-review.py`, run by the `herdr-always-on-review` systemd user timer (the only path; the status token is a 0600 host file); this script's status is advisory. See `docs/operations/independent-ai-review.md`.
+
+The repository ruleset used to require a commit status named exactly `Independent AI review`. `ai-review.py` posts it.
 Before this script, the operator posted it by hand. Operator guide: `docs/operations/independent-ai-review.md`.
 
 ```
@@ -58,8 +60,12 @@ is refused, and nothing from models.json is run.
   reasoning tokens keep a slow answer alive. Only `content` deltas count as the answer; `reasoning_content` is
   ignored.
 - `finish_reason=length` or an empty answer is retried once, then the chunk fails.
-- 429, 5xx and connection errors are retried 4 times, with a backoff of 5 s doubling each time. A `Retry-After`
+- 5xx and connection errors are retried 4 times, with a backoff of 5 s doubling each time. A `Retry-After`
   header wins, capped at 60 s.
+- 429 means the model's single slot is taken (deepseek and qwen serve one request at a time; another review may
+  hold the slot for minutes). It is waited out separately, for up to `reviewer.busy_wait_s` (default 1800 s) in
+  total, and does not use up `retries`. If the gateway stays busy past that, the run fails and posts no terminal
+  status; `poll` retries the head once its pending status goes stale.
 - The answer's `model` field must also be of an independent family. The status names that id.
 - Chunks run one at a time (`reviewer.parallel: 1`), because the gateway is shared.
 
@@ -127,7 +133,138 @@ another run is working or a run crashed recently. Every other head is reviewed, 
 PR's failure does not stop the others, and the exit code is 1 if any PR failed. Each PR has its own `flock`, and
 so does `poll`, so overlapping timer runs never review the same PR twice.
 
-Exit codes: 0 the review completed; 1 the review failed; 2 refused; 3 the head moved; 4 another run holds the PR.
+Exit codes: 0 the review completed; 1 the review failed; 2 refused; 3 the head moved; 4 nothing to do (another run holds the PR or the host-wide review slot, draft, cooldown, budget). `review --host-lock-wait N` waits up to N seconds for the host slot shared with the Woodpecker pipeline and fails (1) if it runs out; `poll` never waits and skips the PR. A parent-death watchdog kills an orphaned reviewer, and each review first removes stale worktrees and `refs/herdr-review/*`.
+
+## Always-on review (two tiers, pluggable backends)
+
+`always-on-review.py` extends this reviewer with two tiers and a choice of backend per tier. It reuses this file's
+diff parsing, chunking, strict verdict schema, finding validation, stale-pending retry and "the script, not the model,
+decides the state" rule. `ai-review.py` itself keeps working unchanged (the gateway backend is the same call).
+
+| Tier | Default context | Backend (config) | When it runs | Required? |
+|---|---|---|---|---|
+| tier1 | `Open-weight pre-review` | `pi` with an open-weight alias | every non-draft head | no, advisory |
+| tier2 | `Opus agent review` | `claude` with `opus` | every non-draft head, without waiting for checks; with `gates.wait_for_green: true`, only when every `gates.required` name is success on that exact SHA and every existing `gates.when_present` check is success | yes, once the ruleset is changed by the operator |
+
+Backends (`tiers.<t>.backend`, settings under `backends.<name>`):
+
+- `gateway`: the OpenAI-compatible call, chunked as in ai-review.
+- `claude`: `claude -p --model <model>` in a fresh detached worktree of the PR head. Tools are exactly `Read`,
+  `Grep` and `Glob`: no Bash and no git allow rules (a `git diff:*` rule is not read-only, since
+  `--output=<path>` writes a file). The diff (cut at `diff_bytes`) and the commit log are in the prompt; the worktree
+  is there for reading the code around the change. `--permission-mode dontAsk`, `--setting-sources ""` (measured: with
+  `--setting-sources user` a permissive user rule let `Read` leave the worktree; with `""` it is denied and a logged-in
+  CLI still works), no MCP, no slash commands, no session persistence, strict `--json-schema` verdict, hard time cap.
+  The prompt text and the worktree are untrusted input; for host-level isolation set `backends.claude.wrapper` to a
+  sandbox prefix such as `bwrap` (optional, not installed or required by this script).
+- `pi`: `pi -p --model <provider/alias>` with `--tools read,grep,find,ls`, no extensions, skills, MCP, context files
+  or session, `--offline`. pi has no JSON-schema flag, so the diff is in the prompt and the answer is parsed strictly
+  from stdout. pi has no file sandbox and can read any file the user can, so its answer is not trusted to be free of
+  secrets: the pi provider key and the `gh auth token` value are added to the redaction set (best effort, exact
+  strings only: other secrets are NOT covered), and a tier that uses pi with `comment: true` is refused unless
+  `backends.pi.wrapper` is set (for example a `bwrap` prefix). Statuses and `reviews.jsonl` are redacted the same way.
+
+### Review prompt v2, passes, evidence and replay
+
+- `prompt.project_rules` (list of strings) and `prompt.checklist_file` (`review-checklist.yaml`: categories code, security, tests, docs, performance, migrations; each item an `id` and a one-line `question`; unknown keys refused) go into both tiers' system prompt. The reviewer names the ids it considered in `checked_items`.
+- Evidence rule: a blocking finding carries `evidence` (text quoted from the diff or the file) and `how_it_fails`. The script, not the model, downgrades it to a note when `how_it_fails` is empty or the evidence is not a meaningful quote: at least 20 normalised characters, or (shorter) a whole line of at least 12 characters (a trivial line such as `except Exception as e:`, `from __future__ import annotations` or `raise NotImplementedError()` is never evidence, of any length), found in the added, context or removed lines of the cited file's hunks (for a deleted file, its removed lines), or in that file at the pinned head. Diff `+`/`-` markers on the quote and an `a/`, `b/` or `./` prefix on the path are ignored; a quote from another file's hunk does not count. A blocker citing a file that is not in the PR is not downgraded: it is dropped (`N finding dropped`), and a `block` verdict whose only blockers were dropped does not count as unverified. The downgrade count goes into the status description (`N downgraded`) and the failure comment. If the model said `block` and every blocker was downgraded, tier 2 does NOT post success: it stays pending (logged as `unverified` with the findings), while tier 1 (advisory) posts success noting `N unverified blockers downgraded`. Disable with `prompt.require_evidence: false`.
+- `tiers.tier2.passes: [{name, focus}]`: one claude run per pass, in order, focus appended to the prompt; findings are merged (deduped by file, line, category and the start of the reason; the one with evidence or higher severity is kept) and any surviving blocker blocks. The time cap is shared: one `time_cap_s` covers all passes, each pass may use an equal share of the time left (unused time passes on). If a pass fails or times out after another completed, the completed passes' findings are kept and logged with `partial` set: a surviving blocker still posts failure, otherwise the status stays pending, never success. Size `time_cap_s` for all passes together (the example uses 3600 for four). The one-review lock covers the whole review. `passes: []` or one pass behaves like a single review.
+- `tiers.<tier>.daily_budget_usd` (optional positive number, default unset = no limit): before a review the poller sums that tier's `usage.cost_usd` in `state_dir/reviews.jsonl` since 00:00 UTC; at or over the budget the review is skipped (one `daily budget exhausted` log line, status unchanged, `--force` does not bypass it). Finished reviews are unaffected.
+- `reviews.jsonl`: each completed review line has `downgraded`, `passes` (name, duration_s, cost_usd, turns when the backend reports them), `checked_items`, and `findings`: up to 20 of `file, line, severity, category, why, evidence, how_it_fails`, each text field cut at 600 chars and passed through `redact()`.
+- Replay: `always-on-review.py replay --corpus DIR --tier tier1|tier2 --config YAML [--limit N] [--out FILE]` checks out each case's head in a detached worktree, runs the tier read-only and posts nothing (no gh client is built; posting functions refuse inside replay). The corpus is one JSON per case: `{repo, pr, head_sha, base_sha?, source: opus|human|revert|follow-up-fix, notes, ground_truth: [{id, file, line|null, category, summary, severity, confirmed?}], known_false_claims?}`. Scoring: FOUND (same file and line within 10, or two shared keywords), PARTIAL (file only), MISSED; a blocking finding matching no ground truth is FALSE_BLOCKER_CANDIDATE (unconfirmed), one matching a known false claim is FALSE_BLOCKER. The report gives per-case and aggregate recall, false-blocker rate, per-category recall, cost and duration. `replay compare a.json b.json` compares two runs.
+- Intended corpus: thousands of PRs across the org's repos. Replay is resumable (cases already scored in `--out` are skipped; failed and skipped ones are retried, and a case whose head or ground truth changed is scored again) and runs one case at a time (a lock refuses a second replay). `corpus build --repo OWNER/NAME --since YYYY-MM-DD --out DIR` derives cases from merged PRs with read-only `gh` calls (reverts, follow-up fixes, review comments). Only thread-root comments by humans, or by logins listed in `replay.reviewers` (pass `--config`), and not by the PR author, count; the case is pinned to the commit most comments were made on (`original_commit_id`) and only those comments keep their line; its ground truth is `confirmed: false` and is not scored until confirmed.
+
+### One command, every repo
+
+`review --repo OWNER/NAME` works for any repository the `gh` login can read. The worktree comes from the clone that
+belongs to that repo: a `clones: [{repo, path}]` entry, else `clone:` if its `origin` is that repo (or is not a
+github.com URL, as before), else a bare clone the script creates itself under `state_dir/clones/OWNER__NAME.git` from
+`clone_url` (default `https://github.com/{repo}.git`, using the `gh auth git-credential` helper). Locks, state, cooldowns
+and `reviews.jsonl` are keyed by `OWNER/NAME#N`. Enrollment (`repos:`, the backfill cutoff) only matters to `poll`; a
+`review` of a named PR needs none.
+
+### Choosing a pi model or alias
+
+pi "aliases" are the gateway aliases listed as model entries under a provider in `~/.pi/agent/models.json` (for
+example provider `metabolomics`, ids `qwen3.8-27b`, `qwen3.8-flash`, ...). There is no separate alias file. List them
+with `pi --list-models [search]`, then set `tiers.tier1.model: metabolomics/<alias>` (optionally `:<thinking>`).
+`PI_CODING_AGENT_DIR` is not used; the default `~/.pi/agent` applies.
+
+### Dry-run is the default; two keys to post
+
+Nothing is posted unless the config has `post: true` AND the command has `--post`. Without both, reviewers still run
+and `state_dir/reviews.jsonl` gets one line per review, but no status or comment is written to GitHub.
+
+```
+always-on-review.py show-command --tier tier2 --config CFG     # print the exact reviewer command line
+always-on-review.py review --tier tier1 --repo O/R --pr N --config CFG           # dry run
+always-on-review.py poll --config CFG                                            # dry run of the whole loop
+always-on-review.py poll --config CFG --post                                     # posts only if CFG has post: true
+```
+
+### Codex second reviewer on risky paths
+
+Opus reviewing Claude-authored PRs drops the different-family rule of `Independent AI review`. For PRs that touch a
+path matching `risky.globs` (YAML; default `[]` = off; the example config lists `deploy/**`, `**/migrations/**`,
+`**/*.sql`, `**/*security*/**`, `**/*auth*`, `**/secrets*`), `Opus agent review` is posted `success` only when a
+Codex review of the same head is also clean:
+
+- Opus runs first. A block, or an incomplete or unverified Opus review, decides as before and Codex is not called.
+  Otherwise `codex exec` reviews the same detached worktree (`--sandbox read-only --ephemeral --ignore-user-config
+  --ignore-rules`, strict `--output-schema`, scrubbed environment, time cap, same prompt, evidence rule and verdict
+  parser). The two verdicts are merged and the script decides the state: any surviving blocking finding from either
+  posts `failure` (with the usual marked comment); both approving posts `success`.
+- If Codex cannot produce a verified verdict (not installed or not logged in, time cap, non-zero exit, malformed
+  answer or wrong `head_sha`, a block whose blockers fail the evidence rule, or a daily budget that cannot be
+  counted) the status stays `pending`: never `success`, and it counts toward the failure cooldown. A clean Opus
+  approve is remembered in `state.json` for that exact head, base and tier model, so the retry runs Codex only (same
+  cooldown and budget rules); a new head, a changed model or `--force` runs Opus again.
+- Non-risky PRs and tier 1 never call Codex. A head that moved posts nothing. Dry-run is unchanged (Codex runs, nothing
+  is posted; posting needs `post: true` and `--post`).
+- Cost: `risky.codex.daily_budget_usd` (optional) is summed from `reviews.jsonl` lines with `tier: codex`, since
+  00:00 UTC. Codex reports tokens only, so the cost is `input_usd_per_mtok` and `output_usd_per_mtok` (both required
+  with a budget) times the tokens. At or over the budget a risky PR is skipped before Opus runs, status unchanged.
+  A Codex run that fails or times out after reporting tokens is logged (`tier: codex`, `state: not-run`) with its
+  cost and counts too; if no tokens were reported the line says `usage_unknown: true` and no cost is invented.
+- `risky:` and `risky.codex:` left empty or `null` mean the defaults. `risky.globs` must be a list of strings (the
+  error names the bad entry). A glob ending in `/` means everything below it: `deploy/` is `deploy/**`.
+- A failed reviewer's `why` is the first 300 characters of its stderr, or of its stdout when stderr is empty (`claude`
+  prints its errors there; control characters are stripped). A usage-limit message ("hit your ... limit", "usage
+  limit") logs `why: usage-limit: ...`, is no cooldown strike, and stops `poll` launching more reviews of that
+  quota in the same run (it is retried on the next run). Codex has its own quota: a Codex limit only skips the later
+  risky PRs (before Opus runs) and never stops Opus on non-risky PRs; an Opus limit stops Opus. A PR stuck on a limit
+  is retried after the others. For Codex only stderr and the `error`/`turn.failed` events are scanned, never command
+  output (it holds the PR's own text). A `risky.globs` entry that is only `**` or `**/` is refused (it would make every
+  PR risky).
+- `show-command --tier codex` prints the command line. The host needs `codex` on PATH and `codex login` (or API key
+  in codex's own auth store); concurrency stays 1 and nothing uses a GPU.
+
+Gates: by default tier 2 does not wait for green checks, so Opus can review every pushed head. Set
+`gates.wait_for_green: true` (YAML only; it must be a boolean) to restore the green-only gate, and then
+`gates.required` is mandatory. With it on, `gates.required` names must be present and `success`; `neutral` and `skipped` do not count as green. A
+`gates.when_present` name (a pipeline that only runs on some PRs, such as `ui-gates`) may be absent or neutral/skipped,
+but when it exists it must be `success`: pending or failed blocks tier 2.
+
+Use a dedicated bare clone for `clone:` (not your working checkout): the script fetches `refs/pull/N/head` into
+`refs/herdr-review/*` there and removes those refs and the worktree after each review.
+
+Guarantees: one review per exact head SHA (idempotent, redone on every push), drafts skipped, one review at a time,
+per-review time cap (process group killed), cooldown after repeated failures, status stays `pending` whenever a
+review cannot run or its answer fails the schema (`post_status` refuses success without a parsed verdict for that
+SHA), blocking findings must cite a file in the PR (others are dropped), and a failure posts one marked comment
+(`<!-- always-on-review:<slug> -->`, updated in place). The reviewer subprocess gets a scrubbed environment (no
+`GH_TOKEN`, no API keys) and the PR title, body and diff are treated as untrusted. "No network" means no network
+tools; the CLIs still reach their own model API.
+
+Tier-1 ensemble: `tiers.tier1.reviewers` runs several open-weight reviewers (`backend: gateway` or `openai`) in
+parallel, read-only. Their deduped findings go to tier 2, where Opus confirms or rejects each (`tier1_checks`) and
+adds its own; tier 2 posts the single comment per head (confirmed, rejected in `<details>`, models per finding). A
+down reviewer is recorded, never fatal. `poll` scope: `repos`, `skip_archived`, `skip_forks`, `skip_drafts`,
+`only_prs_updated_after`, `backfill` (enrolling a repo does not review PRs older than the enrollment) and
+`max_comments_per_hour`; see the example YAML. `herdr-muse-serve.{sh,service}` serve Muse on 127.0.0.1:28931.
+
+Examples (not installed by anything): `always-on-review.example.yaml`, `herdr-always-on-review.service` / `.timer`
+(systemd --user), and `herdr-review-pane.example.sh` (a herdr pane that tails `reviews.jsonl`).
 
 ## Limits
 

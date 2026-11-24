@@ -195,9 +195,11 @@ COLLAB_KEYS = frozenset({"cognito_pool", "cognito_clients", "cognito_group", "co
                          "cognito_domain", "public_url", "operator_user", "operator_email",
                          "open_signup", "approver_groups", "dashboard_hosts", "replay_history", "steering",
                          "contextual", "insights", "team_rooms", "team_roles", "coordinators",
+                         "fabric_trust",   # machine short names only, no secret
                          "skills",
                          "summary_fix",   # summary_fix: ids of the operator's summary-fix room and agent, no secret
                          "delegation_enabled",
+                         "members",       # plan 5 member web: carries session_secret (the slice is 0600, collab-public only)
                          "task_lease_seconds"})   # a number of seconds, no secret
 
 
@@ -255,12 +257,89 @@ def collab_values(cfg: FleetConfig) -> dict:
         normalize_coordinators(collab.get("coordinators"))
     except ValueError as exc:
         raise FleetConfigError(str(exc)) from None
+    from .control_plane.collab_fabric_trust import normalize_fabric_trust
+    try:
+        normalize_fabric_trust(collab.get("fabric_trust"))
+    except ValueError as exc:
+        raise FleetConfigError(str(exc)) from None
     from .control_plane.collab import summary_fix_config
     try:
         summary_fix_config(collab.get("summary_fix"))
     except ValueError as exc:
         raise FleetConfigError(str(exc)) from None
+    _check_members(collab, _share_mapping(cfg)[0], cfg)
     return dict(collab)
+
+
+def _check_members(collab: dict, share: dict, cfg: FleetConfig | None = None) -> None:
+    """Validate ``control_plane.collab.members`` (the member web host comes from ``control_plane.share.public_host``).
+
+    Messages name keys, never values: the section carries ``session_secret``."""
+    host = share.get("public_host")
+    if host is not None and host == _loose_hostname(collab.get("public_url")):
+        raise FleetConfigError("control_plane.share.public_host must be a host other than control_plane.collab."
+                               "public_url's: the member web and share links live there, MCP stays on the collab host")
+    members = collab.get("members")
+    if share.get("member_host") is not None and cfg is not None and artifact_host_enabled(cfg):
+        raise FleetConfigError("control_plane.share.member_host is ignored while control_plane.artifact_host is "
+                               "enabled (the host serves the member web): set control_plane.artifact_host.member_host")
+    if share.get("member_host") is not None and not (isinstance(members, dict) and members.get("enabled") is True):
+        raise FleetConfigError("control_plane.share.member_host needs control_plane.collab.members.enabled: true "
+                               "(it is the member web's own origin on the share path)")
+    if members is None:
+        return
+    if cfg is not None and artifact_host_enabled(cfg):
+        # The dedicated host owns the member web (control_plane.artifact_host: its own host, session_secret and
+        # internal key; no share, bridge or api_keys prerequisite).  A leftover legacy section is ignored.  The
+        # legacy share-public path below still needs share, the bridge and api_keys.
+        return
+    from .control_plane.members_config import parse_members
+    for key in ("public_host", "session_seconds", "member_host"):
+        if isinstance(members, dict) and key in members:
+            raise FleetConfigError(f"control_plane.collab.members.{key} is not authored here: set "
+                                   f"control_plane.share.{key} (the deploy tooling copies it into the slice)")
+    try:
+        parse_members(members, public_host=host, session_seconds=share.get("session_seconds"),
+                      member_host=share.get("member_host"))
+    except ValueError as exc:
+        raise FleetConfigError(str(exc)) from None
+    if members.get("enabled") is True and cfg is not None:
+        _check_members_prerequisites(cfg, share)
+
+
+def _check_members_prerequisites(cfg: FleetConfig, share: dict) -> None:
+    """Members that cannot work are refused here instead of failing silently at runtime (404 everywhere, no routes)."""
+    try:
+        values = cfg.section(CONTROL_PLANE_SECTION)
+    except FleetConfigError:
+        return
+    if share.get("enabled") is not True:
+        raise FleetConfigError("control_plane.collab.members.enabled needs control_plane.share.enabled: true "
+                               "(the member host is routed by the share edge)")
+    bridge = values.get("collab_artifacts")
+    if not (isinstance(bridge, dict) and bridge.get("enabled") is True):
+        raise FleetConfigError("control_plane.collab.members.enabled needs control_plane.collab_artifacts.enabled: "
+                               "true (members publish through the collab artifact bridge)")
+    keys = values.get("api_keys")
+    if not keys:
+        raise FleetConfigError("control_plane.collab.members.enabled needs control_plane.api_keys: without keys the "
+                               "API treats every caller as the operator, who may read and share member artifacts")
+
+
+def _members_with_host(values: dict, share: dict, cfg: FleetConfig | None = None) -> dict:
+    """``values`` with the share host and session lifetime copied into an ENABLED members section (collab-public only
+    loads this slice, never ``control_plane.share``, so it reads both there)."""
+    members = values.get("members")
+    if cfg is not None and artifact_host_enabled(cfg):
+        return {k: v for k, v in values.items() if k != "members"}      # the host serves members; collab-public does not
+    if isinstance(members, dict) and members.get("enabled") is True:
+        slice_ = {**members, "public_host": share.get("public_host")}
+        if share.get("session_seconds") is not None:
+            slice_["session_seconds"] = share["session_seconds"]
+        if share.get("member_host") is not None:
+            slice_["member_host"] = share["member_host"]
+        return {**values, "members": slice_}
+    return values
 
 
 def _collab_artifacts_slice(cfg: FleetConfig) -> dict:
@@ -275,12 +354,21 @@ def _collab_artifacts_slice(cfg: FleetConfig) -> dict:
     return {"collab_artifacts": {"enabled": enabled}}
 
 
+def fabric_listener(cfg: FleetConfig) -> tuple[str, int] | None:
+    """(host, port) of control_plane.collab.fabric_trust's dedicated listener, or None when it is not configured. The
+    values were validated (tailnet address only) by ``collab_values``; deploy.sh publishes exactly this address and port."""
+    from .control_plane.collab_fabric_trust import normalize_fabric_trust
+    trust = normalize_fabric_trust(collab_values(cfg).get("fabric_trust"))
+    return (trust["listen_host"], trust["listen_port"]) if trust["listen_host"] else None
+
+
 def render_collab(cfg: FleetConfig, out: Path) -> None:
     """Write a minimal fleet file (JSON, valid YAML, 0600) holding only control_plane.collab and the
     ``collab_artifacts: {enabled: <bool>}`` switch."""
     data = {"version": SCHEMA_VERSION,
             "sections": {CONTROL_PLANE_SECTION: {"roles": ["control-plane"],
-                                                 "values": {"collab": collab_values(cfg), **_collab_artifacts_slice(cfg)}}},
+                                                 "values": {"collab": _members_with_host(collab_values(cfg), _share_mapping(cfg)[0], cfg),
+                                                        **_collab_artifacts_slice(cfg)}}},
             "hosts": {}}
     _parse(data)
     write_private_file(Path(out), json.dumps(data, indent=2, sort_keys=True) + "\n")
@@ -294,10 +382,10 @@ SHARE_SECTION_KEY = "share"
 # control_plane.share as authored; an unknown key (which could be a secret meant elsewhere) is refused.
 SHARE_KEYS = frozenset({"enabled", "max_share_bytes", "max_total_bytes", "max_files", "default_public_days",
                         "session_seconds", "signing_secret", "shares_dir", "events_dir", "marker_dir",
-                        "annotations", "owner_emails", "public_url"})
+                        "annotations", "owner_emails", "public_url", "public_host", "member_host"})
 # What share-public gets: no directories (its mounts are fixed), nothing else from the central file.
 SHARE_SLICE_KEYS = ("enabled", "max_share_bytes", "max_total_bytes", "max_files", "default_public_days",
-                    "session_seconds", "signing_secret", "annotations", "public_url")
+                    "session_seconds", "signing_secret", "annotations", "public_url", "public_host", "member_host")
 # Cognito identifiers share-public needs for lab sign-in (public values; no group, no operator).
 SHARE_COLLAB_KEYS = ("cognito_pool", "cognito_clients", "cognito_web_client", "cognito_domain", "public_url")
 SHARE_FIXED_DIRS = {"shares_dir": "/shares", "events_dir": "/share-events",
@@ -359,6 +447,20 @@ def share_values(cfg: FleetConfig) -> dict:
         clean_owner_emails(share.get("owner_emails"))
     except ValueError as exc:
         raise FleetConfigError(str(exc)) from None
+    if share.get("public_host") is not None:
+        from .control_plane.members_config import valid_public_host
+        host = share["public_host"]
+        if not valid_public_host(host):
+            raise FleetConfigError("control_plane.share.public_host must be a lowercase DNS name (no scheme, port or "
+                                   "path): share links and the member web live there")
+        if share.get("public_url") is not None and https_origin(share["public_url"]) != f"https://{host}":
+            raise FleetConfigError("control_plane.share.public_url disagrees with control_plane.share.public_host: "
+                                   "set only public_host")
+        share = {**share, "public_url": f"https://{host}"}
+    if share.get("member_host") is not None:
+        share_host = share.get("public_host") or origin_hostname(https_origin(share.get("public_url")) or "")
+        mcp_host = _loose_hostname(collab.get("public_url"))
+        _check_member_host(share["member_host"], share_host, [mcp_host] if mcp_host else [], "control_plane.share")
     if share.get("enabled") is not True:
         return {"share": {"enabled": False}}
     from .control_plane.share_session import MIN_SECRET_BYTES
@@ -416,6 +518,340 @@ def check_share_slice(cfg: FleetConfig) -> None:
                                "Cognito identifiers); this file carries more (mount the slice, not the central file)")
 
 
+# --------------------------------------------------------------------------
+# artifact host slice (the host's only configuration: one JSON file, mounted as a compose secret)
+# --------------------------------------------------------------------------
+
+ARTIFACT_HOST_KEY = "artifact_host"
+ARTIFACT_HOST_KEYS = frozenset(
+    {
+        "enabled",
+        "public_host",
+        "mcp_public_hosts",
+        "member_host",
+        "session_seconds",
+        "session_secret",
+        "claim_key",
+        "health_port",
+        "db_password",
+    }
+)
+ARTIFACT_HOST_SCHEMA_VERSION = (
+    1  # herdr_artifact_host.host_config.SCHEMA_VERSION (a test keeps the two in step)
+)
+ARTIFACT_HOST_MIN_SECRET_BYTES = 32
+ARTIFACT_HOST_MIN_PASSWORD = 16
+ARTIFACT_HOST_MIN_DISTINCT = 10  # distinct characters a secret must hold ("a" * 32 and "ab" * 16 are refused)
+# Fixed, not configurable: these must match deploy/artifact-host/compose.yaml (a test keeps them in step).
+ARTIFACT_HOST_INTERNAL_BIND = "172.31.252.18"
+ARTIFACT_HOST_RELAY_URL = "http://artifact-host-relay:8091"
+ARTIFACT_HOST_SLICE_FILES = ("public.json", "internal.json", "migrate.json")
+ARTIFACT_HOST_ADMIN_PASSWORD_FILE = "db-admin-password"
+ARTIFACT_HOST_ROLES_SQL = "roles.sql"
+ARTIFACT_HOST_ROLE_DB_USERS = {
+    "public": "artifact_public",
+    "internal": "artifact_internal",
+    "migrate": "artifact_owner",
+}
+ARTIFACT_HOST_DEFAULT_HEALTH_PORT = 8092
+_ARTIFACT_HOST_SECRET_HINT = "generate one locally (e.g. `openssl rand -hex 32`) and store it in the fleet YAML; it is never printed"
+
+
+def artifact_host_db_passwords(db_password: str) -> dict[str, str]:
+    """One database password per role (and the bootstrap admin's), each HMAC-SHA256(db_password, role).
+
+    The fleet YAML therefore holds ONE value to generate and rotate, yet no container's slice holds a password that works
+    for another role (an HMAC does not reveal its key or its siblings).  Rotating db_password changes every role's
+    password at the next deploy (roles.sql re-applies them)."""
+    import hmac
+
+    return {
+        role: hmac.new(
+            db_password.encode("utf-8"), f"artifact-host-db:{role}".encode(), hashlib.sha256
+        ).hexdigest()
+        for role in (*ARTIFACT_HOST_ROLE_DB_USERS, "admin")
+    }
+
+
+def _distinct_enough(value: str) -> bool:
+    return len(set(value)) >= ARTIFACT_HOST_MIN_DISTINCT
+
+
+def _artifact_host_mapping(cfg: FleetConfig) -> dict:
+    try:
+        values = cfg.section(CONTROL_PLANE_SECTION)
+    except FleetConfigError:
+        return {}
+    section = values.get(ARTIFACT_HOST_KEY)
+    if section is None:
+        return {}
+    if not isinstance(section, dict):
+        raise FleetConfigError("control_plane.artifact_host must be a mapping")
+    return section
+
+
+def artifact_host_enabled(cfg: FleetConfig) -> bool:
+    """True only when control_plane.artifact_host.enabled is exactly true."""
+    return _artifact_host_mapping(cfg).get("enabled") is True
+
+
+def artifact_host_public_host(cfg: FleetConfig) -> str | None:
+    """The host's public name when it is enabled (the edge's server_name), else None."""
+    return _artifact_host_mapping(cfg).get("public_host") if artifact_host_enabled(cfg) else None
+
+
+def artifact_host_member_host(cfg: FleetConfig) -> str | None:
+    """The member web UI's own name when the host is enabled and sets member_host, else None."""
+    if not artifact_host_enabled(cfg):
+        return None
+    section = _artifact_host_mapping(cfg)
+    member_host = section.get("member_host")
+    if member_host is None:
+        return None
+    mcp_hosts = section.get("mcp_public_hosts", [])
+    _check_member_host(member_host, section.get("public_host"), mcp_hosts if isinstance(mcp_hosts, list) else [])
+    return member_host
+
+
+def _check_member_host(
+    member_host: object,
+    public_host: object,
+    mcp_hosts: list[str],
+    where: str = "control_plane.artifact_host",
+) -> None:
+    from .control_plane.members_config import valid_public_host
+
+    if not valid_public_host(member_host) or member_host == public_host or member_host in mcp_hosts:
+        raise FleetConfigError(
+            f"{where}.member_host must be a lowercase DNS name other than "
+            "public_host and the MCP host(s) (the member web UI's own origin)"
+        )
+
+
+def artifact_host_slices(cfg: FleetConfig) -> dict[str, dict] | None:
+    """The host's per-role configuration slices (herdr_artifact_host.host_config schema), or None when it is disabled.
+
+    Cognito identifiers come from control_plane.collab; the dashboard's bearer key is control_plane.artifact_library.host_key
+    (only its sha256 digest travels into the host).  Errors name keys, never values."""
+    section = _artifact_host_mapping(cfg)
+    unknown = sorted(str(k) for k in set(section) - ARTIFACT_HOST_KEYS)
+    if unknown:
+        raise FleetConfigError("control_plane.artifact_host: unknown keys: " + ", ".join(unknown))
+    if section.get("enabled") is not True:
+        return None
+    if share_enabled(cfg):
+        raise FleetConfigError(
+            "control_plane.artifact_host and control_plane.share cannot both be enabled: the host "
+            "serves /s/ and the member web itself and replaces share-public (set share.enabled: false)"
+        )
+    from .control_plane.members_config import valid_public_host
+
+    host = section.get("public_host")
+    if not valid_public_host(host):
+        raise FleetConfigError(
+            "control_plane.artifact_host.public_host must be a lowercase DNS name (no scheme, port "
+            "or path)"
+        )
+    mcp_hosts = section.get("mcp_public_hosts", [])
+    if (
+        not isinstance(mcp_hosts, list)
+        or not all(valid_public_host(h) for h in mcp_hosts)
+        or host in mcp_hosts
+    ):
+        raise FleetConfigError(
+            "control_plane.artifact_host.mcp_public_hosts must be a list of lowercase DNS names "
+            "other than public_host (the names agents reach /mcp/artifacts on)"
+        )
+    member_host = section.get("member_host")
+    if member_host is not None:
+        _check_member_host(member_host, host, mcp_hosts)
+    secrets_: dict[str, str] = {}
+    for key in ("session_secret", "claim_key"):
+        value = section.get(key)
+        if (
+            not isinstance(value, str)
+            or len(value.encode("utf-8")) < ARTIFACT_HOST_MIN_SECRET_BYTES
+        ):
+            raise FleetConfigError(
+                f"control_plane.artifact_host.{key} is missing or shorter than "
+                f"{ARTIFACT_HOST_MIN_SECRET_BYTES} bytes: {_ARTIFACT_HOST_SECRET_HINT}"
+            )
+        if not _distinct_enough(value):
+            raise FleetConfigError(
+                f"control_plane.artifact_host.{key} is too repetitive (fewer than "
+                f"{ARTIFACT_HOST_MIN_DISTINCT} distinct characters): {_ARTIFACT_HOST_SECRET_HINT}"
+            )
+        secrets_[key] = value
+    if secrets_["session_secret"] == secrets_["claim_key"]:
+        raise FleetConfigError(
+            "control_plane.artifact_host.session_secret and claim_key must differ"
+        )
+    password = section.get("db_password")
+    if not isinstance(password, str) or len(password) < ARTIFACT_HOST_MIN_PASSWORD:
+        raise FleetConfigError(
+            "control_plane.artifact_host.db_password is missing or shorter than "
+            f"{ARTIFACT_HOST_MIN_PASSWORD} characters: {_ARTIFACT_HOST_SECRET_HINT}"
+        )
+    if not _distinct_enough(password):
+        raise FleetConfigError(
+            "control_plane.artifact_host.db_password is too repetitive (fewer than "
+            f"{ARTIFACT_HOST_MIN_DISTINCT} distinct characters): {_ARTIFACT_HOST_SECRET_HINT}"
+        )
+    seconds = section.get("session_seconds", 14400)
+    if isinstance(seconds, bool) or not isinstance(seconds, int) or not 60 <= seconds <= 7 * 86400:
+        raise FleetConfigError(
+            "control_plane.artifact_host.session_seconds must be an integer from 60 to 604800"
+        )
+    health = section.get("health_port", ARTIFACT_HOST_DEFAULT_HEALTH_PORT)
+    if (
+        isinstance(health, bool)
+        or not isinstance(health, int)
+        or not 1024 <= health <= 65535
+        or health in (8090, 8091)
+    ):
+        raise FleetConfigError(
+            "control_plane.artifact_host.health_port must be a port from 1024 to 65535 other than "
+            "8090 and 8091"
+        )
+    collab = _share_mapping(cfg)[1]
+    taken = {_loose_hostname(collab.get("public_url"))}
+    dashboard_hosts = collab.get("dashboard_hosts")
+    if isinstance(dashboard_hosts, list):
+        taken |= {_loose_hostname(h) for h in dashboard_hosts}
+    if host in taken:
+        raise FleetConfigError(
+            "control_plane.artifact_host.public_host must differ from the collaboration MCP host "
+            "(control_plane.collab.public_url) and control_plane.collab.dashboard_hosts: the edge "
+            "serves each name with its own server block"
+        )
+    cognito = {
+        "pool_id": collab.get("cognito_pool"),
+        "client_ids": collab.get("cognito_clients"),
+        "web_client_id": collab.get("cognito_web_client"),
+        "domain": collab.get("cognito_domain"),
+        "group": collab.get("cognito_group"),
+    }
+    clients = cognito["client_ids"]
+    missing = sorted(
+        k for k, v in cognito.items() if not v or (k == "client_ids" and not isinstance(v, list))
+    )
+    if missing:
+        raise FleetConfigError(
+            "control_plane.artifact_host needs control_plane.collab.cognito_pool, cognito_clients "
+            "(a list), cognito_web_client, cognito_domain and cognito_group; missing: "
+            + ", ".join(missing)
+        )
+    del clients
+    library = cfg.section(CONTROL_PLANE_SECTION).get("artifact_library")
+    key = library.get("host_key") if isinstance(library, dict) else None
+    if not isinstance(key, str) or not key:
+        raise FleetConfigError(
+            "control_plane.artifact_host needs control_plane.artifact_library.host_key (the "
+            "dashboard's bearer key; only its sha256 digest reaches the host)"
+        )
+    url = library.get("host_url") if isinstance(library, dict) else None
+    if not isinstance(url, str) or url.rstrip("/") != ARTIFACT_HOST_RELAY_URL:
+        raise FleetConfigError(
+            "control_plane.artifact_library.host_url must be exactly "
+            f"{ARTIFACT_HOST_RELAY_URL} when the artifact host is enabled: the dashboard reaches the internal role only "
+            "through the one-way relay and is not on the network of the internal role itself"
+        )
+    passwords = artifact_host_db_passwords(password)
+    users = ARTIFACT_HOST_ROLE_DB_USERS
+
+    def database(role: str) -> dict[str, str]:
+        return {"user": users[role], "password": passwords[role]}
+
+    return {
+        "public": {
+            "version": ARTIFACT_HOST_SCHEMA_VERSION,
+            "role": "public",
+            "public_host": host,
+            "public_url": f"https://{host}",
+            "mcp_public_hosts": list(mcp_hosts),
+            **({"member_host": member_host} if member_host else {}),
+            "session_seconds": seconds,
+            "cognito": cognito,
+            "session_secret": secrets_["session_secret"],
+            "claim_key": secrets_["claim_key"],
+            "health_port": health,
+            "database": database("public"),
+        },
+        # Only the digest of the dashboard's key, and no session or claim key: this role serves the dashboard.
+        "internal": {
+            "version": ARTIFACT_HOST_SCHEMA_VERSION,
+            "role": "internal",
+            "internal_key_digest": hashlib.sha256(key.encode("utf-8")).hexdigest(),
+            "bind": ARTIFACT_HOST_INTERNAL_BIND,
+            "database": database("internal"),
+        },
+        "migrate": {
+            "version": ARTIFACT_HOST_SCHEMA_VERSION,
+            "role": "migrate",
+            "database": database("migrate"),
+        },
+    }
+
+
+def artifact_host_roles_sql(cfg: FleetConfig) -> str:
+    """The idempotent role/grant script deploy.sh pipes into the database container as its bootstrap admin on every deploy.
+
+    Three non-superuser login roles: ``artifact_owner`` owns the database and runs the migrations (DDL),
+    ``artifact_public`` gets DML only, ``artifact_internal`` gets SELECT only (and ``default_transaction_read_only``).  The
+    script runs before the migration so default privileges apply to every table the owner creates."""
+    slices = artifact_host_slices(cfg)
+    if slices is None:
+        raise FleetConfigError("control_plane.artifact_host is not enabled")
+    users = {r: slices[r]["database"] for r in ARTIFACT_HOST_ROLE_DB_USERS}
+    owner, public, internal = users["migrate"], users["public"], users["internal"]
+    lines = [
+        "-- generated by `herdr-eng fleet config render-artifact-host`; idempotent; contains role passwords",
+        "\\set ON_ERROR_STOP on",
+    ]
+    for u in (owner, public, internal):
+        name, pw = u["user"], u["password"]
+        lines += [
+            f"SELECT 'CREATE ROLE {name} LOGIN' WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{name}')\\gexec",
+            f"ALTER ROLE {name} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD '{pw}';",
+        ]
+    o, p, i = owner["user"], public["user"], internal["user"]
+    lines += [
+        f"ALTER DATABASE artifact_host OWNER TO {o};",
+        "REVOKE ALL ON DATABASE artifact_host FROM PUBLIC;",
+        f"GRANT CONNECT ON DATABASE artifact_host TO {o}, {p}, {i};",
+        f"ALTER SCHEMA public OWNER TO {o};",
+        "REVOKE ALL ON SCHEMA public FROM PUBLIC;",
+        f"GRANT USAGE ON SCHEMA public TO {p}, {i};",
+        f"ALTER ROLE {i} SET default_transaction_read_only = on;",
+        f"ALTER ROLE {p} SET default_transaction_read_only = off;",
+        f"ALTER DEFAULT PRIVILEGES FOR ROLE {o} IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {p};",
+        f"ALTER DEFAULT PRIVILEGES FOR ROLE {o} IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO {p};",
+        f"ALTER DEFAULT PRIVILEGES FOR ROLE {o} IN SCHEMA public GRANT SELECT ON TABLES TO {i};",
+        f"GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO {p};",
+        f"GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO {p};",
+        f"GRANT SELECT ON ALL TABLES IN SCHEMA public TO {i};",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def render_artifact_host(cfg: FleetConfig, out: Path) -> None:
+    """Write the host's files into the directory ``out`` (created 0700; every file 0600) when it is enabled; when disabled
+    write nothing and remove nothing: one JSON slice per role, the bootstrap admin's password and roles.sql."""
+    slices = artifact_host_slices(cfg)
+    if slices is None:
+        return
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
+    out.chmod(0o700)
+    for role, name in zip(ARTIFACT_HOST_ROLE_DB_USERS, ARTIFACT_HOST_SLICE_FILES, strict=True):
+        write_private_file(out / name, json.dumps(slices[role], indent=2, sort_keys=True) + "\n")
+    section = _artifact_host_mapping(cfg)
+    admin = artifact_host_db_passwords(section["db_password"])["admin"]
+    write_private_file(out / ARTIFACT_HOST_ADMIN_PASSWORD_FILE, admin)
+    write_private_file(out / ARTIFACT_HOST_ROLES_SQL, artifact_host_roles_sql(cfg))
+
+
 # Marker line in collab-edge/nginx.conf replaced by the share snippet (zones, upstream and the share host's own
 # server block) when shares are enabled. Disabled, the rendered file is the template byte for byte (and names no
 # share-public upstream nginx would have to resolve).
@@ -424,26 +860,158 @@ EDGE_SHARE_SNIPPET = "share-http.conf"
 EDGE_SHARE_HOST_MARKER = "@share_host@"
 
 
-def render_edge_conf(template: str, *, share: bool, share_host: str | None = None,
-                     snippets_dir: Path | None = None) -> str:
+EDGE_MEMBER_MARKER = "    # @member-locations@\n"
+EDGE_MEMBER_SNIPPET = "member-http.conf"
+EDGE_SHARE_MEMBER_SNIPPET = "share-member-http.conf"
+EDGE_SHARE_MEMBER_HOST_MARKER = "@share_member_host@"
+EDGE_MEMBER_ZONES_MARKER = "  # @member-zones@\n"
+EDGE_MEMBER_ZONES = (
+    "  # The member web UI and API: their own zones (the share zones are for /s/).\n"
+    "  limit_req_zone $remote_addr zone=member_req:10m rate=10r/s;\n"
+    "  limit_conn_zone $remote_addr zone=member_conn:10m;\n")
+
+
+EDGE_ARTIFACT_HOST_SNIPPET = "artifact-host-http.conf"
+EDGE_ARTIFACT_MEMBER_SNIPPET = "artifact-host-member-http.conf"
+EDGE_ARTIFACT_MEMBER_MARKER = "@member_host@"
+EDGE_ARTIFACT_MCP_MARKER = "    # @artifact-mcp@ (render-edge: artifact-host-mcp.conf when control_plane.artifact_host.enabled: POST /mcp/artifacts)\n"
+EDGE_ARTIFACT_MCP_SNIPPET = "artifact-host-mcp.conf"
+EDGE_ARTIFACT_HOST_MARKER = "@artifact_host@"
+
+
+def render_edge_conf(
+    template: str,
+    *,
+    share: bool,
+    share_host: str | None = None,
+    snippets_dir: Path | None = None,
+    members: bool = False,
+    artifact_host: str | None = None,
+    member_host: str | None = None,
+    mcp_hosts: list[str] | None = None,
+    share_member_host: str | None = None,
+) -> str:
     """The edge's nginx.conf: the template, plus the share host's zones, upstream and server when ``share`` is true.
 
     ``share_host`` (required then) is the share origin's host, lowercase, a port allowed; the server answers to the
-    hostname (nginx matches ``server_name`` without the port)."""
+    hostname (nginx matches ``server_name`` without the port).  ``artifact_host`` (a lowercase DNS name) renders the
+    artifact host's server INSTEAD of the share host's, plus its /mcp/artifacts location on the MCP server."""
+    if artifact_host is not None:
+        if share:
+            raise FleetConfigError(
+                "the edge serves either share-public or the artifact host, not both"
+            )
+        from .control_plane.members_config import valid_public_host
+
+        if not valid_public_host(artifact_host):
+            raise FleetConfigError(
+                f"the edge needs the artifact host's DNS name, got {artifact_host!r}"
+            )
+        base = (
+            Path(snippets_dir)
+            if snippets_dir
+            else (Path(__file__).resolve().parents[1] / "deploy" / "control-plane" / "collab-edge")
+        )
+        for marker in (EDGE_SHARE_MARKER, EDGE_ARTIFACT_MCP_MARKER):
+            if template.count(marker) != 1:
+                raise FleetConfigError(
+                    f"edge template must hold the marker line {marker.strip()!r} exactly once"
+                )
+        server = (base / EDGE_ARTIFACT_HOST_SNIPPET).read_text(encoding="utf-8")
+        if EDGE_ARTIFACT_HOST_MARKER not in server:
+            raise FleetConfigError(
+                f"{EDGE_ARTIFACT_HOST_SNIPPET} must hold {EDGE_ARTIFACT_HOST_MARKER}"
+            )
+        mcp = (base / EDGE_ARTIFACT_MCP_SNIPPET).read_text(encoding="utf-8")
+        server = server.replace(EDGE_ARTIFACT_HOST_MARKER, artifact_host)
+        if member_host is not None:
+            # a second server of its own: the member UI routes only, never /s/ (rendered only when member_host is set)
+            _check_member_host(member_host, artifact_host, mcp_hosts or [])
+            member = (base / EDGE_ARTIFACT_MEMBER_SNIPPET).read_text(encoding="utf-8")
+            if EDGE_ARTIFACT_MEMBER_MARKER not in member:
+                raise FleetConfigError(
+                    f"{EDGE_ARTIFACT_MEMBER_SNIPPET} must hold {EDGE_ARTIFACT_MEMBER_MARKER}"
+                )
+            server = (
+                server.rstrip("\n")
+                + "\n\n"
+                + member.replace(EDGE_ARTIFACT_MEMBER_MARKER, member_host)
+            )
+        return template.replace(EDGE_SHARE_MARKER, server).replace(EDGE_ARTIFACT_MCP_MARKER, mcp)
+    if share_member_host is not None and not (share and members):
+        raise FleetConfigError(
+            "control_plane.share.member_host needs the share host and the members routes on the edge"
+        )
     if not share:
         return template
-    if not isinstance(share_host, str) or https_origin("https://" + share_host) != "https://" + share_host:
-        raise FleetConfigError("the edge needs the share host (a lowercase hostname, port allowed) when shares are "
-                               f"enabled, got {share_host!r}")
-    base = Path(snippets_dir) if snippets_dir else (
-        Path(__file__).resolve().parents[1] / "deploy" / "control-plane" / "collab-edge")
+    if (
+        not isinstance(share_host, str)
+        or https_origin("https://" + share_host) != "https://" + share_host
+    ):
+        raise FleetConfigError(
+            "the edge needs the share host (a lowercase hostname, port allowed) when shares are "
+            f"enabled, got {share_host!r}"
+        )
+    base = (
+        Path(snippets_dir)
+        if snippets_dir
+        else (Path(__file__).resolve().parents[1] / "deploy" / "control-plane" / "collab-edge")
+    )
     if template.count(EDGE_SHARE_MARKER) != 1:
-        raise FleetConfigError(f"edge template must hold the marker line {EDGE_SHARE_MARKER.strip()!r} exactly once")
+        raise FleetConfigError(
+            f"edge template must hold the marker line {EDGE_SHARE_MARKER.strip()!r} exactly once"
+        )
     snippet = (base / EDGE_SHARE_SNIPPET).read_text(encoding="utf-8")
     if EDGE_SHARE_HOST_MARKER not in snippet:
         raise FleetConfigError(f"{EDGE_SHARE_SNIPPET} must hold {EDGE_SHARE_HOST_MARKER}")
     snippet = snippet.replace(EDGE_SHARE_HOST_MARKER, share_host.split(":")[0])
+    if snippet.count(EDGE_MEMBER_MARKER) != 1:
+        raise FleetConfigError(
+            f"{EDGE_SHARE_SNIPPET} must hold the marker line {EDGE_MEMBER_MARKER.strip()!r} once"
+        )
+    member = (base / EDGE_MEMBER_SNIPPET).read_text(encoding="utf-8") if members else ""
+    if snippet.count(EDGE_MEMBER_ZONES_MARKER) != 1:
+        raise FleetConfigError(
+            f"{EDGE_SHARE_SNIPPET} must hold the marker line {EDGE_MEMBER_ZONES_MARKER.strip()!r} once"
+        )
+    snippet = snippet.replace(EDGE_MEMBER_ZONES_MARKER, EDGE_MEMBER_ZONES if members else "")
+    snippet = snippet.replace(
+        EDGE_MEMBER_MARKER, member
+    )  # members off: the share host serves /s/ and nothing else
+    if share_member_host is not None:
+        # a second server of its own: the member UI routes only, never /s/ (rendered only when member_host is set)
+        _check_member_host(share_member_host, share_host.split(":")[0], mcp_hosts or [], "control_plane.share")
+        extra = (base / EDGE_SHARE_MEMBER_SNIPPET).read_text(encoding="utf-8")
+        if EDGE_SHARE_MEMBER_HOST_MARKER not in extra or extra.count(EDGE_MEMBER_MARKER) != 1:
+            raise FleetConfigError(
+                f"{EDGE_SHARE_MEMBER_SNIPPET} must hold {EDGE_SHARE_MEMBER_HOST_MARKER} and the marker line "
+                f"{EDGE_MEMBER_MARKER.strip()!r} once"
+            )
+        extra = extra.replace(EDGE_SHARE_MEMBER_HOST_MARKER, share_member_host).replace(EDGE_MEMBER_MARKER, member)
+        snippet = snippet.rstrip("\n") + "\n" + extra
     return template.replace(EDGE_SHARE_MARKER, snippet)
+
+
+def _share_member_host(cfg: FleetConfig, share: bool) -> str | None:
+    """control_plane.share.member_host when the share edge (with members) is rendered, else None."""
+    value = _share_mapping(cfg)[0].get("member_host")
+    if value is None or not share or not _members_enabled(cfg) or artifact_host_enabled(cfg):
+        return None
+    return value
+
+
+def _members_enabled(cfg: FleetConfig) -> bool:
+    collab = cfg.section("control_plane").get("collab")
+    members = collab.get("members") if isinstance(collab, dict) else None
+    return isinstance(members, dict) and members.get("enabled") is True
+
+
+def _edge_mcp_hosts(cfg: FleetConfig) -> list[str]:
+    """control_plane.artifact_host.mcp_public_hosts as a list of names (a malformed value is refused, not rendered)."""
+    hosts = _artifact_host_mapping(cfg).get("mcp_public_hosts") or []
+    if artifact_host_enabled(cfg) and not (isinstance(hosts, list) and all(isinstance(h, str) for h in hosts)):
+        raise FleetConfigError("control_plane.artifact_host.mcp_public_hosts must be a list of lowercase DNS names")
+    return list(hosts) if isinstance(hosts, list) else []
 
 
 def render_edge(cfg: FleetConfig, template: Path, out: Path) -> None:
@@ -455,7 +1023,11 @@ def render_edge(cfg: FleetConfig, template: Path, out: Path) -> None:
         origin = https_origin(share_values(cfg)["share"]["public_url"])
         share_host = origin.removeprefix("https://") if origin else None
     text = render_edge_conf(template.read_text(encoding="utf-8"), share=share, share_host=share_host,
-                            snippets_dir=template.parent)
+                            snippets_dir=template.parent, members=share and _members_enabled(cfg),
+                            artifact_host=artifact_host_public_host(cfg),
+                            member_host=artifact_host_member_host(cfg),
+                            share_member_host=_share_member_host(cfg, share),
+                            mcp_hosts=_edge_mcp_hosts(cfg))
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(text, encoding="utf-8")
@@ -565,10 +1137,13 @@ def _collect_hosts(answers: dict, prompt: Callable) -> dict[str, list[str]]:
 
 
 API_KEYS_WARNING = (
-    "warning: --with-api-keys turns on X-API-Key auth for the control plane. The browser "
-    "dashboard, the llm-proxy and the emit hook do not send keys yet, so they will get "
-    "401 until they do. Leave control_plane.api_keys empty ({}) to keep the tailnet-open "
-    "posture.")
+    "warning: --with-api-keys turns on X-API-Key auth for the control plane. The llm-proxy "
+    "(HERDR_CP_CLIENT_KEY_FILE) and the emit hook (ingest.api_key / agent.api_key) send keys "
+    "once configured; until then they get 401. The browser "
+    "dashboard works only behind the dashboard proxy: set control_plane.dashboard_proxy "
+    "(viewer_key_file, operator_key_file) and run `herdr-eng control-plane dashboard-proxy` "
+    "(compose profile dashboard-proxy); without it the dashboard gets 401. Leave "
+    "control_plane.api_keys empty ({}) to keep the tailnet-open posture.")
 
 
 OPTIONAL_SECRET_LABELS = {"github_token": "GitHub token"}
@@ -582,7 +1157,7 @@ def init_config(path: Path, answers: dict | None = None, prompt: Callable = inpu
     The control plane stays open on the tailnet (``control_plane.api_keys: {}``) and
     ``ingest.api_key`` / ``agent.api_key`` are empty, so clients send no X-API-Key.
     ``with_api_keys`` generates operator/ingest/agent keys instead (keyed mode; the
-    dashboard, llm-proxy and emit hook do not support keys yet - see API_KEYS_WARNING).
+    llm-proxy and emit hook send keys once configured, the dashboard needs the dashboard proxy - see API_KEYS_WARNING).
 
     Hosts get a placeholder hash of a discarded token: they cannot authenticate
     until ``fleet join`` / ``fleet config token`` installs a real one.
@@ -942,7 +1517,19 @@ def validate_config(path: Path) -> dict:
         validate_section((cfg.section("control_plane") or {}).get("graph_merge_gate"))
     except ValueError as exc:
         raise FleetConfigError(str(exc)) from None
+    check_artifact_library(cfg)
+    artifact_host_slices(cfg)   # names the missing or weak key when the host is enabled but incomplete
     return {"revision": cfg.revision, "hosts": len(cfg.status()["hosts"])}
+
+
+def check_artifact_library(cfg: FleetConfig) -> None:
+    """Validate ``control_plane.artifact_library`` (host_url, host_key, timeout_seconds).  The key is never echoed."""
+    from .control_plane.artifact_host_client import parse_library_host
+    section = (cfg.section(CONTROL_PLANE_SECTION) if CONTROL_PLANE_SECTION in cfg.section_names() else {}).get("artifact_library")
+    try:
+        parse_library_host(section)
+    except ValueError as exc:
+        raise FleetConfigError(str(exc)) from None
 
 
 # --------------------------------------------------------------------------

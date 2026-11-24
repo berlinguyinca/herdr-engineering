@@ -17,6 +17,7 @@ import re
 
 from ..host_policy import normalize_aliases
 from ..review_gate.entities import RESERVED_ENTITY_PREFIXES
+from .admission import AdmissionContext
 from .envelope import ENVELOPE_ONLY_TYPES, EnvelopeConflict, normalize_envelope
 from .events import SequenceCollision
 from .federation import (
@@ -128,25 +129,32 @@ def validate_ai_sync(entity_id, event_type, payload) -> dict:
     return clean
 
 
+def validate_fleet_rollout(entity_id, event_type, payload) -> dict:
+    """Strict allow-list for a fleet rollout event (docs/specs/herdr-fleet-rollout-watcher-20261104, section 8)."""
+    from .fleet_rollout import validate_fleet_rollout as _validate
+    return _validate(entity_id, event_type, payload)
+
+
 # Entity types an ingest principal may write. Dispatched types have handlers; the generic ones are
 # plain activity records nothing authoritative reads back. Adding a type here is a security decision.
 DISPATCHED_ENTITY_TYPES = frozenset({"lineage", "host", "session", "mission", "service", "inspector",
                                      "mission_activity", "test_run", "build", "review",
                                      "review_finding", "pull_request", "token_usage", "resource_usage",
-                                     "ai_sync"})
+                                     "ai_sync", "fleet_rollout"})
 # ledger / platform / lifecycle are the Pi envelope adapters' activity streams (envelopeAdapters.ts)
 # repository / request / span are the opt-in system-graph adapter's lifecycle streams (graph_ingest.py, runbook
 # docs/specs/herdr-system-graph-20261020/11-p0-p6-status-and-runbook.md). They were accepted before T16, nothing
 # authoritative reads them back, and like mission/session they are only reflected into lineage when the operator
 # turned the adapter on.
 GENERIC_ENTITY_TYPES = frozenset({"task", "note", "workspace", "ledger", "platform", "lifecycle",
-                                  "repository", "request", "span"})
+                                  "repository", "request", "span", "communication"})
 INGEST_ENTITY_TYPES = DISPATCHED_ENTITY_TYPES | GENERIC_ENTITY_TYPES
 # Event types the server itself writes for an allowed entity type: receipts other code trusts as idempotency
 # markers (repo.send_message, ci_debug, bridge). A client may not name them.
 SERVER_OWNED_EVENT_TYPES = {
     "session": frozenset({"SessionCommandQueued", "SessionCommandSettled"}),
     "host": frozenset({"HostPolicyChanged"}),
+    "lifecycle": frozenset({"session.dismissed"}),     # the operator's Agent Operations tombstone (AgentOpsService.dismiss)
 }
 
 # Sources whose host events prove the host is alive: its fabric agent, and the
@@ -300,7 +308,7 @@ class IngestService:
             raise ValueError("events must contain at most 64 envelopes")
         return [self.ingest(body, principal, valid=valid) for body in bodies]
 
-    def ingest(self, body: dict, principal: dict | None = None, valid=None) -> dict:
+    def ingest(self, body: dict, principal: dict | None = None, valid=None, *, server_owned: bool = False) -> dict:
         """Apply one ingest body.
 
         ``valid`` (T10) is an optional zero-argument callable evaluated inside the ledger lock,
@@ -326,6 +334,8 @@ class IngestService:
         payload = body.get("payload") or {}
         if not isinstance(payload, dict):
             raise ValueError("payload must be a JSON object")
+        if "_envelope" in payload and entity_type != "lineage":   # lineage streams reject '_' keys with a 400 in _prevalidate
+            payload = {k: v for k, v in payload.items() if k != "_envelope"}   # server-owned metadata, never client-set
         source = body.get("source") or "herdr"
         if not isinstance(source, str):
             raise ValueError("invalid source")
@@ -347,7 +357,7 @@ class IngestService:
             raise ValueError("entity type is not accepted by generic ingestion")
         if entity_type in ("token_usage", "resource_usage") and not payload:
             raise ValueError("token_usage/resource_usage payload is not accepted without usage fields")
-        if event_type in SERVER_OWNED_EVENT_TYPES.get(entity_type, ()):
+        if event_type in SERVER_OWNED_EVENT_TYPES.get(entity_type, ()) and not server_owned:
             raise ValueError("event type is reserved for the server")
         clamp = self._peer_clamp(principal, entity_type)
         env = normalize_envelope(body, principal, self.repo._stamp(), clamp=clamp)
@@ -364,9 +374,14 @@ class IngestService:
             self._check_reserved_nodes(env, event_type, payload)
             self._check_evidence_namespace(env, event_type, payload)
         self._prevalidate(entity_type, entity_id, payload, event_type, source)
+        if entity_type == "communication":
+            from .communications import validate_observation
+            payload = validate_observation(entity_id, event_type, payload)
         if env is None:
             return self._dispatch(entity_type, entity_id, event_type, payload, source)
         env["entity_type"] = entity_type
+        if server_owned and "agent_ops" in env:
+            env["agent_ops"]["operator_action"] = True    # server-stamped: the projection honours a tombstone only with it
         ledger = self.repo.ledger
         ack = {"event_id": env["event_id"], "source": env["source"],
                "source_sequence": env["source_sequence"]}
@@ -393,7 +408,7 @@ class IngestService:
             # The envelope row is persisted FIRST. If that fails nothing has
             # been applied and the ledger is untouched, so the emitter retries.
             try:
-                self.repo.record_event(
+                recorded = self.repo.record_event(
                     entity_type, entity_id, event_type, row_payload,
                     envelope=env, feed=entity_type not in ENVELOPE_ONLY_TYPES,
                     publish=entity_type not in ENVELOPE_ONLY_TYPES)
@@ -420,7 +435,10 @@ class IngestService:
                             and not payload.get("occurred_at"):
                         payload = {**payload, "occurred_at": env.get("occurred_at") or env.get("received_at")}
                     result = self._dispatch(entity_type, entity_id, event_type, payload, source,
-                                            record_generic=False)
+                                            record_generic=False,
+                                            admission=(AdmissionContext.from_admitted(env, entity_id)
+                                                if entity_type == "inspector"
+                                                and recorded["durably_acknowledged"] else None))
             finally:
                 # The row is durable, so its (source, sequence) is consumed even
                 # if the handler then fails; the failure is reported once.
@@ -458,6 +476,9 @@ class IngestService:
         report never consumes its event id/sequence: the corrected retry with
         the same idempotency identity can still be applied.
         """
+        if entity_type == "communication":
+            from .communications import validate_observation
+            validate_observation(entity_id, event_type, payload)
         if entity_type == "mission":
             validate_mission_id(entity_id, source)
         if entity_type == "lineage":
@@ -466,6 +487,8 @@ class IngestService:
             _git_identity(payload)
         if entity_type == "ai_sync":
             validate_ai_sync(entity_id, event_type, payload)
+        if entity_type == "fleet_rollout":
+            validate_fleet_rollout(entity_id, event_type, payload)
         if entity_type == "service" and any(
                 k in payload for k in ("repository_id", "forge_url", "repository_url",
                                        "repo_url", "clone_url", "commit_sha")):
@@ -532,7 +555,7 @@ class IngestService:
                     not isinstance(r, dict) for r in results):
                 raise ValueError("results must be a list of objects")
     def _dispatch(self, entity_type, entity_id, event_type, payload, source,
-                  record_generic=True) -> dict:
+                  record_generic=True, *, admission: AdmissionContext | None = None) -> dict:
         # System-graph live-ingest adapter (opt-in): reflect lifecycle events
         # into the running lineage graph as lineage envelopes. Best-effort: a
         # failure here is logged inside the adapter and never breaks the source
@@ -560,6 +583,17 @@ class IngestService:
             # Latest-per-host config-sync status; the event stream is the durable record (repo.list_ai_sync).
             self.repo.record_event("ai_sync", entity_id, event_type, validate_ai_sync(entity_id, event_type, payload))
             return {"entity_type": "ai_sync", "entity_id": entity_id, "event_type": event_type}
+        if entity_type == "fleet_rollout":
+            # Append-only per-rollout stream; a replay of the same seq is a no-op (repo.list_fleet_rollouts reads it).
+            from .fleet_rollout import record_event as record_fleet_rollout
+            stored = record_fleet_rollout(self.repo, entity_id, event_type,
+                                          validate_fleet_rollout(entity_id, event_type, payload))
+            return {"entity_type": "fleet_rollout", "entity_id": entity_id, "event_type": event_type,
+                    "duplicate": not stored}
+        if entity_type == "communication":
+            from .communications import record_observation
+            stored = record_observation(self.repo, payload)
+            return {"entity_type": entity_type, "entity_id": entity_id, "duplicate": not stored}
         if entity_type == "host":
             return self._ingest_host(entity_id, event_type, payload, source)
         if entity_type == "session":
@@ -576,7 +610,7 @@ class IngestService:
             # by the store; not recorded on the global event feed.
             if "kind" not in payload and "events" not in payload and event_type != "inspector.batch":
                 payload = {**payload, "kind": event_type.removeprefix("inspector.")}
-            res = self.repo.inspector.ingest(entity_id, payload)
+            res = self.repo.inspector.ingest(entity_id, payload, admission=admission)
             return {"entity_type": "inspector", "entity_id": entity_id,
                     "event_type": event_type, **res}
         if entity_type in ("test_run", "build"):

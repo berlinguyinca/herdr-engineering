@@ -462,6 +462,51 @@ def _push_event(ci_context):
     return parts[2] if len(parts) >= 4 and parts[0] == "ci" and parts[1] == "woodpecker" else "push"
 
 
+CI_KEY = "control_plane.ci_deployments"
+
+
+def _ci_summary(row: dict) -> dict:
+    """The last finished event of a CI-reported row: outcome, time, commits, evidence link."""
+    events = [e for e in row.get("timeline") or () if isinstance(e, dict) and e.get("outcome") != "started"]
+    last = events[-1] if events else None      # the timeline is in arrival order
+    if last is None and isinstance(row.get("last_result"), dict):
+        last = row["last_result"]
+    last = last or {}
+    from .ci_deployments import evidence_url     # lazy: see _ci_read
+    return {"outcome": last.get("outcome"), "at": last.get("received_at"),
+            "from": last.get("from"), "to": last.get("to"),
+            "evidence_url": evidence_url(last.get("evidence")),
+            "detail": (last.get("evidence") or "").strip()[:PROBLEM_DETAIL] if isinstance(last.get("evidence"), str) else ""}
+
+
+#: Outcomes that are problems an operator should see (not started/ok/skipped).
+PROBLEM_OUTCOMES = ("failed", "refused", "rolled-back")
+MAX_PROBLEMS = 20
+PROBLEM_DETAIL = 300
+
+
+def recent_problems(components: dict) -> list[dict]:
+    """Newest-first problem events across every component's timeline: component, step, outcome,
+    time, host, the evidence text (bounded; already redacted) and its run link. ``recovered`` is
+    True when a later ``ok`` for the same component arrived."""
+    from .ci_deployments import evidence_url     # lazy: see _ci_read
+    found = []
+    for name, row in (components or {}).items():
+        timeline = [e for e in (row.get("timeline") or ()) if isinstance(e, dict)] if isinstance(row, dict) else []
+        for i, e in enumerate(timeline):
+            if e.get("outcome") not in PROBLEM_OUTCOMES:
+                continue
+            evidence = e.get("evidence") if isinstance(e.get("evidence"), str) else ""
+            found.append({
+                "component": name, "step": e.get("step"), "outcome": e.get("outcome"),
+                "at": e.get("received_at"), "host": e.get("host"), "reported_by": e.get("reported_by"),
+                "detail": evidence.strip()[:PROBLEM_DETAIL], "evidence_url": evidence_url(evidence),
+                "recovered": any(later.get("outcome") == "ok" for later in timeline[i + 1:]),
+                "_epoch": e.get("received_epoch") or 0})
+    found.sort(key=lambda p: p["_epoch"], reverse=True)
+    return [{k: v for k, v in p.items() if k != "_epoch"} for p in found[:MAX_PROBLEMS]]
+
+
 class DeploymentAuthorizationError(PermissionError):
     """The reporting host may not report this component (HTTP 403)."""
 
@@ -478,8 +523,9 @@ class DeploymentDefinitions:
     a CIMonitor-shaped snapshot (``{'pipelines': {group: [row]}}``).
     """
 
-    def __init__(self, path_fn, *, ci_snapshot=None):
+    def __init__(self, path_fn, *, ci_snapshot=None, ci_components=None):
         self._path_fn = path_fn
+        self._ci_components_fn = ci_components
         self._ci_snapshot = ci_snapshot
         self._lock = threading.RLock()
         self._sig = None
@@ -582,9 +628,34 @@ class DeploymentDefinitions:
                 out.append({"stage": d.stage, "order": d.order, "components": [d.component]})
         return out
 
+    # ---------------------------------------------------- CI-reported set
+    def _ci_read(self, defs) -> tuple[dict, list]:
+        """The validated ``control_plane.ci_deployments`` (read live) and its errors. A bad
+        list is refused whole; a component that also has a definition drops only that entry."""
+        if self._ci_components_fn is None:
+            return {}, []
+        # Imported here: pipelines-sync.sh loads this file standalone as the validator, so it must
+        # not import its siblings at module level.
+        from .ci_deployments import parse_ci_deployments
+        try:
+            mapping, errors = parse_ci_deployments(self._ci_components_fn())
+        except Exception:  # noqa: BLE001 - a broken config reader must not crash ingest
+            return {}, [f"{CI_KEY} could not be read"]
+        clash = sorted(c for c in mapping if c in defs)
+        kept = {c: h for c, h in mapping.items() if c not in defs}
+        errors += [f"{CI_KEY}: component {c[:64]!r} also has a deployment definition; "
+                   "remove one of them" for c in clash[:5]]
+        return kept, errors
+
+    def ci_components(self) -> dict:
+        """{component: host id} reported by CI (no definition exists for any of them)."""
+        return self._ci_read(self.definitions())[0]
+
     # -------------------------------------------------------- authorization
     def authorize(self, component, host) -> None:
-        """Raise unless ``host`` (the authenticated fleet id) may report ``component``."""
+        """Raise unless ``host`` (the authenticated fleet id) may report ``component``: it is the
+        definition's host, or the (component, host) pair is in ``control_plane.ci_deployments``.
+        Definitions configured but never valid refuse everything (CI pairs included)."""
         self._refresh()
         with self._lock:
             if not self._configured:
@@ -592,6 +663,9 @@ class DeploymentDefinitions:
             if not self._loaded:
                 raise DeploymentDefinitionsUnavailable(INVALID_WARNING)
             d = self._defs.get(component)
+            defs = dict(self._defs)
+        if d is None and self._ci_read(defs)[0].get(component) == host:
+            return
         if d is None or d.host != host:
             raise DeploymentAuthorizationError(
                 f"component {str(component)[:64]!r} is not defined for host {str(host)[:64]!r}")
@@ -599,7 +673,17 @@ class DeploymentDefinitions:
     def annotate(self, snapshot: dict) -> dict:
         """The monitor snapshot plus ``definitions`` (status, groups) for the page."""
         view = copy.deepcopy(snapshot)
-        view["definitions"] = {**self.status(), "groups": self.groups()}
+        # CI rows are only part of the picture when definitions are loaded: without them ingest is
+        # unrestricted and nothing marks a component as CI-reported.
+        ci, ci_errors = self._ci_read(self.definitions()) if self.status()["loaded"] else ({}, [])
+        view["definitions"] = {**self.status(), "groups": self.groups(),
+                               "ci_components": sorted(ci), "ci_errors": ci_errors}
+        components = view.get("components")
+        for name in ci:
+            if isinstance(components, dict) and isinstance(components.get(name), dict):
+                components[name]["kind"] = "ci"
+                components[name]["ci"] = _ci_summary(components[name])
+        view["problems"] = recent_problems(components if isinstance(components, dict) else {})
         return view
 
     # ------------------------------------------------------- target + plan

@@ -10,6 +10,8 @@ import { defineComponents } from './herdr-web-components/index.js';
 import { missionSubtitle, sessionSummary } from './herdr-web-components/humanize.js';
 import { mountInspector } from './inspector-view.js';
 import { mountSessionWorkspace } from './session-workspace.js';
+import { mountSessionContext } from './session-context.js';
+import { workCenterEnabled } from './work-center-flag.js';
 import { mountTerminalAttach } from './terminal-attach.js';
 import { mountMissionActivity } from './mission-live-view.js';
 import { mountMissionCatalog } from './mission-catalog-view.js';
@@ -17,18 +19,20 @@ import { mountOverview } from './overview-view.js';
 import { mountIntegrations } from './integrations-view.js';
 import { mountGithub } from './github-view.js';
 import { mountGithubProjects } from './github-projects-view.js';
+import { refsFromMissionOutcomes } from './board-links.js';
 import { mountReviewGate } from './review-gate-view.js';
 import { mountTopology } from './topology-view.js';
 import { mountArchitecture } from './architecture-view.js';
 import { mountPersonalAssistant } from './personal-assistant-view.js';
 import { mountProjectIntelligence } from './project-intelligence-view.js';
 import { visibleNav } from './nav-capabilities.js';
+import { mountSettings } from './settings-view.js';
 import { mountSessionsView, sessionEntries } from './sessions-view.js';
 import { agentStory, renderStory } from './agents-lineage.js';
 import { recordOutcome, statusOutcome } from './record-state.js';
 import { RANGES, safeHostId } from './host-view.js';
 import { mountHosts, loadHosts, mountDiagnostics } from './hosts-view.js';
-import { createDiagnosticsSource } from './diagnostics-source.js';
+import { createHostDiagnosticsSource } from './diagnostics-source.js';
 import { mountHostDetail, loadHostDetail } from './host-detail-view.js';
 import { mountActivity, loadActivity } from './activity-view.js';
 import { mountAnalytics, loadAnalytics, usageStrip } from './analytics-view.js';
@@ -40,6 +44,8 @@ import { mountFabricServices } from './fabric-services-view.js';
 import { mountAiSync } from './ai-sync-view.js';
 import { mountPrTrail } from './pr-trail-view.js';
 import { mountTeamMap } from './team-map-view.js';
+import { mountAgentOps } from './agent-ops-view.js';
+import { lineageEnabled, mountAgentOpsLineage } from './agent-ops-lineage.js';
 import { mountTeams } from './teams-view.js';
 import { mountAgentEvolution, tabsHtml, TABS_STYLE, wireTabs } from './agent-evolution-view.js';
 import { mountCollab, completeSignInIfRedirected } from './collab-view.js';
@@ -49,13 +55,16 @@ import { mountRelated } from './related-panel.js';
 import { mountMissionStory } from './mission-story-view.js';
 import { renderLlm, renderLlmSession, llmQuery, STEP_FOR, WINDOWS } from './llm-view.js';
 import { mountArtifacts, renderArtifactDetail } from './artifacts-view.js';
+import { mountLibrary, mountLibraryItem } from './library-view.js';
 import { mountPublications } from './publications-view.js';
 import { mountHandoffs } from './handoffs-view.js';
 import { mountMemory } from './memory-view.js';
 import { mountScheduling } from './scheduler-view.js';
 import { mountDeployments } from './deployments-view.js';
+import { mountBuildCache, mountBuildDetail } from './build-cache-view.js';
 import { classifyDashboardError, dashboardErrorMessage } from './dashboard-load-state.js';
 import { mountEventHistory } from './event-history.js';
+import { mountCommunications } from './communications-view.js';
 
 // Cache of { [mission_id]: title } so activity/session text can resolve
 // cryptic mission ids to their human names. Fetched lazily, best-effort.
@@ -85,34 +94,35 @@ const root = document.getElementById('view');
 const NAV = [
   { group: 'Monitor', path: '/overview', label: 'Overview' },
   { group: 'Monitor', path: '/attention', label: 'Attention', match: ['/activity'] },
-  { group: 'Agents', path: '/herd', label: 'Agents', match: ['/missions', '/handoffs', '/topology'] },
-  { group: 'Agents', path: '/collab', label: 'Collaboration' },
+  { group: 'Agents', path: '/herd', label: 'Agents', match: ['/missions', '/handoffs', '/topology', '/communications'] },
+  { group: 'Agents', path: '/collab', label: 'Collaboration', capability: 'collab_v1' },
   { group: 'Agents', path: '/personal-assistant', label: 'Assistant', capability: 'assistant_v1' },
   { group: 'Agents', path: '/teams', label: 'Your teams', capability: 'unified_workspace_v1' },
   { group: 'Agents', path: '/team-map', label: 'Team map', capability: 'unified_workspace_v1' },
-  { group: 'Fabric', path: '/hosts', label: 'Hosts', match: ['/scheduling', '/ai-sync'] },
+  { group: 'Agents', path: '/agent-ops', label: 'Agent Operations', capability: 'agent_ops_v1' },
+  { group: 'Fabric', path: '/hosts', label: 'Hosts', match: ['/scheduling', '/ai-sync', '/build-cache', '/diagnostics'] },
   { group: 'Fabric', path: '/services', label: 'Services', match: ['/fabric-services', '/local-services', '/system-services'] },
-  { group: 'Fabric', path: '/diagnostics', label: 'Diagnostics' },
+  { group: 'Fabric', path: '/settings', label: 'Settings' },
   { group: 'Fabric', path: '/llm', label: 'Usage', match: ['/analytics'] },
   { group: 'Delivery', path: '/ci', label: 'CI', match: ['/deployments'] },
   { group: 'Delivery', path: '/reviews', label: 'Reviews', match: ['/review-gate'] },
   { group: 'Delivery', path: '/github', label: 'Projects', match: ['/github/projects', '/pr'] },
   { group: 'Code', path: '/architecture', label: 'Architecture', capability: 'architecture_v1' },
-  { group: 'Code', path: '/artifacts', label: 'Artifacts', match: ['/publications'] },
+  { group: 'Code', path: '/artifacts', label: 'Artifacts', match: ['/library', '/publications'] },
   { group: 'Code', path: '/memory', label: 'Memory', capability: 'memory_v1' },
   { group: 'Code', path: '/intelligence', label: 'Project intelligence', capability: 'project_intelligence_v1' },
 ];
 // Handoffs are the thread through the Agents section: who started whom, and why. Topology is no longer listed (the lineage
 // graph replaces it); its route still answers for old links.
 const SECTION_TABS = [
-  [['/herd', 'Agents'], ['/missions', 'Missions'], ['/handoffs', 'Handoffs']],
+  [['/herd', 'Agents'], ['/missions', 'Missions'], ['/handoffs', 'Handoffs'], ['/communications', 'Communications']],
   [['/attention', 'Attention'], ['/activity', 'Activity']],
-  [['/hosts', 'Hosts'], ['/scheduling', 'Scheduling'], ['/ai-sync', 'AI sync']],
+  [['/hosts', 'Hosts'], ['/scheduling', 'Scheduling'], ['/ai-sync', 'AI sync'], ['/build-cache', 'Build cache', 'build_cache_v1'], ['/diagnostics', 'Diagnostics']],
   [['/services', 'Catalog'], ['/fabric-services', 'Fabric'], ['/local-services', 'Local'], ['/system-services', 'System']],
   [['/ci', 'CI'], ['/deployments', 'Deployments']],
-  [['/reviews', 'Plan reviews'], ['/review-gate', 'Review gate']],
+  [['/reviews', 'Plan reviews'], ['/review-gate', 'Review gate', 'review_gate_v1']],
   [['/github', 'Issues'], ['/github/projects', 'Boards']],
-  [['/artifacts', 'Artifacts'], ['/publications', 'Publications']],
+  [['/artifacts', 'Artifacts'], ['/library', 'Library'], ['/publications', 'Publications']],
 ];
 
 const SHELL = document.getElementById('shell');
@@ -138,7 +148,8 @@ function renderSubnav() {
   // The longest matching path wins, so /github/projects is not also an active "Issues" tab.
   const current = tabs.map(([p]) => p).filter((p) => path === p || path.startsWith(p + '/')).sort((x, y) => y.length - x.length)[0];
   SUBNAV.hidden = false;
-  const listed = tabs.filter(([p]) => showUnavailable || p === current || !unavailable.has(p));
+  // A tab with a third element is an optional feature: it is listed only while /api/v1/health advertises that capability.
+  const listed = tabs.filter(([p, , cap]) => (!cap || capabilities.includes(cap)) && (showUnavailable || p === current || !unavailable.has(p)));
   SUBNAV.hidden = listed.length < 2;
   SUBNAV.innerHTML = listed.map(([p, label]) => `<a href="#${p}"${p === current ? ' aria-current="page"' : ''}>${label}</a>`).join('');
 }
@@ -161,7 +172,7 @@ function applyRoutes() {
 }
 function markAvailability(ok, message) {
   const path = routePath();
-  if (!KNOWN_PAGES.has(path) || path === '/overview' || path === '/attention') return;
+  if (!KNOWN_PAGES.has(path) || path === '/overview' || path === '/attention' || path === '/settings') return;
   const missing = !ok && MISSING.test(message || '');
   if (!ok && !missing) return;
   if (missing === unavailable.has(path)) return;
@@ -179,7 +190,13 @@ root.addEventListener('hd-freshness', (event) => markAvailability(event.detail.o
 window.addEventListener('hashchange', applyRoutes);   // the entry you are on stays listed; leaving it lets it go
 applyRoutes();
 // Optional tabs appear once /api/v1/health advertises their capability; a failed probe keeps them hidden.
-client.health({ probe: true }).then((h) => { capabilities = h?.capabilities || []; applyRoutes(); }).catch(() => { /* optional tabs stay hidden */ });
+const capabilitiesReady = client.health({ probe: true }).then((h) => { capabilities = h?.capabilities || []; applyRoutes(); }).catch(() => { /* optional tabs stay hidden */ });
+// WC-006 rollout gate: the Work Command Center UI exists only while the control plane advertises `work_center_v1`. A failed or
+// slow capability probe means "off" (the pages then behave exactly as before the Work Command Center); the wait is bounded.
+async function workCenterOn() {
+  await Promise.race([capabilitiesReady, new Promise((resolve) => setTimeout(resolve, 3000))]);
+  return workCenterEnabled(capabilities);
+}
 SHELL.setAttribute('brand', 'HerdR Dev Fabric');
 
 // The nav badge follows the server inbox on every page, so a new critical item is visible from anywhere.
@@ -219,6 +236,8 @@ const ROUTES = {
   '/collab': viewCollab,
   '/ci': viewIntegrations,
   '/deployments': viewDeployments,
+  '/build-cache': viewBuildCache,
+  '/build-cache/:id': viewBuildDetail,
   '/reviews': viewIntegrations,
   '/review-gate': viewReviewGate,
   '/topology': viewTopology,
@@ -237,6 +256,7 @@ const ROUTES = {
   '/pr/:owner/:repo/:number': viewPrTrail,
   '/teams': viewTeams,
   '/team-map': viewTeamMap,
+  '/agent-ops': viewAgentOps,
   '/services/:id': viewService,
   '/hosts': viewHosts,
   '/diagnostics': viewDiagnostics,
@@ -244,6 +264,7 @@ const ROUTES = {
   '/intelligence': viewIntelligence,
   '/hosts/:id': viewHost,
   '/activity': viewActivity,
+  '/communications': () => mountCommunications(root, client),
   '/analytics': viewAnalytics,
   '/analytics/missions': viewAnalytics,
   '/analytics/models': viewAnalytics,
@@ -255,10 +276,13 @@ const ROUTES = {
   '/llm/session/:id': viewLlmSession,
   '/artifacts': viewArtifacts,
   '/artifacts/:id': viewArtifact,
+  '/library': viewLibrary,
+  '/library/:id': viewLibraryItem,
   '/publications': viewPublications,
   '/scheduling': viewScheduling,
   '/handoffs': viewHandoffs,
   '/memory': viewMemory,
+  '/settings': viewSettings,
 };
 
 // Router rule: render() runs only on a route change (any hash change, query
@@ -410,10 +434,22 @@ async function viewArtifact(parts, revision) {
   const controller = new AbortController();
   const chip = root.querySelector('herdr-freshness');
   // Mount immediately so navigation can cancel the pending detail read.
-  void renderArtifactDetail(container, client, id, { signal: controller.signal, versionId: route().query.get('version') || undefined })
+  void renderArtifactDetail(container, client, id, { signal: controller.signal, versionId: route().query.get('version') || undefined, anchor: route().query.get('at') || undefined })
     .then(result => { if (!controller.signal.aborted && revision === renderRevision) chip.touch(!result?.errors?.length, result?.errors?.join('; ')); })
     .catch(error => { if (!controller.signal.aborted && revision === renderRevision) { container.innerHTML = `<herdr-error message="${esc(error.message)}"></herdr-error><button type="button" data-route-retry>Retry</button>`; chip.touch(false, error.message); } });
   return { refresh() {}, dispose: () => controller.abort() };
+}
+
+async function viewLibrary() {
+  root.innerHTML = `${liveHead('<h1>Library</h1>')}<div id="artifact-library"></div>`;
+  return mountLibrary(root.querySelector('#artifact-library'), client, { freshness: chipIn(root), folderId: route().query.get('folder') || null });
+}
+
+async function viewLibraryItem(parts) {
+  const id = safeDecode(parts[1]);
+  if (!id) { statusPage('<herdr-error message="Item not found"></herdr-error>', true); return; }
+  root.innerHTML = `<a href="#/library">← Library</a>${liveHead('<h1>Library item</h1>')}<div id="library-item"></div>`;
+  return mountLibraryItem(root.querySelector('#library-item'), client, id, { freshness: chipIn(root), versionId: route().query.get('version') || null });
 }
 
 async function viewPublications() {
@@ -429,6 +465,23 @@ async function viewScheduling() {
 async function viewDeployments() {
   root.innerHTML = `${liveHead('<h1>Deployments</h1>')}<div id="deployments"></div>`;
   return mountDeployments(root.querySelector('#deployments'), client, { freshness: chipIn(root) });
+}
+
+async function viewSettings() {
+  root.innerHTML = `${liveHead('<h1>Settings</h1>')}<div id="settings"></div>`;
+  return mountSettings(root.querySelector('#settings'), client, { freshness: chipIn(root) });
+}
+
+async function viewBuildCache() {
+  root.innerHTML = `${liveHead('<h1>Build cache</h1>')}<div id="build-cache"></div>`;
+  return mountBuildCache(root.querySelector('#build-cache'), client, { freshness: chipIn(root) });
+}
+
+async function viewBuildDetail(parts) {
+  const id = safeDecode(parts[1]);
+  if (!id) { statusPage('<herdr-error message="Build not found"></herdr-error>', true); return; }
+  root.innerHTML = `${liveHead('<h1>Build</h1>')}<div id="build-cache"></div>`;
+  return mountBuildDetail(root.querySelector('#build-cache'), client, id, { freshness: chipIn(root) });
 }
 
 async function viewPrTrail(parts) {
@@ -447,6 +500,12 @@ async function viewTeamMap() {
   const view = mountTeamMap(root.querySelector('#team-map'), client, { root: route().query.get('root') || '', freshness: chipIn(root),
     onRoot: (r) => history.replaceState(null, '', `#/team-map${r ? `?root=${encodeURIComponent(r)}` : ''}`) });
   return ownPolling(view);   // positions the person moved must survive a live event, so only the Open button reloads
+}
+
+async function viewAgentOps() {
+  root.innerHTML = `${liveHead('<h1>Agent Operations</h1>')}<div id="agent-ops"></div>`;
+  const view = mountAgentOps(root.querySelector('#agent-ops'), client, { freshness: chipIn(root), filters: { task: route().query.get('task') || '' } });
+  return { refresh: () => view.refresh(), dispose: () => view.dispose() };   // the view owns its own SSE stream (cursor resume) and replay state
 }
 
 async function viewHandoffs() {
@@ -476,8 +535,16 @@ async function viewArchitecture() {
 }
 
 async function viewOverview() {
-  root.innerHTML = `${liveHead('<h1>Overview</h1>')}<div id="overview-dashboard"></div>`;
-  return ownPolling(mountOverview(document.getElementById('overview-dashboard'), client, { freshness: chipIn(root) }));
+  // Show the page frame and a skeleton straight away; the capability wait (bounded) must not leave the generic page skeleton up.
+  root.innerHTML = `${liveHead('<h1>Overview</h1>')}<div id="overview-dashboard">${skeleton('overview', { rows: 8, height: 64 })}</div>`;
+  const host = document.getElementById('overview-dashboard');
+  const workCenter = await workCenterOn();
+  if (!host.isConnected) return { refresh() {}, dispose() {} };   // navigated away while the capability probe was pending
+  const overview = mountOverview(host, client, { freshness: chipIn(root), workCenter });
+  // Slice 07: task lineage from Agent Operations, only while BOTH work_center_v1 and agent_ops_v1 are advertised.
+  let lineage = null;
+  if (lineageEnabled(capabilities)) { const slot = document.createElement('div'); slot.id = 'agent-lineage'; host.after(slot); lineage = mountAgentOpsLineage(slot, client); }
+  return ownPolling({ dispose() { overview.dispose(); lineage?.dispose(); document.getElementById('agent-lineage')?.remove(); } });
 }
 
 async function viewAttention() {
@@ -503,7 +570,25 @@ async function viewGithub() {
 async function viewGithubProjects() {
   // Read-only Projects v2 boards; keeps its own 5 s poll, live events refresh it too.
   const query = route().query;
-  return mountGithubProjects(root, client, { project: query.get('project') || '', layout: query.get('layout') || 'board' });
+  // WC-005b: one read on mount of the mission PR refs (no polling); a failed read marks the Herdr data partial.
+  // Flag off: no read at all and no refs, exactly the board before the Work Command Center.
+  // Same frame as the board's own first paint (heading + board skeleton), so the capability wait does not leave the generic page skeleton up.
+  root.innerHTML = `<div class="hd-live-head"><h1>Project boards</h1></div>${skeleton('project board', { rows: 2, height: 64 })}`;
+  const frame = root.firstElementChild;
+  const workCenter = await workCenterOn();
+  if (!frame.isConnected) return { refresh() {}, dispose() {} };   // navigated away while the capability probe was pending
+  let herdrRefs = workCenter ? [] : null;
+  let herdrRefsFailed = false;
+  if (workCenter) try {
+    const mapped = refsFromMissionOutcomes(await client.missionOutcomes());
+    herdrRefs = mapped.refs;
+    herdrRefsFailed = mapped.failed;
+  } catch {
+    herdrRefsFailed = true;
+  }
+  // G3: the board re-reads the refs on its own refresh cycle (throttled in the view); flag off: no loader at all.
+  const loadHerdrRefs = workCenter ? signal => client.missionOutcomes({ signal }).then(refsFromMissionOutcomes) : null;
+  return mountGithubProjects(root, client, { project: query.get('project') || '', layout: query.get('layout') || 'board', herdrRefs, herdrRefsFailed, loadHerdrRefs });
 }
 
 async function viewReviewGate() {
@@ -885,6 +970,8 @@ async function viewSession(parts, revision) {
     const s = await client.getSession(id, {signal: controller.signal});
     if (revision !== renderRevision || controller.signal.aborted) return;
     if (!s) { statusPage('<herdr-error message="Agent not found"></herdr-error>', true); return; }
+    const workCenter = await workCenterOn();
+    if (revision !== renderRevision || controller.signal.aborted) return;
     const outcome = recordOutcome(s);
     const activeTab = route().query.get('tab') === 'evolution' ? 'evolution' : 'overview';
     const terminal = outcome === 'failed' || outcome === 'finished';
@@ -898,6 +985,7 @@ async function viewSession(parts, revision) {
        ${terminal ? `<p class="sd-meta">${outcome === 'failed' ? 'Failed' : 'Finished'} agent · recorded inspection remains available.</p>` : ''}
        ${TABS_STYLE}${tabsHtml(activeTab)}
       <div id="agent-panel-overview" role="tabpanel" tabindex="0" aria-labelledby="agent-tab-overview"${activeTab === 'overview' ? '' : ' hidden'}>
+       ${workCenter ? '<div id="session-context"></div>' : ''}
        <div id="session-story"></div>
       ${s.mission_id || s.mission_key ? `<p class="sd-meta" id="session-mission">Mission association not resolved · ${esc(s.mission_key || s.mission_id)}</p>` : ''}
       <div id="related-panel"></div>
@@ -942,7 +1030,9 @@ async function viewSession(parts, revision) {
       },
     });
     if (activeTab === 'evolution') startEvolution();
-    const disposeSession = combineDisposers(relatedDispose, disposeWorkspace, disposeTerminal, () => disposeAdvanced?.(), () => evolution?.dispose());
+    // Work Context: read-only parent mission, measured progress and sibling agents; distinct from the terminal attach panel below.
+    const disposeContext = workCenter ? mountSessionContext(document.getElementById('session-context'), client, s, {signal: controller.signal, onLinked: () => document.getElementById('session-mission')?.setAttribute('hidden', '')}) : () => {};
+    const disposeSession = combineDisposers(disposeContext, relatedDispose, disposeWorkspace, disposeTerminal, () => disposeAdvanced?.(), () => evolution?.dispose());
     const missionElement = document.getElementById('session-mission');
     if (missionElement) {
       const contextController = new AbortController();
@@ -1058,7 +1148,10 @@ async function viewHosts(_parts, revision) {
 // mount writes into this route's own node, so a read that finishes after the operator navigated away cannot write over the page they moved to.
 async function viewDiagnostics(_parts, revision) {
   root.innerHTML = '<div data-diagnostics></div>';
-  const source = createDiagnosticsSource({ fetchEvents: () => client.request('/api/v1/events').catch(() => null), fetchHosts: () => client.listHosts().catch(() => null), now: Date.now() });
+  // Only feeds that exist: the host list, then one event page per host through the adapter's own path builder.
+  // The bare events endpoint answers 400 (it requires both entity parameters), so that query lives in
+  // hostEventsPath beside the adapter that maps the answer, and this page names no URL of its own.
+  const source = createHostDiagnosticsSource({ request: (path) => client.request(path), listHosts: () => client.listHosts(), now: Date.now() });
   await mountDiagnostics(root.querySelector('[data-diagnostics]'), { source });
   if (revision !== renderRevision) return NO_REFRESH;
   addSnapshotChip();

@@ -22,9 +22,42 @@ from .inspector import InspectorStore, SnapshotStale
 log = logging.getLogger(__name__)
 
 _PAGE = 20000
+_KEYS = {"enabled", "interval_seconds"}
+MIN_INTERVAL_SECONDS = 60
+DEFAULT_INTERVAL_SECONDS = 600.0
 _COLUMNS = ("event_id, schema_version, source_timestamp, ingest_timestamp, entity_type, entity_id, mission_id, "
             "session_id, sequence, event_type, payload")
 _VALID = "entity_type = 'inspector' AND entity_id IS NOT NULL AND entity_id <> ''"
+
+
+def parse_inspector_snapshots(raw) -> dict:
+    """Validate ``control_plane.inspector_snapshots`` (YAML only) and return ``{"enabled", "interval_seconds"}``.
+
+    Absent or empty means off with the default interval. Anything malformed raises ``ValueError`` rather than being
+    guessed at, so a typo cannot silently leave the optimisation in an unintended state."""
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError("inspector_snapshots must be a mapping")
+    unknown = sorted(set(raw) - _KEYS, key=str)
+    if unknown:
+        raise ValueError(f"inspector_snapshots: unknown key(s) {unknown}; allowed: {sorted(_KEYS)}")
+    enabled = raw.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("inspector_snapshots.enabled must be a boolean")
+    interval = raw.get("interval_seconds", DEFAULT_INTERVAL_SECONDS)
+    if isinstance(interval, bool) or not isinstance(interval, (int, float)) or interval < MIN_INTERVAL_SECONDS:
+        raise ValueError(f"inspector_snapshots.interval_seconds must be a number >= {MIN_INTERVAL_SECONDS}")
+    return {"enabled": enabled, "interval_seconds": float(interval)}
+
+
+async def archived_inspector_count(conn, watermark: int) -> int:
+    """Inspector rows the archive job moved out of ``fabric_events`` at or below ``watermark``. The snapshot consumed them,
+    so they count toward its ``event_count``; 0 when the archive table does not exist."""
+    if not await conn.fetchval("SELECT to_regclass('fabric_events_archive') IS NOT NULL"):
+        return 0
+    return int(await conn.fetchval(f"SELECT count(*) FROM fabric_events_archive WHERE {_VALID} AND sequence <= $1",
+                                   int(watermark)))
 
 
 def encode(state: dict) -> bytes:
@@ -50,7 +83,7 @@ def apply_to_store(store: InspectorStore, row: dict | None, events: list[dict], 
         covered = row.get("covered_count")
         if covered is None:
             covered = sum(1 for e in events if isinstance(e.get("sequence"), int) and e["sequence"] <= watermark)
-        if int(covered) != int(row["event_count"]):
+        if int(covered) + int(row.get("archived_count") or 0) != int(row["event_count"]):
             raise SnapshotStale("the event log below the watermark is not the one the snapshot consumed")
         state = decode(row["body"])
         if state.get("watermark") != watermark or state.get("count") != int(row["event_count"]):
@@ -114,6 +147,7 @@ class SnapshotWriter:
         covered = await conn.fetchval(f"SELECT count(*) FROM fabric_events WHERE {_VALID} AND sequence <= $1 "
                                       "AND ingest_timestamp < now() - make_interval(secs => $2)",
                                       shadow.replay_watermark, self.settle)
+        covered = int(covered) + await archived_inspector_count(conn, shadow.replay_watermark)
         if int(covered) != shadow.replay_count:
             log.warning("inspector snapshot missed or lost events (%s stored, %s consumed); rebuilding", covered, shadow.replay_count)
             return await self._rebuild(conn)
@@ -131,20 +165,70 @@ class SnapshotWriter:
         return self._make_store()
 
     async def _rebuild(self, conn) -> str:
+        """Rebuild the shadow from the whole log, one page at a time so memory stays bounded by ``_PAGE``.
+
+        ``hydrate`` replays in (receive time, per-session sequence) order, not fabric-sequence order. Pages are in
+        fabric-sequence order, so feeding them one by one (``hydrate_delta``) is exactly a full replay only while each
+        page's order keys do not precede what earlier pages consumed. The first page that does (``SnapshotStale``)
+        abandons the streaming pass for :meth:`_replay_in_order`."""
         self._shadow = shadow = self._make_store()
-        events = await self._fetch(conn, -1)
-        await asyncio.to_thread(shadow.hydrate, events)
+        fetched = 0
+        try:
+            async for page in self._pages(conn, -1):
+                await asyncio.to_thread(shadow.hydrate_delta, page)
+                fetched += len(page)
+        except SnapshotStale as exc:
+            log.warning("inspector snapshot rebuild is out of replay order across pages (%s); replaying the log in one pass", exc)
+            self._shadow = shadow = self._make_store()
+            fetched = await self._replay_in_order(conn, shadow)
         covered = await conn.fetchval(f"SELECT count(*) FROM fabric_events WHERE {_VALID} AND sequence <= $1 "
                                       "AND ingest_timestamp < now() - make_interval(secs => $2)",
                                       shadow.replay_watermark, self.settle)
+        covered = int(covered) + await archived_inspector_count(conn, shadow.replay_watermark)
         if int(covered) != shadow.replay_count:
             self._shadow = None
             return "rebuild did not match the stored log; nothing written"
-        return await self._write(conn, shadow, len(events))
+        return await self._write(conn, shadow, fetched)
 
-    async def _fetch(self, conn, after: int) -> list[dict]:
-        """Inspector events newer than ``after``, in the same shape a boot sees (via ``_rebuild_events``)."""
-        rows: list[dict] = []
+    async def _replay_in_order(self, conn, shadow: InspectorStore) -> int:
+        """Replay the whole log in exact replay order with bounded memory: one pass that reads only each row's order key
+        (about 80 bytes a row, instead of the row), a sort of those keys, then the rows fetched ``_PAGE`` at a time in
+        key order. Ties on the key keep fabric-sequence order, as in the one-shot hydrate. Returns the rows replayed."""
+        keys: list[tuple] = []
+        last = -1
+        while True:
+            page = await conn.fetch(
+                "SELECT sequence, source_timestamp, ingest_timestamp, "
+                "CASE WHEN jsonb_typeof(payload->'_received_at') = 'number' THEN payload->>'_received_at' END AS ra, "
+                "CASE WHEN jsonb_typeof(payload->'_sequence') = 'number' THEN payload->>'_sequence' END AS sq "
+                f"FROM fabric_events WHERE {_VALID} AND sequence > $1 "
+                "AND ingest_timestamp < now() - make_interval(secs => $2) ORDER BY sequence LIMIT $3",
+                last, self.settle, _PAGE)
+            for r in page:
+                probe = {"sequence": int(r["sequence"]), "source_timestamp": r["source_timestamp"],
+                         "ingest_timestamp": r["ingest_timestamp"],
+                         "payload": {"_received_at": float(r["ra"]) if r["ra"] is not None else None,
+                                     "_sequence": float(r["sq"]) if r["sq"] is not None else None}}
+                recv, seq = shadow._replay_order(probe)
+                keys.append((recv, seq, probe["sequence"]))
+            if len(page) < _PAGE:
+                break
+            last = int(page[-1]["sequence"])
+        keys.sort()
+        replayed = 0
+        for lo in range(0, len(keys), _PAGE):
+            wanted = [k[2] for k in keys[lo:lo + _PAGE]]
+            rows = await conn.fetch(f"SELECT {_COLUMNS} FROM fabric_events WHERE {_VALID} AND sequence = ANY($1::bigint[])",
+                                    wanted)
+            streams, _ = _rebuild_events([dict(r) for r in rows])
+            by_seq = {e["sequence"]: e for stream in streams.values() for e in stream}
+            batch = [by_seq[q] for q in wanted if q in by_seq]
+            await asyncio.to_thread(shadow.hydrate, batch)
+            replayed += len(batch)
+        return replayed
+
+    async def _row_pages(self, conn, after: int):
+        """Raw inspector rows newer than ``after``, ``_PAGE`` rows at a time, in fabric-sequence order."""
         last = after
         while True:
             page = await conn.fetch(
@@ -152,11 +236,23 @@ class SnapshotWriter:
                 "AND ingest_timestamp < now() - make_interval(secs => $2) ORDER BY sequence LIMIT $3",
                 last, self.settle, _PAGE)
             if not page:
-                break
-            rows.extend(dict(r) for r in page)
+                return
             last = int(page[-1]["sequence"])
+            yield [dict(r) for r in page]
             if len(page) < _PAGE:
-                break
+                return
+
+    async def _pages(self, conn, after: int):
+        """Like :meth:`_row_pages`, each page folded into the shape a boot sees (via ``_rebuild_events``)."""
+        async for rows in self._row_pages(conn, after):
+            streams, _ = _rebuild_events(rows)
+            yield [e for stream in streams.values() for e in stream]
+
+    async def _fetch(self, conn, after: int) -> list[dict]:
+        """Inspector events newer than ``after`` (all pages), in the same shape a boot sees (via ``_rebuild_events``)."""
+        rows: list[dict] = []
+        async for page in self._row_pages(conn, after):
+            rows.extend(page)
         streams, _ = _rebuild_events(rows)
         return [e for stream in streams.values() for e in stream]
 

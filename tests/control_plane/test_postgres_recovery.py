@@ -213,6 +213,10 @@ def test_snapshot_runs_compact_but_do_not_cross_partial_updates(db):
     assert recovered.record_event("service", "svc", "ServiceRetired", {})["sequence"] == 501
 
 
+# ~5.5 min alone, >23 min under disk contention (it builds ~1.77M rows), so the suite-wide 900 s hang detector is far too low: the
+# ceiling is 1 hour, still a hang detector. `slow` makes scripts/ci/unit-gates.sh run it serially after the parallel pass.
+@pytest.mark.slow
+@pytest.mark.timeout(3600)
 def test_production_cardinality_snapshot_recovery_and_database_restart(db):
     """Audited row/type/cardinality mix, synthetic payloads; not a latency bound."""
     observation = {**_snapshot(), "service_id": "svc", "source_port": 8000,

@@ -4,7 +4,13 @@
 #   deploy/control-plane/deploy.sh [--ref origin/main] [--dry-run] [--no-fetch]
 #                                  [--fleet-config PATH] [--collab-lock-wait SECONDS]
 #                                  [--deploy-lock-wait SECONDS]
+#                                  [--checkpoint-lock-wait SECONDS] [--pause-worker]
 #                                  [--with-memory [--memory-checkout PATH]]
+#                                  [--memory-client-config PATH]
+#                                  [--memory-private-egress --memory-private-egress-gateway IPV4/32]
+#                                  [--no-memory-private-egress]
+#                                  [--memory-private-egress-cidr CIDR]
+#                                  [--memory-private-egress-recover SAVED_ATTEMPT]
 #                                  [--allow-divergent]
 #   HEAD expressions use the caller worktree only after common-repository proof.
 #   Normal rollouts must descend from the verified deployed commit; intentional
@@ -20,9 +26,14 @@
 #   3. renders the variables docker compose itself needs (images' passwords, ports,
 #      bind address) from the central file into a transient 0600 env file inside a
 #      0700 directory (`herdr-eng fleet config render-compose`), removed on exit
-#   4. recreates control-plane-web, control-plane-worker and llm-proxy on that one
-#      image tag (postgres, rustfs, coredns, gateway, herdr-web untouched) using the
-#      compose files from that same commit; the central file's DIRECTORY is
+#   4. recreates control-plane-web, control-plane-worker, llm-proxy, fabric-gateway and herdr-web
+#      on that one image tag (postgres, rustfs, coredns untouched) using the
+#      compose files from that same commit. Recreating fabric-gateway drops its in-memory
+#      port leases for the restart window; the fabric agents re-register them on their next
+#      keepalive (herdr_engineering/fabric_agent.py, _keepalive: a heartbeat for an unknown
+#      lease, or a failed one, re-registers the same target and lease id), so dev:<port> URLs
+#      return without operator action, but expect a short gap in every forwarded service.
+#      The central file's DIRECTORY is
 #      mounted read-only at /etc/herdr/fleet/ (a single-file mount would keep the old
 #      inode after a rename-replace, so edits would never reach the server).
 #      With the collaboration marker it also renders control_plane.collab (and only
@@ -38,6 +49,14 @@
 #      before the edge;
 #      disabled, a running share-public is stopped and the edge conf is the repo file unchanged. A rollback
 #      recreates share-public from the previous commit when the restored edge conf routes /s/, else stops it
+#      Artifact host (member-owned artifacts): control_plane.artifact_host is always validated
+#      (render-artifact-host; an enabled but incomplete block is refused before anything runs, no value
+#      printed). Only when it is enabled (which needs the collaboration marker, and share-public off) is its
+#      configuration installed 0644 in a 0700 directory (Compose ignores secret modes; see compose.yaml),
+#      its image built from the same commit, the edge conf rendered with its server block and /mcp/artifacts,
+#      and the host project (deploy/artifact-host/compose.yaml: db, public, internal) migrated and brought up
+#      healthy BEFORE the control plane's compose up, which attaches control-plane-web and the edge to the
+#      host's two networks (compose.artifact-host.yaml). `--dry-run` renders and validates all of it.
 #   5. waits for /api/v1/health to report the new commit AND for every recreated
 #      container (web, worker, llm-proxy, collab-public/edge) to be running, not
 #      restarting and not unhealthy. Nothing on the host changes before the image is
@@ -55,6 +74,14 @@
 #      A service container that is MISSING when the deploy starts (an interrupted
 #      recreate removed it) is recorded as absent, not an error: the deploy recreates it,
 #      and a rollback recreates it from the previous web's pinned image.
+#
+# The checkpoint prewarm needs the per-schema projection materializer lock, which the
+# running worker's periodic refresh holds for most of each cycle. By default the prewarm
+# waits for it (--checkpoint-lock-wait, default 420s: longer than one 300s refresh cycle
+# plus a pass), failing with the lock's reason only after that. --pause-worker (opt-in)
+# instead stops herdr-cp-worker for the prewarm and starts it again straight after, on
+# success, failure or interrupt; the worker's jobs (artifacts, collab bridge) idle for
+# that time. See docs/operations/projection-checkpoints.md.
 #
 # One deploy at a time: every real deploy holds STATE_DIR/deploy.lock from before it
 # changes anything until it exits (rollback included), waiting --deploy-lock-wait
@@ -107,7 +134,12 @@
 set -euo pipefail
 
 REF="origin/main"; DRY=0; FETCH=1; ALLOW_DIVERGENT=0; COLLAB_LOCK_WAIT=300; DEPLOY_LOCK_WAIT=600
+CHECKPOINT_LOCK_WAIT=420; PAUSE_WORKER=0; WORKER_PAUSED=0
+MEMORY_PRIVATE_EGRESS=auto; MEMORY_PRIVATE_EGRESS_RECOVER=""
+MEMORY_PRIVATE_EGRESS_CIDR="172.31.252.0/29"
+MEMORY_PRIVATE_EGRESS_GATEWAY="${HERDR_CP_MEMORY_PRIVATE_EGRESS_GATEWAY:-}"
 MEMORY=0; MEMORY_CHECKOUT="${HERDR_MEMORY_CHECKOUT:-}"
+MEMORY_CLIENT_CONFIG="${HERDR_CP_MEMORY_CLIENT_CONFIG:-}"
 CENTRAL="$HOME/.config/herdr-engineering/fleet/fleet-config.yaml"
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -118,18 +150,46 @@ while [ $# -gt 0 ]; do
     --fleet-config) CENTRAL="${2:?--fleet-config needs a value}"; shift 2 ;;
     --collab-lock-wait) COLLAB_LOCK_WAIT="${2:?--collab-lock-wait needs a value}"; shift 2 ;;
     --deploy-lock-wait) DEPLOY_LOCK_WAIT="${2:?--deploy-lock-wait needs a value}"; shift 2 ;;
+    --checkpoint-lock-wait) CHECKPOINT_LOCK_WAIT="${2:?--checkpoint-lock-wait needs a value}"; shift 2 ;;
+    --pause-worker) PAUSE_WORKER=1; shift ;;
+    --memory-private-egress-recover) MEMORY_PRIVATE_EGRESS_RECOVER="${2:?needs the saved deploy attempt}"; shift 2 ;;
+    --memory-private-egress) MEMORY_PRIVATE_EGRESS=1; shift ;;
+    --no-memory-private-egress) MEMORY_PRIVATE_EGRESS=0; shift ;;
+    --memory-private-egress-cidr) MEMORY_PRIVATE_EGRESS_CIDR="${2:?needs a CIDR}"; shift 2 ;;
+    --memory-private-egress-gateway) MEMORY_PRIVATE_EGRESS_GATEWAY="${2:?needs an explicit IPv4/32}"; shift 2 ;;
     --with-memory) MEMORY=1; shift ;;
     --memory-checkout) MEMORY_CHECKOUT="${2:?--memory-checkout needs a value}"; shift 2 ;;
+    --memory-client-config) MEMORY_CLIENT_CONFIG="${2:?--memory-client-config needs a path}"; shift 2 ;;
     -h|--help) sed -n '2,/^[^#]/{/^#/p}' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
 [[ "$COLLAB_LOCK_WAIT" =~ ^[0-9]+$ ]] || { echo "--collab-lock-wait needs a whole number of seconds" >&2; exit 2; }
+[[ "$CHECKPOINT_LOCK_WAIT" =~ ^[0-9]+$ ]] || { echo "--checkpoint-lock-wait needs a whole number of seconds" >&2; exit 2; }
 [[ "$DEPLOY_LOCK_WAIT" =~ ^[0-9]+$ ]] || { echo "--deploy-lock-wait needs a whole number of seconds" >&2; exit 2; }
+if [ -n "$MEMORY_CLIENT_CONFIG" ]; then
+  MEMORY_CLIENT_CONFIG="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).expanduser().absolute())' "$MEMORY_CLIENT_CONFIG")"
+fi
 
 HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 REPO="$(git -C "$HERE" rev-parse --show-toplevel)"
 REF_REPO="$REPO"
+# The interpreter for every python helper below: the repository's own virtualenv when it has one (the fleet config needs
+# PyYAML and pydantic, which a bare system python3 may lack), else python3. HERDR_DEPLOY_PYTHON overrides.
+PY="${HERDR_DEPLOY_PYTHON:-}"
+[ -n "$PY" ] || { [ -x "$REPO/.venv/bin/python" ] && PY="$REPO/.venv/bin/python"; } || PY=python3
+# The artifact host's names, networks and addresses are FIXED: the edge's :8082 deny, the internal role's bind address and
+# the project the rollback and the disable path stop are all derived from them. They exist as environment variables only
+# so the real-Docker tests can run a second copy beside a live one; a deploy refuses them rather than let a stray export
+# make the deny list describe a different network than the one Docker creates.
+for v in HERDR_ARTIFACT_HOST_PROJECT HERDR_ARTIFACT_NET_PREFIX HERDR_ARTIFACT_EDGE_SUBNET HERDR_ARTIFACT_INTERNAL_SUBNET \
+    HERDR_ARTIFACT_INTERNAL_IP HERDR_ARTIFACT_HOST_DIR HERDR_ARTIFACT_HOST_TAG; do
+  if [ -n "${!v:-}" ]; then
+    echo "$v is set in the environment: the artifact host's project, networks and addresses are fixed by the repository" \
+         "and are not deploy settings (unset $v)" >&2
+    exit 2
+  fi
+done
 case "$REF" in
   HEAD|HEAD[~^:@]*|@|@[~^:]*|'@{'*)
     # A canonical tool worktree has its own HEAD. Never substitute that for the
@@ -149,6 +209,23 @@ STATE_DIR="$HOME/.local/state/herdr-engineering/deploys"
 STATE_HELPER="$HERE/deploy-state.py"
 # shellcheck source=deploy-lock.sh
 source "$HERE/deploy-lock.sh"
+
+# Permission-only hard-interruption recovery. Reuse the SAME lock and saved
+# attempt; never guess or recreate an image/config/profile from partial state.
+if [ -n "$MEMORY_PRIVATE_EGRESS_RECOVER" ]; then
+  [ "$DRY" = 0 ] || { echo "permission recovery is explicit and cannot run in --dry-run; no changes made" >&2; exit 2; }
+  deploy_lock_acquire || exit $?
+  trap 'deploy_lock_cleanup' EXIT
+  trap '' INT TERM HUP
+  deploy_compat_lock_acquire || exit $?
+  source "$HERE/web-egress-deploy.sh"
+  RECOVER_ATTEMPT="$("$PY" -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve(strict=True))' "$MEMORY_PRIVATE_EGRESS_RECOVER")" || exit 3
+  web_egress_cmd recover --current "$STATE_DIR/web-egress/current.json" \
+    --attempt "$RECOVER_ATTEMPT/web-egress" --lock-fd "$DEPLOY_LOCK_FD" \
+    --lock-path "$STATE_DIR/rollout.lock" || exit 3
+  echo "private egress permission recovery phase finished; network/image/config/profile restoration is NOT completed; preserve and review the saved attempt" >&2
+  exit 3
+fi
 MOUNT_TARGET="/etc/herdr/fleet/fleet-config.yaml"
 # Collaboration network (HCN) is opt-in per host: it is layered on only when this
 # marker file exists, so an ordinary deploy never switches it on elsewhere.
@@ -275,6 +352,18 @@ check_pipelines_dir || exit 1
 WORK=""; ENV_DIR=""; PREV_WORK=""
 HOST_MUTATED=0
 DEPLOY_FINISHED=0
+# Start the worker again if --pause-worker stopped it. Idempotent; never fatal.
+# shellcheck disable=SC2317
+resume_worker() {
+  [ "$WORKER_PAUSED" = 1 ] || return 0
+  if docker start herdr-cp-worker >/dev/null 2>&1; then
+    echo "resumed herdr-cp-worker"
+  else
+    echo "WARNING: could not start herdr-cp-worker; start it with: docker start herdr-cp-worker" >&2
+    return 0
+  fi
+  WORKER_PAUSED=0
+}
 # Called by the EXIT trap via finish().
 # shellcheck disable=SC2317
 cleanup() {
@@ -292,6 +381,7 @@ finish() {
   # Repeated interrupts must not cut short recovery or release ownership early.
   trap '' INT TERM HUP
   trap - EXIT
+  resume_worker
   if [ "$HOST_MUTATED" = 1 ] && [ "$DEPLOY_FINISHED" = 0 ]; then
     rollback || rollback_status=$?
     [ "$rollback_status" != 3 ] || status=3
@@ -328,9 +418,9 @@ else
 fi
 # herdr-eng from exactly the commit being deployed, so the rendered variables match
 # the compose files that ship with it.
-# Run from inside $WORK: `python3 -m` puts the cwd first on sys.path, so a caller
+# Run from inside $WORK: `"$PY" -m` puts the cwd first on sys.path, so a caller
 # standing in another checkout would otherwise get that checkout's code.
-herdr_eng() { (cd "$WORK" && PYTHONPATH="$WORK" python3 -m herdr_engineering.cli "$@"); }
+herdr_eng() { (cd "$WORK" && PYTHONPATH="$WORK" "$PY" -m herdr_engineering.cli "$@"); }
 
 # Validation prints revision and host count only, never a value.
 if ! herdr_eng fleet config validate --path "$CENTRAL" >/dev/null 2>&1; then
@@ -368,6 +458,16 @@ if [ "$MEMORY" = 1 ]; then
   . "$MEM_LIB"
 fi
 if [ "$MEMORY" = 1 ]; then memory_preflight || exit 1; fi
+
+# The read-only explorer's CLI/profile use the app's existing rollout, lock
+# and rollback, independently of the optional backend memory step.
+MEMORY_CLIENT_LIB="$WORK/deploy/control-plane/memory-client-deploy.sh"
+[ -f "$MEMORY_CLIENT_LIB" ] || MEMORY_CLIENT_LIB="$HERE/memory-client-deploy.sh"
+. "$MEMORY_CLIENT_LIB"
+memory_client_preflight || exit 1
+# Private bridge activation is an explicit, separately reviewed opt-in.
+source "$HERE/web-egress-deploy.sh"
+web_egress_preflight || exit 1
 
 # only_file <dir> <name>: the directory (mounted whole into a container) holds nothing else
 only_file() {
@@ -432,6 +532,52 @@ SHARE_CONFIG="$SHARE_DIR/share-config.json"
 SHARE_SERVICE=()
 [ "$SHARE" = 0 ] || SHARE_SERVICE=(share-public)
 
+# Artifact host: a DIRECTORY rendered from control_plane.artifact_host, the Cognito identifiers of control_plane.collab and
+# the digest of control_plane.artifact_library.host_key: one config slice per role (public.json, internal.json,
+# migrate.json), the database admin's password and roles.sql. Always rendered (to validate), installed only when enabled.
+# An older candidate without the command has no host wiring at all.
+ARTIFACT_HOST=0; NEW_AH=""
+AH_PROJECT="herdr-artifact-host"
+if grep -q '"render-artifact-host"' "$WORK/herdr_engineering/cli.py" 2>/dev/null \
+    && [ -f "$WORK/deploy/artifact-host/compose.yaml" ] && [ -f "$WORK/deploy/control-plane/compose.artifact-host.yaml" ]; then
+  NEW_AH="$ENV_DIR/new/artifact-host"
+  if ! AH_OUT="$(herdr_eng fleet config render-artifact-host --path "$CENTRAL" --out "$NEW_AH")"; then
+    echo "control_plane.artifact_host is incomplete or invalid in $CENTRAL; nothing was changed" >&2
+    exit 1
+  fi
+  case "$AH_OUT" in *artifact_host=enabled) ARTIFACT_HOST=1 ;; esac
+fi
+if [ "$ARTIFACT_HOST" = 1 ] && [ "$COLLAB" = 0 ]; then
+  echo "control_plane.artifact_host.enabled is true but the collaboration network is off: the host is served behind" \
+       "the collab edge (create $COLLAB_MARKER), or set control_plane.artifact_host.enabled: false" >&2
+  exit 1
+fi
+if [ "$DRY" = 1 ]; then AH_DIR="$NEW_AH"; else AH_DIR="$HOME/.config/herdr-engineering/artifact-host"; fi
+AH_FILES=(public.json internal.json migrate.json db-admin-password roles.sql)
+AH_PUBLIC_HOST=""; AH_MEMBER_HOST=""; SHARE_MEMBER_HOST=""
+[ "$ARTIFACT_HOST" = 1 ] && { AH_PUBLIC_HOST="$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["public_host"])' "$NEW_AH/public.json")" \
+  && [ -n "$AH_PUBLIC_HOST" ] || { echo "cannot read the artifact host's public name from its rendered slice" >&2; exit 1; }; }
+# Optional own origin for the member web UI (control_plane.artifact_host.member_host): empty when unset.
+[ "$ARTIFACT_HOST" = 1 ] && { AH_MEMBER_HOST="$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1])).get("member_host", ""))' "$NEW_AH/public.json")" \
+  || { echo "cannot read the artifact host's member name from its rendered slice" >&2; exit 1; }; }
+# What the PREVIOUS deploy left running: the marker it wrote on success, else (older deploys) whether the project has
+# containers. A rollback restores THIS, not whatever the new configuration says.
+AH_STATE="$HOME/.config/herdr-engineering/artifact-host.state"
+PREV_AH=0
+if [ -f "$AH_STATE" ]; then [ "$(cat "$AH_STATE" 2>/dev/null)" != enabled ] || PREV_AH=1
+elif [ -n "$(docker ps -q --filter "label=com.docker.compose.project=$AH_PROJECT" 2>/dev/null || true)" ]; then PREV_AH=1; fi
+# ah_run <worktree> <image tag> <compose args...>: the artifact host's own project (that worktree's compose file, none of the
+# control plane's), with this deploy's config directory. The only place the host's variables are set (see the refusal above).
+ah_run() {
+  local tree="$1" tag="$2"; shift 2
+  HERDR_ARTIFACT_HOST_TAG="$tag" HERDR_ARTIFACT_HOST_DIR="$AH_DIR" \
+    docker compose -p "$AH_PROJECT" -f "$tree/deploy/artifact-host/compose.yaml" "$@"
+}
+ah_compose() { ah_run "$WORK" "$TAG" "$@"; }
+AH_MIGRATED=0        # set when the deploy may have changed the SCHEMA (a failed migration, or the applied-migration count moved)
+AH_MANUAL=0          # a rollback that could not revert the host and says so
+AH_BACKUP_FILE=""
+
 # The edge bind-mounts this single nginx.conf, so it is written IN PLACE (same inode): a
 # rename-replace would leave the running container reading the old file.
 EDGE_CONF_CHANGED=0
@@ -469,7 +615,7 @@ if [ "$COLLAB" = 1 ]; then
   # The edge conf for this config: the repo file, plus the share host server only when share is enabled.
   NEW_EDGE="$ENV_DIR/new/collab-edge/nginx.conf"
   EDGE_TEMPLATE="$WORK/deploy/control-plane/collab-edge/nginx.conf"
-  if [ -n "$NEW_SHARE" ]; then
+  if [ -n "$NEW_SHARE" ] || [ -n "$NEW_AH" ]; then
     herdr_eng fleet config render-edge --path "$CENTRAL" --template "$EDGE_TEMPLATE" --out "$NEW_EDGE" >/dev/null || exit 1
   else
     mkdir -p "$(dirname "$NEW_EDGE")" && cp "$EDGE_TEMPLATE" "$NEW_EDGE"
@@ -489,10 +635,62 @@ if [ "$COLLAB" = 1 ]; then
   fi
 fi
 
+# Fabric-trust listener (SPEC 6a): only with the collab overlay AND control_plane.collab.fabric_trust.listen_* set.
+# The address was validated (tailnet range) by the config; docker publishes exactly that host:port.
+FABRIC=0
+FABRIC_SERVICE_ORPHAN=0
+FABRIC_SERVICE=()   # the services only the fabric overlay defines; rebuilt per checkout on rollback
+# An older candidate (a rollback target, a pinned --ref) has neither the helper nor the overlay: no listener then.
+if [ "$COLLAB" = 1 ] && grep -q 'fabric-listener' "$WORK/herdr_engineering/cli.py" 2>/dev/null \
+    && [ -f "$WORK/deploy/control-plane/compose.collab-fabric.yaml" ]; then
+  if ! FABRIC_LISTEN="$(herdr_eng fleet config fabric-listener --path "$CENTRAL")"; then
+    echo "control_plane.collab.fabric_trust is invalid in $CENTRAL" >&2
+    exit 1
+  fi
+  if [ -n "$FABRIC_LISTEN" ]; then
+    FABRIC=1
+    read -r FABRIC_HOST FABRIC_PORT <<< "$FABRIC_LISTEN"
+    export HERDR_COLLAB_FABRIC_BIND="$FABRIC_HOST" HERDR_COLLAB_FABRIC_PORT="$FABRIC_PORT"
+    if [ "$DRY" = 1 ]; then export HERDR_COLLAB_FABRIC_WHOIS_DIR="$ENV_DIR/fabric-whois"
+    else export HERDR_COLLAB_FABRIC_WHOIS_DIR="$HOME/.local/share/herdr-engineering/collab-fabric-whois"; fi
+    COLLAB_FILES+=(-f "$WORK/deploy/control-plane/compose.collab-fabric.yaml")
+    EDGE_SERVICE=(fabric-whois "${EDGE_SERVICE[@]}")
+    FABRIC_SERVICE=(fabric-whois)
+    echo "fabric-trust listener: $FABRIC_HOST:$FABRIC_PORT (whois sidecar fabric-whois)"
+    # Host hardening the listener relies on but a deploy cannot install (root): warn, never fail.
+    FABRIC_FW="$WORK/deploy/control-plane/collab-fabric-firewall.sh"
+    if [ -x "$FABRIC_FW" ]; then
+      FW_RC=0; "$FABRIC_FW" --check >/dev/null 2>&1 || FW_RC=$?
+      case "$FW_RC" in
+        0) ;;
+        2) FW_BOOT=""
+           if systemctl is-enabled herdr-collab-fabric-firewall.service >/dev/null 2>&1; then
+             FW_BOOT="; boot unit herdr-collab-fabric-firewall.service is enabled"
+           fi
+           echo "NOTE: fabric network firewall rules could not be verified without root${FW_BOOT}. To verify: sudo $FABRIC_FW --check" >&2 ;;
+        *) echo "WARNING: fabric network firewall is not confirmed present: collab-public's network has a default route" \
+             "and can reach this host's own addresses. As root run: $FABRIC_FW --install  (docs/operations/fabric-trust.md, Required hardening)" >&2 ;;
+      esac
+    fi
+    if [ ! -e /etc/systemd/system/docker.service.d/after-tailscale.conf ]; then
+      echo "WARNING: docker is not ordered after tailscaled: after a reboot the published fabric port may fail to bind and the PUBLIC collab site" \
+        "stay down. Install $WORK/deploy/control-plane/docker-after-tailscale.conf as /etc/systemd/system/docker.service.d/after-tailscale.conf" >&2
+    fi
+  fi
+fi
+
 COMPOSE_FILES=(-f "$WORK/deploy/control-plane/compose.yaml" "${COLLAB_FILES[@]}")
+if [ "$WEB_EGRESS_COMPOSE_ENABLED" = 1 ]; then
+  COMPOSE_FILES+=(-f "$WEB_EGRESS_OVERLAY")
+fi
+if [ "$ARTIFACT_HOST" = 1 ] && [ -f "$WORK/deploy/control-plane/compose.artifact-host.yaml" ]; then
+  COMPOSE_FILES+=(-f "$WORK/deploy/control-plane/compose.artifact-host.yaml")
+fi
+export HERDR_CP_WEB_EGRESS_CIDR="$MEMORY_PRIVATE_EGRESS_CIDR"
+export HERDR_CP_WEB_EGRESS_GENERATION="$WEB_EGRESS_GENERATION"
 # Every service of ours that runs the herdr-engineering image and reads the fleet
 # config: rolled forward (and back) together on one tag.
-APP_SERVICES=(control-plane-web control-plane-worker llm-proxy)
+APP_SERVICES=(control-plane-web control-plane-worker llm-proxy fabric-gateway herdr-web)
 
 if [ "$DRY" = 1 ]; then
   echo "[dry-run] rendered the compose variables to a 0600 file in a 0700 temp dir (removed on exit)"
@@ -505,6 +703,14 @@ if [ "$DRY" = 1 ]; then
     else
       echo "[dry-run] docker compose config FAILED (details withheld; they could contain values)" >&2
       exit 1
+    fi
+    if [ "$ARTIFACT_HOST" = 1 ]; then
+      if ah_run "$WORK" "$TAG" config -q >/dev/null 2>&1; then
+        echo "[dry-run] artifact host docker compose config: valid"
+      else
+        echo "[dry-run] artifact host docker compose config FAILED (details withheld; they could contain values)" >&2
+        exit 1
+      fi
     fi
   else
     echo "[dry-run] docker compose not available: skipped offline compose validation"
@@ -536,7 +742,10 @@ if [ "$DRY" = 1 ]; then
   if [ "$SHARE" = 1 ]; then
     echo "[dry-run] share links enabled: rendered the share slice to a temp dir (would install it at ~/.config/herdr-engineering/share/), the edge conf gains the share host's server block, the edge certificate must name that host, share-public would be force-recreated before the edge"
   fi
-  echo "[dry-run] would prewarm the target image checkpoint on an existing deployment when its CLI supports it, before host or service changes"
+  if [ "$ARTIFACT_HOST" = 1 ]; then
+    echo "[dry-run] artifact host enabled: rendered its configuration to a temp dir (would install it in a 0700 $AH_DIR), the edge conf gains its server block and /mcp/artifacts, would build herdr-artifact-host:$TAG, create the database roles, back the database up, run migrate, and bring up project $AH_PROJECT (db, public, internal, relay) healthy BEFORE the control plane's compose up"
+  fi
+  echo "[dry-run] would prewarm the target image checkpoint on an existing deployment when its CLI supports it, before host or service changes (waiting up to ${CHECKPOINT_LOCK_WAIT}s for the worker's materializer lock$([ "$PAUSE_WORKER" = 1 ] && echo '; --pause-worker: herdr-cp-worker is stopped for the prewarm and started again after'))"
   echo "[dry-run] would build herdr-engineering:$TAG and recreate ${APP_SERVICES[*]} ${EDGE_SERVICE[*]}${SHARE_SERVICE[*]:+ ${SHARE_SERVICE[*]}}"
   exit 0
 fi
@@ -552,7 +761,7 @@ PREV_RECEIPT_TAG=""; VERIFIED_PREV_COMMIT=""
 if [ -n "$PREVIOUS_IMAGE" ]; then
   # Protected rollback uses image IDs as Config.Image. Recover its logical tag
   # from the actual image buildstamp, cross-checked against the existing receipt.
-  PREVIOUS_IDENTITY="$(python3 "$STATE_HELPER" verified-previous "$STATE_DIR" "$PREVIOUS_IMAGE")" || exit 1
+  PREVIOUS_IDENTITY="$("$PY" "$STATE_HELPER" verified-previous "$STATE_DIR" "$PREVIOUS_IMAGE")" || exit 1
   read -r PREV_RECEIPT_TAG VERIFIED_PREV_COMMIT <<< "$PREVIOUS_IDENTITY"
 fi
 if [ -z "$PREVIOUS_IMAGE" ]; then
@@ -561,7 +770,7 @@ elif ! [[ "$PREV_RECEIPT_TAG" =~ ^[0-9a-f]{12}$ ]] || [ ! -r "$STATE_DIR/$PREV_R
   ROLLBACK_NOTE="no deploy receipt for the running image $PREVIOUS_IMAGE"
 else
   receipt_field() {
-    python3 -c 'import json,sys; v=json.load(open(sys.argv[1])).get(sys.argv[2]); print(v if isinstance(v,str) else "")' \
+    "$PY" -c 'import json,sys; v=json.load(open(sys.argv[1])).get(sys.argv[2]); print(v if isinstance(v,str) else "")' \
       "$STATE_DIR/$PREV_RECEIPT_TAG.json" "$1" 2>/dev/null || true
   }
   CANDIDATE="$(receipt_field commit)"
@@ -640,22 +849,28 @@ fi
 
 deploy_lock_phase build
 
-# A failed build exits here: nothing on the host has been touched yet.
+# A failed build exits here: no running service or installed profile changed.
+memory_client_build || exit 1
 docker build -q -f "$WORK/deploy/fabric-stack/Dockerfile" --build-arg "GIT_COMMIT=$SHA" \
-  -t "herdr-engineering:$TAG" "$WORK" >/dev/null
+  "${MEMORY_CLIENT_BUILD_ARGS[@]}" -t "herdr-engineering:$TAG" "$WORK" >/dev/null
+# The host's image comes from the same commit (only the standalone herdr_artifact_host package goes into it).
+if [ "$ARTIFACT_HOST" = 1 ]; then
+  docker build -q -f "$WORK/deploy/artifact-host/Dockerfile" --build-arg "GIT_COMMIT=$SHA" \
+    -t "herdr-artifact-host:$TAG" "$WORK" >/dev/null
+fi
 
 # Use this checkout's helper, not the target commit's possibly older deploy tooling.
 # The selected canonical source stays the forward mount. Snapshots live outside
 # ENV_DIR so cleanup, logout and a failed rollout cannot destroy recovery inputs.
-ATTEMPT="$(python3 "$STATE_HELPER" prepare "$STATE_DIR" "$CENTRAL_REAL" "$FULL" \
+ATTEMPT="$("$PY" "$STATE_HELPER" prepare "$STATE_DIR" "$CENTRAL_REAL" "$FULL" \
   "$PREV_COMMIT" "$PREVIOUS_IMAGE" "$COLLAB")" || exit 1
 if [ "$CENTRAL_HASH" != "$(sha256sum "$ATTEMPT/candidate/fleet-config.yaml" | cut -d' ' -f1)" ]; then
-  python3 "$STATE_HELPER" outcome "$ATTEMPT" config_changed
+  "$PY" "$STATE_HELPER" outcome "$ATTEMPT" config_changed
   echo "canonical config changed during preparation; refusing to recreate services" >&2
   exit 1
 fi
 ROLLBACK_IMAGES=""
-ABSENT="$(python3 -c 'import json,sys; print(" ".join(json.load(open(sys.argv[1]))["previous"].get("absent", [])))' \
+ABSENT="$("$PY" -c 'import json,sys; print(" ".join(json.load(open(sys.argv[1]))["previous"].get("absent", [])))' \
   "$ATTEMPT/metadata.json" 2>/dev/null || true)"
 if [ -n "$ABSENT" ]; then
   echo "missing service containers (will be created by this deploy): $ABSENT"
@@ -667,21 +882,37 @@ fi
 # network namespace so its database names/routes work without starting any service.
 # A first deploy has no live database/network; legacy targets lack this CLI.
 if [ -n "$PREVIOUS_IMAGE" ] && grep -q '^def _cmd_cp_checkpoint(' "$WORK/herdr_engineering/cli.py"; then
-  CANDIDATE_IMAGE_ID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["candidate"]["image_id"])' "$ATTEMPT/metadata.json")"
+  CANDIDATE_IMAGE_ID="$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["candidate"]["image_id"])' "$ATTEMPT/metadata.json")"
   PREWARM_LOG="$ATTEMPT/checkpoint-prewarm.log"
   (umask 077; : > "$PREWARM_LOG")
   chmod 600 "$PREWARM_LOG"
   deploy_lock_phase checkpoint-prewarm
   echo "prewarming target projection checkpoint before host or service changes"
+  if [ "$PAUSE_WORKER" = 1 ]; then
+    if [ "$(docker inspect -f '{{.State.Running}}' herdr-cp-worker 2>/dev/null || true)" = true ]; then
+      echo "pausing herdr-cp-worker for the prewarm (restarted right after, even on failure)"
+      WORKER_PAUSED=1
+      if ! docker stop -t 60 herdr-cp-worker >/dev/null 2>&1; then
+        echo "could not stop herdr-cp-worker; no host files or services changed" >&2
+        resume_worker
+        exit 1
+      fi
+    else
+      echo "herdr-cp-worker is not running; nothing to pause"
+    fi
+  fi
   if ! docker run --rm --network container:herdr-cp-web \
       --mount "type=bind,src=$ATTEMPT/candidate,dst=/etc/herdr/fleet,readonly" \
       --entrypoint herdr-eng "$CANDIDATE_IMAGE_ID" \
       control-plane checkpoint --fleet-config "$MOUNT_TARGET" \
-      --migrations /app/control-plane/migrations >"$PREWARM_LOG" 2>&1; then
-    python3 "$STATE_HELPER" outcome "$ATTEMPT" prewarm_failed
+      --migrations /app/control-plane/migrations \
+      --lock-wait "$CHECKPOINT_LOCK_WAIT" >"$PREWARM_LOG" 2>&1; then
+    resume_worker
+    "$PY" "$STATE_HELPER" outcome "$ATTEMPT" prewarm_failed
     echo "target projection checkpoint prewarm failed; no host files or services changed. Reason and output saved in private log: $PREWARM_LOG" >&2
     exit 1
   fi
+  resume_worker
   echo "projection checkpoint prewarm succeeded; metrics saved in private log: $PREWARM_LOG"
 else
   echo "projection checkpoint prewarm skipped (first deploy or target predates checkpoint CLI)"
@@ -695,7 +926,7 @@ if [ "$COLLAB" = 1 ]; then
   mkdir -p "$(dirname "$COLLAB_LOCK")"
   exec {COLLAB_LOCK_FD}>>"$COLLAB_LOCK"
   if ! flock -w "$COLLAB_LOCK_WAIT" "$COLLAB_LOCK_FD"; then
-    python3 "$STATE_HELPER" outcome "$ATTEMPT" collab_sync_busy
+    "$PY" "$STATE_HELPER" outcome "$ATTEMPT" collab_sync_busy
     echo "collab-sync is still running after ${COLLAB_LOCK_WAIT}s (lock $COLLAB_LOCK); nothing was changed. Retry, or raise --collab-lock-wait" >&2
     exit 1
   fi
@@ -740,6 +971,7 @@ if [ "$COLLAB" = 1 ]; then
   for u in "${SYNC_UNITS[@]}"; do backup_file "$UNIT_DIR/$u"; done
 fi
 if [ "$SHARE" = 1 ]; then backup_file "$SHARE_CONFIG"; fi
+if [ "$ARTIFACT_HOST" = 1 ]; then for f in "${AH_FILES[@]}"; do backup_file "$AH_DIR/$f"; done; fi
 
 # restore_host_state: every backed-up file back to its pre-deploy content. nginx.conf in
 # place (same inode, then the edge reloads); the collab-sync units reload in systemd.
@@ -765,6 +997,9 @@ install_private() {   # <src> <dest>: 0600 file in a 0700 dir, atomic
     && install -m 0600 "$1" "$2.install.tmp" && mv -f "$2.install.tmp" "$2"
 }
 
+memory_client_snapshot || exit 1
+web_egress_snapshot || exit 1
+
 # compose_run <worktree> <env file> <image tag> <commit> <compose args...>: that
 # worktree's compose files with the given env file and this deploy's paths. Rollback
 # passes the previous commit's worktree and an env file rendered by ITS code.
@@ -772,10 +1007,18 @@ compose_run() {
   local tree="$1" envf="$2" tag="$3" commit="$4"; shift 4
   local files=(-f "$tree/deploy/control-plane/compose.yaml")
   if [ "$COLLAB" = 1 ]; then files+=(-f "$tree/deploy/control-plane/compose.collab.yaml"); fi
+  if [ "$FABRIC" = 1 ] && [ -f "$tree/deploy/control-plane/compose.collab-fabric.yaml" ]; then
+    files+=(-f "$tree/deploy/control-plane/compose.collab-fabric.yaml")
+  fi
+  if [ "$ARTIFACT_HOST" = 1 ] && [ -f "$tree/deploy/control-plane/compose.artifact-host.yaml" ]; then
+    files+=(-f "$tree/deploy/control-plane/compose.artifact-host.yaml")
+  fi
+  if [ "$WEB_EGRESS_COMPOSE_ENABLED" = 1 ]; then files+=(-f "$WEB_EGRESS_OVERLAY"); fi
   if [ -n "$ROLLBACK_IMAGES" ]; then files+=(-f "$ROLLBACK_IMAGES"); fi
   # TRANSITION: a rollback to the release BEFORE the apps mount builds that release's compose.yaml, which still
   # requires HERDR_CP_GOOGLE_DIR (mounted at /etc/herdr/google:ro). Docker would create a missing bind source as
   # root, so point it at $APPS_DIR (exists, read-only, harmless). Remove after the next release.
+  HERDR_CP_WEB_EGRESS_CIDR="$MEMORY_PRIVATE_EGRESS_CIDR" HERDR_CP_WEB_EGRESS_GENERATION="$WEB_EGRESS_GENERATION" \
   HERDR_CP_FLEET_DIR="$FLEET_DIR" HERDR_LLM_SLICE_DIR="$LLM_DIR" \
     HERDR_CP_GITHUB_APP_DIR="$GITHUB_APP_DIR" HERDR_CP_APPS_DIR="$APPS_DIR" HERDR_CP_GOOGLE_DIR="$APPS_DIR" HERDR_CP_PIPELINES_DIR="$PIPELINES_DIR" HERDR_CP_IMAGE_TAG="$tag" HERDR_CP_GIT_COMMIT="$commit" \
     docker compose --env-file "$envf" -p "$PROJECT" "${files[@]}" "$@"
@@ -826,7 +1069,7 @@ healthy_commit() {
   local want="$1" i body
   for i in $(seq 1 "$HEALTH_TRIES"); do
     body="$(curl -fsS -m 5 "$HEALTH_URL" 2>/dev/null || true)"
-    if printf '%s' "$body" | python3 -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get('status')=='ok' and str(d.get('commit','')).startswith(sys.argv[1]) else 1)" "$want" 2>/dev/null; then
+    if printf '%s' "$body" | "$PY" -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get('status')=='ok' and str(d.get('commit','')).startswith(sys.argv[1]) else 1)" "$want" 2>/dev/null; then
       return 0
     fi
     [ "$i" = "$HEALTH_TRIES" ] || sleep "$HEALTH_INTERVAL"
@@ -840,8 +1083,8 @@ healthy_commit() {
 container_of() {
   case "$1" in
     control-plane-web) echo herdr-cp-web ;; control-plane-worker) echo herdr-cp-worker ;;
-    llm-proxy) echo herdr-llm-proxy ;; collab-public) echo herdr-collab-public ;;
-    collab-edge) echo herdr-collab-edge ;; share-public) echo herdr-share-public ;; *) echo "$1" ;;
+    llm-proxy) echo herdr-llm-proxy ;; fabric-gateway) echo herdr-fabric-gateway ;; collab-public) echo herdr-collab-public ;;
+    collab-edge) echo herdr-collab-edge ;; fabric-whois) echo herdr-collab-fabric-whois ;; share-public) echo herdr-share-public ;; *) echo "$1" ;;
   esac
 }
 services_settled() {
@@ -878,9 +1121,84 @@ stop_share_public() {   # never fatal; plain docker, so it works whichever compo
   fi
 }
 
+# install_artifact_host_files: the rendered directory into place. Compose ignores secret uid/gid/mode, so the container
+# users read the host files with their own mode: the secrets are 0644 inside a 0700 directory (that is what keeps other
+# host users out), and roles.sql, which only this script reads, is 0600.
+install_artifact_host_files() {
+  mkdir -p "$AH_DIR" && chmod 700 "$AH_DIR" || return 1
+  local f mode
+  for f in "${AH_FILES[@]}"; do
+    mode=0644; [ "$f" != roles.sql ] || mode=0600
+    install -m "$mode" "$NEW_AH/$f" "$AH_DIR/$f.install.tmp" && mv -f "$AH_DIR/$f.install.tmp" "$AH_DIR/$f" || return 1
+  done
+}
+
+# apply_ah_roles <worktree> <tag>: roles.sql as the bootstrap admin over the database container's local socket (idempotent;
+# creates the three non-superuser roles and their grants, and moves the passwords with the fleet db_password).
+apply_ah_roles() {
+  ah_run "$1" "$2" exec -T artifact-host-db psql -U artifact_admin -d artifact_host -X -q -v ON_ERROR_STOP=1 -f - \
+    < "$AH_DIR/roles.sql" >/dev/null
+}
+
+# backup_ah_database: a custom-format pg_dump kept next to the config (0700 dir, 0600 file), the newest five. Taken AFTER the
+# roles exist and BEFORE migrate, so a failed or regretted migration has something to go back to.
+backup_ah_database() {
+  local dir="$AH_DIR/backups" f
+  mkdir -p "$dir" && chmod 700 "$dir" || return 1
+  AH_BACKUP_FILE="$dir/pre-$TAG-$(date -u +%Y%m%dT%H%M%SZ).dump"
+  ( umask 077; ah_compose exec -T artifact-host-db pg_dump -U artifact_admin -d artifact_host -Fc > "$AH_BACKUP_FILE" ) || {
+    rm -f "$AH_BACKUP_FILE"; echo "the database backup before the migration failed; nothing was migrated" >&2; return 1; }
+  # shellcheck disable=SC2012
+  ls -1t "$dir"/pre-*.dump 2>/dev/null | tail -n +6 | while read -r old; do rm -f "$old"; done
+  return 0
+}
+
+# ah_schema_count: how many migrations the host database has applied ("" before the first migration has created the table).
+ah_schema_count() {
+  ah_compose exec -T artifact-host-db psql -U artifact_admin -d artifact_host -X -A -t \
+    -c "SELECT count(*) FROM schema_migrations" 2>/dev/null | tr -d '[:space:]' || true
+}
+
+# artifact_host_up: database first (never force-recreated: its data directory is not touched by a routine deploy), then the
+# roles, a backup, the schema (as the owner role), and last the three services recreated (they read their slice at startup)
+# and waited on until healthy. Runs BEFORE the control plane's compose up, which attaches control-plane-web and the edge to
+# the networks created here.
+artifact_host_up() {
+  local before after
+  ah_compose up -d --no-build --wait --wait-timeout 120 artifact-host-db >/dev/null || return 1
+  apply_ah_roles "$WORK" "$TAG" || return 1
+  before="$(ah_schema_count)"
+  backup_ah_database || return 1
+  # AH_MIGRATED means the SCHEMA may differ from what the previous release's code expects. Roles alone are not that
+  # (a rollback re-applies the previous roles.sql), so it is set when the migration failed (it may have applied some of
+  # its steps) or when the applied-migrations count changed, and not on a deploy that migrated nothing.
+  ah_compose run --rm artifact-host-migrate >/dev/null || { AH_MIGRATED=1; return 1; }
+  after="$(ah_schema_count)"
+  # an unreadable count after a successful migrate is "moved", never "unchanged": empty == empty must not read as safe
+  case "$after" in ''|*[!0-9]*) AH_MIGRATED=1 ;; esac
+  [ "$before" = "$after" ] || AH_MIGRATED=1
+  ah_compose up -d --no-build --no-deps --force-recreate --wait --wait-timeout 180 \
+    artifact-host-public artifact-host-internal artifact-host-relay >/dev/null || return 1
+}
+
+stop_artifact_host() {   # never fatal: the host is disabled, so a project a previous deploy started has no job (data stays)
+  local ids
+  ids="$(docker ps -q --filter "label=com.docker.compose.project=$AH_PROJECT" 2>/dev/null || true)"
+  [ -z "$ids" ] || docker stop $ids >/dev/null 2>&1 \
+    || echo "WARNING: could not stop the artifact host project $AH_PROJECT (control_plane.artifact_host.enabled is false)" >&2
+}
+
+stop_fabric_whois() {   # never fatal: the listener is not configured, so the sidecar a previous deploy started has no job
+  if docker inspect herdr-collab-fabric-whois >/dev/null 2>&1; then
+    docker stop herdr-collab-fabric-whois >/dev/null 2>&1 \
+      || echo "WARNING: could not stop herdr-collab-fabric-whois (fabric_trust.listen_* is not configured)" >&2
+  fi
+}
+
 forward() {
   deploy_lock_phase forward || return 1
   HOST_MUTATED=1
+  web_egress_before forward || return 1
   install_private "$NEW_LLM" "$LLM_DIR/llm-config.json" || return 1
   # mount sources of web/worker (and share-public): created here, after the build, never before
   mkdir -p "$HERDR_SHARES_DIR" "$HERDR_SHARE_EVENTS_DIR" && chmod 755 "$HERDR_SHARES_DIR" "$HERDR_SHARE_EVENTS_DIR" \
@@ -891,6 +1209,7 @@ forward() {
     && chmod 755 "$HERDR_COLLAB_MIRROR_DIR" "$HERDR_COLLAB_OUTBOX_DIR" && chmod 700 "$HERDR_COLLAB_SPOOL_DIR" \
     || return 1
   if [ "$SHARE" = 1 ]; then install_private "$NEW_SHARE" "$SHARE_CONFIG" || return 1; fi
+  if [ "$ARTIFACT_HOST" = 1 ]; then install_artifact_host_files || return 1; fi
   # the deploy/pipelines refresh timer; its first run is the timer's (a fetch never fails a deploy)
   if [ -f "$PIPELINES_SYNC" ]; then
     "$PIPELINES_SYNC" install --dir "$PIPELINES_DIR" || return 1
@@ -898,6 +1217,9 @@ forward() {
   if [ "$COLLAB" = 1 ]; then
     install_private "$NEW_COLLAB" "$COLLAB_CONFIG" || return 1
     mkdir -p "$HERDR_COLLAB_DATA_DIR" && chmod 700 "$HERDR_COLLAB_DATA_DIR" || return 1
+    if [ "$FABRIC" = 1 ]; then   # the sidecar's socket directory: created before any container mounts it (collab-public, control-plane-web)
+      mkdir -p "$HERDR_COLLAB_FABRIC_WHOIS_DIR" && chmod 700 "$HERDR_COLLAB_FABRIC_WHOIS_DIR" || return 1
+    fi
     # keys + membership files, the edge certificate, the 1-minute timer and the cert renew
     # timer (pool, group and the invite provisioner's operator come from the slice; the
     # provisioner reads collab-public's log in the data dir it mounts). Runs BEFORE the new nginx.conf lands, so
@@ -910,21 +1232,29 @@ forward() {
     # Shares enabled: the edge serves the share host with this same certificate, so refuse one that does not
     # name it (checked by collab-sync before it copies, and once more on the staged copy).
     local share_host=()
-    if [ "$SHARE" = 1 ]; then
-      SHARE_HOST_NAME="$(python3 -c 'import json,sys; from urllib.parse import urlsplit; print(urlsplit(json.load(open(sys.argv[1]))["sections"]["control_plane"]["values"]["share"]["public_url"]).hostname or "")' "$SHARE_CONFIG")" \
+    if [ "$ARTIFACT_HOST" = 1 ]; then   # the artifact host's name is served with this same certificate: the same check
+      share_host=(--share-host "$AH_PUBLIC_HOST")
+      [ -z "${AH_MEMBER_HOST:-}" ] || share_host+=(--member-host "$AH_MEMBER_HOST")   # the member UI's own name too
+    elif [ "$SHARE" = 1 ]; then
+      SHARE_HOST_NAME="$("$PY" -c 'import json,sys; from urllib.parse import urlsplit; print(urlsplit(json.load(open(sys.argv[1]))["sections"]["control_plane"]["values"]["share"]["public_url"]).hostname or "")' "$SHARE_CONFIG")" \
         && [ -n "$SHARE_HOST_NAME" ] || { echo "cannot read the share host from $SHARE_CONFIG" >&2; return 1; }
       share_host=(--share-host "$SHARE_HOST_NAME")
+      # Optional own origin for the member web UI on the share path (control_plane.share.member_host): the same cert check.
+      SHARE_MEMBER_HOST="$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["sections"]["control_plane"]["values"]["share"].get("member_host") or "")' "$SHARE_CONFIG")" \
+        || { echo "cannot read the share member host from $SHARE_CONFIG" >&2; return 1; }
+      [ -z "${SHARE_MEMBER_HOST:-}" ] || share_host+=(--member-host "$SHARE_MEMBER_HOST")
     fi
     "$WORK/deploy/control-plane/collab-sync.sh" install --config "$COLLAB_CONFIG" \
       --dir "$HERDR_COLLAB_SYNC_DIR" --data-dir "$HERDR_COLLAB_DATA_DIR" --cert-dir "$CERT_DIR_VALUE" \
       "${share_host[@]}" "${held[@]}" || return 1
-    if [ "$SHARE" = 1 ]; then
+    if [ "$SHARE" = 1 ] || [ "$ARTIFACT_HOST" = 1 ]; then
       "$WORK/deploy/control-plane/collab-sync.sh" cert-host --config "$COLLAB_CONFIG" --cert-dir "$CERT_DIR_VALUE" \
         "${share_host[@]}" || return 1
     fi
     mkdir -p "$(dirname "$HERDR_COLLAB_EDGE_CONF")" || return 1
     write_edge_conf "$NEW_EDGE" || return 1
   fi
+  if [ "$ARTIFACT_HOST" = 1 ]; then artifact_host_up || return 1; fi
   if [ "$SHARE" = 1 ]; then
     # Stateless and it reads its slice only at startup: recreated once, alone, BEFORE the edge (whose conf
     # now names it as an upstream nginx resolves at start and reload).
@@ -935,19 +1265,42 @@ forward() {
     # once, alone, first - and leave it out of the up below. Recreating it twice back to
     # back is what raced Docker's removal of the old container (2026-10-29).
     compose_up_retry "$WORK" "$ENV_FILE" "$TAG" "$SHA" up -d --no-deps --no-build --force-recreate collab-public >/dev/null || return 1
-    compose_up_retry "$WORK" "$ENV_FILE" "$TAG" "$SHA" up -d --no-deps --no-build "${APP_SERVICES[@]}" collab-edge >/dev/null || return 1
+    compose_up_retry "$WORK" "$ENV_FILE" "$TAG" "$SHA" up -d --no-deps --no-build "${APP_SERVICES[@]}" collab-edge "${FABRIC_SERVICE[@]}" >/dev/null || return 1
   else
     compose_up "$WORK" "$ENV_FILE" "$TAG" "$SHA" >/dev/null || return 1
   fi
+  memory_client_apply forward "$WORK" || return 1
+  web_egress_after forward || return 1
+  memory_client_forward_connectivity "$WORK" || return 1
   # The edge resolves collab-public once, at (re)load: a recreated collab-public has a
   # new address, so reload the edge after every collab up, not only on a new conf.
   if [ "$COLLAB" = 1 ]; then EDGE_CONF_CHANGED=1; reload_edge_if_changed || return 1; fi
   # Shares disabled: the edge no longer serves the share host; stop a share-public a previous deploy started (its
   # bundles stay on disk). Never fatal.
   if [ "$SHARE" = 0 ] && [ -n "$NEW_SHARE" ]; then stop_share_public; fi
+  if [ "$ARTIFACT_HOST" = 0 ] && [ -n "$NEW_AH" ]; then stop_artifact_host; fi
+  if [ "$COLLAB" = 1 ] && [ "$FABRIC" = 0 ]; then stop_fabric_whois; fi
   deploy_lock_phase verify || return 1
-  python3 "$STATE_HELPER" verify-forward "$ATTEMPT" || return 1
-  verify "$SHA"
+  "$PY" "$STATE_HELPER" verify-forward "$ATTEMPT" || return 1
+  verify "$SHA" || return 1
+  memory_client_promote
+}
+
+# rollback_services: the service list for the checkout being rolled back to. A checkout without the fabric overlay
+# cannot name fabric-whois (compose fails "no such service"), so drop it for the whole rollback and stop the sidecar
+# the failed forward deploy started (it is an orphan there: nothing of that checkout talks to it).
+rollback_services() {
+  local svc kept=()
+  FABRIC_SERVICE_ORPHAN=0
+  [ "$FABRIC" = 1 ] || return 0
+  [ ! -f "$PREV_WORK/deploy/control-plane/compose.collab-fabric.yaml" ] || return 0
+  for svc in "${EDGE_SERVICE[@]}"; do
+    [ "$svc" != fabric-whois ] || continue
+    kept+=("$svc")
+  done
+  EDGE_SERVICE=("${kept[@]}")
+  FABRIC_SERVICE=()
+  FABRIC_SERVICE_ORPHAN=1
 }
 
 rollback_share() {
@@ -963,10 +1316,62 @@ rollback_share() {
   fi
 }
 
+# rollback_artifact_host: the host project as the PREVIOUS deploy left it (PREV_AH), before the control plane goes back (its
+# overlay joins the host's networks, so they must exist, and must not be required when the previous release had no host).
+#  - the previous release had no host: the project this deploy started is stopped (data stays) and the overlay is dropped;
+#  - it had one and this deploy never touched its database: roles re-applied from the restored roles.sql and the previous
+#    release's own compose file and image bring it back (a failed DISABLE lands here too: nothing was migrated);
+#  - it had one and this deploy ran roles or migrations: the previous host code may not run against the changed database,
+#    so nothing is guessed. The host stays as it is, the control plane still goes back, and the exact steps to finish are
+#    printed (AH_MANUAL makes the whole rollback report failure).
+rollback_artifact_host() {
+  ARTIFACT_HOST="$PREV_AH"
+  if [ "$PREV_AH" = 0 ]; then
+    [ -z "$NEW_AH" ] || stop_artifact_host
+    return 0
+  fi
+  if [ ! -f "$PREV_WORK/deploy/artifact-host/compose.yaml" ] || [ ! -f "$PREV_WORK/deploy/control-plane/compose.artifact-host.yaml" ]; then
+    ARTIFACT_HOST=0; AH_MANUAL=1
+    echo "the artifact host was running before this deploy, but commit $PREV_SHA has no artifact host files to restore it from" >&2
+    return 0
+  fi
+  if [ "$AH_MIGRATED" = 1 ]; then
+    AH_MANUAL=1
+    {
+      echo "ARTIFACT HOST NOT REVERTED: this deploy changed its database (roles and/or migrations), and the previous release's host code"
+      echo "may not run against it, so the host project $AH_PROJECT stays on the new release $SHA. To finish the rollback by hand:"
+      # $WORK is deleted when this script exits: print the checkout's own compose file, and every variable it requires.
+      local AH_ENV="HERDR_ARTIFACT_HOST_TAG=$TAG HERDR_COLLAB_SYNC_DIR=$HERDR_COLLAB_SYNC_DIR HERDR_ARTIFACT_HOST_DIR=$AH_DIR"
+      local AH_COMPOSE="docker compose -p $AH_PROJECT -f $REPO/deploy/artifact-host/compose.yaml"
+      echo "  (run these from a checkout of $SHA: $REPO/deploy/artifact-host/compose.yaml must be that release's file)"
+      echo "  1. stop the roles:   $AH_ENV $AH_COMPOSE stop artifact-host-public artifact-host-internal artifact-host-relay"
+      if [ -e "${AH_BACKUP_FILE:-}" ]; then
+        echo "  2. restore the pre-migration dump ($AH_BACKUP_FILE):"
+        echo "       $AH_ENV $AH_COMPOSE exec -T artifact-host-db pg_restore -U artifact_admin -d artifact_host --clean --if-exists < $AH_BACKUP_FILE"
+      else
+        echo "  2. no dump was taken by this deploy (it failed before the backup): the database is as the roles step left it"
+      fi
+      echo "  3. redeploy the previous release: $MANUAL"
+    } >&2
+    return 0
+  fi
+  ah_run "$PREV_WORK" "$PREV_TAG" up -d --no-build --wait --wait-timeout 120 artifact-host-db >/dev/null \
+    && [ -f "$AH_DIR/roles.sql" ] && apply_ah_roles "$PREV_WORK" "$PREV_TAG" \
+    && ah_run "$PREV_WORK" "$PREV_TAG" up -d --no-build --no-deps --force-recreate --wait --wait-timeout 180 \
+      artifact-host-public artifact-host-internal artifact-host-relay >/dev/null || {
+    AH_MANUAL=1; ARTIFACT_HOST=0
+    echo "could not bring the artifact host back on commit $PREV_SHA (project $AH_PROJECT)" >&2
+    return 0
+  }
+}
+
 rollback() {
   trap '' INT TERM HUP
   DEPLOY_FINISHED=1
   deploy_lock_phase rollback || true
+  if declare -F web_egress_before >/dev/null; then
+    web_egress_before rollback || { echo "private egress revocation failed; preserving network and recovery state" >&2; return 3; }
+  fi
 
   echo "deploy of $SHA failed (an install step or compose up failed, the health check did not report $SHA, or a recreated service is not running)" >&2
   # Host files go back first (slices rendered by the previous deploy, its nginx.conf and
@@ -977,7 +1382,7 @@ rollback() {
     echo "WARNING: could not restore every host file this deploy changed" >&2
   fi
   if [ -z "$PREV_COMMIT" ]; then
-    python3 "$STATE_HELPER" outcome "$ATTEMPT" failed_no_rollback || return 3
+    "$PY" "$STATE_HELPER" outcome "$ATTEMPT" failed_no_rollback || return 3
     echo "NOT rolled back: $ROLLBACK_NOTE." >&2
     if [ -n "${PREV_COMMIT_OLD:-}" ]; then
       echo "manual rollback (that commit's own deploy.sh reads ~/.config/herdr-engineering/control-plane.env):" >&2
@@ -999,22 +1404,33 @@ rollback() {
   PREV_ENV="$ENV_DIR/rollback-compose.env"
   # the compose env as the PREVIOUS commit's own code renders it
   prev_render() {
-    (cd "$PREV_WORK" && PYTHONPATH="$PREV_WORK" python3 -m herdr_engineering.cli \
+    (cd "$PREV_WORK" && PYTHONPATH="$PREV_WORK" "$PY" -m herdr_engineering.cli \
       fleet config render-compose --path "$PREV_CONFIG" --out "$PREV_ENV") >/dev/null 2>&1
   }
   if [ "$RESTORED" = 1 ] \
       && git -C "$REPO" worktree add -q --detach "$PREV_WORK" "$PREV_COMMIT" >/dev/null 2>&1 \
       && prev_render \
+      && rollback_artifact_host \
+      && rollback_services \
       && compose_up "$PREV_WORK" "$PREV_ENV" "$PREV_TAG" "$PREV_SHA" >/dev/null \
+      && { [ "${FABRIC_SERVICE_ORPHAN:-0}" = 0 ] || { stop_fabric_whois; true; }; } \
+      && memory_client_apply rollback "$PREV_WORK" \
+      && { ! declare -F web_egress_after >/dev/null || web_egress_after rollback; } \
       && rollback_share \
       && { [ "$COLLAB" = 0 ] || { EDGE_CONF_CHANGED=1; reload_edge_if_changed || true; }; } \
-      && python3 "$STATE_HELPER" verify-rollback "$ATTEMPT" \
-      && verify "$PREV_SHA"; then
-    python3 "$STATE_HELPER" outcome "$ATTEMPT" rolled_back || return 3
+      && "$PY" "$STATE_HELPER" verify-rollback "$ATTEMPT" \
+      && verify "$PREV_SHA" \
+      && [ "$AH_MANUAL" = 0 ]; then
+    if declare -F web_egress_commit >/dev/null; then web_egress_commit rollback || return 3; fi
+    if declare -F web_egress_cleanup >/dev/null; then web_egress_cleanup rollback || echo "owned egress network retained; inspect saved receipt" >&2; fi
+    "$PY" "$STATE_HELPER" outcome "$ATTEMPT" rolled_back || return 3
     echo "rolled back to $PREVIOUS_IMAGE (commit $PREV_SHA) and healthy (all of: ${APP_SERVICES[*]}${EDGE_SERVICE[*]:+ ${EDGE_SERVICE[*]}}); the deploy of $SHA FAILED" >&2
     return 1
   fi
-  python3 "$STATE_HELPER" outcome "$ATTEMPT" rollback_failed || return 3
+  "$PY" "$STATE_HELPER" outcome "$ATTEMPT" rollback_failed || return 3
+  if [ "$AH_MANUAL" = 1 ]; then
+    echo "NOT FULLY ROLLED BACK to $PREVIOUS_IMAGE (commit $PREV_SHA): the artifact host needs the manual steps above" >&2
+  fi
   echo "FAILED TO ROLL BACK to $PREVIOUS_IMAGE (commit $PREV_SHA): the control plane may be down or mixed." >&2
   echo "manual rollback: $MANUAL" >&2
   echo "pinned rollback images and recovery metadata: $ATTEMPT" >&2
@@ -1024,17 +1440,34 @@ rollback() {
 if forward; then
   # The receipt names the ref, commits and images (and only a hash of the collab
   # slice) - never configuration. json.dumps: a ref may contain quotes.
-  python3 "$STATE_HELPER" receipt "$ATTEMPT" "$STATE_DIR/$SHA.json" "$REF" \
+  "$PY" "$STATE_HELPER" receipt "$ATTEMPT" "$STATE_DIR/$SHA.json" "$REF" \
     "herdr-engineering:$TAG" "$PREVIOUS_IMAGE" "$COLLAB_HASH" "$(date -u +%FT%TZ)"
-  python3 "$STATE_HELPER" outcome "$ATTEMPT" succeeded
+  web_egress_commit forward || exit 1
+  "$PY" "$STATE_HELPER" outcome "$ATTEMPT" succeeded
+  if [ -n "$NEW_AH" ] && [ "$DRY" != 1 ]; then   # what a later rollback must restore (see PREV_AH)
+    mkdir -p "$(dirname "$AH_STATE")" && { if [ "$ARTIFACT_HOST" = 1 ]; then echo enabled; else echo disabled; fi; } > "$AH_STATE" \
+      || echo "WARNING: could not record the artifact host state in $AH_STATE" >&2
+  fi
   DEPLOY_FINISHED=1
+  web_egress_cleanup forward || echo "owned egress network retained; inspect saved receipt" >&2
   echo "ok: ${APP_SERVICES[*]}${EDGE_SERVICE[*]:+ ${EDGE_SERVICE[*]}}${SHARE_SERVICE[*]:+ ${SHARE_SERVICE[*]}} running $SHA (receipt $STATE_DIR/$SHA.json)"
-  if [ "$SHARE" = 1 ] && [ -n "${SHARE_HOST_NAME:-}" ]; then
-    # Smoke line, never fatal: an unknown token on the share host's own TLS name answers a bare 404 when the DNS
-    # record, the SNI route, the certificate and the share server all line up.
-    probe="$(curl -sS -m 10 -o /dev/null -w '%{http_code}' "https://$SHARE_HOST_NAME/s/probe/" 2>/dev/null || true)"
-    [ "$probe" = 404 ] || echo "WARNING: probe of https://$SHARE_HOST_NAME/s/probe/ answered '${probe:-no response}', expected 404:" \
-      "check DNS, the SNI route to the edge and the certificate for the share host" >&2
+  PROBE_HOST=""
+  if [ "$SHARE" = 1 ] && [ -n "${SHARE_HOST_NAME:-}" ]; then PROBE_HOST="$SHARE_HOST_NAME"
+  elif [ "$ARTIFACT_HOST" = 1 ]; then PROBE_HOST="$AH_PUBLIC_HOST"; fi
+  if [ -n "$PROBE_HOST" ]; then
+    # Smoke line, never fatal: an unknown token on the share (or artifact) host's own TLS name answers a bare 404 when the
+    # DNS record, the SNI route, the certificate and the server behind it all line up.
+    probe="$(curl -sS -m 10 -o /dev/null -w '%{http_code}' "https://$PROBE_HOST/s/probe/" 2>/dev/null || true)"
+    [ "$probe" = 404 ] || echo "WARNING: probe of https://$PROBE_HOST/s/probe/ answered '${probe:-no response}', expected 404:" \
+      "check DNS, the SNI route to the edge and the certificate for the host" >&2
+  fi
+  MPROBE_HOST="${AH_MEMBER_HOST:-}"
+  [ -n "$MPROBE_HOST" ] || MPROBE_HOST="${SHARE_MEMBER_HOST:-}"
+  if [ -n "$MPROBE_HOST" ]; then
+    # The member host serves no /s/: a bare 404 here proves DNS, the SNI route, the certificate and the server line up.
+    mprobe="$(curl -sS -m 10 -o /dev/null -w '%{http_code}' "https://$MPROBE_HOST/s/probe/" 2>/dev/null || true)"
+    [ "$mprobe" = 404 ] || echo "WARNING: probe of https://$MPROBE_HOST/s/probe/ answered '${mprobe:-no response}', expected 404:" \
+      "check DNS, the SNI route to the edge and the certificate for the member host" >&2
   fi
   if [ "$MEMORY" = 1 ]; then memory_phase || exit 4; fi
   exit 0

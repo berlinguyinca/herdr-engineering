@@ -20,7 +20,7 @@ from . import rakazo_spaces as sp
 from .collab import CollabError, Principal
 
 _CODES = {400: "BAD_REQUEST", 401: "UNAUTHORIZED", 403: "FORBIDDEN", 404: "NOT_FOUND", 409: "CONFLICT",
-          429: "TOO_MANY_REQUESTS", 503: "SERVICE_UNAVAILABLE"}
+          429: "TOO_MANY_REQUESTS", 502: "BAD_GATEWAY", 503: "SERVICE_UNAVAILABLE"}
 _PALETTE = ("#4f46e5", "#0891b2", "#059669", "#d97706", "#dc2626", "#7c3aed", "#db2777", "#475569")
 CHAT_ACTIONS = ["read", "post"]            # what the app grants an agent it adds to a group; nothing that can run commands
 TAIL = 100
@@ -95,7 +95,11 @@ class Rooms:
         return {"ok": True}
 
     def linked(self, ctx) -> bool:
-        return bool(ctx.account.collab_user and self.collab is not None)
+        user = self.b.collab_user_for(ctx.account)
+        if not user or self.collab is None:
+            return False
+        acts_for = getattr(self.collab, "acts_for", None)       # an HTTP collab acts as one user: any other stays unlinked
+        return acts_for(user) if acts_for else True
 
     def principal(self, ctx, *, required: bool = True) -> Principal | None:
         if not self.linked(ctx):
@@ -103,8 +107,9 @@ class Rooms:
                 raise self.Error(400, "BAD_REQUEST", "Collaboration is not linked to this account. "
                                  "The operator sets collab_user for it in the bridge configuration.")
             return None
-        pr = Principal("user", ctx.account.collab_user, ctx.account.collab_user)
-        if not self.collab.still_valid(pr):
+        user = self.b.collab_user_for(ctx.account)
+        pr = Principal("user", user, user)
+        if not self.call(self.collab.still_valid, pr):
             raise self.Error(403, "FORBIDDEN", "This account's collaboration user is not available.")
         return pr
 
@@ -141,10 +146,11 @@ class Rooms:
         return bot
 
     def agent_bots(self, ctx) -> list[dict[str, Any]]:
+        """Owned agents that are online now. Stale/offline ones stay reachable by id (``find_agent``), never listed."""
         pr = self.principal(ctx, required=False)
         if pr is None or ctx.space != sp.DEFAULT_SPACE_ID:
             return []
-        return [self.agent_bot(ctx, a) for a in self.my_agents(ctx, pr)]
+        return [self.agent_bot(ctx, a) for a in self.my_agents(ctx, pr) if a.get("online")]
 
     def find_agent(self, ctx, bot_id: Any) -> dict[str, Any] | None:
         pr = self.principal(ctx, required=False)
@@ -482,8 +488,9 @@ class Rooms:
             if prefix:
                 text = f"{prefix} {text}"
         key = inp.get("clientNonce") if isinstance(inp.get("clientNonce"), str) and inp["clientNonce"] else None
-        status, out = self.call(self.collab.post_message, pr, rid,
-                                {"text": text.strip(), "idempotency_key": key or "rk-" + secrets.token_hex(12)})
+        if key is None:       # no client nonce: every send is its own message, so a deliberate repeat is never dropped
+            key = "rk-" + secrets.token_hex(16)
+        status, out = self.call(self.collab.post_message, pr, rid, {"text": text.strip(), "idempotency_key": key})
         event = out["event"]
         return {"taskId": event["event_id"], "runId": event["event_id"], "seq": event["sequence"]}
 
@@ -502,7 +509,13 @@ class Rooms:
         def fetch(after: int) -> list[dict[str, Any]]:
             chunk = self.call(self.collab.read_events, pr, rid, after, 200)
             return [self.stream_event(m, ctx) for m in (self.message(e, pr.id, tid) for e in chunk["events"]) if m]
-        return fetch, lambda: not self.collab.still_valid(pr)
+
+        def ended() -> bool:
+            try:
+                return not self.collab.still_valid(pr)
+            except CollabError:                 # an unreachable collaboration service ends the stream; the client resubscribes
+                return True
+        return fetch, ended
 
 
 class _Shim:

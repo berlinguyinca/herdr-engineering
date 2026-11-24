@@ -1,0 +1,770 @@
+"""Step 5: operator commands (`fleet-watch resume|abandon`), the `loop` service command, its watchdog, and the
+systemd unit + ansible task that install it (off by default).
+
+No mocks: the Fleet fixture of test_fleet_watch_run (real bare repos, real HTTP "GitHub", a real executable ssh
+stand-in, throwaway HOMEs) drives real subprocesses. Nothing here starts or enables a real service.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import shlex
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import pytest
+import yaml
+
+from herdr_engineering.control_plane.fleet_rollout import validate_fleet_rollout
+from herdr_engineering.fleet_watch import plan, state
+from tests.test_deploy_units import parse_unit
+from tests.test_fleet_watch import git
+from tests.test_fleet_watch_run import BOOT, HE, fleet  # noqa: F401  (fixture)
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def op(fleet, *args: str, timeout: int = 180):
+    """`herdr-eng fleet-watch <args>` in the fixture's throwaway HOME."""
+    argv = ["fleet-watch", *args]
+    return subprocess.run([sys.executable, "-I", "-c", BOOT, *argv], capture_output=True, text=True,
+                          env=fleet.env(), timeout=timeout)
+
+
+def common(fleet) -> list[str]:
+    return ["--lock", str(fleet.lock), "--local-host", "none"]
+
+
+def halt(fleet) -> str:
+    """A halted rollout: bender's checkout is dirty."""
+    (fleet.checkout("bender") / "dirty").write_text("x")
+    assert fleet.cli().returncode == 1
+    (rid,) = fleet.saved()["rollouts"]
+    return rid
+
+
+# --------------------------------------------------------------------------- planner: abandoned is terminal
+
+def test_plan_treats_an_abandoned_rollout_like_a_finished_one_for_the_same_heads():
+    targets = {"a/b": "1" * 40}
+    rid = plan.rollout_id(targets)
+    assert plan.plan_rollout(targets, {}, {rid: {"status": "abandoned"}}) is None
+    assert plan.plan_rollout(targets, {}, {rid: {"status": "halted"}})["rollout_id"] == rid
+    assert plan.plan_rollout({"a/b": "2" * 40}, {}, {rid: {"status": "abandoned"}}) is not None   # a newer head
+
+
+# --------------------------------------------------------------------------- resume
+
+def test_resume_reruns_the_halted_rollout_skipping_settled_rows(fleet):
+    rid = halt(fleet)
+    (fleet.checkout("bender") / "dirty").unlink()
+    before = fleet.calls()
+    out = op(fleet, "resume", rid, *common(fleet))
+    assert out.returncode == 0, out.stderr
+    assert "succeeded" in out.stdout
+    new = fleet.calls()[len(before):]
+    assert {c.split()[0] for c in new} == {"bender", "macbook-pro"}               # beast was already ok
+    resumed = [e["payload"] for e in fleet.queued() if e["event_type"] == "rollout.resumed"]
+    assert len(resumed) == 1 and resumed[0]["reason"] == "operator"
+    assert fleet.saved()["rollouts"][rid]["status"] == "succeeded"
+    assert fleet.saved()["converged"] == {HE: fleet.forge.head(HE)}
+
+
+def test_resume_without_an_id_takes_the_one_halted_rollout(fleet):
+    rid = halt(fleet)
+    (fleet.checkout("bender") / "dirty").unlink()
+    out = op(fleet, "resume", *common(fleet), "--json")
+    assert out.returncode == 0, out.stderr
+    assert json.loads(out.stdout) == {"outcome": "succeeded", "rollout_id": rid}
+
+
+def test_resume_that_halts_again_exits_1(fleet):
+    rid = halt(fleet)
+    out = op(fleet, "resume", rid, *common(fleet))                                  # still dirty
+    assert out.returncode == 1 and "halted" in out.stdout
+
+
+@pytest.mark.parametrize("args", [["0123456789abcdef"], ["not-an-id"], []])
+def test_resume_refuses_an_unknown_malformed_or_absent_target_before_touching_anything(fleet, args):
+    out = op(fleet, "resume", *args, *common(fleet))
+    assert out.returncode == 2 and out.stderr.strip()
+    assert fleet.calls() == [] and fleet.queued() == []
+
+
+def test_resume_refuses_a_rollout_that_is_not_halted(fleet):
+    assert fleet.cli().returncode == 0
+    (rid,) = fleet.saved()["rollouts"]
+    out = op(fleet, "resume", rid, *common(fleet))
+    assert out.returncode == 2 and "not halted" in out.stderr
+
+
+def test_resume_without_an_id_is_ambiguous_with_two_halted_rollouts(fleet):
+    rid = halt(fleet)
+
+    def clone(saved):
+        saved["rollouts"]["f" * 16] = json.loads(json.dumps(saved["rollouts"][rid]))
+    fleet.tamper(clone)
+    out = op(fleet, "resume", *common(fleet))
+    assert out.returncode == 2 and rid in out.stderr and "f" * 16 in out.stderr
+
+
+def test_a_held_watcher_lock_makes_resume_exit_3(fleet):
+    rid = halt(fleet)
+    with state.single_instance(fleet.state_dir):
+        out = op(fleet, "resume", rid, *common(fleet))
+    assert out.returncode == 3 and "lock" in out.stderr
+
+
+def test_the_old_resume_flag_still_works_with_a_deprecation_note(fleet):
+    halt(fleet)
+    (fleet.checkout("bender") / "dirty").unlink()
+    out = fleet.cli("--resume")
+    assert out.returncode == 0, out.stderr
+    assert "deprecated" in out.stderr and "fleet-watch resume" in out.stderr
+    assert "rollout.succeeded" in fleet.types()[-2:]
+
+
+# --------------------------------------------------------------------------- abandon
+
+def test_abandon_marks_the_rollout_abandoned_emits_the_event_and_touches_nothing_else(fleet):
+    fleet.lock.write_text("repos:\n  herdr-engineering: " + git(fleet.forge.work[HE], "rev-parse", "HEAD~1") + "\n")
+    lock_before = fleet.lock.read_text()
+    rid = halt(fleet)
+    calls = fleet.calls()
+    out = op(fleet, "abandon", rid, *common(fleet))
+    assert out.returncode == 0, out.stderr
+    assert "abandoned" in out.stdout
+    saved = fleet.saved()
+    assert saved["rollouts"][rid]["status"] == "abandoned" and saved["converged"] == {}
+    assert fleet.lock.read_text() == lock_before and fleet.calls() == calls        # no ssh, lock unchanged
+    events = fleet.queued()
+    assert events[-1]["event_type"] == "rollout.abandoned" and events[-1]["entity_id"] == rid
+    assert events[-1]["payload"]["reason"] == "operator"
+    validate_fleet_rollout(rid, "rollout.abandoned", events[-1]["payload"])
+
+
+def test_after_abandon_the_same_heads_stay_idle_and_a_newer_head_rolls_out(fleet):
+    rid = halt(fleet)
+    assert fleet.cli().returncode == 4                                              # blocked while halted
+    assert op(fleet, "abandon", rid, *common(fleet)).returncode == 0
+    (fleet.checkout("bender") / "dirty").unlink()
+    again = fleet.cli()
+    assert again.returncode == 0 and again.stdout.strip() == "fleet-watch run: idle"
+    newer = fleet.forge.commit(HE, "three")
+    fresh = fleet.cli()
+    assert fresh.returncode == 0, fresh.stderr
+    saved = fleet.saved()
+    assert saved["converged"] == {HE: newer} and saved["rollouts"][rid]["status"] == "abandoned"
+    assert len(saved["rollouts"]) == 2
+
+
+def test_abandon_emits_a_swallowed_halt_first_so_the_stream_stays_valid(fleet):
+    rid = halt(fleet)
+    fleet.tamper(lambda s: s["rollouts"][rid].update(halt_emitted=False))
+    for_halt = [e for e in fleet.queued() if e["event_type"] == "rollout.halted"]
+    assert len(for_halt) == 1
+    assert op(fleet, "abandon", rid, *common(fleet)).returncode == 0
+    types = fleet.types()
+    assert types[-2:] == ["rollout.halted", "rollout.abandoned"]
+
+
+@pytest.mark.parametrize("args", [["0123456789abcdef"], ["zz"], []])
+def test_abandon_refuses_unknown_or_absent_targets(fleet, args):
+    out = op(fleet, "abandon", *args, *common(fleet))
+    assert out.returncode == 2 and fleet.queued() == []
+
+
+def test_abandon_refuses_a_succeeded_rollout(fleet):
+    assert fleet.cli().returncode == 0
+    (rid,) = fleet.saved()["rollouts"]
+    out = op(fleet, "abandon", rid, *common(fleet))
+    assert out.returncode == 2 and "not halted" in out.stderr
+    assert fleet.saved()["rollouts"][rid]["status"] == "succeeded"
+
+
+def test_operator_commands_emit_no_free_text(fleet):
+    from tests.test_fleet_watch_run import assert_closed
+    rid = halt(fleet)
+    op(fleet, "abandon", rid, *common(fleet))
+    for env in fleet.queued():
+        validate_fleet_rollout(env["entity_id"], env["event_type"], env["payload"])
+        assert_closed(env["payload"])
+
+
+# --------------------------------------------------------------------------- next_sleep (D1/D2 cadence)
+
+def test_next_sleep_follows_the_poller_cadence_and_backoff():
+    import random
+
+    from herdr_engineering.fleet_watch import service
+    rng = random.Random(1)
+    ordinary = {"repos": {"a/x": {"outcome": "unchanged", "wait_s": 130}, "a/y": {"outcome": "unchanged", "wait_s": 101}}}
+    assert service.next_sleep(ordinary, None, rng) == 101                          # the soonest repo
+    low = {"repos": {"a/x": {"outcome": "unchanged", "wait_s": 600}}}
+    assert service.next_sleep(low, None, rng) == 600                               # remaining < 100: stretched
+    backoff = {"repos": {"a/x": {"outcome": "backoff", "retry_in_s": 400}, "a/y": {"outcome": "rate_limited", "wait_s": 900}}}
+    assert service.next_sleep(backoff, None, rng) == 400
+    assert service.next_sleep({"repos": {}}, None, rng) in range(100, 141)          # nothing known: 120 +- 20
+    assert service.next_sleep({"repos": {}}, 60, rng) in range(50, 71)             # explicit interval keeps a jitter
+    assert service.next_sleep({"repos": {"a/x": {"outcome": "error", "wait_s": 2}}}, None, rng) >= 5
+
+
+# --------------------------------------------------------------------------- watchdog (soft warns, hard = no progress)
+
+def test_watchdog_soft_limit_only_warns_and_progress_keeps_the_hard_limit_away(tmp_path):
+    from herdr_engineering.fleet_watch import service
+    marker = tmp_path / "state.json"
+    marker.write_text("0")
+    soft, hard = [], []
+    dog = service.Watchdog([marker], soft_s=0.4, hard_s=1.2, on_soft=lambda s: soft.append(s),
+                           on_hard=lambda s: hard.append(s), tick_s=0.05)
+    dog.start()
+    try:
+        with dog.guard():
+            for n in range(12):                       # a 2.4 s "healthy" pass that keeps making progress
+                time.sleep(0.2)
+                marker.write_text(str(n))
+        assert len(soft) == 1 and hard == []           # warned once, never killed
+    finally:
+        dog.stop()
+
+
+def test_watchdog_hard_limit_fires_only_after_no_progress_and_not_while_disarmed(tmp_path):
+    from herdr_engineering.fleet_watch import service
+    marker = tmp_path / "state.json"
+    marker.write_text("0")
+    hard = []
+    dog = service.Watchdog([marker], soft_s=0.2, hard_s=0.6, on_soft=lambda s: None,
+                           on_hard=lambda s: hard.append(s), tick_s=0.05)
+    dog.start()
+    try:
+        time.sleep(1.0)
+        assert hard == []                             # not armed: an idle sleep is never a stall
+        with dog.guard():
+            deadline = time.monotonic() + 5
+            while not hard and time.monotonic() < deadline:
+                time.sleep(0.05)
+        assert len(hard) == 1 and hard[0] >= 0.6
+    finally:
+        dog.stop()
+
+
+# --------------------------------------------------------------------------- loop command
+
+def loop(fleet, *args: str, timeout: int = 180):
+    return op(fleet, "loop", *common(fleet), "--repo", HE, "--interval", "1", *args, timeout=timeout)
+
+
+def test_loop_without_the_enable_flag_only_plans_and_touches_no_host(fleet):
+    out = loop(fleet, "--max-passes", "2")
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.count("pass ") == 2 and "plan only" in out.stdout
+    assert fleet.calls() == [] and fleet.queued() == []
+    assert fleet.saved()["rollouts"] == {}                                         # nothing was even registered
+    assert fleet.saved()["repos"][HE]["head"] == fleet.forge.head(HE)              # but it did poll (ETag cache kept)
+
+
+def test_loop_with_enable_rollouts_applies_once_then_idles(fleet):
+    out = loop(fleet, "--enable-rollouts", "--max-passes", "2")
+    assert out.returncode == 0, out.stderr
+    assert fleet.saved()["converged"] == {HE: fleet.forge.head(HE)}
+    assert fleet.types().count("rollout.succeeded") == 1
+    assert len(fleet.calls()) == 9                                                 # the second pass ran nothing
+    assert "succeeded" in out.stdout and "idle" in out.stdout
+
+
+def test_loop_keeps_a_halted_rollout_halted_and_never_resumes_it_by_itself(fleet):
+    (fleet.checkout("bender") / "dirty").write_text("x")
+    out = loop(fleet, "--enable-rollouts", "--max-passes", "3")
+    assert out.returncode == 0, out.stderr
+    assert "halted" in out.stdout and "needs_resume" in out.stdout
+    assert fleet.types().count("rollout.halted") == 1 and "rollout.resumed" not in fleet.types()
+    assert len(fleet.calls()) == 4                                                 # beast x3, bender's blocked precheck: no retries
+
+
+def test_loop_picks_up_a_new_merge_while_running(fleet):
+    assert loop(fleet, "--enable-rollouts", "--max-passes", "1").returncode == 0
+    fleet.forge.commit(HE, "three")
+    out = loop(fleet, "--enable-rollouts", "--max-passes", "1")
+    assert out.returncode == 0 and len(fleet.saved()["rollouts"]) == 2
+
+
+def test_two_loops_cannot_run_at_once(fleet):
+    with state.single_instance(fleet.state_dir, name="loop.lock"):
+        out = loop(fleet, "--max-passes", "1")
+    assert out.returncode == 3 and "already running" in out.stderr
+
+
+def test_loop_survives_a_failing_pass_and_reports_only_the_error_class(fleet):
+    fleet.gh.mode = "down"                                                         # GitHub answers 500
+    out = loop(fleet, "--enable-rollouts", "--max-passes", "2")
+    assert out.returncode == 0 and fleet.calls() == []
+    assert "traceback" not in out.stderr.lower()
+
+
+def test_loop_exits_70_when_a_pass_makes_no_progress_past_the_hard_limit(fleet):
+    fleet.mode("beast", "hang")                                                    # the precheck call never answers
+    started = time.monotonic()
+    out = loop(fleet, "--enable-rollouts", "--max-passes", "1", "--soft-limit", "1", "--hard-limit", "3")
+    assert out.returncode == 70, (out.returncode, out.stderr)
+    assert time.monotonic() - started < 40
+    assert "soft limit" in out.stderr and "no progress" in out.stderr
+    (rid,) = fleet.saved()["rollouts"]
+    assert fleet.saved()["rollouts"][rid]["status"] == "running"                   # durable: the next start resumes it
+
+
+def test_a_slow_but_progressing_rollout_is_not_killed_by_the_hard_limit(fleet, tmp_path):
+    slow = tmp_path / "slow-ssh"
+    slow.write_text(f'#!/bin/sh\nsleep 1.2\nexec {shlex.quote(str(fleet.ssh))} "$@"\n')
+    slow.chmod(0o755)
+    env_ssh = {"HERDR_FLEET_WATCH_SSH": str(slow)}
+    argv = [sys.executable, "-I", "-c", BOOT, "fleet-watch", "loop", *common(fleet), "--repo", HE, "--interval", "1",
+            "--enable-rollouts", "--max-passes", "1", "--soft-limit", "2", "--hard-limit", "4"]
+    out = subprocess.run(argv, capture_output=True, text=True, env={**fleet.env(), **env_ssh}, timeout=120)
+    assert out.returncode == 0, out.stderr                                         # ~11 s total, > the 4 s hard limit
+    assert "soft limit" in out.stderr and "no progress" not in out.stderr
+    assert fleet.saved()["converged"] == {HE: fleet.forge.head(HE)}
+
+
+def test_loop_stops_cleanly_on_sigterm_between_passes(fleet):
+    argv = [sys.executable, "-I", "-c", BOOT, "fleet-watch", "loop", *common(fleet), "--repo", HE, "--interval", "30"]
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=fleet.env())
+    try:
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and "head" not in json.dumps(fleet.saved()["repos"]):
+            time.sleep(0.2)
+        proc.send_signal(signal.SIGTERM)
+        assert proc.wait(timeout=20) == 0                                          # a clean stop, not death by signal
+    finally:
+        proc.kill()
+        proc.communicate()
+
+
+# --------------------------------------------------------------------------- orphaned children
+
+def local_loop_argv(fleet, remote_bin, *extra: str) -> list[str]:
+    """A loop that applies the local host (beast) without ssh through `remote_bin`."""
+    fleet.identify("beast")
+    return [sys.executable, "-I", "-c", BOOT, "fleet-watch", "loop", "--lock", str(fleet.lock), "--repo", HE,
+            "--interval", "1", "--enable-rollouts", "--local-host", "beast", "--remote-bin", str(remote_bin), *extra]
+
+
+def hung_remote_bin(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """A host-apply stand-in that hangs, leaving a parent shell and a sleeping child, both recorded by pid."""
+    parent, child = tmp_path / "hung.parent.pid", tmp_path / "hung.child.pid"
+    bin_ = tmp_path / "hung-herdr-eng"
+    bin_.write_text(f"#!/bin/sh\nsleep 300 &\necho $! > {child}\necho $$ > {parent}\nwait\n")
+    bin_.chmod(0o755)
+    return bin_, parent, child
+
+
+def alive(pid: int) -> bool:
+    """Running (a zombie counts as dead). Never raises: the process may vanish between any two of these steps."""
+    try:
+        os.kill(pid, 0)
+        state_field = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+    except OSError:                                # ProcessLookupError, FileNotFoundError: it is gone
+        return False
+    return state_field != "Z"
+
+
+def wait_for(path: Path, seconds: float = 30) -> int:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if path.exists() and path.read_text().strip():
+            return int(path.read_text())
+        time.sleep(0.1)
+    raise AssertionError(f"{path} never appeared")
+
+
+def assert_dead_soon(*pids: int) -> None:
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and any(alive(p) for p in pids):
+        time.sleep(0.1)
+    assert not [p for p in pids if alive(p)], "a host-apply child outlived the watcher"
+
+
+def test_sigterm_during_a_local_host_apply_kills_the_child_process_group(fleet, tmp_path):
+    bin_, parent, child = hung_remote_bin(tmp_path)
+    proc = subprocess.Popen(local_loop_argv(fleet, bin_), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            env=fleet.env())
+    pids: list[int] = []
+    try:
+        pids = [wait_for(parent), wait_for(child)]
+        assert all(alive(p) for p in pids)
+        proc.send_signal(signal.SIGTERM)
+        assert proc.wait(timeout=30) == 0
+        assert_dead_soon(*pids)
+    finally:
+        proc.kill()
+        proc.communicate()
+        for pid in pids:
+            if alive(pid):
+                os.kill(pid, signal.SIGKILL)
+
+
+def test_the_hard_limit_exit_kills_the_child_process_group(fleet, tmp_path):
+    bin_, parent, child = hung_remote_bin(tmp_path)
+    argv = local_loop_argv(fleet, bin_, "--soft-limit", "1", "--hard-limit", "3")
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=fleet.env())
+    pids: list[int] = []
+    try:
+        pids = [wait_for(parent), wait_for(child)]
+        assert proc.wait(timeout=60) == 70
+        assert_dead_soon(*pids)
+    finally:
+        proc.kill()
+        proc.communicate()
+        for pid in pids:
+            if alive(pid):
+                os.kill(pid, signal.SIGKILL)
+
+
+def grandchild_remote_bin(fleet, tmp_path: Path) -> tuple[Path, Path]:
+    """The real beast `herdr-eng` shim, but its install command hangs with a child of its own. host_apply runs that
+    command with start_new_session=True, so it and its child are in a different session and process group than
+    host-apply: killing host-apply's group alone would miss both."""
+    pidfile = tmp_path / "grandchild.pid"
+    hang = tmp_path / "hang-install.sh"
+    hang.write_text(f"#!/bin/sh\nsleep 300 &\necho $! > {pidfile}\nwait\n")
+    hang.chmod(0o755)
+    shim = fleet.shims["beast"].read_text()
+    install = fleet.home("beast") / "install.sh"
+    assert str(install) in shim
+    wrapper = tmp_path / "beast-hung-herdr-eng"
+    wrapper.write_text(shim.replace(str(install), str(hang), 1).replace(
+        "#!/bin/sh\n", f"#!/bin/sh\nexport HOME={fleet.home('beast')}\n", 1))
+    wrapper.chmod(0o755)
+    return wrapper, pidfile
+
+
+@pytest.mark.parametrize("how", ["sigterm", "hard_limit"])
+def test_a_grandchild_in_its_own_session_dies_with_the_watcher(fleet, tmp_path, how):
+    wrapper, pidfile = grandchild_remote_bin(fleet, tmp_path)
+    extra = ("--soft-limit", "1", "--hard-limit", "4") if how == "hard_limit" else ()
+    proc = subprocess.Popen(local_loop_argv(fleet, wrapper, *extra), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, env=fleet.env())
+    pids: list[int] = []
+    try:
+        pids = [wait_for(pidfile)]
+        assert alive(pids[0]) and os.getsid(pids[0]) != os.getsid(proc.pid)   # not in the watcher's session
+        if how == "sigterm":
+            proc.send_signal(signal.SIGTERM)
+            assert proc.wait(timeout=40) == 0
+        else:
+            assert proc.wait(timeout=60) == 70
+        assert_dead_soon(*pids)
+    finally:
+        proc.kill()
+        out, err = proc.communicate()
+        print(f"watcher stdout:\n{out}\nwatcher stderr:\n{err}")           # shown by pytest on failure
+        for pid in pids:
+            if alive(pid):
+                os.kill(pid, signal.SIGKILL)
+
+
+def term_ignoring_remote_bin(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """A host-apply stand-in that ignores SIGTERM (so only the watcher's SIGKILL stops it); records parent and child."""
+    parent, child = tmp_path / "deaf.parent.pid", tmp_path / "deaf.child.pid"
+    bin_ = tmp_path / "deaf-herdr-eng"
+    bin_.write_text(f"#!/bin/sh\ntrap '' TERM\nsleep 300 &\necho $! > {child}\necho $$ > {parent}\nwait\n")
+    bin_.chmod(0o755)
+    return bin_, parent, child
+
+
+def test_a_second_sigterm_does_not_cut_the_child_kill_short(fleet, tmp_path):
+    """The loop's SIGTERM handler is one-shot: a second SIGTERM during the 5 s grace must not raise out of the child
+    cleanup before the final SIGKILL (the child here ignores SIGTERM, so only that SIGKILL can stop it)."""
+    bin_, parent, child = term_ignoring_remote_bin(tmp_path)
+    proc = subprocess.Popen(local_loop_argv(fleet, bin_), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            env=fleet.env())
+    pids: list[int] = []
+    try:
+        pids = [wait_for(parent), wait_for(child)]
+        proc.send_signal(signal.SIGTERM)
+        time.sleep(1)                                                              # inside the grace period
+        proc.send_signal(signal.SIGTERM)
+        assert proc.wait(timeout=40) == 0
+        assert_dead_soon(*pids)
+    finally:
+        proc.kill()
+        out, err = proc.communicate()
+        print(f"watcher stdout:\n{out}\nwatcher stderr:\n{err}")
+        for pid in pids:
+            if alive(pid):
+                os.kill(pid, signal.SIGKILL)
+
+
+DRIVER = ("import os, signal, subprocess, sys, time; sys.path.insert(0, {root!r}); "
+          "from herdr_engineering.fleet_watch import host_apply as h; "
+          "ctx = h.Context('0' * 16, 'berlinguyinca/herdr-engineering', 'a' * 40, None, None, "
+          "{{'PATH': os.environ['PATH']}}, 0, 0); h.terminate_on_sigterm()\n{prelude}\n"
+          "print('ready', flush=True); rc = h._run(ctx, ['sh', '-c', {cmd!r}], timeout={timeout}); print('returned', rc)")
+
+
+def start_driver(tmp_path: Path, cmd: str, timeout: float, prelude: str = "") -> subprocess.Popen:
+    """A real process running host_apply._run on `cmd` with host-apply's own SIGTERM handling installed. `prelude` is
+    extra Python run first: it wraps real calls (Popen, os.killpg) to land a signal at an exact point, nothing is faked."""
+    code = DRIVER.format(root=str(ROOT), cmd=cmd, timeout=timeout, prelude=prelude)
+    return subprocess.Popen([sys.executable, "-I", "-c", code], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, cwd=tmp_path)
+
+
+def finish_driver(proc: subprocess.Popen, pids: list[int]) -> None:
+    proc.kill()
+    out, err = proc.communicate()
+    print(f"driver stdout:\n{out}\ndriver stderr:\n{err}")
+    for pid in pids:
+        if alive(pid):
+            os.kill(pid, signal.SIGKILL)
+
+
+def wait_pidfile_in_hook(pidfile: Path) -> str:
+    """Prelude text: block (inside the hooked call) until the command has written its pid."""
+    return (f"def _wait_pid():\n    end = time.monotonic() + 20\n"
+            f"    while time.monotonic() < end and not (os.path.exists({str(pidfile)!r}) "
+            f"and open({str(pidfile)!r}).read().strip()):\n        time.sleep(0.02)\n")
+
+
+def test_a_sigterm_landing_inside_the_spawn_is_held_and_still_kills_the_command(tmp_path):
+    """SIGTERM arrives after the process exists but before `proc` is bound (a Popen hook raises it there). The hold
+    makes it wait until the handle exists, so the command's group is killed instead of orphaned; exit 143."""
+    pidfile = tmp_path / "cmd.pid"
+    prelude = wait_pidfile_in_hook(pidfile) + (
+        "class P(subprocess.Popen):\n"
+        "    def __init__(self, *a, **k):\n"
+        "        super().__init__(*a, **k)\n"
+        "        _wait_pid()\n"
+        "        os.kill(os.getpid(), signal.SIGTERM)\n"
+        "h.subprocess.Popen = P\n")
+    proc = start_driver(tmp_path, f"sleep 300 & echo $! > {pidfile}; wait", 60, prelude)
+    pids: list[int] = []
+    try:
+        assert proc.wait(timeout=60) == 143
+        pids = [wait_for(pidfile)]
+        assert_dead_soon(*pids)
+    finally:
+        finish_driver(proc, pids)
+
+
+def test_a_sigterm_held_during_a_spawn_that_fails_still_exits_143_not_127(tmp_path):
+    prelude = ("class P(subprocess.Popen):\n"
+               "    def __init__(self, *a, **k):\n"
+               "        os.kill(os.getpid(), signal.SIGTERM)\n"
+               "        raise OSError('cannot spawn')\n"
+               "h.subprocess.Popen = P\n")
+    proc = start_driver(tmp_path, "true", 60, prelude)
+    try:
+        assert proc.wait(timeout=30) == 143, "the held SIGTERM was swallowed by the spawn failure"
+    finally:
+        finish_driver(proc, [])
+
+
+def test_an_oserror_while_reading_a_started_command_kills_its_group(tmp_path):
+    pidfile = tmp_path / "cmd.pid"
+    prelude = wait_pidfile_in_hook(pidfile) + (
+        "class P(subprocess.Popen):\n"
+        "    def communicate(self, *a, **k):\n"
+        "        _wait_pid()\n"
+        "        raise OSError('pipe broke')\n"
+        "h.subprocess.Popen = P\n")
+    proc = start_driver(tmp_path, f"sleep 300 & echo $! > {pidfile}; wait", 60, prelude)
+    pids: list[int] = []
+    try:
+        assert proc.wait(timeout=60) != 0                                          # the OSError propagates
+        pids = [wait_for(pidfile)]
+        assert_dead_soon(*pids)
+    finally:
+        finish_driver(proc, pids)
+
+
+def test_a_second_sigterm_landing_inside_the_command_kill_does_not_skip_it(tmp_path):
+    """A second SIGTERM arrives exactly while `_run` is killing the group (os.killpg is wrapped to send it first).
+    A handler that raised again would abort the kill and orphan the command."""
+    pidfile = tmp_path / "cmd.pid"
+    prelude = ("real_killpg = os.killpg\n"
+               "def killpg(pid, sig):\n"
+               "    os.kill(os.getpid(), signal.SIGTERM)\n"
+               "    return real_killpg(pid, sig)\n"
+               "os.killpg = killpg\n")
+    proc = start_driver(tmp_path, f"sleep 300 & echo $! > {pidfile}; wait", 60, prelude)
+    pids: list[int] = []
+    try:
+        pids = [wait_for(pidfile)]
+        proc.send_signal(signal.SIGTERM)
+        assert proc.wait(timeout=30) == 143
+        assert_dead_soon(*pids)
+    finally:
+        finish_driver(proc, pids)
+
+
+def test_sigterm_while_draining_a_timed_out_command_exits_promptly_with_its_group_dead(tmp_path):
+    """After the timeout kill, a process that left the session keeps the pipe open and the drain blocks; SIGTERM must
+    still end host-apply (the leaked process is the documented limit, reaped by the unit's cgroup), and everything
+    that stayed in the command's group is dead by then."""
+    leaked, ingroup = tmp_path / "leaked.pid", tmp_path / "ingroup.pid"
+    cmd = f"setsid sleep 300 & echo $! > {leaked}; sleep 300 & echo $! > {ingroup}; wait"
+    proc = start_driver(tmp_path, cmd, 1)
+    pids: list[int] = []
+    try:
+        pids = [wait_for(leaked), wait_for(ingroup)]
+        time.sleep(3)                                                              # past the timeout kill: now draining
+        assert proc.poll() is None                                                 # blocked on the leaked pipe holder
+        assert not alive(pids[1])                                                  # the in-group process was killed
+        proc.send_signal(signal.SIGTERM)
+        assert proc.wait(timeout=15) == 143
+    finally:
+        finish_driver(proc, pids)
+
+
+def test_stop_group_still_sigkills_when_the_grace_wait_is_interrupted(tmp_path):
+    """An exception inside the grace wait (here: poll() raising) must not skip the final SIGKILL: the child ignores
+    SIGTERM, so only that SIGKILL can stop it."""
+    from herdr_engineering.fleet_watch import run as runner
+    pidfile = tmp_path / "deaf.pid"
+
+    class Interrupted(subprocess.Popen):
+        def poll(self):
+            raise RuntimeError("interrupted during the grace wait")
+
+    child = Interrupted(["sh", "-c", f"trap '' TERM; echo $$ > {pidfile}; sleep 300 & wait"], start_new_session=True,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    pids: list[int] = []
+    try:
+        pids = [wait_for(pidfile), child.pid]
+        with pytest.raises(RuntimeError):
+            runner._stop_group(child)
+        assert_dead_soon(*pids)
+    finally:
+        for pid in pids:
+            if alive(pid):
+                os.kill(pid, signal.SIGKILL)
+        subprocess.Popen.wait(child)
+
+
+def test_stop_group_sends_no_sigkill_when_the_group_is_already_gone(tmp_path, monkeypatch):
+    """The only observable of a signal that was not sent is a recording wrapper around the real os.killpg."""
+    from herdr_engineering.fleet_watch import run as runner
+    child = subprocess.Popen(["true"], start_new_session=True)
+    child.wait()                                                                   # exited and reaped: group is gone
+    sent: list[int] = []
+    real = os.killpg
+
+    def recording(pid, sig):
+        sent.append(sig)
+        return real(pid, sig)
+
+    monkeypatch.setattr(runner.os, "killpg", recording)
+    runner._stop_group(child)
+    assert signal.SIGKILL not in sent and sent[0] == signal.SIGTERM
+
+
+def test_ssh_transport_kills_the_group_when_reading_a_started_command_fails(tmp_path, monkeypatch):
+    from herdr_engineering.fleet_watch import run as runner
+    pidfile = tmp_path / "ssh.pid"
+
+    class Broken(subprocess.Popen):
+        def communicate(self, *a, **k):
+            wait_for(pidfile)
+            raise OSError("pipe broke")
+
+    monkeypatch.setattr(runner.subprocess, "Popen", Broken)
+    bin_ = tmp_path / "herdr-eng"
+    bin_.write_text(f"#!/bin/sh\nsleep 300 &\necho $! > {pidfile}\nwait\n")
+    bin_.chmod(0o755)
+    pids: list[int] = []
+    try:
+        with pytest.raises(OSError):
+            runner.SshTransport(local_host="beast", remote_bin=str(bin_)).run("beast", ["--sha", "a" * 40], 60)
+        pids = [wait_for(pidfile)]
+        assert_dead_soon(*pids)
+    finally:
+        for pid in pids:
+            if alive(pid):
+                os.kill(pid, signal.SIGKILL)
+
+
+# --------------------------------------------------------------------------- systemd unit and ansible task
+
+UNIT = ROOT / "scripts" / "herdr-eng-fleet-watch.service"
+TASKS = ROOT / "ansible" / "tasks" / "fleet-watch.yml"
+
+
+def test_unit_runs_the_installed_build_from_a_neutral_cwd_and_only_plans_by_default():
+    sections = parse_unit(UNIT)
+    service = dict(sections["Service"])
+    argv = shlex.split(service["ExecStart"])
+    assert argv[0] == "%h/.local/bin/herdr-eng" and argv[1:3] == ["fleet-watch", "loop"]
+    assert "python" not in service["ExecStart"] and "-m" not in argv                 # never a checkout (shadowed(), #585)
+    assert "--enable-rollouts" not in argv                                           # applying is a separate opt-in
+    assert service["WorkingDirectory"] == "/"
+    assert service["Restart"] == "on-failure" and int(service["RestartSec"].rstrip("s")) >= 10
+    assert service["UMask"] == "0077" and service["NoNewPrivileges"] == "true"
+    assert "Environment" not in service and "EnvironmentFile" not in service
+    assert dict(sections["Install"])["WantedBy"] == "default.target"
+    assert "RuntimeMaxSec" not in service and "TimeoutStartSec" not in service       # no wall-clock cap on healthy runs
+
+
+def test_the_unit_limits_match_the_cli_defaults():
+    from herdr_engineering.fleet_watch import service
+    assert service.SOFT_LIMIT_S < service.HARD_LIMIT_S
+    assert service.HARD_LIMIT_S > 1800 + 120                                         # longer than one apply + health call
+
+
+def block():
+    return yaml.safe_load(TASKS.read_text())[0]
+
+
+def test_tasks_install_the_unit_but_enable_only_when_fleet_watch_enabled_on_beast():
+    b = block()
+    assert b["when"] == "ansible_facts['system'] == 'Linux'" and b["become"] is False
+    assert b["environment"]["XDG_RUNTIME_DIR"] == "/run/user/{{ ansible_facts['user_uid'] }}"
+    wanted = b["vars"]["watch_wanted"]
+    assert "fleet_watch_enabled | default(false) | bool" in wanted and "inventory_hostname == 'beast'" in wanted
+    service = [t["ansible.builtin.systemd_service"] for t in b["block"] if "ansible.builtin.systemd_service" in t][0]
+    assert service["name"] == "herdr-eng-fleet-watch.service" and service["scope"] == "user"
+    assert "watch_wanted" in service["enabled"] and "stopped" in service["state"]
+    copies = [t["ansible.builtin.copy"] for t in b["block"] if "ansible.builtin.copy" in t]
+    assert any(c["dest"].endswith("/systemd/user/herdr-eng-fleet-watch.service") for c in copies)
+
+
+def test_rollouts_need_their_own_opt_in_through_a_drop_in():
+    text = TASKS.read_text()
+    assert "fleet_watch_apply | default(false) | bool" in text
+    assert "--enable-rollouts" in text and "herdr-eng-fleet-watch.service.d" in text
+    assert "state: absent" in text or "'absent'" in text                             # removed again when not wanted
+
+
+@pytest.mark.parametrize("playbook", ["fleet-sync.yml", "site.yml"])
+def test_playbooks_converge_the_watcher_unit_after_the_fabric_agent(playbook):
+    tasks = yaml.safe_load((ROOT / "ansible/playbooks" / playbook).read_text())[0]["tasks"]
+    includes = [t.get("ansible.builtin.include_tasks") for t in tasks]
+    assert "../tasks/fleet-watch.yml" in includes
+    assert includes.index("../tasks/fabric-agent.yml") < includes.index("../tasks/fleet-watch.yml")
+
+
+def test_no_default_turns_the_watcher_on():
+    for path in list((ROOT / "ansible").rglob("*.yml")) + list((ROOT / "ansible").rglob("*.yaml")):
+        text = path.read_text()
+        assert not re.search(r"^\s*fleet_watch_(enabled|apply):\s*true", text, re.M), path
+
+
+
+def test_the_final_task_starts_and_restarts_only_when_a_file_changed():
+    b = block()["block"]
+    copies = [t for t in b if "ansible.builtin.copy" in t]
+    assert copies and all(t.get("register") for t in copies)
+    svc = [t for t in b if "ansible.builtin.systemd_service" in t][0]
+    assert "restarted" not in svc["ansible.builtin.systemd_service"]["state"]
+    restart = [t for t in b if "restarted" in str(t.get("ansible.builtin.systemd_service", {}).get("state", ""))]
+    assert restart and all("changed" in str(t["when"]) for t in restart)
+
+
+def test_unit_does_not_restart_on_refusal_or_busy_and_wants_the_network():
+    unit = parse_unit(UNIT)
+    assert dict(unit["Service"])["RestartPreventExitStatus"] == "2 3"
+    assert dict(unit["Unit"])["Wants"] == "network-online.target"

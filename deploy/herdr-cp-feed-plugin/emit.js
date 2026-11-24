@@ -29,7 +29,7 @@
 import os from "node:os";
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
-import { readHostJson } from "./host-config.js";
+import { readHostJson, loadHostConfig } from "./host-config.js";
 import { pathToFileURL } from "node:url";
 import { enrichSession, rawWorkspace, resolveSessionEnv } from "./enrich.js";
 import { recordSessionBinding } from "./session-helpers.js";
@@ -97,7 +97,9 @@ function eventJson(env) {
   if (!raw) return {};
   try {
     const v = JSON.parse(raw);
-    return v && typeof v === "object" ? v : {};
+    if (!v || typeof v !== "object") return {};
+    // Herdr sends {"event": ..., "data": {...}}; flat payloads are still accepted.
+    return v.data && typeof v.data === "object" ? { ...v, ...v.data } : v;
   } catch {
     return {};
   }
@@ -268,13 +270,15 @@ export function resolveUrl(env = process.env) {
   catch { return null; }
 }
 
-async function send(url, envelope) {
+export async function send(url, envelope, apiKey = null) {
+  const headers = { "content-type": "application/json" };
+  if (apiKey) headers["X-API-Key"] = apiKey;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 2000);
   try {
     const res = await fetch(`${url}/api/v1/ingest`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers,
       body: JSON.stringify(envelope),
       signal: controller.signal,
     });
@@ -310,7 +314,16 @@ async function main() {
   const envelopes = info && Object.keys(info).length
     ? mapEvent(env, { host, info })
     : base;
-  if (envelopes.length === 0) return;
+  // Agent Operations (additive, off unless HERDR_AGENT_OPS=1): provenance=observed lifecycle events.
+  let ops = [];
+  try {
+    if (env.HERDR_AGENT_OPS === "1") {
+      // Dynamic so a plugin copy without ../agent-ops-adapters keeps working (fail open).
+      const { mapHerdrAgentOps } = await import("../agent-ops-adapters/herdr.js");
+      ops = mapHerdrAgentOps(env, { host, scope: env.HERDR_AGENT_OPS_SCOPE || "private" });
+    }
+  } catch { ops = []; }
+  if (envelopes.length === 0 && ops.length === 0) return;
   // Enrich session envelopes with live detail (cwd/branch/pid/summary/attach)
   // via the herdr CLI + git, then send everything. Enrichment is best-effort.
   const enriched = await Promise.all(
@@ -323,7 +336,10 @@ async function main() {
     process.stderr.write("[herdr-cp-feed] host config unavailable: no host.json; run `herdr-eng fleet join`\n");
     return;
   }
-  await Promise.allSettled(enriched.map((e) => send(url, e)));
+  // Keyed control plane: the host config's ingest key. Absent or unreachable
+  // config keeps the open (keyless) behaviour.
+  const apiKey = await loadHostConfig().then((c) => c?.apiKey ?? null).catch(() => null);
+  await Promise.allSettled([...enriched, ...ops].map((e) => send(url, e, apiKey)));
 }
 
 // Only run when executed directly (not when imported by tests).

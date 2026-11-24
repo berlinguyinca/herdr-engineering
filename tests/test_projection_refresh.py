@@ -1,9 +1,15 @@
 import asyncio
+import logging
+import os
 import threading
+from contextlib import asynccontextmanager
+from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
 from herdr_engineering.control_plane import projection_refresh as refresh
+from herdr_engineering.control_plane.projection_store import ProjectionStore
 
 
 def test_refresh_policy_sanitized_and_closed(monkeypatch):
@@ -109,3 +115,94 @@ def test_periodic_retries_and_sanitizes_failures(monkeypatch, caplog):
 def test_interval_bounded(interval):
     with pytest.raises(ValueError):
         refresh.ProjectionRefresh('secret', interval=interval)
+
+
+# --- real-Postgres diagnostics and skip-when-unchanged -----------------------
+
+DSN = os.environ.get('HERDR_PERF_PG_DSN')
+needs_pg = pytest.mark.skipif(not DSN, reason='dedicated HERDR_PERF_PG_DSN required')
+
+
+@asynccontextmanager
+async def schema_db():
+    import asyncpg
+
+    from herdr_engineering.control_plane.db import Migrator
+
+    admin = await asyncpg.connect(DSN)
+    schema = 'refresh_' + uuid4().hex
+    await admin.execute(f'CREATE SCHEMA {schema}')
+    conn = await asyncpg.connect(DSN, server_settings={'search_path': schema})
+    try:
+        await Migrator(conn).apply(str(Path(__file__).parents[1] / 'deploy/control-plane/migrations'))
+        sep = '&' if '?' in DSN else '?'
+        yield conn, f'{DSN}{sep}search_path={schema}'
+    finally:
+        await conn.close()
+        await admin.execute(f'DROP SCHEMA {schema} CASCADE')
+        await admin.close()
+
+
+async def _append(conn, event_id):
+    await conn.execute(
+        "INSERT INTO fabric_events(event_id,sequence,event_type,entity_type,entity_id,payload,source_timestamp) "
+        "VALUES($1,0,'ServiceRegistered','service','s','{}',now())", event_id)
+
+
+def _pass_lines(caplog):
+    return [r.getMessage() for r in caplog.records if r.getMessage().startswith('projection refresh:')]
+
+
+@needs_pg
+def test_failure_warning_carries_message_when_lock_is_held(caplog):
+    caplog.set_level(logging.INFO)
+
+    async def scenario():
+        async with schema_db() as (conn, dsn):
+            async with ProjectionStore(conn).publisher():
+                await asyncio.to_thread(refresh.ProjectionRefresh(dsn)._pass)
+
+    asyncio.run(scenario())
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any('CheckpointInvalid' in w and 'another projection checkpoint materializer is active' in w
+               for w in warnings), warnings
+    assert any(line.startswith('projection refresh: failed in ') for line in _pass_lines(caplog))
+
+
+@needs_pg
+def test_pass_skipped_when_frontier_current_and_runs_after_append(caplog):
+    caplog.set_level(logging.INFO)
+
+    async def scenario():
+        async with schema_db() as (conn, dsn):
+            periodic = refresh.ProjectionRefresh(dsn)
+            await _append(conn, 'e1')
+            await asyncio.to_thread(periodic._pass)   # no checkpoint: must publish
+            await asyncio.to_thread(periodic._pass)   # nothing new: skip
+            await _append(conn, 'e2')
+            await asyncio.to_thread(periodic._pass)   # new row: publish again
+            await asyncio.to_thread(periodic._pass)   # and current again
+
+    asyncio.run(scenario())
+    outcomes = [line.split()[2] for line in _pass_lines(caplog)]
+    assert outcomes == ['published', 'skipped', 'published', 'skipped']
+
+
+@needs_pg
+def test_no_checkpoint_is_never_current():
+    async def scenario():
+        async with schema_db() as (conn, dsn):
+            assert not await asyncio.to_thread(refresh.checkpoint_is_current, dsn)
+            await _append(conn, 'e1')
+            assert not await asyncio.to_thread(refresh.checkpoint_is_current, dsn)
+
+    asyncio.run(scenario())
+
+
+def test_currency_check_failure_falls_back_to_doing_the_pass():
+    assert refresh.checkpoint_is_current('postgres://nobody@127.0.0.1:1/none') is False
+
+
+def test_failure_message_redacts_urls():
+    assert refresh._safe_message(ValueError('bad postgres://u:pw@h/db now')) == 'bad <url> now'
+    assert len(refresh._safe_message(ValueError('x' * 900))) == 500

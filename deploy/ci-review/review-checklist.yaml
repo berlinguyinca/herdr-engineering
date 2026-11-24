@@ -1,0 +1,56 @@
+# Review checklist: topics the reviewer must consider and name in `checked_items`.
+# Loaded through `prompt.checklist_file` in always-on-review.yaml. Unknown keys are refused.
+version: 1
+categories:
+  code:
+    - id: defaults-change-behaviour
+      question: Does a changed default alter behaviour for existing callers or configs that never set it?
+    - id: version-dependent-defaults
+      question: Is a default hardcoded to a value that depends on a version, model, or release that will change?
+    - id: unbounded-input
+      question: Can an unbounded or unvalidated input crash the process after startup instead of being refused at load?
+    - id: config-wiring-test
+      question: Does every new config key or CLI path have a wiring test that proves it reaches the code that uses it?
+    - id: restart-registration-list
+      question: Is a new restart-required key or registered component missing from the list where those are enumerated?
+    - id: non-unique-key
+      question: Does archive, merge, or dedup logic key on an id that is not actually unique?
+    - id: degrade-not-fail
+      question: Does an error on one item fail the whole page or batch instead of degrade to that item only?
+    - id: string-quoting
+      question: Is quoting or identifier construction done by string slicing or concatenation instead of a proper API?
+    - id: concurrency
+      question: Is there a concurrency hazard where two writers, requests, or processes race on the same state, file, or lock?
+    - id: idempotency
+      question: Is the operation idempotent, safe to run twice or retry after a partial failure?
+    - id: shared-snapshot
+      question: Do two reads that must agree run without a shared snapshot or transaction?
+  security:
+    - id: permission-role-differences
+      question: Does the change behave differently by permission or role, and is each role tested and authorised?
+    - id: secrets-in-repo
+      question: Does the change add a secret, password, token, or key to the repo, a log, or an error message?
+    - id: untrusted-input-reaches-sink
+      question: Does untrusted input reach a shell, SQL, path, or template without validation?
+  tests:
+    - id: test-isolation-order
+      question: Do the tests depend on execution order, or leak global state, environment, or files between cases?
+    - id: test-resource-leaks
+      question: Does test setup leak a resource such as a port, container, temp dir, or process when it fails?
+    - id: tests-prove-the-claim
+      question: Would the new tests fail if the change were reverted, or do they only run the happy path?
+  docs:
+    - id: changelog-defaults-rollback
+      question: Does the changelog omit a changed default, a new config key, or the rollback steps?
+    - id: docs-match-behaviour
+      question: Do the README and operations docs still describe what the code now does?
+  performance:
+    - id: index-query-mismatch
+      question: Does a partial index fail to match the parameterized predicate the query actually sends?
+    - id: unbounded-growth
+      question: Can a loop, cache, queue, or log grow without a bound or an eviction rule?
+  migrations:
+    - id: migration-rollback-safety
+      question: Can the migration be rolled back, and is it safe while the old code is still running?
+    - id: migration-per-schema-change
+      question: Does every schema change ship with a migration, and does it match the queries that use it?

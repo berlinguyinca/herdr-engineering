@@ -299,7 +299,7 @@ def test_bind_refused_when_port_taken(tmp_path):
 def test_resolve_host_bounded_ip_literal_passthrough():
     from herdr_engineering.fabric import _resolve_host_bounded
     assert _resolve_host_bounded("127.0.0.1") == "127.0.0.1"
-    assert _resolve_host_bounded("100.104.39.6") == "100.104.39.6"
+    assert _resolve_host_bounded("100.64.8.6") == "100.64.8.6"
 
 
 def test_resolve_host_bounded_resolves_hostname():
@@ -341,7 +341,7 @@ def test_client_connects_via_resolved_ip_and_preserves_host_header(
     def _fake_getaddrinfo(host, port=0, family=0, type=0, proto=0, flags=0):
         if host == "dev.lan":
             return [(socket.AF_INET, socket.SOCK_STREAM, 6, "",
-                     ("100.104.39.6", port))]
+                     ("100.64.8.6", port))]
         return real_getaddrinfo(host, port, family, type, proto, flags)
 
     monkeypatch.setattr(socket, "getaddrinfo", _fake_getaddrinfo)

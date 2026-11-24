@@ -238,3 +238,79 @@ def test_a_github_app_block_survives_the_loader_and_the_host_slice(tmp_path):
 def test_an_invalid_github_app_block_is_refused_by_the_loader(tmp_path, app):
     with pytest.raises(FleetConfigError, match="section github: github.app is invalid"):
         load_fleet_config(write(tmp_path, _with_github_app(app)))
+
+
+# ---------------------------------------------------------------- unknown keys are rejected
+
+def _with(mutate) -> dict:
+    data = base()
+    mutate(data)
+    return data
+
+
+def test_a_misplaced_top_level_control_plane_key_is_rejected_without_its_value(tmp_path):
+    data = _with(lambda d: d.update(control_plane={"ci_deployments": {"frontend": SECRET}}))
+    with pytest.raises(FleetConfigError) as exc:
+        load_fleet_config(write(tmp_path, data))
+    msg = str(exc.value)
+    assert "control_plane" in msg and "sections.control_plane.values" in msg
+    assert SECRET not in msg and "frontend" not in msg
+
+
+def test_any_other_unknown_top_level_key_is_rejected_by_name_only(tmp_path):
+    data = _with(lambda d: d.update(extras=SECRET))
+    with pytest.raises(FleetConfigError) as exc:
+        load_fleet_config(write(tmp_path, data))
+    assert "extras" in str(exc.value) and SECRET not in str(exc.value)
+
+
+def test_a_key_beside_values_in_a_section_is_rejected(tmp_path):
+    data = _with(lambda d: d["sections"]["control_plane"].update(ci_deployments={"a": SECRET}))
+    with pytest.raises(FleetConfigError) as exc:
+        load_fleet_config(write(tmp_path, data))
+    msg = str(exc.value)
+    assert "section control_plane" in msg and "ci_deployments" in msg and SECRET not in msg
+
+
+def test_an_unknown_host_key_is_rejected(tmp_path):
+    data = _with(lambda d: d["hosts"]["bender"].update(token=SECRET))
+    with pytest.raises(FleetConfigError) as exc:
+        load_fleet_config(write(tmp_path, data))
+    msg = str(exc.value)
+    assert "host bender" in msg and "token" in msg and SECRET not in msg
+
+
+def test_the_shipped_example_uses_only_the_known_keys():
+    example = Path(__file__).resolve().parent.parent / "deploy" / "control-plane" / "fleet-config.example.yaml"
+    data = yaml.safe_load(example.read_text())
+    assert set(data) <= {"version", "sections", "hosts"}
+    assert all(set(s) <= {"roles", "values"} for s in data["sections"].values())
+    assert all(set(h) <= {"roles", "token_sha256", "overrides"} for h in data["hosts"].values())
+
+
+# ------------------------------------------------------- control_plane.ci_deployments at load
+
+@pytest.mark.parametrize("value", [
+    "woodpecker-ci", ["woodpecker-ci"], {5: "woodpecker-ci"}, {"Bad Name": "woodpecker-ci"},
+    {"frontend": 7}, {"frontend": "two words"}])
+def test_a_malformed_ci_deployments_map_is_rejected_at_load(tmp_path, value):
+    data = _with(lambda d: d["sections"]["control_plane"]["values"].update(ci_deployments=value))
+    with pytest.raises(FleetConfigError) as exc:
+        load_fleet_config(write(tmp_path, data))
+    assert str(exc.value).startswith("section control_plane: ") and "ci_deployments" in str(exc.value)
+
+
+def test_a_valid_ci_deployments_map_loads(tmp_path):
+    data = _with(lambda d: d["sections"]["control_plane"]["values"].update(
+        ci_deployments={"frontend": "woodpecker-ci"}))
+    cfg = load_fleet_config(write(tmp_path, data))
+    assert cfg.section("control_plane")["ci_deployments"] == {"frontend": "woodpecker-ci"}
+
+
+def test_the_yaml_on_key_typo_is_rejected_at_load(tmp_path):
+    # YAML 1.1 reads an unquoted `on` as boolean True: the map key is not a component name.
+    data = _with(lambda d: d["sections"]["control_plane"]["values"].update(ci_deployments="ON-MARKER"))
+    text = yaml.safe_dump(data).replace("ci_deployments: ON-MARKER", "ci_deployments:\n        on: woodpecker-ci")
+    assert "on: woodpecker-ci" in text
+    with pytest.raises(FleetConfigError, match="ci_deployments"):
+        load_fleet_config(write(tmp_path, None, text=text))

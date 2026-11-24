@@ -1,0 +1,38 @@
+---
+# Shared agent rules (github.com/berlinguyinca/agent-rules): clone/fetch into ~/.agent-rules, check out the pinned TAG or
+# commit (a branch is refused) and run its install.sh (links AGENTS.md into the harness dirs, ensures the @import in
+# ~/.claude/CLAUDE.md). Skipped when no pin is supplied: `agent_rules_ref` comes from control_plane.agent_rules in the
+# fleet config (fleet join/update pass it as extra vars) or from the inventory.
+# A bad pin (missing ref, branch name, unreachable repo, failing installer) must not abort the rest of the convergence:
+# the rescue records `agent_rules_failure`, which fleet-fingerprint.yml reports as `rules=FAILED:<reason>` so
+# `fleet status` / `fleet update` surface it.
+- name: "Install the pinned shared agent rules"
+  become: false
+  when: agent_rules_ref is defined
+  environment:
+    HOME: "{{ fleet_home }}"
+  block:
+    - name: "Sync ~/.agent-rules to the pinned ref and run install.sh"
+      # ansible.builtin.script copies the controller's script to the host before running it; a plain command would
+      # look for <controller checkout>/scripts/... on the host itself, which exists only on the controller.
+      ansible.builtin.script:
+        cmd: >-
+          {{ herdr_engineering_repo_root }}/scripts/agent-rules-sync.sh
+          {{ (agent_rules_repo_url | default('git@github.com:berlinguyinca/agent-rules.git')) | quote }}
+          {{ agent_rules_ref | quote }}
+          {{ (fleet_home ~ '/.agent-rules') | quote }}
+        executable: bash
+      register: agent_rules_sync
+      changed_when: >-
+        'changed=true' in (agent_rules_sync.stdout_lines | last | default(''))
+        or 'install_changed=true' in (agent_rules_sync.stdout_lines | last | default(''))
+  rescue:
+    - name: "Record the agent-rules failure for the fingerprint"
+      ansible.builtin.set_fact:
+        agent_rules_failure: >-
+          {{ ((ansible_failed_result.stderr | default('', true)).splitlines() or [ansible_failed_result.msg | default('failed', true)])
+             | last | regex_replace('[^A-Za-z0-9 ._:/=-]', '_') | truncate(120, true, '') }}
+
+    - name: "Warn that the pinned agent rules were not installed"
+      ansible.builtin.debug:
+        msg: "agent-rules failed on {{ inventory_hostname }}: {{ agent_rules_failure }}; the rest of the convergence continues"

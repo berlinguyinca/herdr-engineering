@@ -1,12 +1,12 @@
 # Auto-registration agent — live validation (2026-09-25)
 
-Hosts: gateway = bender (100.104.39.6, MagicDNS bender.tail0c50da.ts.net,
-control :29999, tailnet-bound); agent + demo app = beast (100.96.156.65).
+Hosts: gateway = bender (100.64.8.6, MagicDNS bender.<tailnet>.ts.net,
+control :29999, tailnet-bound); agent + demo app = beast (100.64.8.65).
 
 ## Gateway up (token-less on the private tailnet)
 $ herdr-eng devfabric gateway            # on bender
-$ curl -s http://bender.tail0c50da.ts.net:29999/healthz
-{"ok": true, "url_base": "http://bender.tail0c50da.ts.net", ...}
+$ curl -s http://bender.<tailnet>.ts.net:29999/healthz
+{"ok": true, "url_base": "http://bender.<tailnet>.ts.net", ...}
 
 Note: the control API binds the gateway host's tailnet IP only (bind: auto),
 NOT loopback — so every agent (including one on bender itself) reaches the
@@ -16,21 +16,21 @@ reachable only from the tailnet, which is itself the access control.
 ## Zero-manual drill: a web service on beast appears at dev:<port>
 1. On beast, start a demo app:   python3 -m http.server 5678   (binds 0.0.0.0)
 2. On beast, run one agent scan cycle against the gateway:
-   $ HERDR_ENGINEERING_FABRIC_URL=http://bender.tail0c50da.ts.net:29999 \
+   $ HERDR_ENGINEERING_FABRIC_URL=http://bender.<tailnet>.ts.net:29999 \
        herdr-eng devfabric agent --once
    -> registered: 19  (beast's dev web services; noise filtered, see below)
    -> includes: "python3 on beast (port 5678)"
 3. Resolve the lease's external port from the gateway:
-   $ curl -s http://bender.tail0c50da.ts.net:29999/list | jq '.leases[] |
+   $ curl -s http://bender.<tailnet>.ts.net:29999/list | jq '.leases[] |
        select(.target.port==5678) | .external_port'
    18007
 4. Open it via the fleet front door (from bender, and from beast itself):
-   $ curl -s http://bender.tail0c50da.ts.net:18007/
+   $ curl -s http://bender.<tailnet>.ts.net:18007/
    <!doctype html><meta charset="utf-8"><title>beast</title>   -> HTTP 200
    (routed gateway -> beast:5678, no manual `register` on either host)
 5. It surfaces with a clickable link in the gateway host web UI:
    $ python -c "from herdr_engineering.web import _dev; print(_dev())"
-   url=http://bender.tail0c50da.ts.net:18007  <- beast:5678
+   url=http://bender.<tailnet>.ts.net:18007  <- beast:5678
 
 ## Noise filter (registers dev web services, not infrastructure)
 Before the filter the agent registered 26 HTTP responders on beast; after the

@@ -4,6 +4,7 @@ import pytest
 
 from herdr_engineering import cli
 from herdr_engineering.control_plane import db, projection_refresh
+from herdr_engineering.control_plane.projection_recovery import CheckpointBudgets
 from herdr_engineering.control_plane.projection_store import ProjectionStore
 
 
@@ -36,7 +37,8 @@ def test_explicit_checkpoint_order_cleanup_and_sanitization(monkeypatch, capsys,
 
     def load(dsn, **policy):
         calls.append('load')
-        assert policy == {'host_aliases': {'a': 'b'}, 'inspector_limits': cp['inspector_limits']}
+        assert policy == {'host_aliases': {'a': 'b'}, 'inspector_limits': cp['inspector_limits'],
+                          'checkpoint_budgets': CheckpointBudgets(100_000, 600_000, 2_000_000, 500_000), 'lock_wait': 0.0}
         if failure == 'load':
             raise RuntimeError('postgres://secret')
         return {'counts': {'events': 2}, 'recovery_info': {'mode': 'checkpoint'}}
@@ -102,7 +104,9 @@ def test_worker_refresh_lifecycle_preserves_upstream_flows(
     class Refresh:
         def __init__(self, dsn, **kwargs):
             assert dsn == cp['pg_dsn']
-            assert kwargs == {'host_aliases': {'a': 'b'}, 'inspector_limits': {}}
+            assert kwargs == {'host_aliases': {'a': 'b'}, 'inspector_limits': {},
+                              'checkpoint_budgets': CheckpointBudgets(100_000, 600_000, 2_000_000, 500_000),
+                              'heap_release': True}
             events.append('refresh-init')
 
         def start(self):
@@ -173,7 +177,8 @@ def test_cli_rejects_successful_load_without_publication(monkeypatch, capsys, re
 
     class Source:
         def __init__(self, **kwargs):
-            assert kwargs == {'dsn': 'postgres://secret', 'checkpoint_publish': True}
+            assert kwargs == {'dsn': 'postgres://secret', 'checkpoint_publish': True,
+                              'checkpoint_budgets': CheckpointBudgets(100_000, 600_000, 2_000_000, 500_000)}
             self.recovery_info = recovery_info
 
         def close(self):
@@ -200,3 +205,11 @@ def test_cli_rejects_successful_load_without_publication(monkeypatch, capsys, re
         'ok': False, 'error': 'CheckpointNotPublished', 'stage': 'materialization'}
     assert 'secret' not in output
     assert closed == ['migration', 'source']
+
+
+def test_fleet_config_budgets_are_validated_and_defaulted():
+    assert cli._checkpoint_budgets_from({}) == CheckpointBudgets(100_000, 600_000, 2_000_000, 500_000)
+    assert cli._checkpoint_budgets_from(
+        {'projection_checkpoint': {'max_dirty_rows': 9}}) == CheckpointBudgets(100_000, 9, 2_000_000, 500_000)
+    with pytest.raises(SystemExit, match='fleet config control_plane.projection_checkpoint.max_dirty_rows'):
+        cli._checkpoint_budgets_from({'projection_checkpoint': {'max_dirty_rows': 0}})

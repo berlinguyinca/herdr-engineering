@@ -70,6 +70,7 @@ ANNOTATIONS_NAME = "annotations.json"
 ANNOTATIONS_MAX_BYTES = 1024 * 1024
 HEAD_NAME = "head.json"
 ARTIFACTS_DIR = "artifacts"
+HIDDEN_LIFECYCLES = frozenset({"retracted", "tombstoned"})   # a mirror never carries these artifacts
 BLOBS_DIR = "blobs"
 REPORT_READ_ONLY = "report artifacts are read-only for collaborators"
 RENDERED_READ_ONLY = "renderer-built artifacts are read-only for collaborators"
@@ -196,9 +197,11 @@ class CollabMirror:
         else:
             def is_retracted(_artifact_id: str) -> bool:
                 return False
+        deleted = frozenset(await store.tombstoned_ids()) if store is not None and hasattr(
+            store, "tombstoned_ids") else frozenset()
         agents: dict[str, dict] = {}
         for row in rows:
-            if is_retracted(row["artifact_id"]):
+            if is_retracted(row["artifact_id"]) or row["artifact_id"] in deleted:
                 continue
             agents.setdefault(row["agent_id"], {})[row["artifact_id"]] = {
                 "permission": row["permission"], "expires_at": _epoch(row["expires_at"])}
@@ -297,7 +300,7 @@ class CollabMirror:
         if artifact is None:
             return None, []
         artifact_id = artifact["artifact_id"]
-        if artifact["lifecycle"] == "retracted" or gate.artifact_retracted(artifact_id):
+        if artifact["lifecycle"] in HIDDEN_LIFECYCLES or gate.artifact_retracted(artifact_id):
             return None, []
         live = self._live(artifact_id, versions, gate)
         head_id = artifact["current_version_id"]
@@ -556,7 +559,8 @@ class CollabMirror:
         for artifact_id in granted:
             try:
                 artifact = await store.get(artifact_id)
-                if artifact is None or artifact["lifecycle"] == "retracted" or gate.artifact_retracted(artifact_id):
+                if artifact is None or artifact["lifecycle"] in HIDDEN_LIFECYCLES \
+                        or gate.artifact_retracted(artifact_id):
                     if await self._known(artifact_id):
                         await self._remove_into(artifact_id, out)
                     continue

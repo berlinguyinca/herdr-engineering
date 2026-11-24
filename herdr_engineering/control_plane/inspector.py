@@ -15,6 +15,7 @@ a reasoning capability, and it is never synthesised.
 """
 from __future__ import annotations
 
+import json
 import math
 import re
 import secrets
@@ -24,6 +25,7 @@ from collections import OrderedDict, deque
 from datetime import UTC, datetime
 from typing import Any
 
+from .admission import AdmissionContext
 from .envelope import (
     _checkpoint_header,
     _checkpoint_int,
@@ -36,7 +38,16 @@ from .envelope import (
 from .redact import redact_payload, redact_text, rules_fingerprint
 
 #: Bump when the replayed projection changes shape or meaning, so older snapshots are replayed from events instead.
-SNAPSHOT_VERSION = 1
+SNAPSHOT_VERSION = 2
+
+
+def _replayed_admission(payload, session_id):
+    private = payload.get("_inspector_context")
+    if (type(private) is not dict or set(private) != {"version", "admission"}
+            or type(private["version"]) is not int or private["version"] != 2):
+        return None
+    context = AdmissionContext.from_private(private["admission"])
+    return context if context is not None and context.entity_id == session_id else None
 
 
 class SnapshotStale(Exception):
@@ -48,6 +59,7 @@ KINDS = frozenset({
 })
 #: Capture must be committed before acknowledging emitter checkpoints.
 REQUIRED_DURABLE_KINDS = frozenset({"message", "tool", "file", "usage"})
+_TOOL_ENDING_PHASES = ("restarted", "interrupted", "ended")   # lifecycle phases that close every running tool call
 DURABLE_KINDS = REQUIRED_DURABLE_KINDS | frozenset({"capabilities", "association", "model", "lifecycle", "test"})
 VIEWS = ("all", "conversation", "reasoning", "tools", "files", "tests", "usage")
 _VIEW_KINDS = {
@@ -210,7 +222,7 @@ class _Session:
                  "dropped_ring", "client_dropped", "seen", "capabilities",
                  "assoc", "models", "usage_totals", "usage_latest", "last_event",
                  "last_ingest", "ended", "prefs", "tools", "tests", "subs",
-                 "evicted_to")
+                 "evicted_to", "tool_pending", "tool_carry", "last_durable")
 
     def __init__(self, session_id: str):
         self.session_id = session_id
@@ -236,6 +248,11 @@ class _Session:
         self.tests: dict[str, dict] = {}   # run_id  -> live ring entry
         self.subs: set = set()
         self.evicted_to = -1
+        # Journal suppression (journal_suppression.py): per live call_id, the latest tool update not yet journaled, and what
+        # the journaled rows of the call already established. Process-local; never part of a snapshot.
+        self.tool_pending: dict[str, dict] = {}
+        self.last_durable: tuple[float, int, int] | None = None   # (_received_at, _sequence, ingest number) last journaled
+        self.tool_carry: dict[str, dict] = {}
 
 
 class Subscriber:
@@ -279,7 +296,9 @@ class InspectorStore:
     def __init__(self, *, limits: dict | None = None, persist=None,
                  reasoning_roles: str = "operator",
                  sensitive_roles: str = "operator", store_reasoning: bool = True,
-                 clock=time.time):
+                 clock=time.time, journal_suppression=None):
+        from .journal_suppression import JournalSuppression
+        self._journal = journal_suppression if journal_suppression is not None else JournalSuppression()
         self.limits = dict(DEFAULT_LIMITS)
         for k, v in (limits or {}).items():
             if k in DEFAULT_LIMITS and isinstance(v, (int, float)) and v > 0:
@@ -295,12 +314,16 @@ class InspectorStore:
         #: Changes on every process start; clients resync when it differs (seq/rev restart).
         self.epoch = secrets.token_hex(6)
         self._lock = threading.RLock()
+        # Serialises ingest writers. ``_lock`` is released while a durable write waits on the database, so this keeps
+        # two ingests from interleaving in that window; readers only ever need ``_lock``.
+        self._ingest_lock = threading.RLock()
         self.stats = {"accepted": 0, "duplicates": 0, "rejected": 0,
                       "evicted_events": 0, "evicted_sessions": 0}
         # Replay cursor: the largest replay order key, fabric sequence and event count that hydrate() has consumed.
         self._replay_key: tuple | None = None
         self._replay_watermark = -1
         self._replay_count = 0
+        self._ingest_n = 0      # counts ingest() calls, so a flush can tell whether the row that caused it was just journaled
 
     def export_checkpoint(self) -> dict:
         """Explicit JSON state; indexes encode references, never duplicate entries.
@@ -323,13 +346,17 @@ class InspectorStore:
                     "tools": {key: entry["seq"] for key, entry in sess.tools.items()},
                     "tests": {key: entry["seq"] for key, entry in sess.tests.items()},
                 })
-            return _checkpoint_json({"version": 1, "domain": "inspector", "sessions": sessions,
+            return _checkpoint_json({"version": 1, "domain": "inspector", "inspector_private_schema": 2, "sessions": sessions,
                                      "global_prefs": self._global_prefs, "stats": self.stats,
                                      "replay": {"key": list(self._replay_key) if self._replay_key is not None else None,
                                                 "watermark": self._replay_watermark,
                                                 "count": self._replay_count}})
 
     def restore_checkpoint(self, state) -> None:
+        state = _checkpoint_json(state)
+        _checkpoint_require(type(state) is dict)
+        private_schema = state.pop("inspector_private_schema", 1)
+        _checkpoint_require(type(private_schema) is int and private_schema in (1, 2))
         state = _checkpoint_header(state, "inspector", ("sessions", "global_prefs", "stats", "replay"))
         replay = state['replay']
         _checkpoint_object(replay, ('key', 'watermark', 'count'))
@@ -355,7 +382,7 @@ class InspectorStore:
                           "seen", "capabilities", "assoc", "models", "usage_totals", "usage_latest",
                           "last_event", "last_ingest", "ended", "prefs", "evicted_to", "tools", "tests")
         entry_fields = ("seq", "rev", "kind", "agent_id", "parent_agent_id", "event_id", "ts",
-                        "recv", "sensitive", "redacted", "truncated", "data", "size")
+                        "recv", "sensitive", "redacted", "truncated", "data", "size", "admission")
         usage_keys = ("input_tokens", "output_tokens", "reasoning_tokens", "cache_read_tokens")
         for row in state["sessions"]:
             _checkpoint_object(row, session_fields)
@@ -397,7 +424,13 @@ class InspectorStore:
             _checkpoint_require(type(row["events"]) is list)
             previous = -1
             for entry in row["events"]:
+                if private_schema == 1:
+                    entry.pop("admission", None)
+                    entry["admission"] = None
                 _checkpoint_object(entry, entry_fields, ("t0",))
+                context = AdmissionContext.from_private(entry["admission"])
+                _checkpoint_require(entry["admission"] is None or (
+                    context is not None and context.entity_id == sid))
                 _checkpoint_int(entry["seq"])
                 _checkpoint_int(entry["rev"])
                 _checkpoint_int(entry["size"])
@@ -421,7 +454,7 @@ class InspectorStore:
                 # Current policy may disable reasoning capture entirely.
                 if entry["kind"] == "reasoning" and not self.store_reasoning:
                     continue
-                entry["size"] = self._size(entry["data"])
+                entry["size"] = self._entry_size(entry)
                 sess.events.append(entry)
                 sess.by_seq[entry["seq"]] = entry
                 sess.bytes += entry["size"]
@@ -436,7 +469,7 @@ class InspectorStore:
             restored._sessions[sid] = sess
             restored._enforce(sess)
         restored._enforce_global()
-        with self._lock:
+        with self._ingest_lock, self._lock:   # swaps the projection: no ingest may sit in an unlocked durable write (startup/recovery only)
             for sess in self._sessions.values():
                 for sub in sess.subs:
                     sub.close()
@@ -496,7 +529,7 @@ class InspectorStore:
     def set_prefs(self, raw: Any, session_id: str | None = None, *,
                   persist: bool = True) -> dict:
         clean = validate_prefs(raw)
-        with self._lock:
+        with self._ingest_lock, self._lock:
             if session_id is None:
                 self._global_prefs.update(clean)
             else:
@@ -514,11 +547,18 @@ class InspectorStore:
             return self.get_prefs(session_id)
 
     # --------------------------------------------------------------- ingest
-    def ingest(self, session_id: str, payload: dict, *, persist: bool = True) -> dict:
+    def ingest(self, session_id: str, payload: dict, *, persist: bool = True,
+               admission: AdmissionContext | None = None) -> dict:
         """Ingest one envelope payload (``{"events": [...]}`` or a single event)."""
         if (not isinstance(session_id, str) or len(session_id) > 128 or
                 not (_SESSION_ID.fullmatch(session_id) or _CANONICAL_SESSION_ID.fullmatch(session_id))):
             raise ValueError("entity_id must be a valid session id (1-128 chars; canonical pane %3A escapes allowed)")
+        if admission is not None:
+            if type(admission) is not AdmissionContext:
+                raise TypeError("admission must be a private AdmissionContext")
+            if admission.entity_id != session_id:
+                raise ValueError("admission session mismatch")
+        self._ingest_n += 1
         events = payload.get("events") if isinstance(payload, dict) else None
         if events is None:
             events = [payload]
@@ -527,11 +567,12 @@ class InspectorStore:
         if len(events) > _MAX_BATCH:
             raise ValueError(f"batch too large (max {_MAX_BATCH})")
         result = {"accepted": 0, "duplicates": 0, "rejected": [], "session_id": session_id}
-        with self._lock:
+        with self._ingest_lock, self._lock:
             sess = self._session(session_id)
             for i, ev in enumerate(events):
                 try:
-                    status = self._ingest_one(sess, ev, persist)
+                    status = self._ingest_one(sess, ev, persist,
+                        admission.for_child(i) if admission is not None and persist else admission)
                 except RuntimeError:
                     # A partially persisted batch is retried by the emitter. Keep
                     # successful entries bounded while leaving the failed id unseen.
@@ -552,7 +593,7 @@ class InspectorStore:
             self._enforce_global(keep=session_id)
         return result
 
-    def _ingest_one(self, sess: _Session, ev: Any, persist: bool) -> str:
+    def _ingest_one(self, sess: _Session, ev: Any, persist: bool, admission: AdmissionContext | None) -> str:
         if not isinstance(ev, dict):
             raise ValueError("event must be an object")
         kind = ev.get("kind")
@@ -562,7 +603,7 @@ class InspectorStore:
         if eid and eid in sess.seen:
             return "dup"
         try:
-            status = self._apply(sess, kind, ev, persist)
+            status = self._apply(sess, kind, ev, persist, admission)
         except ValueError:
             raise
         except (TypeError, AttributeError, KeyError, OverflowError, IndexError) as exc:
@@ -573,9 +614,10 @@ class InspectorStore:
                 sess.seen.popitem(last=False)
         return status
 
-    def _apply(self, sess: _Session, kind: str, ev: dict, persist: bool) -> str:
+    def _apply(self, sess: _Session, kind: str, ev: dict, persist: bool, admission: AdmissionContext | None) -> str:
         data = self._sanitize(kind, ev)
         base = {
+            "admission": admission.to_private() if admission is not None else None,
             "agent_id": _s(ev.get("agent_id"), 128) or "main",
             "parent_agent_id": _s(ev.get("parent_agent_id"), 128),
             "event_id": _s(ev.get("event_id"), 128),
@@ -589,6 +631,8 @@ class InspectorStore:
             flagged = flagged or self._cmd_sensitive(data) or bool(live and live["sensitive"])
             if data["phase"] == "end" and "duration_ms" not in data and live and live.get("t0") is not None:
                 data["duration_ms"] = int((self._clock() - live["t0"]) * 1000)
+        if persist and kind == "lifecycle" and data.get("phase") in _TOOL_ENDING_PHASES:
+            self._flush_tool_updates(sess)          # the interrupted call keeps its last update, ahead of the lifecycle row
         if persist and kind in REQUIRED_DURABLE_KINDS and (
                 kind != "message" or data["role"] in ("user", "assistant")):
             # Commit before any projection mutation, publication or retry-id update.
@@ -622,14 +666,17 @@ class InspectorStore:
             sess.models.append({**data, "ts": base["ts"]})
         elif kind == "lifecycle":
             phase = data.get("phase")
-            if phase in ("restarted", "interrupted", "ended"):
+            if phase in _TOOL_ENDING_PHASES:
                 # Never claim success for work whose telemetry was cut off.
                 for t in sess.tools.values():
                     if t["data"].get("status") == "running":
                         t["data"]["status"] = "interrupted"
                         t["data"]["incomplete"] = True
+                        t["admission"] = base["admission"]
                         self._touch(sess, t)
                 sess.tools = {k: t for k, t in sess.tools.items() if t["data"]["status"] == "running"}
+                sess.tool_pending.clear()       # already journaled by _flush_tool_updates before the lifecycle row
+                sess.tool_carry.clear()
             if phase == "ended":
                 sess.ended = True
             dropped = data.get("dropped")
@@ -806,6 +853,12 @@ class InspectorStore:
                 n += 8
         return n
 
+    @classmethod
+    def _entry_size(cls, entry: dict) -> int:
+        """Ring cost of an entry: its data plus the private admission context it carries."""
+        admission = entry.get("admission")
+        return cls._size(entry["data"]) + (len(json.dumps(admission).encode("utf-8")) if admission else 0)
+
     def _store(self, sess: _Session, kind: str, base: dict, data: dict, flagged: bool,
                persist: bool) -> dict:
         flags = data.pop("_flags", {"redacted": False, "truncated": False})
@@ -817,7 +870,7 @@ class InspectorStore:
         if persist and kind in DURABLE_KINDS - REQUIRED_DURABLE_KINDS:
             self._persist_detail(sess, kind, base, data, flagged, flags)
         sess.next_seq += 1
-        entry["size"] = self._size(data)
+        entry["size"] = self._entry_size(entry)
         sess.bytes += entry["size"]
         sess.events.append(entry)
         sess.by_seq[entry["seq"]] = entry
@@ -832,22 +885,123 @@ class InspectorStore:
             "entity_type": "inspector", "entity_id": sess.session_id,
             "event_type": f"inspector.{kind}", "session_id": sess.session_id,
             "source_timestamp": base["ts"],
-            "payload": {**{k: v for k, v in data.items() if k not in ("failures", "_flags")},
+            "payload": {"_inspector_context": {"version": 2, "admission": base["admission"]},
+                        **{k: v for k, v in data.items() if k not in ("failures", "_flags")},
                         "agent_id": base["agent_id"], "parent_agent_id": base["parent_agent_id"],
                         "event_id": base["event_id"], "kind": kind, "sensitive": flagged,
                         **flags, "_received_at": self._clock(), "_sequence": sess.rev},
         }
+        sess.last_durable = (durable["payload"]["_received_at"], durable["payload"]["_sequence"], self._ingest_n)
+        if kind == "tool" and self._journal.inspector_tool_updates:
+            if not self._defer_tool_update(sess, durable):
+                self._write_durable(sess, durable)
+            return
+        if kind == "usage" and self._journal.inspector_zero_usage and self._repeats_zero_usage(sess, data):
+            return
         if kind in REQUIRED_DURABLE_KINDS:
             try:
-                self._persist(durable)
+                self._persist_unlocked(durable)
             except Exception as exc:
                 raise RuntimeError("inspector persistence unavailable") from exc
         else:
             self._safe_persist(durable)
 
+    # --- journal suppression -----------------------------------------------
+    # A tool call journals start, update... and end rows, and each update repeats the whole output so far. Replay only
+    # needs the end row when it carries the output, so updates are held back (latest only) until the call ends: dropped
+    # when the end row covers everything they carried, journaled just before it when it does not, and journaled when the
+    # session is interrupted/ended/restarted or the call leaves the ring. The remaining gap: if the process dies with a
+    # call still running and no such row ever follows, that call's last update is lost and a replay shows its start only.
+    _VALID_TOOL = staticmethod(lambda v: bool(v) and v != "unknown")
+
+    def _write_durable(self, sess: _Session, durable: dict, *, safe: bool = False) -> None:
+        """Journal one tool row and fold what it establishes into the call's carry."""
+        p = durable["payload"]
+        carry = sess.tool_carry.setdefault(p.get("call_id"), {"tool": None, "args_preview": None, "sensitive": False,
+                                                              "redacted": False, "truncated": False})
+        if not self._VALID_TOOL(carry["tool"]) and self._VALID_TOOL(p.get("tool")):
+            carry["tool"] = p["tool"]
+        if not carry["args_preview"] and p.get("args_preview"):
+            carry["args_preview"] = p["args_preview"]
+        for key in ("sensitive", "redacted", "truncated"):
+            carry[key] = carry[key] or bool(p.get(key))
+        if p.get("phase") == "end":
+            sess.tool_carry.pop(p.get("call_id"), None)
+        if safe:
+            self._safe_persist(durable)
+            return
+        try:
+            self._persist_unlocked(durable)
+        except Exception as exc:
+            raise RuntimeError("inspector persistence unavailable") from exc
+
+    def _defer_tool_update(self, sess: _Session, durable: dict) -> bool:
+        """Hold back an update row (True), or settle what is held for the call and let the row through (False)."""
+        p = durable["payload"]
+        cid, phase = p.get("call_id"), p.get("phase")
+        held = sess.tool_pending.get(cid)
+        if phase == "update":
+            if held is not None:        # fold the earlier update into this one: output is the latest, the rest accumulates
+                q = held["payload"]
+                for key in ("tool", "args_preview"):
+                    if (self._VALID_TOOL if key == "tool" else bool)(q.get(key)) and not (
+                            self._VALID_TOOL if key == "tool" else bool)(p.get(key)):
+                        p[key] = q[key]
+                for key in ("sensitive", "redacted", "truncated"):
+                    p[key] = bool(p.get(key)) or bool(q.get(key))
+            sess.tool_pending[cid] = durable
+            return True
+        if held is None:
+            return False
+        if phase == "end" and "output" in p and self._covers(sess.tool_carry.get(cid), held["payload"], p):
+            del sess.tool_pending[cid]                      # the end row replays to the same entry
+            return False
+        del sess.tool_pending[cid]
+        self._stamp_held(held, p["_received_at"], p["_sequence"])      # replays in the slot it is written in
+        self._write_durable(sess, held)                     # before the row that follows it
+        return False
+
+    def _covers(self, carry: dict | None, update: dict, end: dict) -> bool:
+        """True when replaying ``update`` between the journaled rows of the call and ``end`` changes nothing ``end`` and
+        those rows do not already settle: the first valid tool and args_preview, and the sensitive/redacted/truncated flags."""
+        carry = carry or {"tool": None, "args_preview": None, "sensitive": False, "redacted": False, "truncated": False}
+
+        def first(valid, key, *rows):
+            return next((r[key] for r in rows if valid(r.get(key))), None)
+        if first(self._VALID_TOOL, "tool", carry, end) != first(self._VALID_TOOL, "tool", carry, update, end):
+            return False
+        if first(bool, "args_preview", carry, end) != first(bool, "args_preview", carry, update, end):
+            return False
+        return all(not update.get(k) or carry[k] or end.get(k) for k in ("sensitive", "redacted", "truncated"))
+
+    @staticmethod
+    def _stamp_held(held: dict, received_at: float, sequence: int) -> None:
+        """Give a held-back update the replay key of the moment it is journaled. It was stamped when the update arrived,
+        possibly long before other sessions' rows; written late with that old key it orders before a snapshot cursor that
+        has since moved on, and every such row forced a full snapshot rebuild. Replay order for the call is unchanged
+        (the update still replays after its start row and before the row that released it); only its place among
+        unrelated rows of the same session between those two moves."""
+        held["payload"]["_received_at"], held["payload"]["_sequence"] = received_at, sequence
+
+    def _flush_tool_updates(self, sess: _Session, *, safe: bool = False) -> None:
+        pending, sess.tool_pending = sess.tool_pending, {}
+        for held in pending.values():
+            self._stamp_held(held, self._clock(), sess.rev)     # the lifecycle row that follows is stamped later or equal
+            self._write_durable(sess, held, safe=safe)
+
+    def _repeats_zero_usage(self, sess: _Session, data: dict) -> bool:
+        """An all-zero usage report (no token or context number above zero, no model) that equals the session's latest one
+        changes neither the totals nor the latest report, so its row is not journaled. (An all-zero report that would
+        replace a different latest one is journaled: dropping it would change ``usage.latest`` after a replay.)"""
+        body = {k: v for k, v in data.items() if k != "_flags"}
+        if body.get("model") or any(isinstance(v, int) and v > 0 for v in body.values()):
+            return False
+        latest = sess.usage_latest
+        return latest is not None and {k: v for k, v in latest.items() if k != "_flags"} == body
+
     def _touch(self, sess: _Session, entry: dict, *, account: bool = True) -> None:
         if account:
-            new = self._size(entry["data"])
+            new = self._entry_size(entry)
             sess.bytes += new - entry["size"]
             entry["size"] = new
         sess.rev += 1
@@ -869,6 +1023,7 @@ class InspectorStore:
                 flagged or self._cmd_sensitive(data), False)
             sess.tools[cid] = live
             live["t0"] = self._clock()
+        live["admission"] = base["admission"]
         d = live["data"]
         if data.get("tool") and d.get("tool") in (None, "unknown"):
             d["tool"] = data["tool"]
@@ -905,6 +1060,7 @@ class InspectorStore:
                 "run_id": rid, "command": data.get("command"), "status": "running",
                 "_flags": {"redacted": False, "truncated": False}}, flagged, False)
             sess.tests[rid] = live
+        live["admission"] = base["admission"]
         d = live["data"]
         for k in ("command", "passed", "failed", "skipped", "duration_ms", "failures"):
             if k in data:
@@ -921,7 +1077,8 @@ class InspectorStore:
                     "entity_type": "inspector", "entity_id": sess.session_id,
                     "event_type": "inspector.test", "session_id": sess.session_id,
                     "source_timestamp": base["ts"],
-                    "payload": {"kind": "test", **{k: v for k, v in d.items() if k != "failures"},
+                    "payload": {"_inspector_context": {"version": 2, "admission": base["admission"]},
+                                "kind": "test", **{k: v for k, v in d.items() if k != "failures"},
                                 # Sensitive runs persist counts/status only, never bodies.
                                 "failures": [] if live["sensitive"] else (d.get("failures") or [])[:20],
                                 "sensitive": live["sensitive"],
@@ -930,9 +1087,24 @@ class InspectorStore:
         self._touch(sess, live)
         return "ok"
 
-    def _safe_persist(self, ev: dict) -> None:
+    def _persist_unlocked(self, ev: dict) -> None:
+        """Run the durable write without holding ``_lock``. The write can wait seconds behind the sink's single
+        database connection; holding the store lock meanwhile stalled every reader (agents/list, health, has_session).
+        Callers are ingest, which still holds ``_ingest_lock``, so ordering between writers is unchanged and the
+        commit-before-projection rule holds: readers see the state from before the event until it is durable."""
+        lock = self._lock
+        if not lock._is_owned():                    # type: ignore[attr-defined]  # not under the store lock: nothing to release
+            self._persist(ev)
+            return
+        state = lock._release_save()                # type: ignore[attr-defined]  # every re-entrant level, as Condition.wait does
         try:
             self._persist(ev)
+        finally:
+            lock._acquire_restore(state)            # type: ignore[attr-defined]
+
+    def _safe_persist(self, ev: dict) -> None:
+        try:
+            self._persist_unlocked(ev)
         except Exception:  # durability is best-effort and never breaks ingest
             pass
 
@@ -952,7 +1124,17 @@ class InspectorStore:
         self.stats["evicted_events"] += 1
         # Only unlink the live map if it still points at the evicted entry (ids can be reused).
         if old["kind"] == "tool" and sess.tools.get(old["data"].get("call_id")) is old:
-            del sess.tools[old["data"]["call_id"]]
+            cid = old["data"]["call_id"]
+            held = sess.tool_pending.pop(cid, None)
+            if held is not None:
+                last = sess.last_durable
+                if last is not None and last[2] == self._ingest_n:     # the row that evicted it was just journaled: replay before it
+                    self._stamp_held(held, last[0] - 1e-6, last[1])
+                else:
+                    self._stamp_held(held, self._clock(), sess.rev)
+                self._write_durable(sess, held, safe=True)      # a call leaving the ring keeps its last update
+            sess.tool_carry.pop(cid, None)
+            del sess.tools[cid]
         elif old["kind"] == "test" and sess.tests.get(old["data"].get("run_id")) is old:
             del sess.tests[old["data"]["run_id"]]
 
@@ -979,7 +1161,7 @@ class InspectorStore:
 
     def sweep(self) -> int:
         """Apply retention to every session (called periodically / on demand)."""
-        with self._lock:
+        with self._ingest_lock, self._lock:
             before = self.stats["evicted_events"]
             for s in list(self._sessions.values()):
                 self._enforce(s)
@@ -1074,6 +1256,66 @@ class InspectorStore:
                 "capabilities": self._caps(sess),
                 "prefs": self.get_prefs(session_id),
             }
+
+    def activity_metadata(self, session_id: str, role: str = "viewer", *, limit: int = 200):
+        """Private metadata-only projection for explicit digest preview, never bodies.
+
+        No producer identity is inferred here: callers supply independent bindings
+        to the pure extractor. Raw revisions are freshness data, not digest input.
+        """
+        from .activity_digest import ActivityMetadata
+
+        if role != "operator":
+            raise PermissionError("private operator metadata access required")
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("metadata limit must be an integer in 1..1000")
+        with self._lock:
+            sess = self._sessions.get(session_id)
+            if sess is None:
+                raise KeyError(session_id)
+            rows = []
+            for entry in reversed(sess.events):
+                kind = entry["kind"]
+                if kind not in ("file", "test"):
+                    continue
+                data = entry["data"]
+                rows.append(ActivityMetadata(
+                    entry["seq"], entry["rev"], kind,
+                    path=data.get("path") if kind == "file" else None,
+                    operation=data.get("op") if kind == "file" else None,
+                    run_id=data.get("run_id") if kind == "test" else None,
+                    status=data.get("status") if kind == "test" else None,
+                    passed=data.get("passed") if kind == "test" else None,
+                    failed=data.get("failed") if kind == "test" else None,
+                    skipped=data.get("skipped") if kind == "test" else None,
+                    sensitive=entry.get("sensitive") is not False,
+                    withheld=entry.get("withheld", False) is not False or data.get("withheld", False) is not False))
+                if len(rows) == limit:
+                    break
+            return tuple(reversed(rows))
+
+    def oldest_recv(self, session_id: str) -> float | None:
+        """Receive time of the oldest event still in the ring; durable rows older than it are only in Postgres."""
+        with self._lock:
+            sess = self._sessions.get(session_id)
+            return sess.events[0]["recv"] if sess is not None and sess.events else None
+
+    @staticmethod
+    def view_kinds(view: str) -> frozenset[str] | None:
+        if view not in VIEWS:
+            raise ValueError(f"view must be one of {list(VIEWS)}")
+        kinds = _VIEW_KINDS.get(view)
+        return frozenset(kinds) if kinds else None
+
+    def render_history(self, entries: list[dict], role: str = "viewer") -> list[dict]:
+        """Render durable-history entries for ``role`` with the ring's own redaction. Nothing enters the ring."""
+        out = []
+        for e in entries:
+            e = {**e, "size": self._size(e["data"])}
+            rendered = self._render(e, role, full=False)
+            rendered["history_id"] = e.get("history_id")
+            out.append(rendered)
+        return out
 
     def events_after(self, session_id: str, after_rev: int, role: str = "viewer",
                      limit: int = 200) -> list[dict]:
@@ -1320,6 +1562,11 @@ class InspectorStore:
             for row in state["sessions"]:
                 sess = _Session(row["session_id"])
                 sess.events = deque(row["events"])
+                for entry in sess.events:
+                    context = AdmissionContext.from_private(entry.get("admission"))
+                    if "admission" not in entry or (entry["admission"] is not None and (
+                            context is None or context.entity_id != sess.session_id)):
+                        raise SnapshotStale("invalid private admission context")
                 sess.by_seq = {e["seq"]: e for e in sess.events}
                 sess.bytes, sess.next_seq, sess.rev = int(row["bytes"]), int(row["next_seq"]), int(row["rev"])
                 sess.dropped_ring, sess.client_dropped = int(row["dropped_ring"]), int(row["client_dropped"])
@@ -1340,7 +1587,7 @@ class InspectorStore:
             raise
         except (KeyError, TypeError, ValueError, AttributeError) as exc:
             raise SnapshotStale(f"snapshot is malformed ({type(exc).__name__}: {exc})") from exc
-        with self._lock:
+        with self._ingest_lock, self._lock:
             self._sessions, self._global_prefs, self.stats = sessions, global_prefs, {**self.stats, **stats}
             self._replay_key = tuple(key) if key is not None else None
             self._replay_watermark, self._replay_count = watermark, count
@@ -1348,7 +1595,7 @@ class InspectorStore:
 
     def reset_replay(self) -> None:
         """Back to an empty projection, for a boot that decided not to trust a snapshot."""
-        with self._lock:
+        with self._ingest_lock, self._lock:
             self._sessions = OrderedDict()
             self._global_prefs = {}
             self.stats = {"accepted": 0, "duplicates": 0, "rejected": 0, "evicted_events": 0, "evicted_sessions": 0}
@@ -1385,12 +1632,13 @@ class InspectorStore:
                 elif isinstance(et, str) and et.startswith("inspector.") and p.get("kind") in DURABLE_KINDS:
                     if p["kind"] == "message" and p.get("role") not in ("user", "assistant"):
                         continue
-                    with self._lock:
+                    with self._ingest_lock, self._lock:
                         before_seq = (self._sessions[sid].next_seq
                                       if isinstance(sid, str) and sid in self._sessions else 0)
                         result = self.ingest(sid, {**p, "ts": _iso_of(ev.get("source_timestamp")),
                                                   **({"phase": "end"} if p["kind"] == "test" else {})},
-                                             persist=False)
+                                             persist=False,
+                                             admission=_replayed_admission(p, sid))
                         if not result["accepted"]:
                             continue
                         sess = self._sessions[sid]

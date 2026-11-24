@@ -1,34 +1,47 @@
-# Woodpecker CI (ci.metabolomics.us) -- the Python and client unit gates (scripts/ci/unit-gates.sh).
+# Woodpecker CI (ci.metabolomics.us) -- the REQUIRED `unit-gates` context (ci/woodpecker/pr/unit-gates).
 #
-# Same conventions as ui-gates.yml: `image:` names an executable on the agent, skip_clone plus a plain git checkout with the staged
-# credential, pull_request and manual only (a push to a PR branch must not build twice). The step logic lives in the script so
-# `bash scripts/ci/unit-gates.sh` reproduces CI from a clean checkout. The browser (Playwright) suites stay in ui-gates.yml.
+# The unit gate is sharded into .woodpecker/unit-gates-shard-{1,2,3}.yml (see the header there). Woodpecker names a status context after
+# the workflow file, so this file keeps the name branch protection and the ruleset already require, and depends_on the shards: it runs
+# after all of them finished, whatever their result (`runs_on: [success, failure]`). With the default, a red shard left this context
+# `pending` forever (verified on pipeline 1906): never green, but never red either, so a PR just hung. Now the step asks the Woodpecker API
+# for the three shards' states and exits non-zero unless every one is `success`, so a red shard turns this required context red.
+# Fail closed: an unreachable API or a missing shard is a failure. tests/test_ci_unit_shards.py pins this wiring and runs the step.
 #
-# Whole suites, not scoped subsets; nothing is deselected. Green on the hive exec host (Python 3.13) once the host-dependent
-# tests were made host-independent. Still timing-sensitive under load: test_ci_api.py's telemetry race and a few fabric tests.
-# To use the larger hive pool, add `labels: {cluster: hive}` (queues are long, 10+ minutes).
+# No `when: {path: ...}`, deliberately (issue #719): a path-filtered pipeline is never created and a context that never reports cannot be
+# required. The shards decide applicability themselves and always report.
 when:
   - event: manual
   - event: pull_request
-    path:
-      include: ['herdr_engineering/**', 'tests/**', 'packages/**', 'pyproject.toml', 'scripts/ci/unit-gates.sh', '.woodpecker/unit-gates.yml']
+
+depends_on:
+  - unit-gates-shard-1
+  - unit-gates-shard-2
+  - unit-gates-shard-3
+
+runs_on: [success, failure]
 
 skip_clone: true
 
 steps:
-  - name: checkout
-    image: bash
-    commands:
-      - 'set -eu'
-      - 'test -r /etc/woodpecker-git-credentials || { echo "the job staged no forge credential" >&2; exit 1; }'
-      - 'git init -q -b "${CI_COMMIT_BRANCH:-main}" .'
-      - 'git remote add origin "https://github.com/${CI_REPO}.git"'
-      - 'git fetch --no-tags origin "$CI_COMMIT_SHA"'      # full history: tests/test_deploy_scripts.py resolves older commits
-      - 'git checkout -q FETCH_HEAD'
-      - 'git --no-pager log --oneline -1'
-
   - name: unit-gates
     image: bash
     commands:
-      - 'set -eu'
-      - 'bash scripts/ci/unit-gates.sh'
+      - |
+        python3 - <<'PY'
+        import json, os, sys, time, urllib.request
+        url = "%s/api/repos/%s/pipelines/%s" % (os.environ["CI_SYSTEM_URL"].rstrip("/"), os.environ["CI_REPO_ID"], os.environ["CI_PIPELINE_NUMBER"])
+        want = ["unit-gates-shard-1", "unit-gates-shard-2", "unit-gates-shard-3"]
+        for attempt in range(5):
+            try:
+                states = {w["name"]: w["state"] for w in json.load(urllib.request.urlopen(url, timeout=20))["workflows"]}
+                break
+            except Exception as exc:
+                print("unit-gates: cannot read %s (%s)" % (url, exc))
+                time.sleep(2)
+        else:
+            sys.exit("unit-gates: cannot read the shard states; failing closed")
+        bad = {n: states.get(n, "missing") for n in want if states.get(n) != "success"}
+        if bad:
+            sys.exit("unit-gates: shards not green: %s" % bad)
+        print("unit-gates: all %d shards (unit-gates-shard-1..%d) succeeded" % (len(want), len(want)))
+        PY

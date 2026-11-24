@@ -1,0 +1,37 @@
+id = "herdr.agent-ops"
+name = "HerdR Agent Operations Map"
+version = "0.1.0"
+min_herdr_version = "0.9.1"
+description = "Terminal Agent Operations map: live agent graph, tasks, handoffs, timeline and replay from the control plane"
+platforms = ["linux", "macos"]
+
+# The map itself: a split pane running the herdr-eng TUI (read-only; it only GETs /api/v1/agent-ops/*).
+[[panes]]
+id = "map"
+title = "Agent Operations"
+description = "Live agent activity map (q closes the pane)"
+placement = "split"
+command = ["herdr-eng", "agent-ops"]
+
+# Same map without color or Unicode animation, for narrow or low-capability panes.
+[[panes]]
+id = "map-ascii"
+title = "Agent Operations (ASCII)"
+description = "ASCII, no-animation variant"
+placement = "split"
+command = ["herdr-eng", "agent-ops", "--ascii", "--no-animation"]
+
+[[actions]]
+id = "open"
+title = "Open Agent Operations map"
+description = "Open the Agent Operations map in a split pane"
+contexts = ["workspace", "global"]
+command = ["herdr", "plugin", "pane", "open", "--plugin", "herdr.agent-ops", "--entrypoint", "map"]
+
+# Doctor: fetch one frame from the control plane; exits non-zero when the API is unreachable or agent_ops is off.
+[[actions]]
+id = "doctor"
+title = "Agent Operations doctor"
+description = "Check control-plane reachability and the agent_ops_v1 capability by printing one frame"
+contexts = ["global"]
+command = ["herdr-eng", "agent-ops", "--once", "--width", "100", "--height", "30"]

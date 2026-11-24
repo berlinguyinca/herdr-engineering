@@ -13,8 +13,8 @@ allows. Everything one participant writes is shown to the others (and to their a
 
 | | Public site | Private dashboard |
 |---|---|---|
-| Address | `https://localdev.mcp.metabolomics.us/` | `http://100.104.39.6/#/collab` (tailnet only) |
-| Who | members of the Cognito group `local.dev` | the operator (acts as `wohlgemuth@ucdavis.edu`) |
+| Address | `https://localdev.mcp.metabolomics.us/` | `http://100.64.8.6/#/collab` (tailnet only) |
+| Who | members of the Cognito group `local.dev` | the operator (acts as `user@example.com`) |
 | Sign-in | Cognito hosted login | none; the tailnet is the boundary |
 | Other dashboard pages | none (they do not exist there) | the full HerdR control plane |
 | Agents connect to | `https://localdev.mcp.metabolomics.us/mcp` (MCP) and `/a2a` (A2A) | not applicable: agents always use the public address |
@@ -290,6 +290,43 @@ When the owner revokes a grant, the agent loses read and write access within a f
 second); commits that were already waiting are checked against the grant again before they are applied. If the
 owner's system stops publishing, every artifact tool fails closed after at most two minutes.
 
+### Publishing your own artifacts
+
+If your operator has turned on member artifacts and you belong to the member group, you can own artifacts: upload
+files, publish them as versions, and share them by link. Open the artifacts address your operator gave you, sign in,
+and use **My artifacts** (`/my/`). The same actions are available to your agent through MCP tools: `artifact_create`,
+`artifact_upload_chunk` (with `artifact_upload_status` and `artifact_upload_abort`), `artifact_publish`,
+`artifact_head`, `artifact_history`, `artifact_delete`, and the share tools `artifact_share_create`,
+`artifact_share_list`, `artifact_share_events` and `artifact_share_revoke`. Your agent can prepare a share link
+(`artifact_share_create`), but only you can make it live: open the artifact in **My artifacts** and press
+**Approve**. There is no agent tool for approval. Your agent can
+also look things up in your library with the read-only `artifact_search` (search text, source, folder, type; at most
+50 results). It only sees your own library and never your pending pushes. Slow
+operations return a ticket; poll it with `artifact_result`.
+
+* **Limits.** There are no built-in size or count caps. The operator can see how much each member uses and may set
+  optional limits; if one applies, the page and the tool answer say which. Large files are uploaded in chunks; the
+  page shows progress, and an interrupted upload resumes where it stopped (start the same upload again).
+* **Sharing.** You can share only an artifact you own, and only while it is active. Choose who may open it:
+  * **Lab**: signed-in lab members. A lab link is for exactly the lab group, not for individuals. It expires after
+    30 days unless you pick a date, and never later than 90 days.
+  * **Public**: anyone with the link. It must expire within 90 days.
+* **What can be shared.** A member's HTML page is limited to 2 MiB. SVG, PDF, XHTML and XML files cannot be shared
+  through a public member link, and a page whose markup cannot be proven safe to label (for example a script
+  containing `a <!b`, or content before `<body>` other than head elements) is refused rather than shared.
+* **The "Shared by" banner.** Pages opened through your link carry a banner naming you, so readers know who
+  published them. It is added to HTML pages only, and it is a hint, not a guarantee: the page's own styles or
+  scripts can hide it. The real limits are the sandbox the page runs in, the audience, the expiry and revoking.
+* **The link is shown once.** The secret link appears a single time, when you approve the share. If you lose it,
+  revoke that share and share again. Nobody, including the operator, can show it to you a second time.
+* **Operator oversight.** The operator can see every member link and revoke any of them.
+* **Delete and purge.** Deleting an artifact is a tombstone: its links stop working immediately, and the operator can
+  restore it. Only the operator can purge it for good. Purging removes the files and anonymises other people's
+  annotations, share events and feedback on it.
+* **Losing access.** If you are removed from the member group or the feature is switched off, your links are
+  revoked, but not instantly: group changes are noticed after a delay (up to about a day) plus a grace period
+  (about an hour by default).
+
 ### The flow of work (live graph)
 
 Every room has a **Flow of work** panel (not shown to guests): people on the left, agents to the right, one line per
@@ -341,7 +378,7 @@ tokens per hour.
 
 ## 5. The private dashboard (operator)
 
-Open `http://100.104.39.6/#/collab` (use the IP; a DNS name is refused unless listed with
+Open `http://100.64.8.6/#/collab` (use the IP; a DNS name is refused unless listed with
 `--collab-dashboard-host`). It is the same Rooms and AI agents pages with two differences: no
 sign-in (you act as the operator user) and the page sits inside the control plane's navigation.
 
@@ -792,6 +829,52 @@ helper's own agent (their cursor still moves past them).
   provisioner added them (they were not in the group before), and they never accepted any invitation. Anyone you
   added to the group by hand, or who already joined a room, stays; the Cognito account is never deleted.
 * A leaked agent credential: revoke it on the AI agents page.
+* An agent whose credential expired: **Renew access** on the AI agents page (or `POST /api/v1/collab/agents/<id>/renew`
+  as the signed-in owner). It keeps the agent id, name and device, mints a NEW credential (shown once; re-run the connect
+  snippet with it) and starts a fresh window of the connect lifetime (30 days by default). The old credential stops
+  working at once. Only the owner can do it (anyone else gets 404). Revoked agents, helper agents, fabric-machine
+  identities and externally invited agents are refused: an external agent never lives past its invite's hard expiry.
+* From a shell: `herdr-eng collab agents list` (id, name, harness, status, expires_at, renewable; never a credential) and
+  `herdr-eng collab agents renew <agent-id|@name> --credential-file ~/.config/herdr/<name>.cred`. It calls the collab
+  operator listener (`--operator-url`, else `HERDR_COLLAB_OPERATOR_URL`, default `http://127.0.0.1:9482`; no sign-in, the
+  listener acts as the operator) and writes the NEW credential only to that file (created 0600; an existing file is refused
+  without `--force`, and before anything is renewed). It prints the agent id, the new `expires_at` and `grants_restored`,
+  never the credential, unless you pass `--print-credential` (stdout only). `--json` gives the same fields. Exit 1 with the
+  server's message on 404 (not yours), 403 (cannot be renewed), 409 (revoked) and 429 (agent cap); 2 when neither
+  `--credential-file` nor `--print-credential` is given, because the old credential dies at once.
+  **After renewing, update the harness with the new credential**: the `claude mcp add` header, `~/.codex/config.toml`, or the
+  credential file a collab-spawn reads. Until then that harness is locked out.
+* Room grants have their own expiry (30 days by default) and the service drops a lapsed grant, so an expired agent has
+  usually lost its rooms. A renew therefore also re-grants, with the SAME actions, every room grant of the agent that
+  lapsed, and extends every one that would lapse before the new credential does, to the new credential expiry (the reply
+  lists them as `grants_restored`). Only rooms the renewing user owns are restored: where the owner is only a
+  contributor the room owner must approve the agent again, and a grant the owner removed by hand is never brought back.
+  A restored grant runs to the new credential expiry, not its old one. Once a grant has lapsed the owner cannot stop its
+  restore by removing it (that answers 404): revoke the agent, or remove the person from the room. Team-attached and
+  coordinator grants are left alone, and a team attach or a coordinator designation replaces the lapsed direct grant for good.
+* Agents made by **Connect an agent** also slide: a successful use once less than half the window is left pushes the
+  expiry out to a full window again (about two log events per window), so an agent in daily use does not expire. Sliding
+  stops at 180 days after the agent was made or last renewed (an absolute cap): after that it expires and the owner must
+  renew it. A stolen credential that is used regularly therefore lives until the owner revokes it or that cap is
+  reached. Sliding does not touch room grants, which keep their own expiry. An agent that is already expired or revoked
+  is never revived by use; renew it instead. Helper, fabric and external agents never slide.
+
+### 5.2a Renewing an expired agent (runbook)
+1. Find it: `herdr-eng collab agents list`. An expired agent shows its old `expires_at` and, if it can be renewed, `renewable=yes`.
+2. Renew it: `herdr-eng collab agents renew <agent-id|@name> --credential-file ~/.config/herdr/<name>.cred`. The old
+   credential stops working at once; the NEW one goes only to that 0600 file. Add `--force` to replace an existing file.
+   `--print-credential` puts it on stdout instead (with `--json` it is the `credential` key of the one JSON object). If the
+   write fails after the renew, the command still exits 1 and keeps the credential (kept temp file, or stdout when you asked
+   for it there): re-running renew would replace it, so save it first.
+3. Update the harness that used the agent, or it stays locked out: for Claude re-run `claude mcp add` with the new
+   `Authorization` header; for Codex edit the token in `~/.codex/config.toml`; for a collab-spawn replace the credential
+   file it reads.
+4. Check the output: `grants_restored` lists the room grants brought back. They are restored only in rooms you own; in a
+   room where you are only a contributor the room owner must approve the agent again.
+5. Refused renewals exit 1: external, fabric-machine, fabric-join (auto-joined) and helper agents (403) and revoked agents
+   (409) cannot be renewed. Create a new agent instead (an external agent needs a new invitation), and 404 means the agent
+   is not yours. Renewing an expired agent takes its slot back, so at your agent limit it returns 429: revoke an agent you
+   no longer use, then renew.
 
 ### 5.3 Health and routine tasks
 * Containers: `docker ps | grep herdr-collab` shows `herdr-collab-edge` (TLS front),
@@ -811,7 +894,7 @@ helper's own agent (their cursor still moves past them).
 ### 5.4 Why the private dashboard needs no password
 It listens only on the tailnet address, the collab operator port is also tailnet-only, and both hops
 refuse names that could be DNS-rebound and writes that come from another website. Anyone who can reach
-`100.104.39.6` is you. Do not add people to the tailnet who should not be.
+`100.64.8.6` is you. Do not add people to the tailnet who should not be.
 
 ## 6. Security model in brief
 * The public site runs in its own container: no database, no cloud credentials, no outbound network,
@@ -826,6 +909,8 @@ refuse names that could be DNS-rebound and writes that come from another website
   20 projects and 10 agents per person; 100 members per room.
 * Helpers (5.1f): only with `spawn_helpers` and a room profile that allows a family; boxed with no network but
   the room's allowlist; never more than their parent; the panic switch stops them all. Read its residual risks.
+* Agents on the operator's own tailnet machines can use token-free `Authorization: Fabric` auth when the operator and the agent's owner
+  switch it on: see [fabric-trust.md](fabric-trust.md) and its [threat model](fabric-trust-threat-model.md).
 * Reporting a problem: tell the operator, revoke any agent you are unsure about.
 
 ## 7. Troubleshooting
@@ -851,5 +936,5 @@ refuse names that could be DNS-rebound and writes that come from another website
 | `helper_spawn` returns 503 helpers are paused | the operator pressed the panic switch |
 | A helper's result says host access was requested | the host is not approved yet: ask the operator |
 | Private dashboard says collaboration unavailable | `herdr-collab-public` is down: `docker ps`, `docker logs herdr-collab-public` |
-| Private dashboard 404s on a name | use `http://100.104.39.6/` or add the name with `--collab-dashboard-host` |
+| Private dashboard 404s on a name | use `http://100.64.8.6/` or add the name with `--collab-dashboard-host` |
 | Everything on the public site fails at once | membership refresh stale (>10 min): `journalctl --user -u herdr-collab-sync.service` (AWS credentials?) |

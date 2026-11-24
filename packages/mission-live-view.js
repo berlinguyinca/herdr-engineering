@@ -2,6 +2,7 @@
 // activity events, attention notifications, or session control operations.
 import { escapeHtml as esc } from './herdr-web-components/util.js';
 import { skeleton } from './motion.js';
+import { piNextAction } from './pi-next-action.js';
 
 const list = (value) => Array.isArray(value) ? value : [];
 const records = (value) => list(value).filter(item => item && typeof item === 'object' && !Array.isArray(item));
@@ -93,7 +94,7 @@ export function missionCard(p, now = Date.now(), detail = false) {
     <div class="muted" data-workers-label>${f.state === 'live' ? 'Workers' : 'Last recorded workers'}</div>
     ${detail ? `<div>${workers.length - finished} current · ${finished} ${terminalMission(m) ? 'recorded' : 'finished'}</div>` : records(a.workerDetails).length ? `<div class="ml-workers-summary">${records(a.workerDetails).slice(0, 100).map(w => `<div>${esc(w.workerId)} · ${esc(w.health || w.state || 'unknown')} · ${esc(model(w))}</div>`).join('')}</div>` : '<div class="muted">Worker detail not reported</div>'}
     ${row('Models', modelUseLine(a.modelUse))}
-    ${row('Next action', a.nextAction)}
+    ${row('Next action', piNextAction(a)?.text)}
   </article>`;
 }
 export function missionDetail(p, now = Date.now()) {

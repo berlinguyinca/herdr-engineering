@@ -6,7 +6,9 @@ not worker health: a missing collector never manufactures a stalled mission.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
+import logging
 import math
 import re
 import threading
@@ -53,6 +55,20 @@ MISSION_FIELDS = frozenset((
     'id', 'title', 'status', 'goal', 'revision', 'workflowClass', 'canonicalState',
     'tasks', 'acceptanceCriteria', 'stop',
 ))
+# Snapshot contract v4 (additive): validated separately by clean_pi_fields, never by the generic sanitizer.
+PI_V4_FIELDS = ('created_at', 'completed_at', 'links')
+SUMMARY_MISSION_FIELDS = ('id', 'title', 'status', 'goal', 'canonicalState', 'created_at', 'completed_at')
+MAX_LINKS = 20
+# G8-C durable mirror: a private stream, one bounded row per accepted snapshot (throttled per mission).
+ENTITY_TYPE = 'mission_activity_store'
+STORED_EVENT = 'MissionActivityStored'
+PERSIST_INTERVAL_SECONDS = 30
+PERSIST_HEARTBEAT_SECONDS = 600     # an unchanged projection is still re-written this often so restart freshness holds
+WARN_INTERVAL_SECONDS = 300         # persist-failure warnings (with traceback) at most this often; the rest are counted
+log = logging.getLogger(__name__)
+LINK_KINDS = frozenset(('issue', 'pull_request'))
+_REPOSITORY = re.compile(r'^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$')
+MAX_LINK_NUMBER = 2 ** 31 - 1
 WORKER_SUMMARY_FIELDS = frozenset((
     'workerId', 'taskId', 'health', 'state', 'model', 'route', 'currentActivity',
     'lastOutputAt', 'lastMeaningfulProgressAt', 'lastHeartbeatAt',
@@ -74,6 +90,52 @@ def _timestamp(value: Any, name: str, now: float) -> float:
         return epoch
     except (ValueError, OverflowError, OSError) as exc:
         raise ValueError(f'{name} must be a timezone-qualified timestamp, not in the future') from exc
+
+
+def _pi_time(value: Any, now: float) -> str | None:
+    try:
+        return iso(_timestamp(value, 'time', now))
+    except ValueError:
+        return None
+
+
+def _pi_link(raw: Any) -> dict | None:
+    if not isinstance(raw, dict):
+        return None
+    kind, repository, number = raw.get('kind'), raw.get('repository'), raw.get('number')
+    if (kind not in LINK_KINDS or not isinstance(repository, str) or not _REPOSITORY.fullmatch(repository)
+            or repository.split('/')[0] in ('.', '..') or repository.split('/')[1] in ('.', '..')
+            or type(number) is not int or not 1 <= number <= MAX_LINK_NUMBER):
+        return None
+    return {'kind': kind, 'repository': repository, 'number': number}
+
+
+def clean_pi_fields(mission: Any, *, now: float) -> dict:
+    """Validate the contract-v4 mission fields. Malformed or absent entries are dropped, never repaired or inferred."""
+    if not isinstance(mission, dict):
+        return {}
+    out: dict = {}
+    for name in ('created_at', 'completed_at'):
+        value = _pi_time(mission.get(name), now)
+        if value is not None:
+            out[name] = value
+    raw = mission.get('links')
+    if isinstance(raw, list):
+        links, seen = [], set()
+        for item in raw[:MAX_LINKS * 4]:
+            link = _pi_link(item)
+            if link is None:
+                continue
+            identity = (link['kind'], link['repository'].lower(), link['number'])
+            if identity in seen:
+                continue
+            seen.add(identity)
+            links.append(link)
+            if len(links) >= MAX_LINKS:
+                break
+        if links:
+            out['links'] = links
+    return out
 
 
 def _identifier(value: Any, name: str) -> str:
@@ -112,11 +174,36 @@ def _sanitize(value: Any, *, depth=0, budget=None) -> Any:
     return None
 
 
+_VOLATILE = frozenset(('observed_at', 'snapshot_at', 'received_at', 'activity_snapshot_at', 'lastHeartbeatAt'))
+
+
+def _content_digest(value: dict) -> str:
+    """Hash of what a mirror row would say, ignoring timestamps that move on every snapshot."""
+    def strip(item):
+        if isinstance(item, dict):
+            return {k: strip(v) for k, v in item.items() if k not in _VOLATILE}
+        if isinstance(item, list):
+            return [strip(v) for v in item]
+        return item
+    return hashlib.sha256(json.dumps(strip(value), sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
+def _only_valid_v4(mission: dict, now: float) -> bool:
+    """A saved mission may carry the contract-v4 fields only in the exact shape clean_pi_fields would have stored."""
+    saved = {name: mission[name] for name in PI_V4_FIELDS if name in mission}
+    return clean_pi_fields(saved, now=now) == saved
+
+
 class MissionActivityStore:
     """Latest read-only projection per namespaced mission, under a fixed memory cap."""
 
-    def __init__(self, *, now=None, max_missions=MAX_MISSIONS):
+    def __init__(self, *, now=None, max_missions=MAX_MISSIONS, persist=None):
         self._now = now or time.time
+        self._persist = persist           # callable(event dict) or None; best-effort, never breaks ingest
+        self._persisted: dict[str, tuple[float, str, str]] = {}   # key -> (epoch, connection, content digest) of the last mirrored row
+        self.persist_failures = 0
+        self._warned_at: float | None = None
+        self._warned_failures = 0
         self._max_missions = max(1, min(MAX_MISSIONS, max_missions))
         self._entries: OrderedDict[str, dict] = OrderedDict()
         self._lock = threading.RLock()
@@ -169,7 +256,8 @@ class MissionActivityStore:
                 _checkpoint_stamp(value["activity_snapshot_at"])
             _checkpoint_require(type(value["mission"]) is dict and type(value["activity"]) is dict
                                 and value["mission"].get("id") == key[3:]
-                                and value["mission"].keys() <= MISSION_FIELDS
+                                and value["mission"].keys() <= MISSION_FIELDS | set(PI_V4_FIELDS)
+                                and _only_valid_v4(value["mission"], self._now())
                                 and value["activity"].keys() <= ACTIVITY_FIELDS)
             # The saved value has already crossed the sanitizing boundary; do not
             # ingest it again or manufacture a new receive timestamp.
@@ -231,7 +319,8 @@ class MissionActivityStore:
             'received_at': iso(now), 'mission_revision': revision, 'connection': connection,
             'activity_revision': revision if connection == 'connected' else None,
             'activity_snapshot_at': iso(snapshot) if connection == 'connected' else None,
-            'mission': _sanitize({k: v for k, v in mission.items() if k in MISSION_FIELDS}),
+            'mission': {**_sanitize({k: v for k, v in mission.items() if k in MISSION_FIELDS}),
+                        **clean_pi_fields(mission, now=now)},
             'activity': (_sanitize({k: v for k, v in activity.items() if k in ACTIVITY_FIELDS})
                          if connection == 'connected' else {}),
         }
@@ -267,7 +356,103 @@ class MissionActivityStore:
             self._entries.move_to_end(mission_key)
             while len(self._entries) > self._max_missions:
                 self._entries.popitem(last=False)
+            row = self._storable(mission_key, self._entries[mission_key], now)
+        if row is not None:
+            try:
+                self._persist(row)
+            except Exception:  # noqa: BLE001 - the mirror is best-effort; the in-memory projection already holds the snapshot
+                self._note_persist_failure(mission_key, now)
         return {'accepted': True, 'mission_key': mission_key}
+
+    def _note_persist_failure(self, key, now):
+        """Warn with a traceback at most once per WARN_INTERVAL_SECONDS; every failure is counted."""
+        with self._lock:
+            self.persist_failures += 1
+            if self._warned_at is not None and now - self._warned_at < WARN_INTERVAL_SECONDS:
+                return
+            earlier = self.persist_failures - self._warned_failures - 1
+            self._warned_at, self._warned_failures = now, self.persist_failures
+        log.warning('mission activity persistence failed for %s%s', key,
+                    f' ({earlier} earlier failure(s) not logged)' if earlier else '', exc_info=True)
+
+    def _storable(self, key, entry, now):
+        """The event to mirror for this accepted snapshot, or None (no sink, throttled, or unchanged). Caller holds the
+        lock. A connection change is always written; otherwise at most once per PERSIST_INTERVAL_SECONDS, and an
+        unchanged projection only once per PERSIST_HEARTBEAT_SECONDS."""
+        if self._persist is None:
+            return None
+        connection = entry['value']['connection']
+        digest = _content_digest(entry['value'])
+        last = self._persisted.get(key)
+        if last is not None and last[1] == connection:
+            age = now - last[0]
+            if age < PERSIST_INTERVAL_SECONDS or (last[2] == digest and age < PERSIST_HEARTBEAT_SECONDS):
+                return None
+        self._persisted[key] = (now, connection, digest)
+        while len(self._persisted) > 4 * self._max_missions:
+            self._persisted.pop(next(iter(self._persisted)))
+        return {'entity_type': ENTITY_TYPE, 'entity_id': key, 'event_type': STORED_EVENT,
+                'payload': {'value': copy.deepcopy(entry['value']), 'received_epoch': entry['received_epoch'],
+                            'observed_epoch': entry['observed_epoch'], 'snapshot_epoch': entry['snapshot_epoch']}}
+
+    def hydrate(self, rows) -> dict:
+        """Rebuild the projection from mirrored rows after a restart. Newest row per mission wins; rows that are expired,
+        corrupt, of another kind or not shaped like what this store writes are skipped, never fatal. Returns counts."""
+        now = self._now()
+        best: dict[str, tuple[float, dict]] = {}
+        skipped = 0
+        for row in rows:
+            entry = self._restore(row, now)
+            if entry is None:
+                skipped += 1
+                continue
+            key = row['entity_id']
+            if key not in best or entry['received_epoch'] >= best[key][0]:
+                best[key] = (entry['received_epoch'], entry)
+        with self._lock:
+            self._entries.clear()
+            self._persisted.clear()
+            for key, (_, entry) in sorted(best.items(), key=lambda item: item[1][0])[-self._max_missions:]:
+                self._entries[key] = entry
+                self._persisted[key] = (entry['received_epoch'], entry['value']['connection'],
+                                        _content_digest(entry['value']))
+        return {'loaded': len(self._entries), 'skipped': skipped}
+
+    @staticmethod
+    def _restore(row, now):
+        try:
+            if row.get('entity_type') != ENTITY_TYPE or row.get('event_type') != STORED_EVENT:
+                return None
+            key, payload = row.get('entity_id'), row.get('payload')
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            if not isinstance(key, str) or not _MISSION_KEY.fullmatch(key) or not isinstance(payload, dict):
+                return None
+            value = payload['value']
+            if (not isinstance(value, dict) or value.get('mission_key') != key or value.get('source') != 'pi'
+                    or value.get('contract_version') != 1
+                    or value.get('connection') not in ('connected', 'disconnected', 'updating')
+                    or not isinstance(value.get('mission'), dict) or value['mission'].get('id') != key[3:]
+                    or not isinstance(value.get('activity'), dict)
+                    or type(value.get('mission_revision')) is not int
+                    or len(json.dumps(value, allow_nan=False).encode()) > MAX_PROJECTION_BYTES):
+                return None
+            epochs = {}
+            for name in ('received_epoch', 'observed_epoch', 'snapshot_epoch'):
+                number = payload.get(name)
+                if number is None and name == 'snapshot_epoch':
+                    epochs[name] = None
+                    continue
+                if isinstance(number, bool) or not isinstance(number, (int, float)) or not math.isfinite(number):
+                    return None
+                epochs[name] = float(number)
+            if now - epochs['received_epoch'] > RETENTION_SECONDS or epochs['received_epoch'] > now + 60:
+                return None
+            value['mission'] = {**{k: v for k, v in value['mission'].items() if k not in PI_V4_FIELDS},
+                                **clean_pi_fields(value['mission'], now=now)}
+            return {'value': value, **epochs}
+        except (KeyError, TypeError, ValueError, RecursionError, AttributeError):
+            return None
 
     def _view(self, entry, now, *, summary=False):
         value = copy.deepcopy(entry['value'])
@@ -285,8 +470,7 @@ class MissionActivityStore:
                 {k: v for k, v in worker.items() if k in WORKER_SUMMARY_FIELDS}
                 for worker in activity.get('workerDetails', []) if isinstance(worker, dict)
             ]
-            value['mission'] = {k: v for k, v in value['mission'].items()
-                                if k in ('id', 'title', 'status', 'goal', 'canonicalState')}
+            value['mission'] = {k: v for k, v in value['mission'].items() if k in SUMMARY_MISSION_FIELDS}
         return value
 
     def get(self, mission_key: str) -> dict | None:
@@ -295,6 +479,13 @@ class MissionActivityStore:
             self._prune(now)
             entry = self._entries.get(mission_key)
             return self._view(entry, now) if entry else None
+
+    def links_by_mission(self) -> dict[str, list[dict]]:
+        """{mission key: Pi-reported links} for retained snapshots that carry any; copies, newest data only."""
+        with self._lock:
+            self._prune(self._now())
+            return {key: copy.deepcopy(entry['value']['mission']['links'])
+                    for key, entry in self._entries.items() if entry['value']['mission'].get('links')}
 
     def list_summaries(self) -> list[dict]:
         with self._lock:

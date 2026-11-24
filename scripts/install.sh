@@ -19,11 +19,40 @@
 #      key via $TS_AUTH_KEY or ~/.config/herdr-engineering/tailscale-auth.key;
 #      otherwise it prints the command and continues)
 #   7. puts `herdr-eng` and `herdr-handoff` on PATH (~/.local/bin) when writable
+#   7e. arms AUTOMATIC handoffs (default on): installs the Pi extension and the Claude
+#       Code Stop/PreCompact hooks, so a session that reaches the context threshold hands
+#       itself off to a fresh pane instead of waiting to be asked or losing detail to a
+#       summarizer. `--no-handoff-autopilot` (or HERDR_HANDOFF_AUTOPILOT=off at runtime)
+#       keeps handoffs on-request-only; `herdr-eng handoff autopilot uninstall` removes it.
 #   8. runs `herdr-eng doctor` and prints a summary
+#   2b. build-cache toolchain: checksum-pinned sccache 0.19.0 into ~/.local/bin
+#      (per-user, no root; non-fatal). --no-build-cache-tools skips it;
+#      --build-cache-tools-only runs just this step. Installing sccache does NOT
+#      enable the feature (fabric_build_cache.enabled stays off by default).
 #   (opt-in) --with-memory / HERDR_INSTALL_MEMORY=1: after step 7, plans and
 #      installs the managed herdr-memory harness adapters (pi, claude, codex,
 #      opencode) via `herdr-eng memory install`; harnesses that are not
 #      installed are skipped and foreign config is reported, never overwritten.
+#   (default on) step 7c registers the managed Claude Code workflow hooks
+#      (SessionStart reminder, PreCompact /handoff prompt) via
+#      `herdr-eng workflow install`; opt out with --no-workflow-hooks or
+#      HERDR_INSTALL_WORKFLOW_HOOKS=0. Skipped when Claude Code is absent.
+#   (default on) step 7c2 registers the managed SubagentStart/SubagentStop hooks
+#      (the registry of running background agents per pane) via
+#      `herdr-eng handoff auto install --subagents-only`; opt out with
+#      --no-subagent-hooks or HERDR_INSTALL_SUBAGENT_HOOKS=0.
+#   (default on) step 7d installs/updates berlinguyinca/screenwright, tracking
+#      origin/main (not pinned), and links its screenwright-review skill via
+#      scripts/install-screenwright.sh; opt out with --no-screenwright or
+#      HERDR_INSTALL_SCREENWRIGHT=0. Non-fatal; dirty/non-main checkouts are skipped.
+#   (default on) step 7e installs the disk-hygiene jobs (worktree reaper every 6 h, docker sweep
+#      nightly; systemd user timers on Linux, LaunchAgents on macOS) via
+#      scripts/install-disk-hygiene.sh; opt out with --no-disk-hygiene or
+#      HERDR_INSTALL_DISK_HYGIENE=0. Non-fatal. See docs/disk-hygiene.md.
+#   (default on) step 7g installs the build-cleanup timer (systemd user unit on Linux,
+#      launchd agent on macOS) and the managed cargo launcher via
+#      `herdr-eng build-hygiene install`; opt out with --no-build-hygiene or
+#      HERDR_INSTALL_BUILD_HYGIENE=0 (or build_cleanup.enabled: false in config). Non-fatal.
 #
 # Re-running produces no unexpected changes. No secrets are written anywhere.
 #
@@ -31,10 +60,29 @@ set -euo pipefail
 
 # Opt-in herdr-memory step: `--with-memory` or HERDR_INSTALL_MEMORY=1.
 WITH_MEMORY="${HERDR_INSTALL_MEMORY:-0}"
+BUILD_CACHE_TOOLS=1
+BUILD_CACHE_TOOLS_ONLY=0
+WITH_WORKFLOW_HOOKS="${HERDR_INSTALL_WORKFLOW_HOOKS:-1}"
+WITH_SUBAGENT_HOOKS="${HERDR_INSTALL_SUBAGENT_HOOKS:-1}"
+WITH_SCREENWRIGHT="${HERDR_INSTALL_SCREENWRIGHT:-1}"
+# Automatic handoffs are installed by default: the operator's rule is that a handoff is
+# never something they have to ask for, so arming the triggers is the expected state of an
+# installed machine. Opt out with --no-handoff-autopilot (or the runtime env var).
+HANDOFF_AUTOPILOT="${HERDR_INSTALL_HANDOFF_AUTOPILOT:-1}"
+WITH_DISK_HYGIENE="${HERDR_INSTALL_DISK_HYGIENE:-1}"
+WITH_BUILD_HYGIENE="${HERDR_INSTALL_BUILD_HYGIENE:-1}"
 for arg in "$@"; do
   case "$arg" in
+    --no-workflow-hooks) WITH_WORKFLOW_HOOKS=0 ;;
+    --no-subagent-hooks) WITH_SUBAGENT_HOOKS=0 ;;
+    --no-screenwright) WITH_SCREENWRIGHT=0 ;;
+    --no-build-hygiene) WITH_BUILD_HYGIENE=0 ;;
+    --no-disk-hygiene) WITH_DISK_HYGIENE=0 ;;
     --with-memory) WITH_MEMORY=1 ;;
-    -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
+    --no-build-cache-tools) BUILD_CACHE_TOOLS=0 ;;
+    --build-cache-tools-only) BUILD_CACHE_TOOLS_ONLY=1 ;;
+    --no-handoff-autopilot) HANDOFF_AUTOPILOT=0 ;;
+    -h|--help) sed -n '2,/^set -euo/p' "$0" | sed '$d'; exit 0 ;;
     *) printf 'unknown option: %s\n' "$arg" >&2; exit 2 ;;
   esac
 done
@@ -45,9 +93,8 @@ cd "$REPO_ROOT"
 VENV="$REPO_ROOT/.venv"
 PY="$VENV/bin/python"
 HERDR_BIN="${HERDR_BIN:-herdr}"
-HANDOFF_REF="${HERDR_HANDOFF_REF:-3051d8c}"
-HANDOFF_REPO="${HERDR_HANDOFF_REPO:-$REPO_ROOT/../herdr-handoff}"
-HANDOFF_CACHE="${HERDR_HANDOFF_CACHE:-$HOME/.local/share/herdr-handoff/$HANDOFF_REF}"
+# The herdr-handoff pin lives in lock/upstreams.yaml and is resolved by
+# scripts/install-handoff.sh; HERDR_HANDOFF_REF overrides it for a controlled rollout.
 ARTIFACT_REF="${HERDR_ARTIFACT_REF:-c6156ea}"
 ARTIFACT_REPO="${HERDR_ARTIFACT_REPO:-$REPO_ROOT/../herdr-artifacts}"
 ARTIFACT_CACHE="${HERDR_ARTIFACT_CACHE:-$HOME/.local/share/herdr-artifacts/$ARTIFACT_REF}"
@@ -62,6 +109,23 @@ INVENTORY_EXAMPLE="$REPO_ROOT/ansible/inventory/hosts.example.yml"
 step() { printf '\n\033[1;32m==> %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m  ! %s\033[0m\n' "$*"; }
 die()  { printf '\033[1;31m  x %s\033[0m\n' "$*" >&2; exit 1; }
+
+install_build_cache_tools() {
+  # Non-fatal by design: a failure warns loudly and the rest of the install continues.
+  if "$REPO_ROOT/scripts/install-sccache.sh"; then
+    return 0
+  fi
+  warn "BUILD-CACHE TOOLCHAIN NOT INSTALLED: sccache 0.19.0 is missing or too old."
+  warn "  The build cache stays off/unavailable; builds are unaffected."
+  warn "  Fix: $REPO_ROOT/scripts/install.sh --build-cache-tools-only"
+  return 1
+}
+
+if [ "$BUILD_CACHE_TOOLS_ONLY" = "1" ]; then
+  step "build-cache toolchain only (sccache 0.19.0, per-user)"
+  install_build_cache_tools
+  exit $?
+fi
 
 # --- 1. assume herdr exists ------------------------------------------------
 step "1/7 verifying Herdr is present (assumption; will not install/upgrade it)"
@@ -82,21 +146,33 @@ fi
 "$PY" -m pip install --quiet -e "$REPO_ROOT[dev]"
 printf '  installed herdr-engineering into %s\n' "$VENV"
 
+# --- 2b. build-cache toolchain (sccache; per-user, non-fatal) ---------------
+if [ "$BUILD_CACHE_TOOLS" = "1" ]; then
+  step "2b/8 build-cache toolchain (sccache 0.19.0 -> ~/.local/bin; does not enable the feature)"
+  install_build_cache_tools || true
+else
+  printf '\n  (build-cache tools skipped: --no-build-cache-tools)\n'
+fi
+
 # --- 3. required cross-harness handoff ------------------------------------
 step "3/8 installing required herdr-handoff integration"
-if [ ! -f "$HANDOFF_REPO/pyproject.toml" ]; then
-  command -v git >/dev/null 2>&1 || die "git is required to install herdr-handoff"
-  mkdir -p "$(dirname "$HANDOFF_CACHE")"
-  if [ ! -d "$HANDOFF_CACHE/.git" ]; then
-    git clone --quiet https://github.com/berlinguyinca/herdr-handoff.git "$HANDOFF_CACHE"
-  fi
-  git -C "$HANDOFF_CACHE" fetch --quiet --depth 1 origin "$HANDOFF_REF" || true
-  git -C "$HANDOFF_CACHE" checkout --quiet --detach "$HANDOFF_REF"
-  HANDOFF_REPO="$HANDOFF_CACHE"
+# One script resolves the pin, fetches it, installs the CLI, links the skills and attests the entrypoint on
+# PATH. install.sh used to declare the revision a second time beside the lock entry, so bumping the pin in
+# lock/upstreams.yaml changed what `herdr-eng fleet status` reported and not what this machine installed.
+# Exit 2 is its collision verdict (a PATH entry that is not ours); it has already named the file, and under
+# `set -e` it used to abort the whole install here. The rest of the install does not depend on it, so say
+# what is unproven and go on; any other failure still stops.
+handoff_rc=0
+HANDOFF_UNATTESTED=0
+HERDR_HANDOFF_PYTHON="$PY" bash "$REPO_ROOT/scripts/install-handoff.sh" || handoff_rc=$?
+if [ "$handoff_rc" = 2 ]; then
+  warn "herdr-handoff was NOT linked onto PATH: $HOME/.local/bin/herdr-handoff is a file or link this installer does not own"
+  warn "(for example an old pip --user install). Remove it (rm $HOME/.local/bin/herdr-handoff) or run"
+  warn "scripts/install-handoff.sh --migrate-copies to back it up, then re-run; the pinned CLI is unattested until then."
+  HANDOFF_UNATTESTED=1
+elif [ "$handoff_rc" != 0 ]; then
+  die "scripts/install-handoff.sh failed (exit $handoff_rc)"
 fi
-"$PY" -m pip install --quiet -e "$HANDOFF_REPO"
-"$HANDOFF_REPO/install/install.sh"
-printf '  herdr-handoff %s installed from %s\n' "$HANDOFF_REF" "$HANDOFF_REPO"
 
 if [ ! -f "$ARTIFACT_REPO/install/install.sh" ]; then
   command -v git >/dev/null 2>&1 || die "git is required to install herdr-artifacts"
@@ -113,6 +189,8 @@ printf '  herdr-artifacts %s installed from %s\n' "$ARTIFACT_REF" "$ARTIFACT_REP
 
 # Idempotent; never overwrites a customized summary skill or command.
 "$PY" -m herdr_engineering.cli summary install || warn "summary skill install reported a problem (see above)"
+# Read-only: skills in all four harnesses, OpenCode command, fabric listener, opt-in hook state (non-fatal).
+"$PY" -m herdr_engineering.cli summary install --check --skill herdr-join || warn "/herdr::join setup check reported a problem (see above)"
 
 # --- 4. state + artifact directories --------------------------------------
 step "4/8 machine-local state + artifact directories"
@@ -252,10 +330,30 @@ step "7/8 making herdr-eng and herdr-handoff available on PATH"
 LINK_DIR="$HOME/.local/bin"
 if [ -d "$LINK_DIR" ] || mkdir -p "$LINK_DIR" 2>/dev/null; then
   if command -v python3 >/dev/null 2>&1 && case "$PATH" in *"$LINK_DIR"*) true;; *) false;; esac; then
-    ln -sf "$VENV/bin/herdr-eng" "$LINK_DIR/herdr-eng"
-    printf '  linked %s -> %s\n' "$LINK_DIR/herdr-eng" "$VENV/bin/herdr-eng"
-    ln -sf "$VENV/bin/herdr-handoff" "$LINK_DIR/herdr-handoff"
-    printf '  linked %s -> %s\n' "$LINK_DIR/herdr-handoff" "$VENV/bin/herdr-handoff"
+    # The same rule as for herdr-handoff, applied to this repo's own CLI: a PATH entry that is not a link to
+    # this venv belongs to someone else's install and is reported, not repointed.
+    eng_link="$LINK_DIR/herdr-eng"
+    if { [ -L "$eng_link" ] && [ "$(readlink "$eng_link")" != "$VENV/bin/herdr-eng" ]; } || \
+       { [ -e "$eng_link" ] && [ ! -L "$eng_link" ]; }; then
+      warn "$eng_link exists and is not a link to $VENV/bin/herdr-eng; leaving it. Remove it to link this"
+      warn "checkout's CLI ($VENV/bin/herdr-eng)."
+    else
+      ln -sfn "$VENV/bin/herdr-eng" "$eng_link"
+      printf '  linked %s -> %s\n' "$eng_link" "$VENV/bin/herdr-eng"
+    fi
+    # Only nothing, or a link this installer made, may be replaced.  A regular file, or a symlink into
+    # another tree (conda, a uv tool shim, a vendor checkout), is someone's own setup and replacing it
+    # silently is how a deliberate PATH entry disappears.  Step 3 attests which CLI actually runs, so a
+    # PATH entry it did not produce has to be reported rather than overwritten here.
+    handoff_link="$LINK_DIR/herdr-handoff"
+    if [ -L "$handoff_link" ] && [ "$(readlink "$handoff_link")" != "$VENV/bin/herdr-handoff" ]; then
+      warn "$handoff_link links to $(readlink "$handoff_link"), not $VENV/bin/herdr-handoff; leaving it. Remove it to link the pinned CLI, or run scripts/install-handoff.sh --migrate-copies."
+    elif [ -e "$handoff_link" ] && [ ! -L "$handoff_link" ]; then
+      warn "$handoff_link is a file this installer does not own; leaving it. Remove it to link the pinned CLI ($VENV/bin/herdr-handoff)."
+    else
+      ln -sfn "$VENV/bin/herdr-handoff" "$handoff_link"
+      printf '  linked %s -> %s\n' "$handoff_link" "$VENV/bin/herdr-handoff"
+    fi
   else
     warn "$LINK_DIR is not on PATH; activate the venv instead: source $VENV/bin/activate"
   fi
@@ -270,6 +368,59 @@ if [ "$WITH_MEMORY" = "1" ]; then
   "$PY" -m herdr_engineering.cli memory install --all || warn "memory install reported conflicts (see above); foreign config was left untouched"
 else
   printf '\n  (herdr-memory adapters not installed; opt in with --with-memory)\n'
+fi
+
+# --- 7c. managed Claude Code workflow hooks (default on) --------------------
+if [ "$WITH_WORKFLOW_HOOKS" = "1" ]; then
+  step "7c/8 Claude Code workflow hooks (managed; foreign hooks untouched)"
+  "$PY" -m herdr_engineering.cli workflow install || warn "workflow hooks not installed (see above); settings.json was left untouched"
+else
+  printf '\n  (workflow hooks not installed; HERDR_INSTALL_WORKFLOW_HOOKS=0 or --no-workflow-hooks)\n'
+fi
+
+# --- 7c2. managed Claude Code subagent registry hooks (default on) ----------
+# Skips (writes nothing) when Claude Code is absent: `claude` not on PATH and no ~/.claude, the same gate as 7c.
+if [ "$WITH_SUBAGENT_HOOKS" = "1" ]; then
+  step "7c2/8 Claude Code subagent registry hooks (managed; foreign hooks untouched)"
+  "$PY" -m herdr_engineering.cli handoff auto install --subagents-only || warn "subagent hooks not installed (see above); settings.json was left untouched"
+else
+  printf '\n  (subagent hooks not installed; HERDR_INSTALL_SUBAGENT_HOOKS=0 or --no-subagent-hooks)\n'
+fi
+
+# --- 7d. screenwright (default on; tracks origin/main, never pinned) --------
+if [ "$WITH_SCREENWRIGHT" = "1" ]; then
+  step "7d/8 screenwright (latest origin/main; skill linked into the harnesses)"
+  bash "$REPO_ROOT/scripts/install-screenwright.sh" || warn "screenwright not installed/updated (see above); the rest of the install is unaffected"
+else
+  printf '\n  (screenwright not installed; HERDR_INSTALL_SCREENWRIGHT=0 or --no-screenwright)\n'
+fi
+
+# --- 7e. automatic handoff triggers (default on) ----------------------------
+if [ "$HANDOFF_AUTOPILOT" = "1" ]; then
+  step "7e/8 arming automatic handoffs (Pi extension + Claude Code hooks)"
+  # Idempotent and content-checked: a second run reports every item unchanged. It only ever
+  # rewrites the hook group it wrote itself, so the workflow hooks in 7c - and any foreign
+  # ~/.claude/settings.json entries - stay exactly where the previous steps put them.
+  "$PY" -m herdr_engineering.cli handoff autopilot install \
+    || warn "automatic handoff triggers are not fully installed (see above); handoffs will still work when asked for"
+else
+  printf '\n  (automatic handoffs not armed; handoffs will have to be asked for. Re-run without --no-handoff-autopilot)\n'
+fi
+
+# --- 7f. disk hygiene jobs (default on) --------------------------------------
+if [ "$WITH_DISK_HYGIENE" = "1" ]; then
+  step "7f/8 disk hygiene (worktree reaper + docker sweep timers)"
+  HERDR_ENG="$VENV/bin/herdr-eng" bash "$REPO_ROOT/scripts/install-disk-hygiene.sh" install || warn "disk-hygiene timers not installed (see above); the rest of the install is unaffected"
+else
+  printf '\n  (disk-hygiene timers not installed; HERDR_INSTALL_DISK_HYGIENE=0 or --no-disk-hygiene)\n'
+fi
+
+# --- 7g. build hygiene (default on): build-cleanup timer + managed cargo launcher -------
+if [ "$WITH_BUILD_HYGIENE" = "1" ]; then
+  step "7g/8 build hygiene (build-cleanup timer, managed cargo launcher; non-fatal)"
+  "$PY" -m herdr_engineering.cli build-hygiene install || warn "build hygiene not installed (see above); opt out with build_cleanup.enabled: false"
+else
+  printf '\n  (build hygiene not installed; HERDR_INSTALL_BUILD_HYGIENE=0 or --no-build-hygiene)\n'
 fi
 
 # --- 8. doctor ------------------------------------------------------------
@@ -290,3 +441,9 @@ cat <<EOF
   This machine is now in the private inventory at: $INVENTORY
   Herdr was NOT modified; your running agent sessions are unaffected.
 EOF
+
+# Honest ending: an old CLI may still be what runs on PATH, so "set up" with exit 0 would be a false report.
+if [ "$HANDOFF_UNATTESTED" = 1 ]; then
+  warn "installed with warnings: the herdr-handoff CLI was not attested (see step 3); exiting 3"
+  exit 3
+fi

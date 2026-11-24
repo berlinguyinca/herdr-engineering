@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Refresh the files the (credential-less, offline) collab container reads:
 #   jwks.json    - the Cognito pool's signing keys
-#   members.json - usernames in the required group, stamped with the refresh time
+#   members.json - usernames in the required group, stamped with the refresh time, plus "disabled": the
+#                  usernames in the required group whose Cognito account is disabled (additive key)
 # Runs on the host with the operator's AWS credentials; the container only sees the output.
 # The pool and group come from the central fleet config (control_plane.collab), via the
 # slice deploy.sh renders with `herdr-eng fleet config render-collab`.
@@ -15,6 +16,7 @@
 # --share-host HOST (shares enabled): the edge presents this one certificate for the share host too, so a
 # certificate whose subjectAltName lacks HOST is refused (never copied to the edge; `once` and the timer exit
 # non-zero) and `cert-host` checks the staged copy. deploy.sh passes it and install writes it into the unit.
+# --member-host HOST (artifact host with member_host set): the same refusal for the member UI's own name.
 # Usage: collab-sync.sh once|install|renew-check|cert-host [--config SLICE] [--dir SYNC_DIR] [--data-dir DIR]
 #          [--cert-dir DIR] [--cert-src LIVE_DIR] [--acme-dir DIR] [--certbot BIN] [--cert-name NAME]
 # Unless --certbot is explicit, Certbot is read from the ACME directory's sibling DIR-venv.
@@ -22,7 +24,7 @@
 # which is what keeps the minute timer's run out of a deploy; without the flag this run would
 # see that lock and skip its own refresh. Never written into a unit.
 set -euo pipefail
-USAGE="usage: $0 once|install|renew-check|cert-host [--config SLICE] [--dir SYNC_DIR] [--data-dir DIR] [--cert-dir DIR] [--cert-src LIVE_DIR] [--acme-dir DIR] [--certbot BIN] [--cert-name NAME] [--share-host HOST] [--lock-held]"
+USAGE="usage: $0 once|install|renew-check|cert-host [--config SLICE] [--dir SYNC_DIR] [--data-dir DIR] [--cert-dir DIR] [--cert-src LIVE_DIR] [--acme-dir DIR] [--certbot BIN] [--cert-name NAME] [--share-host HOST] [--member-host HOST] [--lock-held]"
 ACTION="${1:-once}"; [ $# -gt 0 ] && shift
 CONFIG="$HOME/.config/herdr-engineering/collab/collab-config.json"
 FLEET="$HOME/.config/herdr-engineering/fleet/fleet-config.yaml"
@@ -35,6 +37,7 @@ CERT_SRC=""
 CERTBOT=""
 LOCK_HELD=0
 SHARE_HOST=""
+MEMBER_HOST=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --config) CONFIG="${2:?--config needs a value}"; shift 2 ;;
@@ -47,6 +50,7 @@ while [ $# -gt 0 ]; do
     --certbot) CERTBOT="${2:?--certbot needs a value}"; shift 2 ;;
     --cert-name) CERT_NAME="${2:?--cert-name needs a value}"; shift 2 ;;
     --share-host) SHARE_HOST="${2:?--share-host needs a value}"; shift 2 ;;
+    --member-host) MEMBER_HOST="${2:?--member-host needs a value}"; shift 2 ;;
     --lock-held) LOCK_HELD=1; shift ;;
     *) echo "$USAGE" >&2; exit 2 ;;
   esac
@@ -94,6 +98,9 @@ once() {
   python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["keys"]' "$tmp/jwks.json"
   aws cognito-idp list-users-in-group --region "$REGION" --user-pool-id "$POOL" --group-name "$GROUP" \
     --query 'Users[].Username' --output json > "$tmp/users.json"
+  # The disabled members of the same group ride along (the artifact host revokes a disabled account at any age).
+  aws cognito-idp list-users-in-group --region "$REGION" --user-pool-id "$POOL" --group-name "$GROUP" \
+    --query 'Users[?Enabled==`false`].Username' --output json > "$tmp/disabled.json"
   # The Rakazo phone bridge's group rides in the same file (its own container re-checks membership from it). Only
   # ENABLED users are listed, so disabling someone in Cognito ends their app session like removing them does.
   echo '[]' > "$tmp/rakazo.json"
@@ -101,12 +108,12 @@ once() {
     aws cognito-idp list-users-in-group --region "$REGION" --user-pool-id "$POOL" --group-name "$RAKAZO_GROUP" \
       --query 'Users[?Enabled==`true`].Username' --output json > "$tmp/rakazo.json"
   fi
-  python3 - "$tmp/users.json" "$tmp/members.json" "$GROUP" "$tmp/rakazo.json" "$RAKAZO_GROUP" <<'PY'
+  python3 - "$tmp/users.json" "$tmp/members.json" "$GROUP" "$tmp/rakazo.json" "$RAKAZO_GROUP" "$tmp/disabled.json" <<'PY'
 import json, sys, time
 groups = {sys.argv[3]: json.load(open(sys.argv[1]))}
 if sys.argv[5]:
     groups[sys.argv[5]] = json.load(open(sys.argv[4]))
-json.dump({"updated": time.time(), "groups": groups}, open(sys.argv[2], "w"))
+json.dump({"updated": time.time(), "groups": groups, "disabled": json.load(open(sys.argv[6]))}, open(sys.argv[2], "w"))
 PY
   chmod 644 "$tmp"/*.json
   mv -f "$tmp/jwks.json" "$DIR/jwks.json"; mv -f "$tmp/members.json" "$DIR/members.json"   # atomic per file
@@ -127,12 +134,17 @@ PY
 }
 
 check_cert_host() {   # <pem> <where>: the loud refusal
-  [ -z "$SHARE_HOST" ] && return 0
-  cert_covers_host "$1" "$SHARE_HOST" && return 0
-  echo "ERROR: the $2 certificate ($1) does not name the share host $SHARE_HOST in its subjectAltName;" \
-       "browsers would fail the TLS handshake. Run certbot --expand to add it (or fix the DNS-01 plugin for its zone)" \
-       "before deploying; the previous certificate stays in place." >&2
-  return 1
+  local kind host
+  for kind in share member; do
+    if [ "$kind" = share ]; then host="$SHARE_HOST"; else host="$MEMBER_HOST"; fi
+    [ -z "$host" ] && continue
+    cert_covers_host "$1" "$host" && continue
+    echo "ERROR: the $2 certificate ($1) does not name the $kind host $host in its subjectAltName;" \
+         "browsers would fail the TLS handshake. Run certbot --expand to add it (or fix the DNS-01 plugin for its zone)" \
+         "before deploying; the previous certificate stays in place." >&2
+    return 1
+  done
+  return 0
 }
 
 # Hand the edge ONLY its own certificate. Mounting certbot's whole config dir would give the
@@ -232,7 +244,7 @@ install_timer() {
 Description=Refresh collab Cognito membership and keys
 [Service]
 Type=oneshot
-ExecStart="$bin" once --config "$CONFIG" --dir "$DIR" --data-dir "$DATA_DIR" --cert-dir "$CERT_DIR" --cert-src "$CERT_SRC"${SHARE_HOST:+ --share-host "$SHARE_HOST"}
+ExecStart="$bin" once --config "$CONFIG" --dir "$DIR" --data-dir "$DATA_DIR" --cert-dir "$CERT_DIR" --cert-src "$CERT_SRC"${SHARE_HOST:+ --share-host "$SHARE_HOST"}${MEMBER_HOST:+ --member-host "$MEMBER_HOST"}
 UNIT
   cat > "$u/herdr-collab-sync.timer" <<UNIT
 [Unit]

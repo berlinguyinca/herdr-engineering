@@ -12,7 +12,7 @@ import herdr_engineering.tree as tree
 
 def _fixture(monkeypatch):
     monkeypatch.setattr(tree, "_fleet_machines", lambda: [
-        {"id": "beast", "label": "beast", "target": "100.96.156.65", "reachable": True}])
+        {"id": "beast", "label": "beast", "target": "100.64.8.65", "reachable": True}])
     monkeypatch.setattr(tree, "_workspaces", lambda: [
         {"workspace_id": "w1", "label": "fix augur", "agent_status": "working"},
         {"workspace_id": "w2", "label": "tournament", "agent_status": "idle"}])
@@ -79,3 +79,21 @@ def test_node_detail_unknown(monkeypatch):
     d = tree.node_detail("nope:nothing")
     assert d["kind"] == "unknown"
     assert "error" in d
+
+
+def test_live_processes_sees_args_past_80_columns_under_xdist_columns(monkeypatch):
+    """pytest-xdist workers export COLUMNS=80, which makes `ps` truncate args unless it is run with -ww."""
+    import os
+    import signal
+    import subprocess
+
+    marker = "augur-tail-marker"
+    padding = "x" * 90  # marker lands past column 80 but well inside the 220-char args cap, whatever the interpreter path
+    child = subprocess.Popen(["bash", "-c", "sleep 60; :", "_", padding, marker], start_new_session=True)
+    try:
+        monkeypatch.setenv("COLUMNS", "80")
+        found = [p for p in tree._live_processes() if p["pid"] == str(child.pid)]
+        assert found and marker in found[0]["args"]
+    finally:
+        os.killpg(child.pid, signal.SIGKILL)
+        child.wait()

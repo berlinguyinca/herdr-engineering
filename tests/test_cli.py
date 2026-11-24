@@ -307,6 +307,16 @@ def test_fabric_compaction_settings_default_to_off_and_dry_run():
         _fabric_compaction_settings({"fabric_compaction": {"min_age_days": 0}})
 
 
+def test_fabric_compaction_projection_publish_is_off_unless_exactly_true():
+    from herdr_engineering.cli import _fabric_compaction_settings
+    assert _fabric_compaction_settings({}).publish_projection_checkpoint is False
+    assert _fabric_compaction_settings({"fabric_compaction": {"publish_projection_checkpoint": "yes"}}
+                                       ).publish_projection_checkpoint is False
+    on = _fabric_compaction_settings({"fabric_compaction": {"publish_projection_checkpoint": True,
+                                                            "projection_lock_wait_seconds": 5}})
+    assert on.publish_projection_checkpoint is True and on.projection_lock_wait_seconds == 5.0
+
+
 def test_single_operator_makes_the_assistant_allow_the_owners_own_approval_and_nothing_else_changes():
     from herdr_engineering.cli import _assistant_config
     pa = {"enabled": True, "actions": {"approvers": ["a"]}}
@@ -315,3 +325,23 @@ def test_single_operator_makes_the_assistant_allow_the_owners_own_approval_and_n
     on = _assistant_config({"personal_assistant": pa, "single_operator": True})["personal_assistant"]
     assert on["actions"] == {"approvers": ["a"], "allow_self_approval": True} and "allow_self_approval" not in pa["actions"]
     assert _assistant_config({"single_operator": True}) is None
+
+
+def test_fabric_compaction_normalises_service_timestamps_unless_exactly_false():
+    from herdr_engineering.cli import _fabric_compaction_settings
+    assert _fabric_compaction_settings({}).normalize_service_timestamps is True
+    assert _fabric_compaction_settings({"fabric_compaction": {"normalize_service_timestamps": "no"}}
+                                       ).normalize_service_timestamps is True
+    assert _fabric_compaction_settings({"fabric_compaction": {"normalize_service_timestamps": False}}
+                                       ).normalize_service_timestamps is False
+
+
+def test_journal_suppression_config_defaults_on_and_rejects_bad_keys():
+    from herdr_engineering.cli import _journal_suppression
+    assert _journal_suppression({}).session_noop is True
+    assert _journal_suppression(None).inspector_tool_updates is True
+    assert _journal_suppression({"journal_suppression": {"inspector_zero_usage": False}}).inspector_zero_usage is False
+    with pytest.raises(SystemExit, match="unknown key: sessions_noop"):
+        _journal_suppression({"journal_suppression": {"sessions_noop": True}})
+    with pytest.raises(SystemExit, match="session_heartbeat_seconds"):
+        _journal_suppression({"journal_suppression": {"session_heartbeat_seconds": 9999}})

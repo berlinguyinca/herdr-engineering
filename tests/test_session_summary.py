@@ -235,3 +235,11 @@ def test_installed_wheel_carries_the_skill_and_installs(tmp_path):
     assert (target / "herdr_engineering/skill_data/summary/SKILL.md").is_file()
     assert (target / "herdr_engineering/skill_data/summary/adapters/pi-summary.md").is_file()
     assert (home / ".claude/skills/summary/SKILL.md").read_bytes() == SKILL.read_bytes()
+
+
+def test_skill_asks_for_the_optional_drift_graph_block():
+    text = SKILL.read_text()
+    assert "drift-graph" in text
+    assert "optional" in text.lower()
+    assert "`prompts`" in text and "history helper" in text
+    assert "labels only" in text.lower() and "never times or counts" in text.lower()

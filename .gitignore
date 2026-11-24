@@ -40,12 +40,14 @@ venv/
 .mypy_cache/
 .ruff_cache/
 .coverage
+.coverage.*
 htmlcov/
 .omx/
 
 # T16 acceptance: local overrides and generated run state never enter git
 tests/e2e/acceptance.local.yaml
 tests/e2e/.run/
+.run/
 
 # autospec / UI gate run output (never committed)
 .autospec/reports/
@@ -56,3 +58,10 @@ tests/share-fixtures/html-parquet-duckdb/vendor/*.wasm
 tests/share-fixtures/html-parquet-duckdb/vendor/*.worker.js
 tests/share-fixtures/html-parquet-duckdb/vendor/extensions/
 .superpowers/
+
+# local pytest TMPDIR scratch
+.tmp/
+.herdr-test/
+.venv-test/
+pytest-retried.jsonl
+.coverage-local/

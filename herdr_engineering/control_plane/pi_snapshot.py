@@ -15,7 +15,7 @@ import urllib.parse
 import urllib.request
 from http.client import HTTPException
 
-SUPPORTED = frozenset({1, 2, 3})
+SUPPORTED = frozenset({1, 2, 3, 4})
 
 
 class UnsupportedSnapshotVersion(ValueError):
@@ -23,10 +23,10 @@ class UnsupportedSnapshotVersion(ValueError):
 
 
 def snapshot_to_envelopes(doc: dict) -> list[dict]:
-    """Map versions 1–3 to one mission envelope each, preserving absent/null data."""
+    """Map versions 1–4 to one mission envelope each, preserving absent/null data."""
     version = doc.get("contractVersion")
     if type(version) is not int or version not in SUPPORTED:
-        raise UnsupportedSnapshotVersion("Supported snapshot contractVersion values are 1, 2, 3")
+        raise UnsupportedSnapshotVersion("Supported snapshot contractVersion values are 1, 2, 3, 4")
     envelopes = []
     for mission in doc["missions"]:
         payload = {key: mission[key] for key in ("title", "status") if key in mission}

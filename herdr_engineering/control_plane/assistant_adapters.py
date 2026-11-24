@@ -123,3 +123,120 @@ def draft_writer_hook(server):
             emit_version_lineage(server.ingest, committed, principal)
         return committed
     return hook
+
+
+class ExternalActionsBridge:
+    """Team collaboration slice 5: the in-process bridge from the collab service to the assistant's external action ledger.
+
+    The collab service has already decided WHO may do WHAT (``collab_team_external.py``); this maps the room owner's collaboration
+    user to the operator's assistant identity (``actions.collab_users``, the reverse of the slice 4 mapping) and calls the ledger.
+    A collaboration user the YAML does not map answers like a missing room. The ledger's own refusals become collab errors."""
+
+    def __init__(self, server) -> None:
+        self.server = server
+
+    def _svc(self):
+        return self.server.assistant.external_actions
+
+    def _scope(self, collab_user: str) -> tuple[str, str]:
+        from .collab import CollabError
+        users = self.server.assistant.config["actions"]["collab_users"]
+        user_id = next((u for u, c in users.items() if c == collab_user), None)
+        if user_id is None:
+            raise CollabError(404, "not found")
+        return self.server.assistant.tenant_for(user_id), user_id
+
+    @staticmethod
+    def error(exc: Exception, state_error: int = 400):
+        """The collab error a ledger exception stands for."""
+        from .assistant import (
+            AssistantError,
+            AssistantForbidden,
+            AssistantNotFound,
+            AssistantUnavailable,
+            RateLimited,
+        )
+        from .collab import CollabError
+        from .external_actions import Mismatch
+        if isinstance(exc, CollabError):
+            return exc
+        for cls, status, message in ((AssistantNotFound, 404, "not found"), (AssistantForbidden, 403, "forbidden"),
+                                     (RateLimited, 429, str(exc)), (AssistantUnavailable, 503, str(exc)),
+                                     (Mismatch, 409, str(exc)), (AssistantError, state_error, str(exc)), (ValueError, 400, str(exc))):
+            if isinstance(exc, cls):
+                return CollabError(status, message)
+        raise exc
+
+    def _guard(self):
+        service = self.server.collab
+        if service is None or getattr(service, "degraded", False):
+            from .collab import CollabError
+            raise CollabError(503, "collaboration is disabled; ask the operator")
+
+    def file(self, owner: str, filer: str, kind: str, ctx: dict) -> dict:
+        self._guard()
+        tenant, user = self._scope(owner)
+        try:
+            return self._svc().file(tenant_id=tenant, user_id=user, kind=kind, ctx=ctx,
+                                    requested_by=f"assistant:{user}" if filer == "assistant" else filer)
+        except Exception as exc:                                   # noqa: BLE001 - mapped, or re-raised if unexpected
+            raise self.error(exc) from None
+
+    def rows(self, owner: str, room_id: str, filer: str | None) -> list[dict]:
+        self._guard()
+        tenant, user = self._scope(owner)
+        try:
+            return self._svc().for_room(room_id, tenant_id=tenant, user_id=user, filed_by=filer)
+        except Exception as exc:                                   # noqa: BLE001
+            raise self.error(exc) from None
+
+    def room_of(self, owner: str, action_id: str) -> str | None:
+        tenant, user = self._scope(owner)
+        try:
+            return (self._svc().get(action_id, tenant_id=tenant, user_id=user) or {}).get("room_id")
+        except Exception:                                          # noqa: BLE001 - unknown means no room
+            return None
+
+    def act(self, owner: str, room_id: str, action_id: str, op: str, body: dict) -> dict:
+        """Decide or retry. The action must belong to THIS room: another room's id is a missing action."""
+        from .collab import CollabError
+        self._guard()
+        tenant, user = self._scope(owner)
+        svc = self._svc()
+        try:
+            if svc.get(action_id, tenant_id=tenant, user_id=user).get("room_id") != room_id:
+                raise CollabError(404, "not found")
+            if op == "retry":
+                return svc.retry(action_id, tenant_id=tenant, user_id=user, actor=user, expected_sha256=body.get("expected_sha256"))
+            return svc.decide(action_id, tenant_id=tenant, user_id=user, actor=user, decision=body.get("decision"),
+                              expected_sha256=body.get("expected_sha256"))
+        except Exception as exc:                                   # noqa: BLE001
+            raise self.error(exc) from None
+
+
+class _MappedWorkspace:
+    """The Google workspace with the single-operator mapping the other assistant Google hooks use (the data key, never the actor)."""
+
+    def __init__(self, server) -> None:
+        self._server = server
+
+    def create_draft(self, tenant, user, *args, **kwargs):
+        return self._server.google.create_draft(*self._server._canonical_person(tenant, user), *args, **kwargs)
+
+    def find_draft_by_key(self, tenant, user, key):
+        return self._server.google.find_draft_by_key(*self._server._canonical_person(tenant, user), key)
+
+
+def wire_external_providers(server) -> None:
+    """Give the assistant's external action ledger its two provider clients (slice 5). Called only with the flag on.
+
+    GitHub: the REST client over the GitHub App's ``team_issues`` write capability, else the server-held ``github.token`` (the
+    same credential storage the escalation issues use, YAML/host config only, never an environment variable). Gmail: the
+    person's own Google connection, DRAFTS only. Neither is reachable when it is not configured; the action then fails with a
+    fixed reason and the operator sees it."""
+    from .deployment_escalation import GitHubIssueSink
+    from .external_actions import GitHubIssues, GmailDrafts, sink_credential
+    ea = server.assistant.external_actions
+    gh = ea.cfg["github"]
+    ea.github = GitHubIssues(gh["api_base"], sink_credential(GitHubIssueSink(capability="team_issues")), timeout=gh["timeout_seconds"])
+    ea.gmail = GmailDrafts(lambda: _MappedWorkspace(server) if getattr(server, "google", None) is not None else None)

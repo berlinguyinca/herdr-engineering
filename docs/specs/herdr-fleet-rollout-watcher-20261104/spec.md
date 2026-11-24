@@ -134,6 +134,21 @@ is a host-level operator job that must run `ssh`/`herdr-eng` as the user (the sa
 fabric agent has), and the control plane itself stays a container. It targets the other hosts only via
 `ssh <host> herdr-eng fleet host-apply ...` (below). macOS needs no watcher.
 
+**D12 The watcher self-updates on its own repo's merge.** When a rollout has **succeeded** and it updated
+the watcher's own herdr-engineering install (checkout fast-forwarded + new build installed + receipt), the
+loop exits with a dedicated status (75, sysexits EX_TEMPFAIL): the unit's existing `Restart=on-failure`
+(75 is not in `RestartPreventExitStatus=2 3`) restarts the service about 30 s later, and the fresh main
+process is the newly installed build, so the next pass runs the build the fleet just shipped (issue #865).
+The restart comes from systemd itself - no detached `systemctl` child is spawned, because the unit's
+cgroup cleanup (`KillMode=control-group`) would SIGTERM such a child before it queued its job, and an
+exit 0 would not restart the unit at all. It never requests a restart for a `halted`/`running` rollout
+(the fleet has not converged; the old loop is what handles the halt), for a rollout that did not change
+this host's install (`no_change`/`skipped`), in plan-only mode, or when the process is not running under
+the unit (dev runs and tests are detected via `/proc/self/cgroup` and left alone, with a log note; the
+loop keeps running the old build). The one-shot `run --apply` does not request a restart - the process
+exits anyway. Test/dev seam: `HERDR_FLEET_WATCH_RESTART_CMD` runs an injectable command; the loop still
+exits 75.
+
 ## 5. Components
 
 ```
@@ -143,7 +158,7 @@ GitHub (read-only poll, ETag)                      beast (controller)
                                                        │ verifier (fleet_watch/verify.py: D3 reachability)
                                                        │ planner  (fleet_watch/plan.py: coalesce, rollout_id)
                                                        │ runner   (fleet_watch/run.py: state machine, per-host exec)
-                                                       │ emitter  (fleet_watch/events.py: redact, outbox, POST /ingest)
+                                                       │ emitter  (fleet_watch/events.py: outbox, POST /ingest; section 14)
                                                        │ state    ~/.local/state/herdr-engineering/fleet-watch/{state.json,outbox.jsonl,lock}
                                                        ▼ ssh (tailscale, BatchMode, timeouts)
               beast (local) ─► bender ─► macbook-pro:  herdr-eng fleet host-apply --rollout ID --repo R --sha S
@@ -158,8 +173,8 @@ New module layout is a package `herdr_engineering/fleet_watch/` so `fleet.py` (5
 | repo | host-apply action | health check (all must pass) |
 |---|---|---|
 | `herdr-engineering` | pre-check (D6); `fleet_update(host=<this>, revision=sha, pull_controller=<is controller>)` equivalent for a non-controller: ff-only fetch of the deployment checkout, `pip install` into the venv, converge agent; report before/after from `git rev-parse HEAD` and `herdr-eng --version` | installed revision == sha (`fleet_status` fingerprint), fabric-agent unit/launchd label active, gateway registration present, `herdr-eng fleet status` parity ok |
-| `pi-engineering` | `stage_pi_runtime(sha)` then symlink switch (D7) | release dir exists and complete, `current` -> sha, `pi --version` smoke from the new release in a throwaway cwd, no session signalled |
-| `autospec` | the existing `autospec-fleet.yml` path (ff-only checkout + `autospec-runtime-install.sh`, generation publish) | active generation receipt names sha; `autospec --version` |
+| `pi-engineering` | `stage_pi_runtime(sha)` then symlink switch (D7) | release dir exists and complete, `current` -> sha, `pi --version` smoke (launcher resolved PATH -> `~/.local/bin/pi`; a unit or non-interactive ssh PATH has no `~/.local/bin`) |
+| `autospec` | the existing `autospec-fleet.yml` path (ff-only checkout + `autospec-runtime-install.sh`, generation publish) | active generation receipt names sha; `autospec doctor` smoke (launcher resolved PATH -> `~/.autospec/bin/autospec`; the CLI has no `--version` - it exits 2) |
 | `ai-sync` / `claude-config` (phase 2) | `ai_sync_enforce` forced pull + verify; **beast is the publisher, so its step is verify-only** (the enforcer already refuses there) and the canary shifts to bender for this repo | `ai-sync verify --json` ok, feed `behind == 0` |
 
 Because Ansible is the existing convergence engine, `host-apply` for `herdr-engineering` on remote hosts
@@ -239,16 +254,16 @@ JSON schema (common fields; per-type subsets in the validator):
   "ts": "ISO-8601 UTC",
   "seq": "int >= 0",
   "trigger": {"repo": "autospec|pi-engineering|herdr-engineering|ai-sync|claude-config",
-              "sha": "40 hex", "pr": "int|null", "pr_title": "str<=120|null", "merged_at": "ISO|null"},
+              "sha": "40 hex", "pr": "int|null", "merged_at": "ISO|null"},
   "targets": [{"repo": "str", "sha": "40 hex", "before": "40 hex|null"}],
   "host": "beast|bender|macbook-pro (inventory name, [a-z0-9-]{1,40})",
   "repo": "str (for host events)",
   "status": "pending|precheck|applying|checking|ok|blocked|failed|unreachable|skipped|rolled_back",
-  "reason": "enum: dirty_checkout|not_on_main|unpublished_commits|busy|timeout|health_failed|apply_failed|ssh_failed|halted|optional_unreachable|not_published|rate_limited|operator",
+  "reason": "enum: dirty_checkout|not_on_main|unpublished_commits|busy|timeout|health_failed|apply_failed|ssh_failed|halted|optional_unreachable|not_published|rate_limited|ahead_of_target|operator",
   "before_sha": "40 hex|null", "after_sha": "40 hex|null",
   "started_at": "ISO", "finished_at": "ISO", "duration_ms": "int >= 0",
-  "checks": [{"name": "str<=40", "ok": "bool"}],
-  "log_tail": "str<=2048, <=40 lines, redacted",
+  "checks": [{"name": "closed enum", "status": "ok|failed|skipped", "duration_ms": "int >= 0"}],
+  "log": {"host": "inventory host", "path_id": "updater|installer|healthcheck", "sha256": "64 hex", "bytes": "int", "lines": "int"},
   "counts": {"dirty_paths": "int", "unpublished_commits": "int", "behind": "int"},
   "links": {"pi_session_rollout": "str|null"},
   "halted_at_host": "str|null"
@@ -256,13 +271,12 @@ JSON schema (common fields; per-type subsets in the validator):
 ```
 
 Rules: `reason` and `status` are closed enums (the mermaid generator only ever interpolates enums, short
-SHAs, inventory host names and dates, never free text); `log_tail` is stored but never placed in a diagram.
+SHAs, inventory host names and dates, never free text); there is no free text in any event (section 14).
 
-**No secrets.** `log_tail` passes through the existing `redact()` (userinfo URLs, 24+ character token-like
-runs, non-printables, whitespace-collapsed) plus a denylist for `Authorization`, `token=`, `password=`, `-----BEGIN`;
-environment is never logged; the watcher's GitHub credential comes from `gh auth` on beast and never enters
-a payload; the ingest validator re-applies the length caps and rejects strings matching the denylist so a buggy
-emitter cannot leak.
+**No secrets (revised by section 14).** Events contain no free text: only enums, inventory hosts, hex and UTC
+timestamps, and unknown fields are rejected. Log text is never sent; `log` is a reference (host, kind, SHA-256, sizes)
+to a log kept on the host and read with `herdr-eng fleet-watch log show`. Environment is never logged; the watcher's
+GitHub credential comes from `gh auth` on beast and never enters a payload.
 
 ### 8.2 Read API
 
@@ -302,7 +316,7 @@ Layout (top to bottom):
    head node and one node per host labelled `host sha7 (age)`, an edge `head --> host` solid when equal,
    dashed red when behind, plus the lock pin as a note node. Source: `.../versions` projection.
 5. **Event table** (below the diagrams, because diagrams are lossy): time, rollout, host, repo, status,
-   before -> after, duration, expandable redacted log tail. Filters: repo, host, status.
+   before -> after, duration, the log reference (SHA-256 and the host-side `log show` command, no text). Filters: repo, host, status.
 6. **Mermaid source** in a `<details>` per diagram for copy/paste into a PR or issue.
 
 ### 9.1 How Mermaid is rendered (decision and justification)
@@ -345,20 +359,22 @@ dependency"); client-rendered diagrams from untrusted strings.
 - **Unit** (pytest/vitest, pure functions): ETag/`304` header parsing and backoff schedule from recorded
   real `gh api -i` outputs kept as fixtures; coalescing and `rollout_id` determinism; state-machine
   transitions table (every illegal transition rejected); event validator (unknown field, bad enum, oversize,
-  secret denylist, `host_id` bounds); `redact` of tokens/userinfo; lock writer round-trip preserves comments
+  secret-shaped strings in every field, `host_id` bounds); lock writer round-trip preserves comments
   and unrelated keys; mermaid generators produce only enum/short-SHA/host text (property test over
-  adversarial `pr_title`); `fleet-rollout-view.js` row/escape tests like `ai-sync-view.test.js`.
+  adversarial strings in every field); `fleet-rollout-view.js` row/escape tests like `ai-sync-view.test.js`.
 - **Integration** (real git, real SQLite/Postgres event store, real HTTP): bare repos created in a temp dir
   act as "GitHub" through a real local HTTP server that implements the three used REST endpoints with ETag and
   rate-limit headers (a protocol-faithful fixture server, not a mock of our code); a real `git` pair proves
   D3 (stray unpushed commit refused, ancestor accepted, force-pushed-away SHA refused); real flock contention
   with the nightly updater lock; control plane started for real and queried through `/api/v1/fleet-rollouts*`;
-  outbox replay after killing the control plane; dirty-checkout pre-check against a real dirty repo.
+  outbox replay after killing the control plane; dirty-checkout pre-check against a real dirty repo; the loop
+  requests its self-restart (D12) exactly when a rollout succeeded and updated this host's herdr-engineering
+  row (seam-observed in throwaway HOMEs, and not for halted rollouts or an unchanged local install).
 - **Smoke** (`scripts/validate.sh` target + CI): `herdr-eng fleet-watch once --dry-run` against the fixture
   server; `fleet lock verify` on a sample lock; unit-file lint (`systemd-analyze verify`) for the service.
 - **E2E**: Playwright CLI (`npx playwright test`, never MCP) loads `#/fabric-management` against a control
   plane seeded with a three-host rollout (success, halted-at-bender, superseded) and asserts the three SVG
-  diagrams render, status classes, empty/error/stale states, and that an XSS-style `pr_title` appears
+  diagrams render, status classes, empty/error/stale states, and that an XSS-style string in a field is refused / appears
   escaped. A **real-host canary** (documented runbook, not CI): disposable branch on a fork repo merged, watcher
   rolls beast then a second Linux target, evidence recorded in `STATUS.md`. macOS path is verified live on
   `macbook-pro` only; CI can lint the plist but cannot prove macOS behaviour, and the PR says so.
@@ -403,3 +419,21 @@ dependency"); client-rendered diagrams from untrusted strings.
    existing operator-principal rules in `ingest.py` are sufficient or defer buttons to CLI-only in v1.
 8. Should `herdr-eng` on non-controller hosts own a checkout at all, or move to release-directory installs
    (atomic switch like Pi) so the dirty-checkout hazard disappears instead of being detected?
+
+## 14. Decision record: no free text in rollout events (2026-11-05)
+
+Section 8.1 specified a redacted `log_tail` (and a `pr_title`, free-form check names) with a denylist plus the existing
+`redact()`. Step 3 implemented that and it was reviewed three times; each round found secret shapes that survived or
+were stored (25 of 70 new shapes readable back in round 3, with 17.5% of ordinary lines wrongly withheld). Pattern
+redaction of arbitrary command output cannot be made safe, and the event store is readable by everyone with dashboard
+access. **The user chose option 1: remove all free text from the event model.**
+
+- `log_tail`, `pr_title` and `checks[].name` as free text are deleted. `checks[]` becomes `{name (closed enum), status
+  (ok|failed|skipped), duration_ms}`; the PR is identified by `trigger.pr` (int) and `trigger.sha`.
+- A log is a reference `log = {host, path_id (updater|installer|healthcheck), sha256 (64 hex), bytes, lines}`. The text
+  stays in a 0600 store on the host that captured it and is read with `herdr-eng fleet-watch log show <rollout_id> --host H`.
+- Every remaining string is an enum, a fleet host (`beast|bender|macbook-pro`), lowercase hex, or a UTC timestamp;
+  unknown fields are rejected. Secret-free is a property of the schema, proven by tests that put hundreds of
+  secret-shaped strings into every field and expect refusal.
+- The dashboard (step 6) shows the log reference and the host-side command, not the text.
+- Related fix: `seq` counters are never pruned (a resumed or recovered stream must not restart at 0).

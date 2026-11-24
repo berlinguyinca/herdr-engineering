@@ -28,7 +28,7 @@ import threading
 import time
 from collections import defaultdict
 from datetime import UTC, datetime
-from typing import Any, Protocol
+from typing import Any, NamedTuple, Protocol
 from urllib.parse import urlparse
 
 from ..assistant_packages import ManifestError, agent_package_record
@@ -39,9 +39,12 @@ from . import collab_models, ids, logfile_lock, placement
 from .collab_attention import AttentionMixin
 from .collab_context import ContextMixin
 from .collab_coordinators import CoordinatorsMixin
+from .collab_direct import DirectMixin
+from .collab_fabric_trust import FabricAuthMixin, FabricTrustMixin
 from .collab_federation import FederationMixin
 from .collab_team_briefs import BRIEF_NOTE as _TR_BRIEF_NOTE
 from .collab_team_briefs import TeamBriefsMixin
+from .collab_team_external import ExternalActionsMixin
 from .collab_team_roles import ROLE_FIELDS, TeamRolesMixin
 from .collab_team_rooms import TeamRoomsMixin
 from .collab_workbench import WorkbenchMixin
@@ -82,11 +85,14 @@ BULK_EVENTS = frozenset({"message", "comment_added", "comment_revised", "audit_d
                          # plan 3: the artifact bridge's audit trail (collab_artifacts); _apply ignores them
                          "artifact_tool_used", "artifact_commit_submitted", "artifact_upload_staged",
                          "suggestion_submitted",         # a guest can file one at will, so it stops early like chat
+                         "external_action_filed",        # slice 5: a filer can propose at will (audit record only)
                          "task_reminded"})               # the sweep's reminders stop early like chat
 # audit records only: committed, never wake a room's long-poll
 SILENT_EVENTS = frozenset({"workspace_terminal_authorized", "artifact_tool_used", "artifact_commit_submitted",
                            "artifact_upload_staged"})
 # events after which the artifact bridge's agents.json may be out of date
+AGENT_MAX_LIFE = 180 * 86400.0   # a connected agent's sliding window never carries it past this age; the owner's renew restarts it
+# (a slide is written only when under half the credential window is left, so the log pays about twice per window)
 AGENT_FEED_EVENTS = frozenset({"agent_revoked", "user_decided", "agent_enrolled"})
 # creation event -> kind (what is outstanding is recomputed from state, see _recount)
 REVOCABLE_CREATE = {"member_added": "member", "agent_granted": "grant", "agent_enrolled": "agent",
@@ -95,7 +101,8 @@ REVOCABLE_CREATE = {"member_added": "member", "agent_granted": "grant", "agent_e
                     "egress_decided": "egress", "egress_promoted": "egress", "room_profile_set": "egress",
                     "federation_share_granted": "fedshare", "federation_peer_enabled": "fedpeer",
                     "team_attached": "teamattach", "team_role_assigned": "teamrole",
-                    "team_coordinator_set": "teamcoord", "team_external_coordination_set": "teamext"}
+                    "team_coordinator_set": "teamcoord", "team_external_coordination_set": "teamext",
+                    "room_guest_level_set": "dglevel"}
 # every event that can change what _recount() returns (the cache is cleared when one is committed)
 COUNT_EVENTS = frozenset(REVOCABLE_CREATE) | {
     "member_removed", "agent_grant_revoked", "agent_grant_expired", "agent_revoked", "join_token_revoked",
@@ -131,6 +138,9 @@ class ApprovalPolicy:
         self.auto_groups = frozenset(auto_groups)
         self.approver_groups = frozenset(approver_groups)
 AGENT_ACTIONS = frozenset({"read", "post", "instruct", "execute", "spawn_helpers"})  # an agent can never invite/grant/administer
+# Fabric trust slice 4: "coordinate" is NOT in AGENT_ACTIONS (the ceiling every other path intersects with). Only the room owner's
+# direct grant, naming one attached team, carries it; see grant_agent and _effective.
+COORDINATE = "coordinate"
 PROJECT_ROLES = frozenset({"manager", "contributor"})
 
 MAX_TEXT = 8000
@@ -308,7 +318,8 @@ class StaticTokenAuthenticator:
 
 
 class Principal:
-    __slots__ = ("kind", "id", "owner", "digest", "exp", "status", "approver", "admin", "external")
+    __slots__ = ("kind", "id", "owner", "digest", "exp", "status", "approver", "admin", "external",
+                 "via", "machine", "peer")
 
     def __init__(self, kind: str, id: str, owner: str, digest: str | None = None,
                  exp: float | None = None):
@@ -317,6 +328,9 @@ class Principal:
         self.approver = False          # may approve or deny people waiting
         self.admin = False             # the operator on the tailnet-only listener: may also disable and remove
         self.external = False          # an agent a coworker enrolled by invite (T10): bound to one room, never a person
+        self.via: str | None = None    # "fabric" when the caller was identified by its tailnet machine, not a secret
+        self.machine: str | None = None   # the allow-listed machine that vouched for it (fabric only)
+        self.peer: str | None = None   # the real socket peer address it was resolved from (fabric only), re-checked on streams
 
     @property
     def key(self) -> str:
@@ -396,8 +410,23 @@ class FileEventLog:
     record = record_required
 
 
+def _coordinator_view(grant: dict) -> dict:
+    """What a room member may see of an agent's ``coordinate`` grant: the team and its exact role allow-list."""
+    return {"team_id": grant["coordinate_team"], "roles": sorted(grant.get("coordinate_roles") or [])}
+
+
+class _GroupClaim(NamedTuple):
+    """The last accepted group claim of a user: when seen, the groups, the token's ``iat`` (None when it had none) and
+    since when the claims have continuously lacked the member group (None while they include it)."""
+    at: float
+    groups: tuple[str, ...]
+    iat: float | None
+    removed_since: float | None
+
+
 class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixin, TeamRoomsMixin, TeamRolesMixin,
-                    CoordinatorsMixin, TeamBriefsMixin):
+                    CoordinatorsMixin, TeamBriefsMixin, DirectMixin, FabricTrustMixin, FabricAuthMixin,
+                    ExternalActionsMixin):
     def __init__(self, authenticator: UserAuthenticator, *, sink: Any = None,
                  now=None, enrollment_ttl: float = 600.0, credential_ttl: float = 12 * 3600.0,
                  stream_poll_seconds: float = 1.0, message_limit: int = 60,
@@ -408,8 +437,27 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                  max_log_events: int = 200_000, guest_ttl: float = 7 * 24 * 3600.0,
                  default_grant_ttl: float = 30 * 24 * 3600.0,
                  approval: ApprovalPolicy | None = None, delegation_enabled: bool = False,
-                 summary_fix: dict | None = None):
+                 summary_fix: dict | None = None, member_group: str | None = None,
+                 member_groups_ttl: float = 24 * 3600.0, member_groups_path: Any = None):
         self.auth = authenticator
+        # Member-owned artifacts (plan 5): the Cognito group whose people own artifacts as ``member:<user_id>``.
+        # None = feature off here. Group claims are only seen at sign-in, so the last claims per user are kept in
+        # memory (never logged) and forgotten after ``member_groups_ttl`` seconds without a sign-in.
+        if member_group is not None and (not isinstance(member_group, str) or not member_group.strip()):
+            raise ValueError("member_group must be a non-empty string")
+        if isinstance(member_groups_ttl, bool) or not isinstance(member_groups_ttl, (int, float)) \
+                or not member_groups_ttl > 0:
+            raise ValueError("member_groups_ttl must be a positive number")
+        self.member_group = member_group
+        self.member_groups_ttl = float(member_groups_ttl)
+        self._user_groups: dict[str, _GroupClaim] = {}
+        # Last-seen claims survive a restart in a private file (0600); a claim older than the TTL is "unknown", never
+        # "removed", so a restart or a quiet day cannot look like leaving the group to the worker.
+        self._groups_path = None if member_groups_path is None else str(member_groups_path)
+        self._groups_io = threading.Lock()
+        self._groups_saved = 0.0
+        if self._groups_path is not None and member_group is not None:
+            self._load_groups()
         self._revocable: dict[str, int] = {}                   # outstanding revocable things per kind (H2), from state
         self._outstanding_key = None
         self.degraded: str | None = None     # set when the durable log failed its startup integrity check
@@ -502,6 +550,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         self._requests_by_room: dict[str, set] = defaultdict(set)
         self._requests_by_agent: dict[str, set] = defaultdict(set)
         self._rooms_by_agent: dict[str, set] = defaultdict(set)
+        # grants that lapsed (agent_id -> room_id -> actions): the state drops a lapsed grant, an owner renew restores it
+        self._lapsed_grants: dict[str, dict[str, list]] = defaultdict(dict)
         self._links: dict[str, dict] = {}                    # link id -> room/workspace link
         self._links_by_room: dict[str, list] = defaultdict(list)
         self._primary: dict[tuple, str] = {}                 # (host, workspace id) -> link id of its primary room
@@ -526,6 +576,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         self._joins: dict[str, dict] = {}                    # token digest -> record
         self._joins_by_id: dict[str, str] = {}               # join id -> digest
         self._externals_by_room: dict[str, list] = defaultdict(list)   # room id -> external agent ids (T10)
+        self._ever_guests: set[str] = set()                  # users ever added to a room as a guest (survives lapse/removal)
         self._presence: dict[str, dict] = {}                 # external agent id -> last heartbeat; memory only, by design
         # Lineage write counters per ("agent"|"sponsor"|"room", id). Each is made durable AHEAD of its value
         # (reserve-ahead rows in the log), so after a restart a count can be too high by up to
@@ -538,6 +589,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         # plan 3: the collab-public artifact bridge (collab_artifacts.CollabArtifactBridge), wired by the server
         # when control_plane.collab_artifacts is enabled; None = no artifact tools
         self.artifact_bridge = None
+        self.member_service: Any = None     # MemberService, set by the cli wiring when a member group is configured
         self.stats = defaultdict(int)
         self._init_workbench()
         self._init_context()
@@ -546,7 +598,10 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         self._init_team_rooms()
         self._init_team_roles()
         self._init_coordinators()
+        self._init_fabric_trust()
+        self._init_fabric_auth()
         self._init_team_briefs()
+        self._init_external_actions()
 
     # ------------------------------------------------------------ plumbing
     @property
@@ -641,6 +696,12 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             return payload.get("paused") is True          # resuming helpers is an ordinary write
         if event_type == "team_external_coordination_set" and payload is not None:
             return payload.get("enabled") is False        # turning the opt-in OFF is a revocation; ON is an ordinary write
+        if event_type == "agent_fabric_set" and payload is not None:
+            return payload.get("fabric") is False         # clearing the fabric bit is a revocation; setting it is not
+        if event_type == "room_guest_level_set" and payload is not None:
+            return payload.get("revokes_direct") is True  # leaving Direct is a revocation (pre-paid by setting it); other toggles are ordinary
+        if event_type == "guest_direct_set" and payload is not None:
+            return payload.get("allowed") is False        # withdrawing one guest's Direct right is a revocation
         return event_type in SAFETY_EVENTS
 
     def _creation_cost(self, event_type: str, payload: dict | None) -> int:
@@ -653,6 +714,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             return 1 if payload.get("state") == "approved" else 0
         if event_type == "team_external_coordination_set":
             return 1 if payload.get("enabled") else 0
+        if event_type == "room_guest_level_set":
+            return 1 if payload.get("level") == "direct" else 0       # only Direct has something to take back
         if event_type == "room_profile_set":
             room = self._rooms.get(payload.get("room_id")) or {}
             have = set((room.get("profile") or {}).get("permanent_hosts") or ())
@@ -797,13 +860,15 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         t, p, seq = ev["event_type"], ev["payload"], ev["sequence"]
         if (self._apply_workbench(ev) or self._apply_context(ev) or self._apply_attention(ev)
                 or self._apply_federation(ev) or self._apply_team_rooms(ev) or self._apply_team_roles(ev)
-                or self._apply_coordinators(ev)):
+                or self._apply_coordinators(ev) or self._apply_direct(ev) or self._apply_external_actions(ev)):
             return
         if t == "external_usage_reserved":
             k = (p["scope"], p["key"])
             self._usage_reserved[k] = max(self._usage_reserved[k], int(p["reserved"]))
         elif t == "project_created":
             self._projects[p["project_id"]] = {"name": p["name"], "members": {p["actor_user_id"]: "manager"}}
+            if p.get("fabric_workspaces") and self._fabric_ws_project is None:
+                self._fabric_ws_project = p["project_id"]       # the fabric-workspaces project: first one wins, rebuilt on replay
         elif t == "project_member_added":
             self._projects[p["project_id"]]["members"][p["subject_user_id"]] = p["role"]
         elif t == "room_created":
@@ -812,6 +877,10 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 "members": {p["actor_user_id"]: {"role": "owner", "expires_at": None, "joined_seq": seq,
                                                  "joined_at": p.get("created_at")}},
                 "grants": {}}
+            fw = p.get("fabric_workspace")
+            if isinstance(fw, dict):                              # the workspace-room index: (whois machine, workspace id) -> room
+                self._rooms[p["room_id"]]["fabric_workspace"] = dict(fw)
+                self._fabric_ws_rooms.setdefault((fw["machine"], fw["workspace_id"]), p["room_id"])
         elif t == "room_profile_set":
             self._rooms[p["room_id"]]["profile"] = p["profile"]
         elif t == "user_registered":
@@ -821,6 +890,11 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             u = self._users.setdefault(p["user_id"], {"since": p["at"]})
             u.update(status=p["status"], decided_by=p["decided_by"], decided_at=p["at"], reason=p.get("reason"))
         elif t == "member_added":
+            # "lapsed guest" = the person's LATEST membership was a guest one: a later non-guest add clears it.
+            if p["role"] == "guest":
+                self._ever_guests.add(p["subject_user_id"])
+            else:
+                self._ever_guests.discard(p["subject_user_id"])
             self._rooms[p["room_id"]]["members"][p["subject_user_id"]] = {
                 "role": p["role"], "expires_at": p.get("expires_at"), "joined_seq": seq,
                 "joined_at": p.get("created_at")}
@@ -832,6 +906,9 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             for aid in [a for a in room["grants"] if self._agents.get(a, {}).get("owner") == p["subject_user_id"]]:
                 room["grants"].pop(aid, None)
                 self._rooms_by_agent[aid].discard(p["room_id"])
+            for aid, lapsed in self._lapsed_grants.items():        # nor a grant that had already lapsed (renew restores those)
+                if self._agents.get(aid, {}).get("owner") == p["subject_user_id"]:
+                    lapsed.pop(p["room_id"], None)
             gone = p["subject_user_id"]                # re-adding them later must not restore a terminal right
             self._prune_terminal(p["room_id"], lambda k: k == f"user:{gone}" or (
                 k.startswith("agent:") and self._agents.get(k[6:], {}).get("owner") == gone))
@@ -864,6 +941,10 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 "slot": slot, "_legacy_slot": taken, "aliases": [], "skills": list(p.get("skills") or []),
                 "owner": p["owner_user_id"], "device_id": p["device_id"], "harness_type": p["harness_type"],
                 "instance_id": p.get("instance_id"), "status": "active",
+                "machine": p.get("machine"), "origin": p.get("origin"), "life_end": p.get("life_end_epoch"),
+                # additive (older logs have neither); the bit starts OFF, except for an agent made by fabric-join (whois vouched)
+                "fabric": p.get("origin") == "fabric_join" and p.get("fabric") is True,
+                "fabric_expires_at": p.get("fabric_expires_at") if p.get("origin") == "fabric_join" else None,
                 "name": p.get("name") or _default_handle(p["harness_type"], p["agent_id"]),
                 "parent": p.get("parent_agent_id"), "join": p.get("join_digest"),
                 "cred_digest": p["secret_digest"], "expires_at": p["expires_at_epoch"],
@@ -871,6 +952,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                              if isinstance(p.get("external"), dict) else None)}
             self._by_cred[p["secret_digest"]] = p["agent_id"]
             self._agents_by_owner[p["owner_user_id"]].add(p["agent_id"])
+            if p.get("origin") == "fabric_join" and not isinstance(p.get("external"), dict):
+                self._fabric_join_index[(p["machine"], p["name"])] = p["agent_id"]
             if isinstance(p.get("external"), dict):
                 self._externals_by_room[p["external"]["room_id"]].append(p["agent_id"])
             if p.get("action") == "helper.agent.create":
@@ -891,6 +974,16 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 self._joins[self._joins_by_id[p["join_id"]]]["revoked"] = True
         elif t == "agent_linked":
             self._agents[p["agent_id"]]["instance_id"] = p.get("instance_id")
+        elif t == "agent_fabric_set":
+            a = self._agents.get(p["agent_id"])
+            if a is not None:
+                a["fabric"] = bool(p["fabric"])
+                a["fabric_expires_at"] = p.get("fabric_expires_at") if a["fabric"] else None   # absent = expired (fail closed)
+                if p.get("machine") and p.get("action") != "agent.fabric.renew":   # a renewal never rebinds the owner's choice
+                    a["machine"] = p["machine"]
+        elif t == "audit_denied":
+            if p.get("action") == "agent.fabric_join":
+                self._fabric_join_denied_total += 1
         elif t == "agent_renamed":
             a = self._agents[p["agent_id"]]
             if a["name"] not in a["aliases"]:                  # an old name keeps working as an alias
@@ -901,9 +994,12 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             a = self._agents[p["agent_id"]]
             self._by_cred.pop(a["cred_digest"], None)
             a.update(cred_digest=p["secret_digest"], expires_at=p["expires_at_epoch"])
+            if p.get("life_end_epoch") is not None:
+                a["life_end"] = p["life_end_epoch"]
             self._by_cred[p["secret_digest"]] = p["agent_id"]
         elif t == "agent_revoked":
             self._agents[p["agent_id"]]["status"] = "revoked"
+            self._lapsed_grants.pop(p["agent_id"], None)
             if self._agents[p["agent_id"]].get("external"):
                 self._agents[p["agent_id"]]["external"]["revoked_at"] = p["created_at"]
                 self._agents[p["agent_id"]]["external"]["revoked_by"] = (
@@ -912,7 +1008,10 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             for rid in self._requests_by_agent.get(p["agent_id"], ()):
                 self._requests[rid]["open"] = False
         elif t in ("agent_grant_revoked", "agent_grant_expired"):
-            self._rooms[p["room_id"]]["grants"].pop(p["agent_id"], None)
+            gone = self._rooms[p["room_id"]]["grants"].pop(p["agent_id"], None)
+            self._lapsed_grants[p["agent_id"]].pop(p["room_id"], None)
+            if t == "agent_grant_expired" and gone and not gone.get("team_id") and not gone.get("coordinate_team"):
+                self._lapsed_grants[p["agent_id"]][p["room_id"]] = list(gone["actions"])
             self._rooms_by_agent[p["agent_id"]].discard(p["room_id"])
             self._prune_terminal(p["room_id"], lambda k: k == "agent:" + p["agent_id"])
         elif t == "agent_access_requested":
@@ -939,6 +1038,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 "updated_at": p["created_at"], "seq": seq}
             self._tr2_fold_created(p["task_id"], p)
             self._tc_fold_created(p["task_id"], p)
+            self._dg_fold_created(p["task_id"], p)
             if p.get("reviews_task_id"):
                 self._tasks[p["task_id"]]["reviews"] = p["reviews_task_id"]
             if p.get("origin"):          # team rooms: written only by the server (a suggestion's approval), never by a request body
@@ -1114,10 +1214,17 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 self._rooms[runtime["room_id"]]["grants"].pop(aid, None)
                 self._rooms_by_agent[aid].discard(runtime["room_id"])
         elif t == "agent_granted":
+            self._lapsed_grants[p["agent_id"]].pop(p["room_id"], None)
             self._rooms[p["room_id"]]["grants"][p["agent_id"]] = {
-                "actions": list(p["actions"]), "expires_at": p.get("expires_at"), "granted_seq": seq}
+                "actions": list(p["actions"]), "expires_at": p.get("expires_at"), "granted_seq": seq,
+                **({"coordinate_team": p["coordinate_team"],
+                   # a grant written before the role list existed replays as EMPTY: fail closed, the owner re-grants
+                   "coordinate_roles": list(p.get("coordinate_roles") or [])} if p.get("coordinate_team") else {})}
             self._agent_projects[p["agent_id"]].add(p["project_id"])
             self._rooms_by_agent[p["agent_id"]].add(p["room_id"])
+            fw = p.get("fabric_workspace")
+            if isinstance(fw, dict) and p["agent_id"] in self._agents:   # binds the auto-joined agent to its one workspace
+                self._agents[p["agent_id"]]["workspace"] = {**fw, "room_id": p["room_id"]}
         elif t == "workspace_linked":
             self._links[p["link_id"]] = {
                 "link_id": p["link_id"], "room_id": p["room_id"], "workspace_id": p["workspace_id"],
@@ -1294,9 +1401,14 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                     lk["grants"] = [g for g in lk["grants"] if g != "terminal"]
 
     # ------------------------------------------------------ authentication
-    def authenticate(self, authorization: str, device: str | None) -> Principal:
+    def authenticate(self, authorization: str, device: str | None, *, peer_ip: str | None = None,
+                     machine: str | None = None) -> Principal:
+        """``peer_ip`` is the REAL socket peer address (never X-Forwarded-For) and ``machine`` the informational
+        ``X-Herdr-Machine`` header; both matter only to the ``Fabric`` scheme."""
         scheme, _, token = (authorization or "").partition(" ")
         token = token.strip()
+        if scheme == "Fabric":
+            return self._fabric_authenticate(token, peer_ip, machine)
         if self.degraded and scheme != "Bearer":
             self.stats["auth_failures"] += 1       # agents cannot be verified without the log: same 401 as any bad token
             raise CollabError(401, "unauthorized")
@@ -1305,6 +1417,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             raise CollabError(401, "unauthorized")
         if scheme == "Bearer":
             claims = getattr(self.auth, "verify_claims", None)
+            c = None
             if claims is not None:
                 c = claims(token)
                 got, groups = ((c["user"], c["exp"]), c["groups"]) if c else (None, [])
@@ -1316,6 +1429,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             if self.degraded:                      # only a caller with a VALID token learns that collaboration is down
                 raise CollabError(503, "collaboration is disabled; ask the operator")
             pr = Principal("user", got[0], got[0], exp=got[1])
+            if claims is not None:
+                self._note_groups(got[0], groups, c.get("iat") if c else None, bool(c and c.get("groups_capped")))
             if self.approval is not None:
                 self._admit(pr, set(groups))
             return pr
@@ -1343,12 +1458,217 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                     raise CollabError(401, "unauthorized")
                 pr = Principal("agent", aid, agent["owner"], digest)
                 pr.external = bool(agent.get("external"))
+                self._slide_agent(pr, agent)
                 return pr
         self.stats["auth_failures"] += 1
         raise CollabError(401, "unauthorized")
 
+    def _slide_agent(self, pr: Principal, agent: dict) -> None:
+        """Sliding window for an agent made by ``connect_agent``: a successful use moves ``expires_at`` to now + the remote TTL,
+        written only once less than half the window is left (about twice per window, so a busy agent does not spend the log),
+        and never past ``life_end`` (AGENT_MAX_LIFE after creation or the owner's last renew; an agent made before the cap
+        existed gets its cap at its first slide). Never a helper, fabric or externally bound agent (their life is bound
+        elsewhere); only called after the agent proved active and unexpired. Room grants are NOT slid: they keep their own
+        expiry. Best effort: a full or failing log must not fail authentication. Caller holds the lock."""
+        aid = pr.id
+        if (agent.get("origin") != "connect" or agent.get("external") or agent.get("fabric")
+                or aid in self._helper_minted or aid in self._helper_by_agent):
+            return
+        now = self._now()
+        if agent["expires_at"] - now >= self.remote_credential_ttl / 2:
+            return
+        life_end = agent.get("life_end")
+        capless = life_end is None
+        if capless:
+            life_end = now + AGENT_MAX_LIFE
+        expires = min(now + self.remote_credential_ttl, life_end)
+        if expires <= agent["expires_at"]:
+            return                                        # the cap is reached: the owner renews
+        try:
+            self._commit("credential_rotated", self._actor(
+                pr, agent_id=aid, secret_digest=agent["cred_digest"], expires_at_epoch=expires,
+                action="agent.slide", outcome="allowed", project_ids=[], resource_id=aid,
+                **({"life_end_epoch": life_end} if capless else {})))
+        except CollabError:
+            pass
+
     _REFUSED = {"denied": "your request to join was declined", "disabled": "your account is disabled",
                 "kicked": "your access was removed"}
+
+    # ---------------------------------------------------------- member-owned artifacts (plan 5)
+    MAX_NOTED_GROUPS = 64
+
+    MEMBER_FORGET_AFTER = 30 * 24 * 3600.0     # an unrefreshed claim is "unknown" for this long, then forgotten
+    GROUPS_SAVE_EVERY = 300.0
+
+    def _note_groups(self, uid: str, groups: Any, iat: Any = None, capped: bool = False) -> None:
+        """Remember the group claims of a verified sign-in; wake the feed when the set changed.
+
+        Evidence rules (a claim that cannot be trusted to be the newest is ignored, never read as "left the group"):
+        an empty claim proves nothing; a claim capped by the verifier that lacks the member group proves nothing (the
+        group may be past the cap); a token older (``iat``) than the one already recorded is ignored; a token with no
+        ``iat`` can confirm membership but never record a removal."""
+        clean = tuple(sorted({g for g in (groups if isinstance(groups, (list, tuple, set, frozenset)) else ())
+                              if isinstance(g, str) and 0 < len(g) <= 128}))[:self.MAX_NOTED_GROUPS]
+        if not clean:
+            return
+        member = self.member_group is not None and self.member_group in clean
+        if capped and not member:
+            return
+        stamp = None if isinstance(iat, bool) or not isinstance(iat, (int, float)) or not math.isfinite(iat) \
+            else float(iat)
+        if stamp is None and not member:
+            return
+        with self._lock:
+            old = self._user_groups.get(uid)
+            if old is not None and stamp is not None and old.iat is not None and stamp < old.iat:
+                return
+            now = self._now()
+            if stamp is None and old is not None:
+                stamp = old.iat
+            removed_since = None
+            if not member and self.member_group is not None:
+                removed_since = old.removed_since if old is not None and old.removed_since is not None else now
+            self._user_groups[uid] = _GroupClaim(now, clean, stamp, removed_since)
+            changed = old is None or old.groups != clean
+            persist = changed or now - self._groups_saved >= self.GROUPS_SAVE_EVERY
+        if persist:
+            self._save_groups()
+        bridge = self.artifact_bridge
+        if changed and bridge is not None and self.member_group is not None:
+            bridge.agents_changed()
+
+    def _save_groups(self) -> None:
+        """Atomically (tmp + fsync + rename, mode 0600) persist the last-seen claims; failure is logged by type only."""
+        path = self._groups_path
+        if path is None:
+            return
+        with self._lock:
+            snap = {u: {"at": c.at, "groups": list(c.groups), "iat": c.iat, "removed_since": c.removed_since}
+                    for u, c in self._user_groups.items()}
+            self._groups_saved = self._now()
+        data = json.dumps({"version": 1, "users": snap}, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        try:
+            with self._groups_io:
+                directory = os.path.dirname(path) or "."
+                os.makedirs(directory, mode=0o700, exist_ok=True)
+                tmp = f"{path}.tmp-{os.getpid()}"
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+                try:
+                    os.fchmod(fd, 0o600)
+                    view = memoryview(data)
+                    while view:
+                        view = view[os.write(fd, view):]
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                os.replace(tmp, path)
+        except OSError as exc:
+            print(f"collab: member group claims not saved error={type(exc).__name__}", file=sys.stderr)
+
+    def _load_groups(self) -> None:
+        """Read the persisted claims; a missing, damaged or hostile file (any parse failure, including deeply nested
+        JSON) means no knowledge: everyone starts unseen. Never raises."""
+        try:
+            with open(self._groups_path, "rb") as fh:
+                doc = json.loads(fh.read(8 * 1024 * 1024))
+            users = doc["users"]
+            if not isinstance(users, dict):
+                return
+            loaded: dict[str, _GroupClaim] = {}
+            for uid, row in users.items():
+                try:
+                    at, groups = float(row["at"]), row["groups"]
+                    iat, since = row.get("iat"), row.get("removed_since")
+                    iat = float(iat) if isinstance(iat, (int, float)) and not isinstance(iat, bool) else None
+                    since = float(since) if isinstance(since, (int, float)) and not isinstance(since, bool) else None
+                except (KeyError, TypeError, ValueError, AttributeError):
+                    continue
+                if isinstance(uid, str) and math.isfinite(at) and isinstance(groups, list) \
+                        and all(x is None or math.isfinite(x) for x in (iat, since)):
+                    clean = tuple(sorted({g for g in groups if isinstance(g, str) and 0 < len(g) <= 128}))[
+                        :self.MAX_NOTED_GROUPS]
+                    if clean:
+                        loaded[uid] = _GroupClaim(at, clean, iat, since)
+            self._user_groups.update(loaded)
+        except Exception:  # incl. RecursionError, MemoryError
+            return
+
+    def _member_status(self, uid: str) -> tuple[str, list[str]] | None:
+        """``(status, groups)`` for a user whose claims were ever seen, else None. Caller holds the lock.
+
+        approved/disabled: fresh claims include the member group.  removed: fresh claims do not (positive evidence).
+        unknown: the claims are older than the TTL (or from the future): they prove nothing about group membership.
+
+        The account record is positive evidence whatever the claim age: a disabled account (last seen in the member
+        group) reports ``disabled`` even when idle past the TTL. Only the group part goes stale, so group REMOVAL
+        still needs a fresh sign-in claim (there is no synced directory to consult)."""
+        seen = self._user_groups.get(uid)
+        if seen is None or self.member_group is None:
+            return None
+        age = self._now() - seen.at
+        if not 0 <= age <= self.member_groups_ttl:
+            if not 0 <= age <= self.MEMBER_FORGET_AFTER:
+                return None
+            if (self.member_group in seen.groups and self.approval is not None and uid in self._users
+                    and not self._ok(uid)):
+                return "disabled", list(seen.groups)
+            return "unknown", list(seen.groups)
+        groups = list(seen.groups)
+        if self.member_group not in groups:
+            return "removed", groups
+        if self.approval is not None and uid not in self._users:   # no account record (e.g. log not replayed): no proof
+            return "unknown", groups
+        return ("approved" if self._ok(uid) else "disabled"), groups
+
+    def _groups_of(self, uid: str) -> list[str]:
+        """The fresh last-seen groups of ``uid`` (``[]`` when never seen or older than the TTL). Caller holds the lock."""
+        seen = self._user_groups.get(uid)
+        if seen is None or not 0 <= self._now() - seen.at <= self.member_groups_ttl:
+            return []
+        return list(seen.groups)
+
+    def member_directory(self) -> dict | None:
+        """``member-directory.json``'s body, or None when no member group is configured.
+
+        Every user whose claims were seen is listed with an explicit status: approved / disabled (in the group),
+        removed (fresh claims without it) or unknown (claims expired). The worker destroys only on disabled/removed."""
+        group = self.member_group
+        if group is None:
+            return None
+        users: dict[str, dict] = {}
+        with self._lock:
+            for uid in list(self._user_groups):
+                got = self._member_status(uid)
+                if got is None:
+                    continue
+                status, groups = got
+                email = self._user_email.get(uid) if status != "removed" else None
+                users[uid] = {"email": email, "display_name": email.split("@")[0] if email else uid,
+                              "status": status, "groups": groups}
+                if status == "removed":
+                    users[uid]["removed_since"] = self._user_groups[uid].removed_since
+        return {"group": group, "users": users}
+
+    def member_check(self, pr: Principal):
+        """The ``member_for_actor`` verdict for an authenticated principal (an agent is judged by its owner)."""
+        from .artifact_members import MemberCheck, member_for_actor
+        group = self.member_group
+        if group is None:
+            return MemberCheck(False, None, "members_disabled")
+        with self._lock:
+            if pr.is_agent:
+                a = self._agents.get(pr.id)
+                if a is None:
+                    return MemberCheck(False, None, "unknown_agent")
+                actor = {"kind": "agent", "agent_id": pr.id}
+                agents = {pr.id: {"owner": a["owner"], "status": a.get("status"), "external": bool(a.get("external"))}}
+                uid = a["owner"]
+            else:
+                actor, agents, uid = {"kind": "user", "user_id": pr.id}, {}, pr.id
+            got = self._member_status(uid)
+            directory = {} if got is None else {uid: {"status": got[0], "groups": got[1]}}
+        return member_for_actor(actor, agents=agents, group=group, directory=directory)
 
     def _admit(self, pr: Principal, groups: set) -> None:
         """Approval mode: record a first sign-in, apply the automatic rules, refuse the refused. Someone
@@ -1389,6 +1709,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
 
     def still_valid(self, pr: Principal) -> bool:
         """Re-check a long-lived stream's principal (revocation / expiry / owner loss)."""
+        if pr.via == "fabric":
+            return self._fabric_still_valid(pr)
         with self._lock:
             if pr.kind == "user":
                 # An open stream ends when its token expires (the client re-opens
@@ -1426,6 +1748,17 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             if not room or self._member(room, pr.id) is None:
                 raise CollabError(404, "not found")
         return self.artifact_room_handle(pr.id, room_id, query)
+
+    def readable_room_ids(self, pr: Principal) -> list[str]:
+        """Ids of the rooms ``pr`` may read right now. Same rule as ``_authorize(.., "read", ..)`` but silent (no audit row,
+        no denial counter): for projections that must filter, not probe."""
+        with self._lock:
+            out = []
+            for rid, room in self._rooms.items():
+                eff = self._effective(pr, room)
+                if eff is not None and "read" in eff[0]:
+                    out.append(rid)
+            return out
 
     def room_exists(self, room_id: str) -> bool:
         """Whether a room by this id exists. For callers (API keys) that have no room membership of their own."""
@@ -1473,6 +1806,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         if not m or not self._ok(agent["owner"]):
             return None  # owner lost membership: the agent loses it too
         allowed = frozenset(grant["actions"]) & ROLE_ACTIONS[m["role"]] & AGENT_ACTIONS
+        if COORDINATE in grant["actions"] and grant.get("coordinate_team") and m["role"] == "owner":
+            allowed |= {COORDINATE}          # slice 4: the owner's own agent, granted by the owner for one team; never inherited
         bound = agent.get("external")
         if bound:
             # An external agent is bound to the room it was invited into: a later grant anywhere else
@@ -1538,8 +1873,11 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
 
     @staticmethod
     def _actor(pr: Principal, **extra) -> dict:
-        return {"actor_user_id": pr.owner, "actor_agent_id": pr.id if pr.is_agent else None,
-                "actor_kind": "external" if pr.external else pr.kind, **extra}
+        out = {"actor_user_id": pr.owner, "actor_agent_id": pr.id if pr.is_agent else None,
+               "actor_kind": "external" if pr.external else pr.kind}
+        if pr.via:                                    # additive audit fields: how the caller was identified
+            out.update(via=pr.via, machine=pr.machine)
+        return {**out, **extra}
 
     def _require_user(self, pr: Principal) -> None:
         if pr.is_agent:
@@ -1563,8 +1901,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
 
     def _agent_slots(self, owner: str, extra: int = 1) -> None:
         now = self._now()
-        live = sum(1 for aid in self._agents_by_owner.get(owner, ())
-                   if (a := self._agents[aid])["status"] == "active" and a["expires_at"] > now)
+        live = sum(1 for aid in self._agents_by_owner.get(owner, ())      # auto-joined agents have their own caps (fabric_trust)
+                   if (a := self._agents[aid])["status"] == "active" and a["expires_at"] > now and a.get("origin") != "fabric_join")
         waiting = sum(1 for d in self._pending_by_owner.get(owner, ())
                       if not (r := self._pending[d])["used"] and r["expires_at"] > now)
         if live + waiting + extra > self.max_agents_per_user:
@@ -1679,6 +2017,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 resource_id=room_id))
             self._expire_helpers()                   # their helpers in this room end now and free their slots
             self._tc_reconcile_room(room_id)         # slice 3: a removed coordinator's open assignments are requeued now
+            self._dg_reconcile_room(room_id)         # Direct: a removed guest's open tasks are cancelled now
         self._xlink_sweep(room_id)          # T14: links this person made no longer stand
         return {"ok": True}
 
@@ -1927,6 +2266,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 self.stats["auth_failures"] += 1
                 raise CollabError(401, "unauthorized")
             skills = _skills(body.get("skills"))
+            machine = _machine(body.get("machine"))
             aid, cred = ids.new_id("agent"), "hca_" + secrets.token_urlsafe(32)
             expires = self._now() + self.credential_ttl
             instance = body.get("instance_id")
@@ -1936,7 +2276,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 "harness_type": rec["harness_type"],
                 "instance_id": instance if isinstance(instance, str) and len(instance) <= 120
                 and not _NAME_BAD.search(instance) else None,
-                **({"skills": skills} if skills else {}),
+                **({"skills": skills} if skills else {}), **({"machine": machine} if machine else {}),
                 "secret_digest": _digest(cred), "expires_at_epoch": expires,
                 "action": "agent.enroll", "outcome": "allowed",
                 "project_ids": [], "resource_id": aid})
@@ -1962,6 +2302,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         label = _name(body.get("harness_type", "claude-code"), "harness_type")
         handle = _handle(body["name"]) if body.get("name") is not None else None
         skills = _skills(body.get("skills"))
+        machine = _machine(body.get("machine"))
         cred = "hca_" + secrets.token_urlsafe(32)
         device = "remote-" + secrets.token_hex(8)
         expires = self._now() + self.remote_credential_ttl
@@ -1973,7 +2314,9 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 "actor_user_id": pr.id, "actor_agent_id": None, "agent_id": aid,
                 "owner_user_id": pr.id, "code_digest": None, "device_id": device,
                 "harness_type": label, "instance_id": None, "name": handle, "parent_agent_id": parent,
-                **({"skills": skills} if skills else {}),
+                "origin": "connect",             # marks the agents whose window slides on use (see _slide_agent)
+                "life_end_epoch": self._now() + AGENT_MAX_LIFE,
+                **({"skills": skills} if skills else {}), **({"machine": machine} if machine else {}),
                 "secret_digest": _digest(cred),
                 "expires_at_epoch": expires, "action": "agent.connect", "outcome": "allowed",
                 "project_ids": [], "resource_id": aid})
@@ -2092,6 +2435,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 return self._redeem_external(rec, digest, body, client)
             owner = rec["owner"]
             skills = _skills(body.get("skills"))
+            machine = _machine(body.get("machine"))
             self._agent_slots(owner)
             name = self._agent_names(owner, rec["prefix"], 1)[0]
             aid, cred = ids.new_id("agent"), "hca_" + secrets.token_urlsafe(32)
@@ -2104,7 +2448,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 "parent_agent_id": rec.get("parent") if (self._agents.get(rec.get("parent")) or {}).get("status") == "active" else None,
                 "instance_id": instance if isinstance(instance, str) and len(instance) <= 120
                 and instance and not _NAME_BAD.search(instance) else None,
-                **({"skills": skills} if skills else {}),
+                **({"skills": skills} if skills else {}), **({"machine": machine} if machine else {}),
                 "secret_digest": _digest(cred), "expires_at_epoch": expires,
                 "action": "agent.join", "outcome": "allowed", "project_ids": [], "resource_id": aid})
             request_id = self._file_request(owner, rec["room_id"], aid, rec["actions"]) if rec["room_id"] else None
@@ -2831,7 +3175,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             out = []
             for aid in self._agents_by_owner.get(pr.id, ()):
                 a = self._agents[aid]
-                rooms = [{"room_id": rid, "name": self._rooms[rid]["name"], "actions": g["actions"]}
+                rooms = [{"room_id": rid, "name": self._rooms[rid]["name"], "actions": g["actions"],
+                          **({"coordinator": _coordinator_view(g)} if g.get("coordinate_team") else {})}
                          for rid in self._rooms_by_agent.get(aid, ()) if (g := self._rooms[rid]["grants"].get(aid))]
                 pending = [{"room_id": r["room_id"], "name": self._rooms[r["room_id"]]["name"],
                             "actions": r["actions"]} for r in map(self._requests.get, self._requests_by_agent.get(aid, ()))
@@ -2839,9 +3184,14 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                            and self._now() - r["created_epoch"] < REQUEST_TTL]
                 out.append({"agent_id": aid, "name": a["name"], "harness_type": a["harness_type"],
                             "instance_id": a.get("instance_id"), "external": bool(a.get("external")),
+                            "machine": a.get("machine"), "fabric": bool(a.get("fabric")),
+                            "fabric_expires_at": a.get("fabric_expires_at"), "origin": a.get("origin"),
+                            "workspace": ({"id": a["workspace"]["workspace_id"], "label": a["workspace"].get("label"),
+                                           "room_id": a["workspace"]["room_id"], "tab_id": a["workspace"].get("tab_id"),
+                                           "pane_id": a["workspace"].get("pane_id")} if a.get("workspace") else None),
                             "online": any(self._online(r["room_id"], "agent", aid) for r in rooms),
                             "status": a["status"], "expires_at": a["expires_at"], "rooms": rooms,
-                            "pending": pending})
+                            "renewable": self._renewable(aid, a), "pending": pending})
         return {"agents": out}
 
     def agent_rooms(self, pr: Principal) -> dict:
@@ -2857,7 +3207,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         return {"rooms": out}
 
     def rotate_credential(self, pr: Principal) -> dict:
-        if not pr.is_agent:
+        if not pr.is_agent or pr.via == "fabric":     # a machine identity must never be turned into a secret
             raise CollabError(403, "forbidden")
         cred = "hca_" + secrets.token_urlsafe(32)
         expires = self._now() + self.credential_ttl
@@ -2876,6 +3226,69 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 project_ids=[bound["project_id"]] if bound else [], resource_id=pr.id))
         return {"agent_id": pr.id, "credential": cred, "expires_at": expires}
 
+    def renew_agent(self, pr: Principal, agent_id: str) -> dict:
+        """Owner only: give one of the owner's own agents a NEW credential and a fresh window, even when it has expired, keeping
+        its id, device, name and room grants. The old secret stops working at once; the new one is shown once. Never a revoked
+        agent, a helper (its life is the helper's), a fabric-machine identity, or an externally bound one (the invite's
+        hard expiry is never extended). An agent cannot call this (it has ``rotate``)."""
+        self._require_user(pr)
+        cred = "hca_" + secrets.token_urlsafe(32)
+        with self._lock:
+            agent = self._agents.get(agent_id)
+            if not agent or agent["owner"] != pr.id:
+                raise CollabError(404, "not found")
+            if agent["status"] != "active":
+                raise CollabError(409, "a revoked agent cannot be renewed")
+            if not self._renewable(agent_id, agent):
+                raise CollabError(403, "this agent cannot be renewed")
+            if self._now() >= agent["expires_at"]:
+                self._agent_slots(pr.id)                  # an expired agent holds no slot; renewing takes one back
+            expires = self._now() + self.remote_credential_ttl
+            self._commit("credential_rotated", self._actor(
+                pr, agent_id=agent_id, secret_digest=_digest(cred), expires_at_epoch=expires,
+                life_end_epoch=self._now() + AGENT_MAX_LIFE,
+                action="agent.renew", outcome="allowed", project_ids=[], resource_id=agent_id))
+            device, name = agent["device_id"], agent["name"]
+            restored = self._restore_grants(pr, agent_id, expires)
+        return {"agent_id": agent_id, "credential": cred, "device_id": device, "expires_at": expires, "name": name,
+                "grants_restored": restored}
+
+    def _renewable(self, agent_id: str, agent: dict) -> bool:
+        """The kinds of agent an owner may renew: not external, fabric, fabric-join or helper ones (a revoked one is refused apart)."""
+        return not (agent.get("external") or agent.get("fabric") or agent.get("origin") == "fabric_join"
+                    or agent_id in self._helper_minted or agent_id in self._helper_by_agent)
+
+    def _restore_grants(self, pr: Principal, agent_id: str, expires: float) -> list[str]:
+        """After an owner renew: re-grant, with the SAME actions, every room grant of the agent that lapsed (housekeeping drops
+        it from state; the actions are kept in ``_lapsed_grants``) or lapses before ``expires``, running to ``expires``. Only
+        rooms the owner owns (the rule for a direct grant); team-attached and coordinate grants are left alone (their own
+        approval or team decides). A room that no longer allows it is skipped, never fatal. Caller holds the lock."""
+        wanted = {rid: list(actions) for rid, actions in self._lapsed_grants.get(agent_id, {}).items()}
+        for rid in self._rooms_by_agent.get(agent_id, ()):
+            g = (self._rooms.get(rid) or {}).get("grants", {}).get(agent_id)
+            if (g and g["expires_at"] is not None and g["expires_at"] < expires
+                    and not g.get("team_id") and not g.get("coordinate_team")):
+                wanted[rid] = list(g["actions"])
+        done = []
+        name = self._agents[agent_id]["name"]
+        for rid, actions in sorted(wanted.items()):
+            room = self._rooms.get(rid)
+            if room and agent_id in room["grants"] and rid in self._lapsed_grants.get(agent_id, {}):
+                continue                                    # something else holds a grant here now (a team attach): never overwrite
+            m = self._member(room, pr.id) if room else None
+            if not m or m["role"] != "owner":
+                continue
+            try:
+                self._name_free(room, agent_id, name)
+                self._commit("agent_granted", self._actor(
+                    pr, project_id=room["project_id"], room_id=rid, agent_id=agent_id, actions=actions,
+                    expires_at=expires, action="agent.grant", outcome="allowed",
+                    project_ids=[room["project_id"]], resource_id=agent_id))
+            except CollabError:
+                continue
+            done.append(rid)
+        return done
+
     def revoke_agent(self, pr: Principal, agent_id: str) -> dict:
         self._require_user(pr)
         with self._lock:
@@ -2891,6 +3304,33 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             self._end_agent(self._actor(pr), agent_id, "revoked", set())      # and every helper under it
         self._refresh_agent_feed()
         return {"ok": True}
+
+    def set_agent_fabric(self, pr: Principal, agent_id: str, body: dict) -> dict:
+        """Owner only: switch the ``fabric`` bit of one of the owner's own agents, optionally (re)recording the machine it is
+        bound to. Agents (fabric ones included) can never call this, and an external or helper agent can never carry the bit."""
+        self._require_user(pr)
+        fabric = body.get("fabric")
+        if not isinstance(fabric, bool):
+            raise CollabError(400, "fabric must be true or false")
+        machine = _machine(body.get("machine"))
+        with self._lock:
+            agent = self._agents.get(agent_id)
+            if (not agent or agent["status"] != "active" or agent["owner"] != pr.id
+                    or agent.get("external") or agent_id in self._helper_minted or agent_id in self._helper_by_agent):
+                raise CollabError(404, "not found")
+            bound = machine or agent.get("machine")
+            if fabric and not bound:
+                raise CollabError(400, "the agent has no machine; give one with machine")
+            changed = bool(agent.get("fabric")) != fabric or bound != agent.get("machine")
+            if not fabric and not changed:
+                return {"agent_id": agent_id, "fabric": False, "machine": bound, "changed": False}
+            expires = self._now() + self.fabric_trust_cfg()["agent_ttl_seconds"] if fabric else None
+            self._commit("agent_fabric_set", self._actor(            # setting the bit again renews the expiry
+                pr, agent_id=agent_id, fabric=fabric, machine=bound, fabric_expires_at=expires,
+                action="agent.fabric.set" if fabric else "agent.fabric.clear", outcome="allowed",
+                project_ids=[], resource_id=agent_id))
+        return {"agent_id": agent_id, "fabric": fabric, "machine": bound, "changed": changed,
+                **({"fabric_expires_at": expires} if fabric else {})}
 
     # ------------------------------------------------------- room profile
     def _profile(self, room_id: str) -> dict:
@@ -3197,9 +3637,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             model = choice.model if isinstance(choice.model, str) else None
             hid = ids.new_id("collab")
             # The text rides in its own event with no "action": the audit log and the room feed never show it.
-            self._commit("helper_task", {"actor_user_id": pr.owner, "actor_agent_id": pr.id, "helper_id": hid,
-                                         "task": task, "tier": str(choice.tier)[:40],
-                                         "model_reason": str(choice.reason)[:200]})
+            self._commit("helper_task", self._actor(pr, helper_id=hid, task=task, tier=str(choice.tier)[:40],
+                                                    model_reason=str(choice.reason)[:200]))
             try:
                 self._commit("helper_requested", self._actor(
                     pr, project_id=room["project_id"], room_id=room_id, helper_id=hid, requester_agent_id=pr.id,
@@ -3486,7 +3925,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             while name in taken:
                 name = f"{r['role']}-{secrets.token_hex(3)}"
             aid, cred, device = ids.new_id("agent"), "hca_" + secrets.token_urlsafe(32), "helper-" + secrets.token_hex(8)
-            actions = sorted(allowed)
+            actions = sorted(allowed - {COORDINATE})     # a helper never holds coordinate; do not list it
             grant_exp = (room["grants"].get(r["requester_agent_id"]) or {}).get("expires_at")
             expires = r["expires_epoch"]
             self._commit("agent_enrolled", self._actor(
@@ -3619,8 +4058,9 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             aid = body["agent_id"]
             if (room["grants"].get(aid) or {}).get("team_id"):
                 raise CollabError(409, "this agent's access comes from an attached team; detach the team to change it")
-            actions = _actions(body.get("actions"))
+            actions = _actions(body.get("actions"), allow_coordinate=True)
             m = self._member(room, pr.id)
+            coordinate_team, coordinate_roles = self._grant_coordinate(pr, room, room_id, aid, actions, body, m)
             existing = room["grants"].get(aid)
             self._name_free(room, aid, agent["name"])
             narrowing = bool(existing) and set(actions) <= set(existing["actions"])
@@ -3633,7 +4073,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 self._commit("agent_granted", self._actor(
                     pr, project_id=room["project_id"], room_id=room_id, agent_id=aid,
                     actions=actions, expires_at=exp, action="agent.grant", outcome="allowed",
-                    project_ids=[room["project_id"]], resource_id=aid))
+                    project_ids=[room["project_id"]], resource_id=aid,
+                    **({"coordinate_team": coordinate_team, "coordinate_roles": coordinate_roles} if coordinate_team else {})))
                 return {"room_id": room_id, "agent_id": aid, "actions": actions, "status": "granted"}
             now = self._now()
             open_here = [r for r in map(self._requests.get, self._requests_by_room.get(room_id, ()))
@@ -3647,6 +4088,32 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 actions=actions, created_epoch=now, action="agent.request", outcome="allowed",
                 project_ids=[room["project_id"]], resource_id=aid))
         return {"room_id": room_id, "agent_id": aid, "actions": actions, "status": "pending", "request_id": rid}
+
+    def _grant_coordinate(self, pr: Principal, room: dict, room_id: str, aid: str, actions: list[str], body: dict, m: dict) -> tuple[str | None, list[str]]:
+        """Fabric trust slice 4. ``coordinate`` is granted by the room OWNER alone, directly (never by request and never by an agent:
+        grant_agent is a person's route), for ONE attached team of this room, to the owner's own ordinary agent."""
+        team, roles = body.get("team_id"), body.get("roles")
+        if COORDINATE not in actions:
+            if team is not None or roles is not None:
+                raise CollabError(400, "team_id and roles go with the coordinate action")
+            return None, []
+        if m["role"] != "owner":
+            self._audit_denied(pr, "agent.grant", "coordinate_owner_only", room_id=room_id,
+                               project_ids=[room["project_id"]], resource_id=aid)
+            self.stats["policy_denied"] += 1
+            raise CollabError(403, "forbidden: only the room owner grants coordinate")
+        if aid in self._helper_minted or aid in self._helper_by_agent:
+            raise CollabError(400, "a helper cannot coordinate")
+        if not isinstance(team, str):
+            raise CollabError(400, "coordinate names the attached team it coordinates: team_id")
+        if self._tr2_attached(room_id, team) is None:
+            raise CollabError(404, "no such team in this room")
+        from .collab_team_rooms import TEAM_ROLE_ACTIONS
+        if (not isinstance(roles, list) or not roles or len(set(roles)) != len(roles)
+                or not all(isinstance(r, str) and r in TEAM_ROLE_ACTIONS for r in roles)):
+            raise CollabError(400, "coordinate names the team roles it may assign to: roles, a non-empty list of "
+                                   + ", ".join(sorted(TEAM_ROLE_ACTIONS)))
+        return team, sorted(roles)
 
     def _helper_room_only(self, agent_id: str, room_id: str) -> None:
         h = self._helper_by_agent.get(agent_id)
@@ -3855,7 +4322,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                         "status": "active" if g and a.get("status") == "active" else "removed",
                         "instance_id": a.get("instance_id") if a.get("owner") == pr.id else None,
                         "parent_agent_id": a.get("parent") if a.get("parent") in room["grants"] else None,
-                        "group": _herd_group(a.get("name", ""))}
+                        "group": _herd_group(a.get("name", "")),
+                        **({"coordinator": _coordinator_view(g)} if g and g.get("coordinate_team") else {})}
                 return nodes[key]
 
             def user_node(uid: str) -> dict:
@@ -3961,10 +4429,11 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 a = self._agents.get(aid)
                 if a and a["status"] == "active":
                     out.append({"agent_id": aid, "name": a["name"], "harness_type": a["harness_type"],
-                                "owner_user_id": a["owner"], "actions": g["actions"],
+                                "owner_user_id": a["owner"], "actions": g["actions"], "expires_at": g["expires_at"],
                                 "external": bool(a.get("external")), "address": self._address(aid),
                                 "aliases": list(a.get("aliases", ())), "skills": list(a.get("skills", ())),
-                                "online": self._online(room_id, "agent", aid)})
+                                "online": self._online(room_id, "agent", aid),
+                                **({"coordinator": _coordinator_view(g)} if g.get("coordinate_team") else {})})
         return {"agents": out}
 
     # -- room <-> workspace and mission links
@@ -4546,6 +5015,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         gives work to ONE agent that the owner approved with "execute"."""
         with self._lock:
             room, first = self._tc_authorize_create(pr, room_id)
+            if self._dg_applies(pr, room_id):              # the Direct guest level: its own path, its own limits
+                return self._dg_create(pr, room, room_id, body)
             roles_on = self.team_roles_active()
             bad = [k for k in body if k not in ("target_agent_id", "text", "parent_task_id", "idempotency_key",
                                                 "reviews_task_id") and not (roles_on and k in ROLE_FIELDS)]
@@ -4579,6 +5050,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                         or pt["seq"] < first or self._task_status(pt) != "accepted"
                         or not self._creator_valid(pt, room)):
                     raise CollabError(400, "agents delegate: parent_task_id must be a task you accepted in this room")
+                self._dg_refuse_child(pr, room, pt)                  # T-TC5: a guest's task is not handed on
                 if pt["by_kind"] == "agent" and pt["by_id"] == tid_:
                     raise CollabError(400, "cannot hand a task straight back to the agent that gave it")
                 self._tc_loop_check(pr, pt, "agent:" + tid_)         # slice 3: no loop through a third agent, no assistant chain
@@ -5465,6 +5937,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
 
     def _creator_valid(self, t: dict, room: dict) -> bool:
         """A task is only as good as its requester's CURRENT authority."""
+        if t.get("origin") == "guest-direct":
+            return self._dg_creator_valid(t, room)           # a guest's authority is the room's Direct level, not a member right
         c = t.get("coord")
         if c is not None and t["by_kind"] == "user" and c["key"] == "user:" + t["by_id"]:
             return self._tc_holder_active(room, c["team"], c["key"])    # an external coordinator: authority is `coordinate`
@@ -5475,7 +5949,10 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
         if not creator:
             return False
         eff = self._effective(Principal("agent", t["by_id"], creator["owner"]), room)
-        return bool(eff and "instruct" in eff[0])
+        if eff and "instruct" in eff[0]:
+            return True
+        c = t.get("coord")             # slice 4: a coordinator the owner granted `coordinate` is a creator while that holds
+        return bool(eff and c and COORDINATE in eff[0] and self._tc_holder_active(room, c["team"], "agent:" + t["by_id"]))
 
     def _task_json(self, tid: str, t: dict, *, bounds: bool = False, quoted: bool = False) -> dict:
         a = self._agents.get(t["target"], {})
@@ -5561,8 +6038,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 result=None, target_agent_id=pr.id, visibility_scope="room", action="task.requeue",
                 outcome="allowed", project_ids=[room["project_id"]], resource_id=tid))
 
-    def task_inbox(self, pr: Principal, limit: int = 20) -> dict:
-        """Open tasks addressed to this agent, only where it STILL holds "execute"."""
+    def task_inbox(self, pr: Principal, limit: int = 20, room_id: str | None = None) -> dict:
+        """Open tasks addressed to this agent, only where it STILL holds "execute". ``room_id`` narrows it to one room."""
         if not pr.is_agent or pr.external:
             raise CollabError(403, "forbidden")
         with self._lock:
@@ -5572,6 +6049,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 t = self._tasks[tid]
                 if self._task_status(t) not in ("pending", "accepted") or "bounds" in t:
                     continue                            # a bounded delegation is never an instruction to execute
+                if room_id is not None and t["room_id"] != room_id:
+                    continue
                 room = self._rooms.get(t["room_id"])
                 eff = self._effective(pr, room) if room else None
                 # a task made before this agent's current grant never revives; and its requester
@@ -5620,6 +6099,27 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 action="task.update", outcome="allowed", project_ids=[room["project_id"]],
                 resource_id=task_id))
         return {"task_id": task_id, "status": status, "attempt": t.get("attempt", 1)}
+
+    # -- fabric trust slice 3: the agent's own task routes, scoped to one room. They serve a credential agent and a fabric
+    # agent alike (both are the same Principal) and add no authority: they are task_inbox / update_task with a room check.
+    def agent_room_tasks(self, pr: Principal, room_id: str) -> dict:
+        out = self.task_inbox(pr, room_id=room_id)
+        return {"tasks": [dict(t, untrusted=True) for t in out["tasks"]]}
+
+    def agent_created_tasks(self, pr: Principal, room_id: str) -> dict:
+        """The tasks THIS coordinator agent made in this room, with status and result (the owner reads them as in any task list)."""
+        if not pr.is_agent or pr.external:
+            raise CollabError(403, "forbidden")
+        return self.coordination_view(pr, room_id)
+
+    def agent_respond_task(self, pr: Principal, room_id: str, task_id: str, body: dict) -> dict:
+        if not pr.is_agent or pr.external:
+            raise CollabError(403, "forbidden")
+        with self._lock:
+            t = self._tasks.get(task_id) if isinstance(task_id, str) else None
+            if not t or t["room_id"] != room_id:
+                raise CollabError(404, "not found")
+            return self.update_task(pr, task_id, body)
 
     # -- bounded delegation and artifact proposals (T11)
     # A delegation is a task in the SAME store with a ``bounds`` block, addressed to an external coworker agent
@@ -6319,6 +6819,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                "project_id": p.get("project_id"), "created_at": p["created_at"],
                "correlation_id": p.get("correlation_id"), "causation_id": p.get("causation_id"),
                "visibility_scope": p.get("visibility_scope", "room")}
+        if p.get("via"):                              # additive: the actor was identified by its tailnet machine
+            out.update(via=p["via"], machine=p.get("machine"))
         if t == "message":
             out.update(sender={"type": "external" if p.get("sender_external") else p["sender_kind"],
                                "id": p["sender_id"], "owner_user_id": p["actor_user_id"]},
@@ -6432,6 +6934,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                             "actor_kind": p.get("actor_kind"), "client_ip": p.get("client_ip"),
                             "room_id": p.get("room_id"), "resource_id": p.get("resource_id"),
                             "created_at": p["created_at"], "correlation_id": p.get("correlation_id")})
+                if p.get("via"):
+                    out[-1].update(via=p["via"], machine=p.get("machine"))
                 if ev["event_type"].startswith("helper_"):
                     out[-1]["helper"] = {"helper_id": p.get("helper_id"), "role": p.get("role"), "model": p.get("model")}
                 elif ev["event_type"] == "helpers_paused":
@@ -6483,15 +6987,27 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
     # --------------------------------------------------------------- routing
     def dispatch(self, method: str, parts: list[str], query: dict, body: dict,
                  authorization: str, device: str | None, operator: str | None = None,
-                 client: str | None = None):
-        """parts: path segments after /api/v1/collab. Returns (status, json) or a Stream."""
+                 client: str | None = None, peer_ip: str | None = None, machine: str | None = None,
+                 fabric_listener: bool = False, fabric_owner: str | None = None):
+        """parts: path segments after /api/v1/collab. Returns (status, json) or a Stream.
+
+        ``fabric_listener``: the request came in on the dedicated fabric listener, where the routes that run BEFORE
+        authentication (enrollment, join, join-link, the public config) do not exist: a 404, whatever the headers.
+        ``fabric_owner``: the collab operator, who owns the agents ``agents/fabric-join`` creates (that route exists only there)."""
         try:
+            if fabric_listener and (parts[:1] == ["agents"] and parts[1:] in (["enrollment", "complete"], ["join"], ["join-link"])
+                                    or parts == ["config"]):
+                raise CollabError(404, "not found")
             if parts == ["agents", "enrollment", "complete"] and method == "POST":
                 return 201, self.complete_enrollment(body)
             if parts == ["agents", "join"] and method == "POST":
                 return 201, self.redeem_join_token(body, client)  # the token IS the authentication
             if parts == ["agents", "join-link"] and method == "POST":
                 return 200, self.link_joined(body)
+            if parts == ["agents", "fabric-join"] and method == "POST":
+                if not fabric_listener:                  # the whois proof exists only on the dedicated listener
+                    raise CollabError(404, "not found")
+                return self.fabric_join(body, peer_ip, machine, fabric_owner)   # whois is the authentication: the header is ignored
             if parts == ["config"] and method == "GET":
                 return 200, self.public_config  # public identifiers only; no auth needed
             if operator is not None and self.degraded:
@@ -6507,7 +7023,7 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                 pr = Principal("user", operator, operator)
                 pr.admin = pr.approver = True
             else:
-                pr = self.authenticate(authorization, device)
+                pr = self.authenticate(authorization, device, peer_ip=peer_ip, machine=machine)
             n = len(parts)
             if pr.status != "approved" and parts != ["me"]:
                 self.stats["policy_denied"] += 1
@@ -6589,6 +7105,10 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                         return 200, self.list_room_externals(pr, rid)
                     if parts[2:] == ["agent-requests"]:
                         return 200, self.list_agent_requests(pr, rid)
+                    if parts[2:] == ["agent", "tasks"]:
+                        return 200, self.agent_room_tasks(pr, rid)
+                    if parts[2:] == ["agent", "tasks", "created"]:
+                        return 200, self.agent_created_tasks(pr, rid)
                     if parts[2:] == ["tasks"]:
                         return 200, self.list_tasks(pr, rid)
                     if parts[2:] == ["artifacts"]:
@@ -6605,6 +7125,10 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                         return 200, self.team_role_view(pr, rid, parts[3])
                     if n == 5 and parts[2] == "teams" and parts[4] == "coordinator":
                         return 200, self.view_team_coordinator(pr, rid, parts[3])
+                    if n == 5 and parts[2] == "teams" and parts[4] == "issue-target":
+                        return 200, self.view_issue_target(pr, rid, parts[3])
+                    if parts[2:] == ["external-actions"]:
+                        return 200, self.list_external_actions(pr, rid)
                     if parts[2:] == ["coordination"]:
                         return 200, self.coordination_view(pr, rid)
                     if parts[2:] == ["my-tasks"]:
@@ -6613,6 +7137,10 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                         return 200, self.get_member_visibility(pr, rid)
                     if parts[2:] == ["guest-level"]:
                         return 200, self.get_guest_level(pr, rid)
+                    if parts[2:] == ["direct-tasks"]:
+                        return 200, self.direct_tasks(pr, rid)
+                    if parts[2:] == ["direct-guests"]:
+                        return 200, self.direct_guests(pr, rid)
                     if parts[2:] == ["suggestions"]:
                         return 200, self.list_suggestions(pr, rid, query)
                     if n == 4 and parts[2] == "suggestions":
@@ -6668,6 +7196,10 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                     if parts[2:] == ["events"]:
                         return 200, self.read_events(pr, rid, _int(query, "cursor", 0),
                                                      _int(query, "limit", 100, 1, 200))
+                    if parts[2:] == ["events", "tail"]:         # the newest events, side-effect free (the app's head and tail reads)
+                        return 200, self.read_tail(pr, rid, _int(query, "limit", 100, 1, 500))
+                    if parts[2:] == ["people"]:                 # handles only; unlike /state it records no presence and takes no waiter slot
+                        return 200, {"people": self.room_people(pr, rid)}
                     if parts[2:] == ["events", "stream"]:
                         return self.open_stream(pr, rid, _int(query, "cursor", 0))
             elif method in ("PUT", "POST") and n == 3 and parts[0] == "rooms" and parts[2] == "profile":
@@ -6771,6 +7303,10 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                     return 200, self.rename_agent(pr, parts[1], body)
                 if n == 3 and parts[0] == "agents" and parts[2] == "revoke":
                     return 200, self.revoke_agent(pr, parts[1])
+                if n == 3 and parts[0] == "agents" and parts[2] == "renew":
+                    return 200, self.renew_agent(pr, parts[1])
+                if n == 3 and parts[0] == "agents" and parts[2] == "fabric":
+                    return 200, self.set_agent_fabric(pr, parts[1], body)
                 if n >= 3 and parts[0] == "rooms":
                     rid = parts[1]
                     if parts[2:] == ["members"]:
@@ -6823,6 +7359,16 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                         return 200, self.attach_team(pr, rid, parts[3], body)
                     if n == 5 and parts[2] == "teams" and parts[4] == "detach":
                         return 200, self.detach_team(pr, rid, parts[3])
+                    if n == 5 and parts[2] == "teams" and parts[4] == "issue-target":
+                        return 200, self.set_issue_target(pr, rid, parts[3], body)
+                    if parts[2:] == ["external-actions"]:
+                        return self.file_external_action(pr, rid, body)
+                    if n == 5 and parts[2] == "external-actions" and parts[4] in ("decide", "retry"):
+                        return 200, self.decide_external_action(pr, rid, parts[3], body, "decision" if parts[4] == "decide" else "retry")
+                    if n == 5 and parts[2] == "direct-tasks" and parts[4] == "cancel":
+                        return 200, self.cancel_direct_task(pr, rid, parts[3])
+                    if parts[2:] == ["direct-guests"]:
+                        return 200, self.set_direct_guest(pr, rid, body)
                     if parts[2:] == ["suggestions"]:
                         out = self.submit_suggestion(pr, rid, body)
                         return (200 if out["replayed"] else 201), out
@@ -6874,6 +7420,8 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
                         return 200, self.set_external_coordination(pr, rid, parts[3], body)
                     if parts[2:] == ["member-visibility"]:
                         return 200, self.set_member_visibility(pr, rid, body)
+                    if n == 6 and parts[2] == "agent" and parts[3] == "tasks" and parts[5] == "respond":
+                        return 200, self.agent_respond_task(pr, rid, parts[4], body)
                     if n == 5 and parts[2] == "tasks" and parts[4] == "respond":
                         return 200, self.respond_task(pr, rid, parts[3], body)
                     if n == 5 and parts[2] == "tasks" and parts[4] == "cancel":
@@ -7087,6 +7635,18 @@ _SKILL = re.compile(r"[A-Za-z0-9][A-Za-z0-9:._/-]{0,63}\Z")
 MAX_SKILLS = 100
 
 
+_MACHINE_RE = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\Z")
+
+
+def _machine(value: Any) -> str | None:
+    """The MagicDNS short name an agent says it runs on (absent = none). It is a claim: Fabric auth still needs the owner's bit."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not _MACHINE_RE.match(value.strip().lower()):
+        raise CollabError(400, "machine must be a MagicDNS short name (letters, digits, hyphens)")
+    return value.strip().lower()
+
+
 def _skills(value: Any) -> list[str] | None:
     """Skill names an agent reports at registration, in its own harness's literal form (pi: `skill:review`).
     The room only lists them; it never interprets or rewrites them."""
@@ -7098,8 +7658,9 @@ def _skills(value: Any) -> list[str] | None:
     return sorted(set(value))
 
 
-def _actions(value: Any) -> list[str]:
+def _actions(value: Any, allow_coordinate: bool = False) -> list[str]:
+    ok = AGENT_ACTIONS | {COORDINATE} if allow_coordinate else AGENT_ACTIONS     # only grant_agent passes allow_coordinate
     if (not isinstance(value, list) or not value
-            or not all(isinstance(a, str) and a in AGENT_ACTIONS for a in value)):
+            or not all(isinstance(a, str) and a in ok for a in value)):
         raise CollabError(400, "actions must be a non-empty subset of read, post, instruct, execute, spawn_helpers")
     return sorted(set(value))

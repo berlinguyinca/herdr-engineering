@@ -462,7 +462,8 @@ def test_the_feed_lists_agents_with_the_external_join_id_and_hard_expiry(world):
     agents = feed["agents"]
     row = agents[ext_pr.id]
     assert row == {"owner": "alice", "status": "active", "expires_at": ext_out["expires_at"], "external": True,
-                   "join_id": inv["invite_id"], "hard_expiry": ext_out["expires_at"]}
+                   "join_id": inv["invite_id"], "hard_expiry": ext_out["expires_at"],
+                   "groups": [], "harness_type": "external"}
     a = agents[world.a.id]
     assert a["owner"] == "alice" and a["status"] == "active" and a["external"] is False
     assert a["join_id"] is None and a["hard_expiry"] is None and a["expires_at"] > world.clock()

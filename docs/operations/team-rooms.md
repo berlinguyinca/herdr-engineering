@@ -26,8 +26,8 @@ answer 404 (except `detach`, below).
    separate events in the collab log.
 2. **Guest level, per room.** `read_only` | `suggest` | `direct`. The default is `suggest` (configurable to `read_only`; `direct`
    is refused as a default). Only the owner user sets it. **Direct is stored and validated (agents or roles it may address, never
-   "any"; per hour, open and text caps) but is not implemented: it behaves as `suggest`.** Slices 2 and 3 define what it may
-   do; until then it fails closed. Nothing lets a guest assign work to an agent.
+   "any"; per hour, open and text caps) but behaves as `suggest` unless `team_rooms.direct_enabled` is also on** (see the Direct
+   guest level section at the end). Without that flag it fails closed and nothing lets a guest assign work to an agent.
 3. **The Suggest queue.** A guest (a room member whose role is `guest`) files a request. It is a `pending` row in the owner's
    queue; it creates no task and reaches no agent. At `read_only` the guest gets 403 and nothing is written. The owner approves
    or rejects; approving creates one **new** task made by the owner (`origin: suggestion`) whose text is the owner's command
@@ -375,6 +375,128 @@ herdr-eng rooms coordination ROOM                              # a coordinator's
 
 Web UI (built afterwards, see "The screens"), assistant briefs and the brief-reference check (slice 4: the refusal
 "an external coordinator cannot read a brief reference" holds because no such route exists yet, and the only assistant API an
+external credential reaches is rejected with 401, tested) and approval-gated external actions (slice 5). The `direct` guest level
+is a separate flag (last section). Coordinators cannot yet be handed work by Suggest requests.
+
+---
+
+# Direct guest level
+
+The Direct level of the same design (`TEAM_COLLABORATION.md` sections 2, 9.3, 13 rows T-TC5 / T-TC12 / T-TC15, 15). It sits behind
+its own flag `control_plane.collab.team_rooms.direct_enabled` (a key of the existing `team_rooms` block, off by default) and ALSO needs
+`team_rooms.enabled`. With either off, `direct` is still stored and validated, but it **acts as Suggest**: the guest-level view says
+`behaves_as: suggest`, a guest has no task right (403 on `POST /rooms/{room}/tasks`, exactly as before; a test pins it), and the new
+routes answer 404. Only withdrawing a guest's right (below) stays reachable with the flags off.
+
+## What it does
+
+- **A guest assigns work inside the owner's limits.** In a room whose level is `direct`, a guest sends the ordinary
+  `POST /rooms/{room}/tasks` with `target_agent_id` (an allowed agent) or `target_role` (an allowed team role; the server picks the
+  least-loaded holder; needs `team_roles`), `text`, and optionally `idempotency_key`. The limits are the room's `direct_limits`:
+  `agents` / `roles` (the allow-list, never "any"), `per_hour`, `max_open`, `max_text`, and two flags that are off unless the owner sets
+  them: `may_request_review`, `may_cancel_own`. Where the owner names no number the service defaults apply: **3 per hour and 2 open**
+  (`team_rooms.direct_default_per_hour`, `direct_default_max_open`). `ROLE_ACTIONS["guest"]` stays `{"read"}`; the extra right is
+  computed from the level and the flag on every request.
+- **The task is the guest's, tainted.** `created_by` is the guest and every event carries their user id; `origin` is `guest-direct`;
+  the taint is `external-source:guest`; the command is a fixed sentence and the guest's words ride as `quoted_source` (untrusted data,
+  with the same note as an approved Suggest request). The agent's inbox shows all of that. The same `TASK_RATE` per-creator throttle and
+  the per-agent open cap apply as for anyone else.
+- **What a guest cannot do.** Name a person, a parent task, a lease, a policy or a team (403 `direct_field_forbidden`); target an agent
+  or role outside the allow-list (403 `direct_target_not_allowed`, the same answer for an agent that does not exist); target a personal
+  assistant, a coordinator agent or an external agent (403 `direct_target_is_assistant` / `direct_target_external`); choose a reviewer
+  (403 `direct_reviewer_choice`); ask for a review unless `may_request_review` (403 `direct_review_not_allowed`); hand work on
+  (an agent that accepted a guest's task cannot create a task under it: 400 `direct_no_children`); grant, invite, approve, decide
+  Suggest requests, change the level, limits or settings (the same 404 plus audit as any non-owner). Every refusal above writes an
+  `audit_denied` event under the guest's id. Over a cap: 429 `direct_rate` (per hour) or `direct_open`. **Nothing is silently
+  turned into a Suggest request**: a refusal is a refusal; the guest can still file a Suggest request, which the owner decides.
+- **Review.** A review request is by role only (`target_role: reviewer`, `reviews_task_id` = a Direct task the same guest assigned). The
+  server picks the holder; the guest, the agent that did the work and anyone in a reviewer group of them are excluded. Reviewer-role
+  agents hold read/post only (slice 2) and cannot take a task, so the request goes to a person who holds the reviewer role, or fails
+  with 409 `no_role_holder`.
+- **Seeing it.** A guest reads their own tasks with `GET /rooms/{room}/direct-tasks` (status, their own text, role; never an agent's
+  result, never another guest's task). The owner sees all of them with the submitter. The room task list and task events stay hidden
+  from guests, as before. `may_cancel_own` lets a guest cancel their own open task (`POST .../direct-tasks/{id}/cancel`); the owner
+  can always cancel (`POST .../tasks/{id}/cancel`).
+- **Revocation (cancel, never requeue).** A guest's task is served only while the flag is on, the room is at `direct`, the guest is an
+  unexpired guest of the room whose own right is not withdrawn, and the target is still allowed. Lowering the level, narrowing the
+  allow-list, removing the guest, withdrawing their right (`direct-guests --deny`), the guest expiring, the identity provider dropping
+  them and turning the flag off each make the task unservable on the very next request (the agent's inbox omits it; `update` is a 404),
+  and the sweep (or the owner's action itself, for the first four) then writes a `task_updated` to `cancelled` with reason
+  `direct_revoked`. Finished tasks are not rewritten. It is cancel and not requeue because nothing in a guest task's chain was ever
+  approved by the operator: re-homing it under the operator (what an external coordinator's revocation does) would launder an
+  unapproved guest's words into operator work. A repeat changes nothing.
+
+## Turn it on
+
+```yaml
+control_plane:
+  collab:
+    team_rooms:
+      enabled: true
+      direct_enabled: true          # absent = off; direct then acts as suggest
+      direct_default_per_hour: 3    # 1 .. 100, used where a room's direct_limits name no per_hour
+      direct_default_max_open: 2    # 1 .. 50
+    team_roles: {enabled: true}     # only for role targets; naming an agent does not need it
+```
+
+Read per request (a missing, unreadable or invalid file turns it OFF). No migration, no table, no environment variable. Then, per room:
+
+```bash
+herdr-eng rooms guest-level ROOM direct --agents AGENT_ID,AGENT_ID --roles implementer --per-hour 3 --max-open 2 \
+    [--max-text 2000] [--may-request-review] [--may-cancel-own]
+herdr-eng rooms guest-level ROOM                       # shows behaves_as and the effective limits
+herdr-eng rooms direct-tasks ROOM                      # owner: every guest task; guest: your own
+herdr-eng rooms direct-guests ROOM [--deny USER | --allow USER]
+# a guest, with their own token:
+herdr-eng rooms direct ROOM "please fix the flaky build" --agent AGENT_ID [--key K]
+herdr-eng rooms direct ROOM "review that" --role reviewer --reviews TASK_ID
+herdr-eng rooms direct-cancel ROOM TASK_ID
+```
+
+| Route (`/api/v1/collab`) | Who |
+|---|---|
+| `POST /rooms/{room}/tasks` `{"target_agent_id" \| "target_role", "text", "idempotency_key", "reviews_task_id"}` | a guest at `direct` |
+| `GET /rooms/{room}/direct-tasks` | guest: own; owner: all |
+| `POST /rooms/{room}/direct-tasks/{id}/cancel` | the guest, with `may_cancel_own` |
+| `GET` / `POST /rooms/{room}/direct-guests` `{"user_id", "allowed"}` | owner (withdrawing is reachable with the flags off) |
+
+## Roll back
+
+- **The flag is the whole rollback and it is safe.** `direct_enabled: false` (or `team_rooms.enabled: false` / `kill_switch: true`): the
+  level goes back to acting as Suggest, new guest tasks are 403, open guest tasks are no longer served at once and the next sweep cancels
+  them (they stay cancelled when the flag comes back; nothing is revived). Nothing is deleted from the log. To end one guest or all of them
+  without touching the flag: `direct-guests --deny USER`, or `guest-level ROOM suggest`. Leaving Direct and withdrawing a guest's
+  right are safety writes (setting Direct paid for the first one) and still work when the log is full. Narrowing the allow-list
+  while staying at Direct is an ordinary write, as is toggling between `suggest` and `read_only`; with a full log, lower the room to
+  `suggest` instead.
+- **Image rollback: remove the key first.** An older image rejects the unknown `direct_enabled` key, so the hot path turns ALL team rooms
+  off and the startup path refuses to start. With the key removed, the older image replays a log that holds `guest_direct_set`, guest tasks
+  and cancellations without trouble and serves none of the guest tasks (a guest has no `task` right there, so the "requester still has
+  authority" test fails), but it also lacks the cancel sweep and the per-guest withdrawal. So: set `direct_enabled: false`, wait one sweep
+  interval (or `guest-level ROOM suggest` for each room), remove the key, then roll back the image if you must. See the threat model
+  (R-DG5) and the replay check recorded in `evidence/STATUS.md`.
+- No migration, no table, no environment variable.
+
+## Choices made where the design left room
+
+- **Entry point.** The design's sketch reuses `POST /rooms/{room}/tasks`; so does this. The extra routes are the guest's own view,
+  the cancel and the per-guest switch.
+- **Fallback.** The design does not say a refused Direct request becomes a Suggest request, and §9.2 already lets a guest file one. A
+  refusal is therefore a refusal (403 plus audit, or 429); the guest decides whether to file a request.
+- **"Max task depth".** Fixed at zero for a guest chain (T-TC5: guest-created tasks cannot create children); there is no depth number to set.
+- **Per-guest revoke.** The design has none. `guest_direct_set` is a small owner-only event (`allowed` true or false) beside the level;
+  the level and limits are untouched.
+- **Cancel, not requeue**, on revocation (above).
+- **Denial codes.** A guest or other non-owner using an owner route gets the existing 404 plus an audit event (the indistinguishable-404
+  rule), not 403; an agent principal gets 403 plus audit. A guest's own refusals are 403/429 with a `code`.
+- **Defaults.** 3 per hour and 2 open where the owner names none; `may_request_review` and `may_cancel_own` off.
+- **Person-held review.** The reviewer role is the one case where a guest's task may go to a person (see Review).
+
+## Not built here
+
+The attention inbox, a web UI for external actions, grants of anything wider than a task, taint inheritance into child
+tasks (children are refused instead), and any approval step between a guest and an allowed agent (that is what Suggest is for).
+
 external credential reaches is rejected with 401, tested), approval-gated external actions (slice 5), and `direct` guest behaviour.
 Coordinators can be handed an approved Suggest request or brief by the owner (slice 4 tested this: the coordinator accepts it as the root and decomposes it by role); a `direct` guest still cannot target one.
 
@@ -461,6 +583,103 @@ approval-gated external actions (slice 5), the `direct` guest level, the attenti
 exercised against Gmail. Taint is not propagated into tasks a coordinator authors from an approved brief.
 
 Coordinators cannot yet be handed work by Suggest requests.
+
+---
+
+# Slice 5: approval-gated external actions (a GitHub issue, a Gmail draft)
+
+Slice 5 of the same design (`TEAM_COLLABORATION.md` section 14, slice 5; threat model section 3.9). After the operator has approved
+an email brief, the team can ASK for one of two things to leave the system. It leaves only when the account owner approves the exact
+content.
+
+## What it does
+
+- `github_issue_create`: one issue in the repository the room owner set for that team. The title, the labels (only those the
+  operator listed) and the body (the approved brief in a fenced block plus a machine marker) are built from the approved brief.
+- `email_reply_draft`: one Gmail DRAFT reply to the original sender, in the original thread. The recipient and subject come from the
+  assistant's private record of the email, never from the filer; the filer supplies only the plain reply text (up to 800 characters,
+  secrets refused). Nothing is sent; you send the draft yourself from Gmail.
+- Who: the room owner, the team's issue writer and the team's coordinator may PROPOSE. Only the account owner approves, rejects or
+  retries. Anyone else is told 403 (and the refusal is audited under their own identity), a stranger 404.
+- Approving needs the SHA-256 of the content you were shown (`external-list` prints it), so the card you read is the action that
+  runs. A wrong hash is 409 and nothing happens.
+
+## Turn it on
+
+All YAML, off by default, read at start:
+
+```yaml
+control_plane:
+  collab:
+    team_rooms: {enabled: true}
+  personal_assistant:
+    enabled: true
+    persistence: {dsn: ...}               # required: the intent must be durable before anything leaves
+    collab_users: {"key:<id>": "<collab user that owns the room>"}
+    team_briefs: {enabled: true, topics: [invoice]}
+    external_actions:
+      enabled: true
+      actions_per_hour: 10                # filing cap
+      executions_per_hour: 10             # provider calls cap
+      intent_stale_seconds: 120           # how long an "executing" intent is trusted before it is shown as unknown
+      github:
+        labels: [from-email]              # the only labels a filer may pick
+        # api_base: https://api.github.com   (https only; plain http only to a loopback host)
+```
+
+Credentials are NOT in this block. The issue token comes from the GitHub App's `team_issues` write capability (`github.app.write`)
+or, as a documented fallback, the server-held `github.token` (the same one the deployment escalation issues use). Prefer the App.
+The draft uses the operator's own Google connection (Connectors tab); no extra scope is needed.
+
+Then restart the control plane. Flag off: every route below is 404, the capability `assistant_external_actions` is not advertised,
+and collab behaves as before (pinned by a test).
+
+## Operate it
+
+```
+herdr-eng rooms issue-target ROOM TEAM owner/name            # owner only; omit the repo to show it
+herdr-eng assistant external-file ROOM github_issue_create REF [--title T] [--label L]
+herdr-eng assistant external-file ROOM email_reply_draft REF --body "Thanks, noted."
+herdr-eng assistant external-list [--state awaiting_approval]
+herdr-eng assistant external-show ID                          # the exact card and its sha256
+herdr-eng assistant external-decide ID approved --sha256 HASH # runs it once; or "rejected"
+herdr-eng assistant external-retry ID --sha256 HASH           # failed / unknown only
+herdr-eng rooms external-list|external-file|external-decide|external-retry ROOM ...   # the same, with a collab token
+```
+
+States: `awaiting_approval`, `rejected`, `expired`, `approved` (not run yet), `executed` (with the issue URL or draft id),
+`failed` (the provider refused for good: a revoked token, a missing repository), `unknown` (no usable answer: a timeout, a 5xx, a
+cut connection, a restart in the middle). `failed` and `unknown` show a fixed reason and notify you; only you can retry. A retry
+looks for the earlier result at the provider before creating anything.
+
+## Exactly once, and where that stops
+
+The key is a SHA-256 of the action and the brief, so the same email is one action. The intent is stored durably before the provider
+is called. After a crash or a lost answer, the retry (or the post-restart recovery, which only READS the provider) looks for the
+marker first. It cannot promise: (1) that a request GitHub was still processing when the listing was read does not later appear as a
+second issue; (2) that a Gmail draft older than the newest 50 is found, so a retry may add a second DRAFT (never a second send).
+Check `external-list` for `unknown` actions after an outage.
+
+## Roll back
+
+- Normal and safe: `external_actions.enabled: false` (or `kill_switch: true`) and restart. Routes 404; actions already in the ledger
+  stay, and nothing runs. To stop issue writes entirely also remove the App capability and `github.token`.
+- Rolling the IMAGE back is not recommended and was not run: the state lives in fields the older image already has, so nothing is
+  lost on replay, but the older image knows no executor for these kinds. It lists them in the old proposal queue, where an approver
+  could mark one `approved`; that records permission and runs nothing. After rolling forward such an action shows as approved but
+  not run, and only your retry (with the hash) runs it. Reject anything you do not recognise.
+
+## Choices made where the design left room
+
+- The ledger is `AssistantProposal` with `dedupe_key` (contradiction 10); there is no migration.
+- Routes follow `/api/v1/assistant-*` and `rooms/<id>/external-actions`; the issue repository is data on the team (decision 1),
+  set per room and team by the room owner.
+- `actions.approvers` is not honoured for these kinds: approval for something that leaves the system is the account owner's alone.
+
+## Not built in this slice
+
+Web UI, the attention inbox (P08), a conversation view, calendar actions, any send. GitHub and Gmail were never called: tests use
+contract-level fake servers that speak the REST shapes.
 
 ---
 

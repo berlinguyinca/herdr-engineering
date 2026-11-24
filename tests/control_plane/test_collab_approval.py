@@ -19,12 +19,15 @@ TOKENS = {  # token -> (user id, cognito groups)
 }
 
 
+IAT = {}      # token -> the issued-at claim (default 1.0); a test sets a larger one to model a newer token
+
+
 class OpenAuth:
     """What CognitoAuthenticator(open_signup=True) presents: any valid token, with its group claims."""
 
     def verify_claims(self, token):
         got = TOKENS.get(token)
-        return {"user": got[0], "exp": 4e9, "groups": list(got[1])} if got else None
+        return {"user": got[0], "exp": 4e9, "groups": list(got[1]), "iat": IAT.get(token, 1.0)} if got else None
 
     def verify(self, token):
         c = self.verify_claims(token)

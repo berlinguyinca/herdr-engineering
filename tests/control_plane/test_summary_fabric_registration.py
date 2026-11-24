@@ -27,6 +27,25 @@ def test_fabric_policy_rejects_invalid_identity_or_context(model, window):
     assert not repo.list_custom_models()
 
 
+def test_gateway_fallback_registration_needs_no_private_service_and_survives_restore():
+    repo = ControlPlaneRepo()
+    repo.upsert_custom_model('summaries', None, 'qwen-small', 'summaries', fabric_model='qwen-small',
+                             fallback_models=['qwen3.8-*', 'qwen3.8'], context_window=8192)
+    restored = ControlPlaneRepo()
+    restored.import_state(repo.export_state())
+    model = restored.llm_config()['custom_models'][0]
+    assert model['fallback_models'] == ['qwen3.8-*', 'qwen3.8'] and model.get('base_url') is None
+
+
+@pytest.mark.parametrize('base,fallback', [(None, None), ('', []), (None, 'qwen3.8-*'), (None, ['']),
+    (None, [1]), (None, ['bad pattern']), (None, ['x' * 129]), (None, ['q'] * 9), ('http://cpu:8080', ['bad\nname'])])
+def test_gateway_fallback_registration_rejects_bad_input(base, fallback):
+    repo = ControlPlaneRepo()
+    with pytest.raises(ValueError):
+        repo.upsert_custom_model('summaries', base, fabric_model='qwen-small', fallback_models=fallback)
+    assert not repo.list_custom_models()
+
+
 @pytest.mark.parametrize('kind', ['custom_model', 'llm_key'])
 def test_generic_ingestion_cannot_forge_fabric_policy_or_credentials(kind):
     repo = ControlPlaneRepo()

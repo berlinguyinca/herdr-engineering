@@ -1,0 +1,49 @@
+/* Public share pages: light only. Colours, radius and type come from tokens.css (the dashboard's light tokens);
+   the fallbacks keep the page readable if that file is missing. Inter is bundled on our own host. */
+@font-face { font-family: "Inter"; font-style: normal; font-weight: 400; font-display: swap;
+  src: url("/s/static/fonts/inter-latin-400.woff2") format("woff2"); }
+@font-face { font-family: "Inter"; font-style: normal; font-weight: 600; font-display: swap;
+  src: url("/s/static/fonts/inter-latin-600.woff2") format("woff2"); }
+
+:root { color-scheme: light; }
+
+html, body {
+  margin: 0;
+  background: var(--background, #f7f7f8);
+  color: var(--text, #353740);
+  font: 16px/1.5 var(--font-sans, Inter, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif);
+}
+
+.card {
+  max-width: 28rem;
+  margin: 15vh auto 0;
+  padding: 1.5rem 1.75rem;
+  background: var(--surface, #ffffff);
+  border: 1px solid var(--border, #d9d9e3);
+  border-radius: var(--radius, 8px);
+  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.05);
+  border-top: 3px solid var(--accent, #0a7258);
+}
+
+@media (max-width: 30rem) {
+  .card { margin: 10vh 16px 0; }
+}
+
+h1 {
+  margin: 0 0 0.5rem;
+  font-size: 1.15rem;
+  font-weight: 600;
+}
+
+#status {
+  margin: 0;
+  color: var(--text-secondary, #6e6e80);
+}
+
+#status.failed {
+  color: var(--text, #353740);
+}
+
+code, pre {
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+}

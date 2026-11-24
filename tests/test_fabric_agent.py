@@ -762,10 +762,10 @@ def test_watchdog_does_not_fire_when_cycles_complete(tmp_path, monkeypatch):
     stop = threading.Event()
     threading.Thread(
         target=agent.run, args=(stop,),
-        kwargs={"cycle_timeout": 0.5, "poll": 0.05},
+        kwargs={"cycle_timeout": 2.0, "poll": 0.05},  # 20x the 0.1 s interval: a CPU-starved CI node stalled one cycle past the old 0.5 s
         daemon=True).start()
     try:
-        time.sleep(1.0)  # several healthy cycles
+        time.sleep(2.6)  # longer than cycle_timeout, so only a refreshed cycle clock keeps the watchdog quiet
         assert exited == []
     finally:
         stop.set()  # a failed assert must not leave the watchdog running past monkeypatch's restore of os._exit
@@ -1121,3 +1121,355 @@ def test_connections_beyond_the_cap_are_dropped():
     finally:
         fwd.stop()
         srv.close()
+
+
+# --- SigV4: the signed Host must reach the backend untouched ----------------
+
+_SIGV4_AUTH = (b"Authorization: AWS4-HMAC-SHA256 Credential=AKID/20261104/us-east-1/s3/"
+               b"aws4_request, SignedHeaders=host;x-amz-date, Signature=abcd\r\n")
+
+
+def test_a_sigv4_authorization_header_keeps_its_signed_host():
+    got, _reply, _port = _through_forwarder(
+        {"100.64.8.6"}, b"GET /b?list-type=2 HTTP/1.1\r\nHost: 100.64.8.6:9000\r\n"
+                          + _SIGV4_AUTH + b"X-Amz-Date: 20261104T000000Z\r\n\r\n")
+    assert b"Host: 100.64.8.6:9000\r\n" in got
+    assert b"127.0.0.1" not in got
+
+
+def test_a_sigv4_query_string_keeps_its_signed_host():
+    for q in (b"X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=1", b"a=1&X-Amz-Signature=ff"):
+        got, _reply, _port = _through_forwarder(
+            {"100.64.8.6"}, b"GET /b/k?" + q + b" HTTP/1.1\r\n"
+                              b"Host: 100.64.8.6:9000\r\n\r\n")
+        assert b"Host: 100.64.8.6:9000\r\n" in got
+        assert b"Connection: close" not in got
+
+
+def test_an_unsigned_request_is_still_rewritten_byte_for_byte():
+    got, _reply, port = _through_forwarder(
+        {"100.64.8.6"}, b"GET /?x=1 HTTP/1.1\r\nHost: 100.64.8.6:9000\r\n"
+                          b"Accept: */*\r\n\r\n")
+    assert got == (b"GET /?x=1 HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nAccept: */*\r\n"
+                   b"Connection: close\r\n\r\n" % port)
+
+
+def test_a_non_sigv4_authorization_is_still_rewritten():
+    got, _reply, port = _through_forwarder(
+        {"dev.lan"}, b"GET / HTTP/1.1\r\nHost: dev.lan\r\n"
+                     b"Authorization: Bearer abc\r\n\r\n")
+    assert f"Host: 127.0.0.1:{port}".encode() in got
+
+
+def test_a_signed_request_with_two_hosts_is_forwarded_as_received():
+    req = (b"GET / HTTP/1.1\r\nHost: 100.64.8.6\r\nHost: evil\r\n" + _SIGV4_AUTH + b"\r\n")
+    got, _reply, _port = _through_forwarder({"100.64.8.6"}, req)
+    assert got == req
+
+
+def test_signed_chunked_put_and_keepalive_framing_survive():
+    import socket as _s
+    import threading as _t
+    srv = _s.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(4)
+    seen: list[bytes] = []
+
+    def _serve():
+        c, _ = srv.accept()
+        data = b""
+        # Two requests on one connection: a chunked PUT, then a GET.
+        while not data.endswith(b"\r\n\r\n") or b"GET /two" not in data:
+            chunk = c.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+            if b"0\r\n\r\n" in data and b"PUT" in data and b"GET /two" not in data:
+                c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+        seen.append(data)
+        c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+        c.close()
+
+    _t.Thread(target=_serve, daemon=True).start()
+    fwd = AgentForwarder("127.0.0.1", srv.getsockname()[1],
+                         fabric_names=frozenset({"100.64.8.6"})).start()
+    try:
+        c = _s.create_connection(("127.0.0.1", fwd.port), timeout=5)
+        put = (b"PUT /b/k HTTP/1.1\r\nHost: 100.64.8.6:9000\r\n" + _SIGV4_AUTH +
+               b"Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n")
+        get = b"GET /two HTTP/1.1\r\nHost: 100.64.8.6:9000\r\n" + _SIGV4_AUTH + b"\r\n"
+        c.sendall(put)
+        assert c.recv(4096).startswith(b"HTTP/1.1 200")  # connection still open
+        c.sendall(get)
+        reply = b""
+        while True:
+            chunk = c.recv(4096)
+            if not chunk:
+                break
+            reply += chunk
+        c.close()
+        assert seen[0] == put + get
+        assert reply.endswith(b"ok")
+    finally:
+        fwd.stop()
+        srv.close()
+
+
+# -- lease flood: ephemeral test servers and orphaned forwarders ------------
+
+def _spawn_listener(tmp_path, name: str):
+    """A real HTTP listener; the scanner is fed ``name`` as its process (a real
+    process title is not portable)."""
+    return _http_target(tmp_path)
+
+
+def test_default_process_denylist_names_test_servers():
+    names = fa.DEFAULT_DENY_PROCESSES
+    for needed in ("vitest", "jest", "playwright", "vite", "next-server"):
+        assert needed in names
+    assert fa.process_denied("node (vitest 12", names)
+    assert fa.process_denied("next-server (v14.2.3)", names)
+    assert fa.process_denied("Playwright", names)
+    assert not fa.process_denied("node", names)
+    assert not fa.process_denied(None, names)
+    assert not fa.process_denied("uvicorn", names)
+
+
+def test_scan_does_not_lease_denylisted_test_server(tmp_path, monkeypatch):
+    gw = _FakeGateway()
+    server, port = _spawn_listener(tmp_path, "node (vitest 3")
+    monkeypatch.setattr(fa, "scan_listening_ports",
+                        lambda: _listeners({port: "node (vitest 3"}))
+    agent = _agent(tmp_path, gw)
+    try:
+        agent.scan_once()
+        assert gw.leases == {}
+        assert str(port) not in _store(tmp_path)
+    finally:
+        server.shutdown()
+        agent.stop()
+        gw.stop()
+
+
+def test_denylist_is_configurable(tmp_path, monkeypatch):
+    gw = _FakeGateway()
+    server, port = _spawn_listener(tmp_path, "myrunner")
+    monkeypatch.setattr(fa, "scan_listening_ports",
+                        lambda: _listeners({port: "myrunner"}))
+    agent = _agent(tmp_path, gw, deny_processes=("myrunner",))
+    try:
+        agent.scan_once()
+        assert gw.leases == {}
+    finally:
+        server.shutdown()
+        agent.stop()
+        gw.stop()
+
+
+def test_scan_releases_existing_denylisted_lease(tmp_path, monkeypatch):
+    import json as _json
+    gw = _FakeGateway()
+    server, port = _http_target(tmp_path)
+    (tmp_path / "fabric-agent.json").write_text(_json.dumps({
+        str(port): {"lease_id": "lease_old", "label": f"x (port {port})",
+                    "external_port": 18001, "url": "http://dev.lan:18001",
+                    "process": "node (vitest 1", "last_hb": 0.0},
+    }))
+    monkeypatch.setattr(fa, "scan_listening_ports",
+                        lambda: _listeners({port: "node (vitest 1"}))
+    agent = _agent(tmp_path, gw)
+    try:
+        agent.scan_once()
+        assert "lease_old" in gw.closed
+        assert str(port) not in _store(tmp_path)
+    finally:
+        server.shutdown()
+        agent.stop()
+        gw.stop()
+
+
+def test_scan_releases_forwarded_lease_when_origin_is_gone(tmp_path, monkeypatch):
+    """The leak: the agent's own same-port forwarder keeps the port listening
+    after the loopback app dies, so 'port not in listeners' never fires. The
+    lease must be released once the ORIGIN stops answering."""
+    gw = _FakeGateway()
+    server, port = _http_target(tmp_path)  # loopback-only app
+    # The scan keeps reporting the port: in production the agent's own forwarder
+    # (bound on the tailnet IP) holds it open.
+    monkeypatch.setattr(fa, "scan_listening_ports",
+                        lambda: _listeners({port: "node"}))
+    # 127.0.0.2 stands in for the tailnet IP: the app on 127.0.0.1 is not
+    # reachable there, so the agent puts a forwarder in front of it.
+    agent = _agent(tmp_path, gw, tailnet_ip="127.0.0.2", orphan_grace=0.0)
+    try:
+        agent.scan_once()
+        entry = _store(tmp_path)[str(port)]
+        assert entry["fwd_port"] is not None
+        agent.scan_once()  # origin alive: lease kept
+        assert str(port) in _store(tmp_path)
+        server.shutdown()
+        server.server_close()
+        agent.scan_once()
+        assert str(port) not in _store(tmp_path)
+        assert entry["lease_id"] in gw.closed
+    finally:
+        agent.stop()
+        gw.stop()
+
+
+def test_orphan_grace_delays_release(tmp_path, monkeypatch):
+    gw = _FakeGateway()
+    server, port = _http_target(tmp_path)
+    monkeypatch.setattr(fa, "scan_listening_ports",
+                        lambda: _listeners({port: "node"}))
+    agent = _agent(tmp_path, gw, tailnet_ip="127.0.0.2", orphan_grace=3600.0)
+    try:
+        agent.scan_once()
+        server.shutdown()
+        server.server_close()
+        agent.scan_once()
+        assert str(port) in _store(tmp_path)  # within grace: kept
+    finally:
+        agent.stop()
+        gw.stop()
+
+
+# -- watcher lease max age (backstop) ---------------------------------------
+
+def _seed_store(tmp_path, port: int, registered_at: float | None) -> None:
+    entry = {"lease_id": "lease_old", "label": f"x (port {port})",
+             "external_port": 18001, "url": "http://dev.lan:18001",
+             "process": "node", "last_hb": 0.0}
+    if registered_at is not None:
+        entry["registered_at"] = registered_at
+    (tmp_path / "fabric-agent.json").write_text(json.dumps({str(port): entry}))
+
+
+def test_registered_lease_records_registration_time(tmp_path, monkeypatch):
+    gw = _FakeGateway()
+    server, port = _http_target(tmp_path)
+    monkeypatch.setattr(fa, "scan_listening_ports",
+                        lambda: _listeners({port: "node"}))
+    agent = _agent(tmp_path, gw)
+    try:
+        before = time.time()
+        agent.scan_once()
+        assert before <= _store(tmp_path)[str(port)]["registered_at"] <= time.time()
+    finally:
+        server.shutdown()
+        agent.stop()
+        gw.stop()
+
+
+def test_lease_past_max_age_is_refreshed_while_app_is_live(tmp_path, monkeypatch):
+    """Backstop: an over-age watcher lease is released; a genuinely live app is
+    simply re-registered by the same scan (new lease), not banned."""
+    gw = _FakeGateway()
+    server, port = _http_target(tmp_path)
+    _seed_store(tmp_path, port, registered_at=time.time() - 7200)
+    monkeypatch.setattr(fa, "scan_listening_ports",
+                        lambda: _listeners({port: "node"}))
+    agent = _agent(tmp_path, gw, lease_max_age=3600.0)
+    try:
+        agent.scan_once()
+        assert "lease_old" in gw.closed
+        entry = _store(tmp_path)[str(port)]
+        assert entry["lease_id"] != "lease_old"
+        assert time.time() - entry["registered_at"] < 60
+    finally:
+        server.shutdown()
+        agent.stop()
+        gw.stop()
+
+
+def test_lease_past_max_age_stays_released_when_app_is_gone(tmp_path, monkeypatch):
+    gw = _FakeGateway()
+    _seed_store(tmp_path, 59999, registered_at=time.time() - 7200)
+    monkeypatch.setattr(fa, "scan_listening_ports", lambda: _listeners({}))
+    agent = _agent(tmp_path, gw, lease_max_age=3600.0)
+    try:
+        agent.scan_once()
+        assert "lease_old" in gw.closed
+        assert _store(tmp_path) == {}
+    finally:
+        agent.stop()
+        gw.stop()
+
+
+def test_lease_within_max_age_is_kept(tmp_path, monkeypatch):
+    gw = _FakeGateway()
+    server, port = _http_target(tmp_path)
+    _seed_store(tmp_path, port, registered_at=time.time() - 10)
+    monkeypatch.setattr(fa, "scan_listening_ports",
+                        lambda: _listeners({port: "node"}))
+    agent = _agent(tmp_path, gw, lease_max_age=3600.0)
+    try:
+        agent.scan_once()
+        assert "lease_old" not in gw.closed
+        assert _store(tmp_path)[str(port)]["lease_id"] == "lease_old"
+    finally:
+        server.shutdown()
+        agent.stop()
+        gw.stop()
+
+
+def test_max_age_zero_disables_the_backstop(tmp_path, monkeypatch):
+    gw = _FakeGateway()
+    server, port = _http_target(tmp_path)
+    _seed_store(tmp_path, port, registered_at=1.0)
+    monkeypatch.setattr(fa, "scan_listening_ports",
+                        lambda: _listeners({port: "node"}))
+    agent = _agent(tmp_path, gw, lease_max_age=0.0)
+    try:
+        agent.scan_once()
+        assert "lease_old" not in gw.closed
+    finally:
+        server.shutdown()
+        agent.stop()
+        gw.stop()
+
+
+def test_legacy_entry_without_registration_time_is_stamped_not_released(
+        tmp_path, monkeypatch):
+    gw = _FakeGateway()
+    server, port = _http_target(tmp_path)
+    _seed_store(tmp_path, port, registered_at=None)
+    monkeypatch.setattr(fa, "scan_listening_ports",
+                        lambda: _listeners({port: "node"}))
+    agent = _agent(tmp_path, gw, lease_max_age=3600.0)
+    try:
+        agent.scan_once()
+        assert "lease_old" not in gw.closed
+        assert _store(tmp_path)[str(port)]["registered_at"] > 0
+    finally:
+        server.shutdown()
+        agent.stop()
+        gw.stop()
+
+
+# -- persisted heartbeat clock across a reboot -------------------------------
+
+def test_lease_loaded_after_reboot_is_heartbeated_on_first_cycle(tmp_path, monkeypatch):
+    """``last_hb`` is a ``time.monotonic()`` reading. A host reboot resets the
+    monotonic clock, so a persisted value can sit far in the future: the lease
+    was then never "due" again and the gateway's copy expired for good. A
+    loaded lease must be heartbeated (and re-registered when gone) at once."""
+    gw = _FakeGateway()
+    server, port = _http_target(tmp_path)
+    entry = {"lease_id": "lease_from_before_reboot", "label": f"x (port {port})",
+             "external_port": 18001, "url": "http://dev.lan:18001",
+             "target_host": "127.0.0.1", "target_port": port,
+             "process": "node", "last_hb": time.monotonic() + 1_000_000.0,
+             "registered_at": time.time()}
+    (tmp_path / "fabric-agent.json").write_text(json.dumps({str(port): entry}))
+    monkeypatch.setattr(fa, "scan_listening_ports",
+                        lambda: _listeners({port: "node"}))
+    agent = _agent(tmp_path, gw, heartbeat_ttl=90.0)
+    try:
+        agent.scan_once()
+        stored = _store(tmp_path)[str(port)]
+        assert stored["lease_id"] in gw.leases  # the gateway holds it again
+    finally:
+        server.shutdown()
+        agent.stop()
+        gw.stop()

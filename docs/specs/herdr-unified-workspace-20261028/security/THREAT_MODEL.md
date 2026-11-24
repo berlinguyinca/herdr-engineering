@@ -208,8 +208,9 @@ quoted data tainted `external-source:guest`. Hot YAML flag, off by default, fail
 real Postgres, real collab service and real HTTP (`tests/control_plane/test_team_rooms.py`); not deployed, not run live.
 
 Residual risks:
-- **R-TR1 (Medium).** `direct` is stored and validated but behaves as `suggest`. It fails closed; the risk is a reader assuming it
-  is enforced as a limit. Slices 2 and 3 must define it before it does anything.
+- **R-TR1 (Medium).** `direct` is stored and validated but behaves as `suggest` unless `team_rooms.direct_enabled` is also on (it is
+  off by default; see "Direct guest level" below). It fails closed; the risk is a reader assuming the stored level is what runs:
+  read `behaves_as` in the guest-level view.
 - **R-TR2 (Medium).** The quoted request still reaches a language model in the target agent's `tasks_inbox`. Taint labels and the
   fixed "untrusted data" note reduce, but do not remove, prompt injection by an approved guest request; approval authorises work,
   it does not sanitise text. The owner can trim it (`edited_text`) before approving.
@@ -290,6 +291,62 @@ Residual risks:
 - **R-TC5 (Medium).** Image rollback: an older image ignores the coordinator events and `task_requeued` (no `attempt` fence, requeued
   work shows its old requester) and the slice 2 caveat for person tasks still holds (R-TR14). Fail-closed on serving (the old code serves
   none of a coordinator's tasks), but roll back the flags, not the image.
+- **R-TC6 (Low).** Suggest requests cannot target a coordinator yet (approval names an agent that may execute; a coordinator's grant
+  is checked at the Direct level, which refuses coordinator and assistant agents as targets: R-DG3), and the brief-reference refusal in
+  the design is untestable until slice 4 builds the route (the assistant API already rejects collaboration credentials).
+- **R-TC7 (Info).** No web UI; the API and `herdr-eng rooms coordinator|coordination` only. The Work Graph shows the coordinator as a
+  `team_role` fact for display; it never grants.
+
+#### Direct guest level (`control_plane.collab.team_rooms.direct_enabled`, also needs `team_rooms`; T-TC5, T-TC12, T-TC15)
+Mechanism (`collab_direct.py`, wired in `collab.py`, `collab_coordinators.py` and `collab_team_roles.py`): at level `direct` a guest
+hands work to an agent through the ordinary `POST /rooms/{room}/tasks`, judged against the owner's `direct_limits` (an agent or role
+allow-list, `per_hour`, `max_open`, `max_text`, and the off-by-default `may_request_review` / `may_cancel_own`). The right is computed
+from the room level and flag on each request; `ROLE_ACTIONS["guest"]` stays `{"read"}`. The task is created by the guest (events carry
+their user id), has `origin: guest-direct` and the sticky taint `external-source:guest`, a fixed-sentence command, and the guest's
+words as quoted, untrusted data (exactly as an approved Suggest request). Refusals are 403 plus an `audit_denied` event with a distinct
+reason (an allow-list or field violation, a withdrawn right, an assistant or external target, a reviewer choice, a review request without
+the flag) or 429 for the caps; nothing falls back to the Suggest queue automatically (the guest can still file a Suggest request, which
+is a different, owner-decided act). `_creator_valid` makes the task valid only while the flag is on, the level is `direct`, the guest is
+an unexpired guest whose own right is not withdrawn, and the target is still inside the limits, so the agent's inbox and `update_task`
+refuse it at once; `sweep_direct`, a level change, a member removal and a per-guest withdrawal then CANCEL what is still open (never
+requeue: a guest task has no operator decision in its chain). Lowering the level and withdrawing one guest's right are safety writes
+(they use a full log; setting `direct` is pre-paid). Tested with real HTTP, a real collab service and a real Postgres
+(`test_team_rooms_direct.py`, `test_team_rooms_direct_cli.py`), mutation-checked; not deployed, not run live.
+
+How the design's rows are met:
+- **T-TC5** (guest abuse of Direct): explicit allow-list, never "any"; per-hour and open caps counted from the replayed log (a restart
+  cannot reset them) on top of `TASK_RATE` and `MAX_OPEN_TASKS_PER_AGENT`; no `instruct`, no person target, no parent, no lease or policy,
+  no named reviewer; and **no children**: an agent cannot create a task under a guest's task (`direct_no_children`), so a guest's words do
+  not fan out through a chain. The design's "max task depth" is therefore fixed at zero for a guest chain, not a number.
+- **T-TC12** (revocation lag): lowering the level, narrowing the allow-list, removing the guest, withdrawing the guest's right, the guest
+  expiring and the flag turning off all make the tasks unservable on the next request; the sweep (up to `sweep_interval_seconds`) writes
+  the cancellations.
+- **T-TC15** (collusion): a guest cannot decide Suggest requests, change the level or the limits, or reach a coordinator or an assistant;
+  a guest is excluded from reviewing what they assigned by the same disqualification rule as every other principal.
+
+Residual risks:
+- **R-DG1 (Medium).** An allowed agent still reads the guest's words (quoted, tainted, with the fixed note) and can be steered by them
+  within its own authority; the allow-list and caps bound who and how often, not what the words say (R-TR2 applies, with no operator
+  approval in between). Allow only agents whose own grants you are content to have a guest steer. This is why the flag is off by default.
+- **R-DG2 (Low-Medium).** Caps and the cancel sweep are one-process and replay-derived (like R-TR6 / R-TC2). Between an expiry or an
+  identity-provider group drop and the next sweep, the task is already unservable but is not yet marked cancelled. Withdrawing a guest's
+  right (`guest_direct_set` with `allowed: false`) is a safety write that is not pre-paid; it is bounded only because each guest can be
+  withdrawn once until the right is restored, and restoring it is an ordinary write that a full log refuses. Leaving Direct is the
+  one pre-paid safety write (`revokes_direct`); toggling among the other levels is ordinary, so it cannot fill the log.
+- **R-DG3 (Low).** Assistants and coordinators are excluded by derivation from the log (designated coordinators, claimed assistant
+  runtimes), not by any label the client sends. An assistant that is not yet claimed or designated is not recognised; operators must not
+  list one in `direct_limits`. The Direct tests exercise the designated-coordinator branch through the real routes; the
+  runtime-claimed branch is the same `_tc_assistants()` call slice 3 tests, and has no Direct-specific test (the assistant-runtime path
+  needs a package and a host attestation).
+- **R-DG4 (Low).** A review request goes by role only and the server picks the holder. Read/post-only reviewer agents cannot take tasks
+  (R-TR12), so it routes to a person holder of the reviewer role or fails closed with 409; a person reviewer sees the fixed command text,
+  not the guest's words, and must open the work task to review it.
+- **R-DG5 (Medium).** Image rollback: see the flag row in section 5. An older image rejects the new `direct_enabled` key (the hot
+  path turns all team rooms off; the startup path may refuse to start) and does not know `guest_direct_set`, so remove the key first.
+- **R-DG6 (Info).** No web UI: `packages/collab-team-rooms.js` (PR #598, not merged) shows `direct` as "acts as Suggest for now"; that
+  label must change when both land. The guest's own view is `GET /rooms/{room}/direct-tasks` and `herdr-eng rooms direct-tasks`, and it
+  never includes an agent's result.
+
 - **R-TC6 (Low, updated by slice 4).** `direct` guests cannot target a coordinator yet. Slice 4 built the brief route, so the
   brief-reference refusal is now tested (see R-TB8), and an owner's approval of a Suggest request (a guest's or a brief) CAN
   hand the root task to the team's own coordinator (tested: the coordinator accepts it and decomposes by role).
@@ -353,6 +410,69 @@ Residual risks:
 - **R-TB9 (Low).** A brief is filed even into a `read_only` room (it is the operator's own assistant, not a guest) and counts against
   the room's pending cap, so a flood of briefs can crowd out guest requests until the operator decides some.
 
+### 3.9 Approval-gated external actions (`control_plane.personal_assistant.external_actions.enabled`, slice 5)
+Code: `external_actions.py` (the approval ledger, the executor, the two provider clients), `collab_team_external.py` (who may file,
+decide and retry, and the audit trail), `assistant_adapters.ExternalActionsBridge`, `deployment_escalation.GitHubIssueSink`
+(credential lookup only), `google_workspace.create_draft` / `find_draft_by_key`. Design: `TEAM_COLLABORATION.md` section 14 slice 5 and
+contradiction 10 (the ledger is `AssistantProposal` with `dedupe_key`, not the unwired `workspace_contracts` ledger).
+
+Two actions exist: `github_issue_create` (one issue in the repository the room owner set for a team) and `email_reply_draft` (one Gmail
+DRAFT; the code has no method that sends). Both are built only from an email brief the operator already approved, never from text the
+filer supplies alone.
+
+Threats and mitigations (all exercised in `test_external_actions_*` and `test_team_external_actions*.py` unless marked):
+- **T-EA1, confused deputy.** The operator's credentials act for a request a team agent or a guest wrote. Only the account owner
+  (the room owner as a person, or the API key mapped to that user) can approve, reject or retry; a coordinator, an opted-in external
+  coordinator, a guest, a contributor, a viewer, the issue writer, an implementer, a reviewer and every agent get 403 plus an audit
+  record under their own identity (deduped for 60 s per principal, action and room); a stranger gets 404. `actions.approvers` is
+  deliberately NOT honoured for these kinds. The filer chooses neither the repository, the recipient, the thread nor the brief text.
+- **T-EA2, injection into the issue body.** The body is the approved brief (already redacted, capped, email-tainted) inside a fixed
+  frame, in a fenced block, with a trailing machine marker; the title is single-line, control characters stripped, 200 characters; labels
+  come only from `external_actions.github.labels`. The card shows the exact title, labels and body, and approval needs the SHA-256 of
+  that content, so what is approved is what is sent. Residual R-EA2: a person or model reading the issue later still reads email text.
+- **T-EA3, SSRF and redirect abuse.** The GitHub host comes from YAML only (`github.api_base`; https, or plain http only to a loopback
+  host), never from a request or from the repository field; the repository must match `owner/name`; redirects are refused; responses are
+  read up to 256 KiB; the path is built from validated parts. Gmail goes through the existing `GoogleWorkspace`, which has its own host
+  allowlist.
+- **T-EA4, double execution.** The key is `sha256(kind | brief_key)`: the same email is one action for ever (unless it was rejected, or
+  expired without starting). The intent (`executing`, attempt count, time) is made durable with an acknowledged write BEFORE the provider
+  is called, and a failed write means no call. Every run after the first looks for the key at the provider before creating (GitHub: the
+  last line of the issue body, in a listing of issues updated since the first intent; Gmail: an `X-Herdr-Action-Key` header in the newest
+  50 drafts). A crash, restart, lost answer or timeout leaves the action `unknown`; nothing but the owner's retry (which re-confirms the
+  hash) runs it again, and `recover()` after a restart only READS the provider. Tested through restarts, a lost answer after a successful
+  create, a revoked token and a down provider.
+- **T-EA5, token exposure.** No credential is in a request, a response, the log, an audit record, the proposal or an error: the token is
+  fetched per call from the existing storage (the GitHub App's own `team_issues` write capability, else the server-held `github.token`),
+  held in one request header, and a credential sweep over every response, the collab log and the stored snapshot finds none. There is no
+  environment variable and no key that names a secret. The static `github.token` fallback is allowed and is the same PAT the escalation
+  issues use; remove it as well as the App capability to stop writes (R-EA5).
+- **T-EA6, cost and flooding.** `actions_per_hour` (filing) and `executions_per_hour` (provider calls), counted from the ledger; a filer
+  is also throttled by the collab service. 429 on the cap.
+- **T-EA7, silent failure.** A failure is a visible state (`failed`: a definite refusal; `unknown`: no usable answer) with a fixed
+  reason, an owner notification and an audit record; only the owner can retry.
+- **T-EA8, send by mistake.** `GmailDrafts` has `create` and `find` only; the connection's existing `gmail.compose` scope can send at the Google API level, so the guarantee is the code (only
+  `drafts.create` and a drafts listing are called; a test asserts the send endpoint is never requested); the card says "nothing is sent". The operator sends from Gmail, later, by hand.
+
+Residual risks:
+- **R-EA1 (Low-Medium). Exactly once has limits.** A request that reached GitHub only AFTER the next run read the listing (a provider
+  still processing a cut connection) can yield a second issue. A Gmail draft older than the newest 50 is not found, so a retry can add a
+  second DRAFT (never a second send). Both are rare and visible in the operator's list. A provider that ignores the marker (an edited
+  issue body) defeats reconcile.
+- **R-EA2 (Medium).** The text of an approved brief ends up in a GitHub issue that other people and models read; "this is data" is
+  advice, not a mechanism. The operator sees and approves the exact text first.
+- **R-EA3 (Low).** GitHub is not Gmail: the Gmail DRAFT carries the recipient from the original message's sender, taken from the
+  assistant's private record, never from the filer; a spoofed From header is the operator's to notice on the card.
+- **R-EA4 (Medium). Image rollback.** All state lives in fields the older `AssistantProposal` already had, so an older image replays and
+  rewrites the snapshot without losing an action. The older image has no executor and does not know the kind: it lists the action in its
+  proposal queue and an approver (not only the owner) can mark it `approved` there, which records permission and runs nothing. After
+  rolling forward that action shows as approved-but-not-run and only the owner's retry with the SHA-256 runs it. Roll back the flag first.
+  This path is reasoned from the older code, not run against an older image.
+- **R-EA5 (Medium).** The `github.token` fallback is a broad personal credential; the App capability `team_issues` is narrower. Prefer
+  the App and remove the PAT.
+- **R-EA6 (Info).** Everything above runs against CONTRACT-LEVEL FAKE servers (`tests/control_plane/external_fakes.py`) speaking the
+  GitHub and Gmail REST shapes; GitHub and Gmail were never called. The real services' behaviour (rate limits, search lag, a draft
+  header surviving) is as documented, not observed. No web UI, no attention inbox, no conversation view. The caps live in one process.
+
 ## 4. Severity summary (judged from reading; unverified)
 | Id | Severity | One line |
 |---|---|---|
@@ -375,9 +495,15 @@ Residual risks:
 | R-TC1, R-TC5 | Medium | Coordinators: an opted-in external person instructs the team's agents; image rollback loses the requeue fence |
 | R-TC2, R-TC3 | Low-Medium | Coordinators: one-process caps; identity-provider revocation lag |
 | R-TC4, R-TC6, R-TC7 | Low / Info | See section 3.8 (slice 3) |
+| R-DG1, R-DG5 | Medium | Direct: an allowed agent is steered by a guest's quoted words with no approval between; image rollback needs the key removed first |
+| R-DG2, R-DG3, R-DG4, R-DG6 | Low-Medium / Low / Info | See section 3.8 (Direct guest level) |
+
 | R-TB1, R-TB2, R-TB5 | Medium | Assistant briefs: injection via the brief text, free text through the excerpt, image rollback drops references |
 | R-TB3, R-TB4, R-TB6, R-TB8, R-TB9 | Low-Medium / Low | See section 3.8 (slice 4) |
 | R-TB7 | Info | No automatic scan, no web UI, live Gmail fetch not exercised |
+| R-EA2, R-EA4, R-EA5 | Medium | External actions: approved brief text lands in an issue; image rollback exposes the kind to the old queue; broad PAT fallback |
+| R-EA1, R-EA3 | Low-Medium / Low | External actions: exactly-once limits at the provider; reply recipient comes from the original sender |
+| R-EA6 | Info | External actions were tested against contract-level fakes only; no web UI |
 | R-SH4, R-CL1, R-DP2 | Low-Medium | See sections |
 | R-WG2-4, R-SH5-7, R-ART3, R-RA3, R-TL3, R-CL2 | Low | See sections |
 
@@ -393,7 +519,10 @@ with the flag off (migrations are additive, so the image can be ahead of the fla
 | `control_plane.collab.team_rooms.enabled` | off | Set `true` (hot, read each request); existing rooms' guests become Suggest unless a room is set `read_only` first | `suggestion_submitted`/`decided` events, 403/404 rates on `/rooms/*/suggestions`, `team_attached` grants | `false` or `kill_switch: true`: routes 404, guests see tasks again. `herdr-eng rooms detach` first if attached teams must go (works with the flag off). See `docs/operations/team-rooms.md` |
 | `control_plane.collab.team_roles.enabled` (also needs `team_rooms`) | off | Set `true` (hot); assign people to roles per room and team; set the policy per team (default escalate) | `task_reminded` / `task_escalated` events, `blocked` tasks in the owner's attention, 409 `no_role_holder` rate | `false` or `kill_switch: true`: new fields unknown, routes 404, sweep stops. Do NOT roll the image back while a person task newer than ~8 days exists (R-TR14); roll back the flag. See `docs/operations/team-rooms.md` |
 | `control_plane.collab.coordinators.enabled` (also needs `team_rooms`, `team_roles`) | off | Set `true` (hot); designate an agent per team; `external.enabled` is a second flag and the per-team opt-in a third | `team_coordinator_set`, `task_requeued` events, 429 `coordinator_rate` / `coordinator_open`, 400 `coordination_loop`, 403 audit events from coordinators | `external-coordination off` per team, then `external.enabled: false`, then `enabled: false`; cancel what you do not want. Do not roll the image back (R-TC5) |
+| `control_plane.collab.team_rooms.direct_enabled` (also needs `team_rooms`) | off | Set `true` (hot) only after choosing, per room, the agents and roles a guest may address and the caps (`herdr-eng rooms guest-level ROOM direct ...`); defaults are 3 per hour, 2 open | `task_created` events with `origin: guest-direct`, `audit_denied` reasons `direct_*`, 429 `direct_rate` / `direct_open`, `task_updated` cancellations with reason `direct_revoked` | `direct_enabled: false` (the level acts as Suggest at once; open guest tasks stop being served and the next sweep cancels them). Image rollback is safe for serving (an older image replays the log and serves no guest task, checked) but it rejects the unknown key: remove `direct_enabled` first (R-DG5). See `docs/operations/team-rooms.md` |
+
 | `control_plane.personal_assistant.team_briefs.enabled` (also needs `personal_assistant.enabled`, a persistence DSN, `team_rooms`) | off | Set `true` with a topic list; restart the control plane (read at start); attach a team to a room first | `suggestion_submitted` events with `source: assistant_brief`, 429 `brief_rate`, pending queue age, assistant audit `assistant.team_brief.*` | `false` and restart: both routes 404, the in-process door closes, briefs already filed stay in the queue (decide or reject them). Do NOT roll the image back (R-TB5). See `docs/operations/team-rooms.md` |
+| `control_plane.personal_assistant.external_actions.enabled` (also needs `personal_assistant.enabled` with a persistence DSN, `team_rooms`, an approved brief, a team issue repository set by the owner) | off | Set `true` with `github.labels`; give the App the `team_issues` write capability (or keep `github.token`); restart the control plane | `external_action_filed` / `_decided` events, assistant audit `assistant.external.*`, 429 caps, actions in `unknown` or `failed`, 403 audit records | `false` or `kill_switch: true` and restart: every route 404; actions in the ledger stay. Do NOT roll the image back first (R-EA4). Remove the PAT and the App capability to stop writes. See `docs/operations/team-rooms.md` |
 | Share links `control_plane.share.enabled` (+ `signing_secret`, `share.public_url`) | off | Complete the share block; `deploy.sh` refuses incomplete config, renders the edge with `/s/`, starts `share-public` | share `events` (`opened`, `denied`), 404 rate on `/s/`, live bytes | Revoke individual shares first (`POST .../shares/{sid}/revoke` removes state, then bundle); then `enabled: false` and deploy: the edge stops routing `/s/` and `share-public` is stopped |
 | Per-user rollout | not built | The spec asks for it; every flag today is global | | |
 

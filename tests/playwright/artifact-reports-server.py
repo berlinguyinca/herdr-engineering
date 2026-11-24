@@ -40,6 +40,22 @@ def tiny_pdf(text, height=200):
     return bytes(out)
 
 
+RICH_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Author page</title><style>
+:root { color-scheme: light dark; --bg:#faf9f5; --fg:#1f1e1d; --card:#fff; --accent:#c96442; --line:#e8e6dc; }
+@media (prefers-color-scheme: dark) { :root { --bg:#262624; --fg:#f0eee6; --card:#30302e; --line:#3d3d3a; } }
+body { margin:0; padding:28px 24px; background:var(--bg); color:var(--fg); font:16px/1.6 Georgia, 'Times New Roman', serif; }
+h1 { font-size:30px; margin:0 0 4px; } .kicker { color:var(--accent); font:600 12px/1 system-ui; letter-spacing:.12em; text-transform:uppercase; }
+.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin:20px 0; }
+.card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px 16px; }
+.card b { display:block; font:700 26px/1.2 system-ui; color:var(--accent); }
+</style></head><body><div class="kicker">Latency investigation</div><h1 id="author-heading">Candidate cuts p95 latency by 18%</h1>
+<p>A hand-written page with its own layout, colours and cards.</p>
+<div class="grid"><div class="card"><b>312 ms</b>baseline p95</div><div class="card"><b>256 ms</b>candidate p95</div><div class="card"><b>n = 4,000</b>requests per arm</div></div>
+<p id="probe">Scripts have not run.</p>
+<script>document.getElementById('probe').textContent = 'SCRIPT RAN'; try { window.parent.document.title = 'pwned'; } catch (e) {}</script>
+</body></html>"""
+
+
 class ReportFixture:
     def __init__(self):
         # Plain (non-report) artifacts for the preview tests; bytes live in the same content-addressed store.
@@ -95,6 +111,15 @@ class ReportFixture:
             }
         self.outputs = {version: [] for version in self.descriptors}
         self.blobs = {self.key: self.data}
+        if os.environ.get("REPORT_RICH"):
+            # The author's own page: it styles itself, and its script would flip the probe if scripts ever ran.
+            page = RICH_PAGE.encode()
+            self.rich_digest = hashlib.sha256(page).hexdigest()
+            self.rich_key = f"sha256/{self.rich_digest[:2]}/{self.rich_digest[2:4]}/{self.rich_digest}"
+            self.blobs[self.rich_key] = page
+            for descriptor in self.descriptors.values():
+                descriptor["assets"].append({"id": "author_page", "name": "report.html", "role": "preview",
+                    "media_type": "text/html", "sha256": self.rich_digest, "size_bytes": len(page)})
         self.blobs.update({key: data for _record, key, data in self.plain.values()})
         legacy_versions = ("version_1", "version_2") if os.environ.get("REPORT_ALL_LEGACY") else (
             ("version_1",) if os.environ.get("REPORT_MIXED_HISTORY") else ())
@@ -111,6 +136,15 @@ class ReportFixture:
 
     def sync_call(self, method, *args, **kwargs):
         return asyncio.run(getattr(self, method)(*args, **kwargs))
+
+    async def tombstoned_ids(self):
+        return []
+
+    async def lifecycle_of(self, artifact_id):
+        return "active"
+
+    async def operator_member_access(self, artifact_id, principal, permission):
+        return False
 
     async def get_record(self, artifact_id, **_kwargs):
         if artifact_id in self.plain:
@@ -197,9 +231,12 @@ class ReportFixture:
         return copy.deepcopy(row)
 
     async def get_report_asset(self, artifact_id, version_id, asset_id):
-        if not await self.get_version(version_id, artifact_id) or asset_id != "observations":
+        if not await self.get_version(version_id, artifact_id):
             return None
-        return {**self.descriptors[version_id]["assets"][0], "storage_key": self.key}
+        asset = next((a for a in self.descriptors[version_id]["assets"] if a["id"] == asset_id), None)
+        if asset is None:
+            return None
+        return {**asset, "storage_key": self.rich_key if asset_id == "author_page" else self.key}
 
     def get(self, key, digest):
         data = self.blobs[key]

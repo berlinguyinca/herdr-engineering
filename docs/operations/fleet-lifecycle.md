@@ -63,7 +63,7 @@ and Tailscale must be told to forward `dev.lan` queries there. In the
 **Tailscale admin console → DNS → Nameservers**:
 
 1. **Add nameserver** → the master host's tailnet IPv4
-   (`tailscale ip -4` on the master, e.g. `100.104.39.6`).
+   (`tailscale ip -4` on the master, e.g. `100.64.8.6`).
 2. Enable **"Restrict to domain"** and set it to **`dev.lan`**.
 3. Save.
 
@@ -297,6 +297,26 @@ controller-on-a-checkout flow - but it is recorded: every run writes `runner_mod
 to `herdr-eng memory doctor` rather than assumed. A host whose checkout is *dirty* still needs one
 manual act - clean it, or point `HERDR_ENGINEERING_REPO` at a dedicated clean checkout - and the
 rendered unit on disk is replaced only when the installer runs again.
+
+**Prefer the second option on a host where people work.** A controller checkout is a working tree, so
+any session's uncommitted edit silently disables unattended updates: on 2026-11-04 the 11:59 run
+skipped because another session had added a 9-line shim to `deploy/control-plane/deploy.sh` at 11:45.
+The skip was correct and the work was preserved, but the fleet stopped updating. The controller now
+runs from a checkout nothing else touches (`C` below; any path works, nothing else needs to know it):
+
+```bash
+C=$HOME/fleet/herdr-engineering
+git clone --branch main https://github.com/berlinguyinca/herdr-engineering.git "$C"
+W=<work-checkout>                                     # the checkout people actually work in
+cp "$W/ansible/inventory/hosts.yml"    "$C/ansible/inventory/"  # gitignored: copy, never symlink
+cp -r "$W/ansible/inventory/host_vars" "$C/ansible/inventory/"
+cd "$C" && python3 -m venv .venv
+.venv/bin/pip install "ansible-core==<the version the fleet uses>" .   # non-editable on purpose
+bash scripts/fleet-auto-update.sh        # re-renders the unit at this path; daemon-reload is implied
+```
+
+`runner_is_checkout: false` in `fleet-auto-update.json` is the check that it worked. The work checkout
+keeps its own `.venv` and stays a normal place to develop; only the timer moves.
 
 Failures divide in two, and the difference is what makes the job safe to leave switched on:
 
