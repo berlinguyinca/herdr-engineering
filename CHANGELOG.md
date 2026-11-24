@@ -22,6 +22,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - `scripts/fabric-stack.sh up` creates and checks the token directory the way `deploy.sh` does (real directory, owned by the caller, mode 0700) before compose runs; both refuse a wrong owner or mode.
 - `deploy/control-plane/compose.yaml` mounts `~/.config/herdr-engineering/fabric-gateway` read-only at `/run/fabric` into `fabric-gateway` and `herdr-web` (both call the control API) and keeps `--allow-open` on the gateway for the rollout; `deploy.sh` creates the directory 0700. See the PR for the order.
 
+### Fix: web packages bug-hunt (collaboration sign-in/out, room polling, composer, member routes, nav badge)
+
+- Collaboration: blocked site storage (`window.sessionStorage` throwing) no longer stops `collab-view.js`, and so the whole dashboard, from loading; it falls back to memory. Sign out now also ends the Cognito Hosted-UI session (`/logout?client_id=...&logout_uri=...`, `logout_uri` defaulting to `public_url`, which the user pool must list as an allowed sign-out URL). Every `CollabApi` call now times out after 30 s, so a half-open connection no longer freezes a room silently; `showRoom` removes its `focusout` listener on teardown instead of adding one per visit.
+- Composer: a message delivered after the composer was disposed mid-send no longer survives as the stored draft.
+- Dashboard: mission titles are refreshed after 60 s and a failed load is no longer cached as an empty map (`mission-titles.js`). The nav badge announces "N open, M critical" instead of "true critical".
+- Member page: a slow library load no longer repaints over a newer route.
 ### Fix: required `unit-gates` no longer skips PRs that touch untested-by-list paths; Rust module gates fail in CI without cargo
 
 - `scripts/ci/unit-gates-applicable.sh unit` is now default-run with a short exempt list instead of an allow-list, so `herdr_artifact_host/`, `ansible/`, `skills/`, `scripts/*.sh`, `package.json`, `package-lock.json` and any new top-level path run the suite (they previously passed the required check with no tests; `main-moved-check.sh` shared the gap). A test checks every tracked file against the matcher.
