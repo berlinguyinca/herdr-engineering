@@ -1,4 +1,5 @@
 """Managed releases preserve work and require real installation provenance."""
+import base64
 import importlib.util
 import json
 import subprocess
@@ -493,3 +494,49 @@ def test_dirty_release_exits_with_a_marker_the_controller_can_parse(
     assert parsed['files'] == ['package.json']
     assert 'local work preserved' in parsed['error']
     assert parse_stage_error('PLAY RECAP unreachable=0', '') is None
+
+
+def _dirty(repository, tmp_path, mutate):
+    stage = module()
+    repo, sha = repository
+    home = tmp_path / 'home'
+    release = Path(stage.stage_pi(home, sha, repository=str(repo), runner=install_ok)['sourceRoot'])
+    mutate(release)
+    with pytest.raises(stage.DirtyRelease) as raised:
+        stage.stage_pi(home, sha, repository=str(repo), runner=install_ok)
+    return stage, raised.value
+
+
+def test_dirty_files_with_spaces_and_odd_characters_are_listed_whole(repository, tmp_path):
+    def mutate(release):
+        (release / 'my notes.txt').write_text('x')
+        (release / 'quo"te.txt').write_text('x')
+        (release / 'café →.txt').write_text('x')
+        (release / 'package.json').write_text('local work')
+
+    _, error = _dirty(repository, tmp_path, mutate)
+    assert sorted(error.files) == sorted(
+        ['my notes.txt', 'quo"te.txt', 'café →.txt', 'package.json']
+    )
+
+
+def test_dirty_rename_is_reported_as_old_to_new(repository, tmp_path):
+    def mutate(release):
+        subprocess.run(['git', '-C', str(release), 'mv', 'package-lock.json', 'renamed lock.json'],
+                       check=True, capture_output=True)
+
+    _, error = _dirty(repository, tmp_path, mutate)
+    assert error.files == ['package-lock.json -> renamed lock.json']
+
+
+def test_dirty_list_is_capped_with_an_explicit_more_note(repository, tmp_path):
+    def mutate(release):
+        for index in range(25):
+            (release / f'extra-{index:02d}.txt').write_text('x')
+
+    stage, error = _dirty(repository, tmp_path, mutate)
+    assert len(error.files) == 25
+    detail = json.loads(base64.urlsafe_b64decode(stage.release_error_line(error).split(':', 2)[2]))
+    assert len(detail['files']) == 20
+    assert detail['error'].count('extra-') == 20
+    assert '+5 more' in detail['error']

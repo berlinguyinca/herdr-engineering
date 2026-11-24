@@ -131,10 +131,11 @@ class DirtyRelease(RuntimeError):
 
 def release_error_line(error):
     """One quote-free line the controller can find inside Ansible's escaped output."""
+    more = len(error.files) - 20
     detail = {
         'files': error.files[:20],
         'error': 'managed release is dirty: ' + ', '.join(error.files[:20])
-                 + '; local work preserved',
+                 + (f' (+{more} more)' if more > 0 else '') + '; local work preserved',
     }
     payload = base64.urlsafe_b64encode(json.dumps(detail).encode()).decode()
     return 'HERDR_STAGE_ERROR:managed_release_dirty:' + payload
@@ -143,9 +144,39 @@ def release_error_line(error):
 def verify_checkout(path, revision, runner):
     if runner(['git', '-C', str(path), 'rev-parse', 'HEAD']) != revision:
         raise RuntimeError('Managed release has the wrong commit; refusing overwrite')
-    dirty = runner(['git', '-C', str(path), 'status', '--porcelain', '--untracked-files=all'])
-    if dirty:
-        raise DirtyRelease([line.split(None, 1)[-1] for line in dirty.splitlines()])
+    dirty = runner(['git', '-C', str(path), 'status', '--porcelain=v2', '-z',
+                    '--untracked-files=all'])
+    files = dirty_files(dirty)
+    if files:
+        raise DirtyRelease(files)
+
+
+def dirty_files(status):
+    """Paths from `git status --porcelain=v2 -z`, one entry per changed file.
+
+    NUL-separated v2 output carries raw paths (no quoting, spaces intact) and never begins
+    with a space, so the runners' output stripping cannot eat part of the first entry. A
+    rename or copy is reported as `old -> new`.
+    """
+    entries = [entry for entry in status.split('\0') if entry]
+    files = []
+    index = 0
+    while index < len(entries):
+        entry = entries[index]
+        index += 1
+        kind = entry[:1]
+        if kind == '1':
+            files.append(entry.split(' ', 8)[-1])
+        elif kind == '2':
+            new = entry.split(' ', 9)[-1]
+            old = entries[index] if index < len(entries) else '?'
+            index += 1
+            files.append(old + ' -> ' + new)
+        elif kind == 'u':
+            files.append(entry.split(' ', 10)[-1])
+        elif kind == '?':
+            files.append(entry[2:])
+    return files
 
 
 def checkout(root, revision, repository, runner):
