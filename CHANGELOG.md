@@ -13,6 +13,8 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - `DevServiceRegistry.heartbeat` refuses to revive an expired lease whose external port was re-allocated (the agent re-registers); idempotent `register` refreshes `expires_at`, moves a lapsed lease off a taken port, and runs under the registry lock.
 - A failed send on one pump direction no longer stops the opposite direction, so an origin that answers early and closes still has its response delivered; ETIMEDOUT from TCP keepalive is no longer mistaken for a poll timeout, and TCP keepalive idle is 15 s (was 60 s, longer than the idle timeout).
 - `rewriting_pipe` waits up to `HERDR_GATEWAY_RESPONSE_TIMEOUT` seconds (default 300) for the origin's response head and answers 504 on expiry; local (gateway-less) lease renewal re-registers a lease whose port was re-allocated.
+- A backend that accepts bytes but sends nothing back for the inactivity timeout ends a `proxy_pair` / `prefixed_pipe` even while the client keeps sending; a response that is still flowing is never cut. The head deadline always answers 504 (never an empty reply), and a dead origin (keepalive ETIMEDOUT) answers 502.
+- Gateway-less renewal: a lease moved to a new port restarts its forwarder (`enroll --serve`, `enroll-dir --serve`), `devfabric heartbeat` re-registers like the serve loops, and `heartbeat`/re-register reload the store first so a port another CLI process took is seen. `HERDR_GATEWAY_RESPONSE_TIMEOUT` must be finite and positive, else the 300 s default applies.
 
 ### Fix: assistant store snapshot loading, ordering and locking
 

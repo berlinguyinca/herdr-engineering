@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 import os
 import socket
 import threading
@@ -345,6 +346,8 @@ class DevServiceRegistry:
                  network_namespace: str | None = None) -> DevServiceLease:
         """Register (or idempotently renew) a lease. Allocates a collision-free port."""
         now = _now_iso()
+        if lease_id or owner_herdr_session_id or owner_process_id:
+            self.reload_if_changed()  # a re-register checks the port against other processes' leases
         with self._lock:
             # Idempotent registration for a stable owner/process identity.
             if owner_herdr_session_id or owner_process_id:
@@ -410,6 +413,7 @@ class DevServiceRegistry:
         under the caller (another process renewed or re-registered it), the
         stale-base renewal is REFUSED — renewing from the old base would
         clobber the newer state; the caller retries from a fresh read (#89)."""
+        self.reload_if_changed()  # see leases other processes wrote before the port-taken check
         with self._lock:
             lease = self._leases.get(lease_id)
             if lease is None:
@@ -661,9 +665,23 @@ class _Activity:
     def __init__(self) -> None:
         self.last = time.monotonic()
         self.stop = threading.Event()
+        # When the client first sent something the backend has not answered yet.
+        self.unanswered_since: float | None = None
 
     def touch(self) -> None:
         self.last = time.monotonic()
+
+    def sent_upstream(self) -> None:
+        if self.unanswered_since is None:
+            self.unanswered_since = time.monotonic()
+
+    def answered(self) -> None:
+        self.unanswered_since = None
+
+    def wedged(self, idle: float) -> bool:
+        """The client has been waiting longer than ``idle`` for ANY byte from the backend."""
+        since = self.unanswered_since
+        return since is not None and time.monotonic() - since > idle
 
     def expired(self, idle: float) -> bool:
         return time.monotonic() - self.last > idle
@@ -682,10 +700,12 @@ def enable_keepalive(sock: socket.socket) -> None:
 
 
 def _env_seconds(name: str, default: float) -> float:
+    """A positive, finite number of seconds from the environment, else ``default``."""
     try:
-        return float(os.environ.get(name, default))
+        value = float(os.environ.get(name, default))
     except ValueError:
         return default
+    return value if math.isfinite(value) and value > 0 else default
 
 
 # How long the TLS / header-rewrite path waits for the origin's response head.
@@ -703,7 +723,9 @@ def _send_all(dst: socket.socket, data: bytes, act: _Activity, idle: float) -> N
     while view:
         try:
             sent = dst.send(view)
-        except TimeoutError:
+        except TimeoutError as exc:
+            if exc.errno is not None:
+                raise  # ETIMEDOUT from TCP keepalive: the peer is gone
             if act.stop.is_set() or act.expired(idle):
                 raise
             continue
@@ -712,12 +734,19 @@ def _send_all(dst: socket.socket, data: bytes, act: _Activity, idle: float) -> N
 
 
 def _pump(src: socket.socket, dst: socket.socket, act: _Activity, idle: float,
-          prefix: bytes = b"") -> None:
+          prefix: bytes = b"", role: str = "") -> None:
     """Copy ``src`` -> ``dst``. A recv timeout is NOT an end of stream: the pipe
     ends only when the connection as a whole (either direction) has been idle
-    for ``idle`` seconds, so one-way streams (SSE, downloads) keep flowing."""
+    for ``idle`` seconds, so one-way streams (SSE, downloads) keep flowing.
+
+    ``role`` "up" (client -> backend) / "down" (backend -> client) also tracks
+    whether the backend answers: a backend that swallows the client's bytes but
+    sends nothing back for ``idle`` seconds is wedged, and ends the pipe even
+    though the client keeps sending."""
     try:
         if prefix:
+            if role == "up":
+                act.sent_upstream()
             _send_all(dst, prefix, act, idle)
         while not act.stop.is_set():
             try:
@@ -725,13 +754,20 @@ def _pump(src: socket.socket, dst: socket.socket, act: _Activity, idle: float,
             except TimeoutError as exc:
                 if exc.errno is not None:
                     raise  # ETIMEDOUT from TCP keepalive: the peer is gone
-                if act.expired(idle):
+                if act.expired(idle) or act.wedged(idle):
                     act.stop.set()
                     break
                 continue
             if not data:
                 break  # orderly half-close: the other direction may continue
             act.touch()
+            if role == "up":
+                act.sent_upstream()
+                if act.wedged(idle):
+                    act.stop.set()
+                    break
+            elif role == "down":
+                act.answered()
             _send_all(dst, data, act, idle)
     except (OSError, ValueError):
         # This direction is dead; the other one keeps draining (an origin that
@@ -763,12 +799,13 @@ def _run_pipe(client: socket.socket, target: socket.socket, inactivity_timeout: 
     for s in (client, target):
         enable_keepalive(s)
         s.settimeout(poll)
-    t1 = threading.Thread(target=_pump, args=(client, target, act, inactivity_timeout, client_prefix),
+    t1 = threading.Thread(target=_pump, args=(client, target, act, inactivity_timeout, client_prefix, "up"),
                           daemon=True)
-    t2 = threading.Thread(target=_pump, args=(target, client, act, inactivity_timeout), daemon=True)
+    t2 = threading.Thread(target=_pump, args=(target, client, act, inactivity_timeout, b"", "down"),
+                          daemon=True)
     t1.start()
     t2.start()
-    # Both pumps end on their own: EOF/error, or connection-wide idleness.
+    # Both pumps end on their own: EOF/error, connection-wide idleness, or a wedged backend.
     t1.join()
     t2.join()
     _close_pair(client, target)
@@ -990,9 +1027,17 @@ def rewriting_pipe(client: socket.socket, target: socket.socket, port: int, exte
     try:
         try:
             resp_head, body = _read_head_polled(target, act, response_timeout)
-        except TimeoutError:
-            _send_http_502(client, "origin did not answer in time", status="504 Gateway Timeout")
+        except TimeoutError as exc:
+            if exc.errno is None:
+                _send_http_502(client, "origin did not answer in time", status="504 Gateway Timeout")
+            else:  # TCP keepalive gave up on the origin
+                _send_http_502(client, "origin connection lost")
             raise
+        if not resp_head and not body and act.stop.is_set():
+            # The upload pump's idle clock expired together with the head deadline
+            # and half-closed the origin, which then closed: that is a timeout.
+            _send_http_502(client, "origin did not answer in time", status="504 Gateway Timeout")
+            return
         if rewrite_head and resp_head.endswith(b"\r\n\r\n"):
             resp_head = rewrite_response_head(resp_head[:-4], port, external,
                                               "https" if tls else None) + b"\r\n\r\n"
@@ -1015,7 +1060,9 @@ def _read_head_polled(sock: socket.socket, act: _Activity, idle: float) -> tuple
     while b"\r\n\r\n" not in buf and len(buf) < 65536:
         try:
             chunk = sock.recv(65536)
-        except TimeoutError:
+        except TimeoutError as exc:
+            if exc.errno is not None:
+                raise  # ETIMEDOUT from TCP keepalive: the origin is gone
             if act.stop.is_set() or act.expired(idle):
                 raise
             continue

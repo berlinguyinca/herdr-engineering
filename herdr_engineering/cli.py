@@ -2906,7 +2906,8 @@ def _renew_local(reg, lease_id: str):
     return renewed
 
 
-def heartbeat_local_leases(reg, state: dict) -> None:
+def heartbeat_local_leases(reg, state: dict, fwd: dict | None = None,
+                           bind: str = "127.0.0.1") -> None:
     """Renew every locally-held lease (the --serve renewal loop, #89).
 
     Loud about the two ways a renewal can silently lose the origin: the
@@ -2914,6 +2915,8 @@ def heartbeat_local_leases(reg, state: dict) -> None:
     process — the next sync re-enrolls it), and the lease LAPSED between
     cycles (expired while the forwarder still held the port — fleet-wide
     unreachable until this renewal). The lapsed lease is still renewed.
+    A renewal can move the lease to a new port (its old one went to another
+    lease); with ``fwd`` the forwarder is restarted on the new port.
     """
     from .devfabric import _now_iso, _parse_time
     now = _parse_time(_now_iso())
@@ -2921,6 +2924,7 @@ def heartbeat_local_leases(reg, state: dict) -> None:
         lid = st["lease_id"]
         lease = reg.get(lid)
         lapsed = lease is not None and _parse_time(lease.expires_at) < now
+        old_port = st.get("port")
         renewed = _renew_local(reg, lid)
         if renewed is None:
             logging.getLogger("herdr.cli").warning(
@@ -2931,6 +2935,19 @@ def heartbeat_local_leases(reg, state: dict) -> None:
             logging.getLogger("herdr.cli").warning(
                 "lease %s lapsed (expired while the forwarder held the "
                 "port); renewed now", lid)
+        if renewed is not None and old_port is not None \
+                and renewed.external_port != old_port:
+            logging.getLogger("herdr.cli").warning(
+                "lease %s moved from port %s to %s on renewal", lid,
+                old_port, renewed.external_port)
+            st["port"] = renewed.external_port
+            if fwd is not None and fwd.get(key) is not None:
+                try:
+                    fwd[key].stop()
+                except Exception:
+                    pass
+                fwd.pop(key, None)
+                _ensure_origin_forwarder(fwd, key, renewed, bind)
 
 
 def _ensure_origin_forwarder(fwd: dict, key: str, lease, bind: str):
@@ -3124,7 +3141,7 @@ def _cmd_dev_enroll_sync(args) -> int:
     def _heartbeat_local():
         if client is None:
             try:
-                heartbeat_local_leases(reg, state)
+                heartbeat_local_leases(reg, state, fwd=fwd, bind=args.bind)
             except Exception:
                 pass
 
@@ -3324,7 +3341,7 @@ def _cmd_dev_enroll(args) -> int:
         return 0
 
     try:
-        forwarder_for(lease, bind_host=args.bind).start()
+        forwarder = forwarder_for(lease, bind_host=args.bind).start()
     except ConflictError as exc:
         _print_json({"ok": False, "error": str(exc)})
         return 1
@@ -3341,7 +3358,16 @@ def _cmd_dev_enroll(args) -> int:
         # fabric member (visible in `devfabric list`, kept by a central gateway).
         if time.monotonic() >= next_hb:
             try:
-                _renew_local(reg, lease.id)
+                bound_port = lease.external_port
+                renewed = _renew_local(reg, lease.id)
+                if renewed is not None and renewed.external_port != bound_port:
+                    logging.getLogger("herdr.cli").warning(
+                        "lease %s moved from port %s to %s on renewal",
+                        lease.id, bound_port, renewed.external_port)
+                    forwarder.stop()
+                    forwarder = forwarder_for(renewed, bind_host=args.bind).start()
+                    _print_json({"ok": True, "serving": f"http://{args.bind}:{renewed.external_port}",
+                                 "note": "lease moved to a new port"})
             except Exception:
                 pass
             next_hb = time.monotonic() + 30
@@ -3354,7 +3380,7 @@ def _cmd_dev_heartbeat(args) -> int:
     if client is not None:
         _print_json(client.heartbeat(args.lease_id))
         return 0
-    lease = DevServiceRegistry().heartbeat(args.lease_id)
+    lease = _renew_local(DevServiceRegistry(), args.lease_id)
     _print_json({"ok": lease is not None,
                  "lease": lease.to_dict() if lease else None})
     return 0
