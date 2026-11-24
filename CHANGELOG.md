@@ -15,6 +15,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - A row present in both `fabric_events` and `fabric_events_archive` (an interrupted archive run) is replayed and counted once by a rebuild, so the snapshot is written instead of refused. The per-tick and boot counts of archived rows no longer anti-join the live table (no job copies a row to the archive without deleting it in the same statement).
 - The snapshot now records the last consumed (sequence, event_id), so an incremental tick takes a row that ties the watermark on sequence and sorts after it. A tied row with a smaller event_id that settles later is still below the cursor and still forces a full rebuild. A stored snapshot without that cursor was written by older code, whose in-order replay could feed one of two same-millisecond rows twice and drop the other with the count still right, so the writer replaces it with one full rebuild.
 
+### Fix: web packages bug-hunt (collaboration sign-in/out, room polling, composer, member routes, nav badge)
+
+- Collaboration: blocked site storage (`window.sessionStorage` throwing) no longer stops `collab-view.js`, and so the whole dashboard, from loading; it falls back to memory. Sign out now also ends the Cognito Hosted-UI session (`/logout?client_id=...&logout_uri=...`, `logout_uri` defaulting to `public_url`, which the user pool must list as an allowed sign-out URL). Every `CollabApi` call now times out after 30 s, so a half-open connection no longer freezes a room silently; `showRoom` removes its `focusout` listener on teardown instead of adding one per visit.
+- Composer: a message delivered after the composer was disposed mid-send no longer survives as the stored draft.
+- Dashboard: mission titles are refreshed after 60 s and a failed load is no longer cached as an empty map (`mission-titles.js`). The nav badge announces "N open, M critical" instead of "true critical".
+- Member page: a slow library load no longer repaints over a newer route.
 ### Fix: required `unit-gates` no longer skips PRs that touch untested-by-list paths; Rust module gates fail in CI without cargo
 
 - `scripts/ci/unit-gates-applicable.sh unit` is now default-run with a short exempt list instead of an allow-list, so `herdr_artifact_host/`, `ansible/`, `skills/`, `scripts/*.sh`, `package.json`, `package-lock.json` and any new top-level path run the suite (they previously passed the required check with no tests; `main-moved-check.sh` shared the gap). A test checks every tracked file against the matcher.
