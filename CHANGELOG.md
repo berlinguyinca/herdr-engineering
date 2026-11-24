@@ -14,6 +14,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - The in-order replay keeps a packed 28-byte key per row instead of a tuple with the event_id (2-3 GB on a 10M-row log, now about 280 MB). The order cannot move into SQL: the store's key clamps the receive time to its clock and falls back to parsed timestamps.
 - A row present in both `fabric_events` and `fabric_events_archive` (an interrupted archive run) is replayed and counted once by a rebuild, so the snapshot is written instead of refused. The per-tick and boot counts of archived rows no longer anti-join the live table (no job copies a row to the archive without deleting it in the same statement).
 - The snapshot now records the last consumed (sequence, event_id), so an incremental tick takes a row that ties the watermark on sequence and sorts after it. A tied row with a smaller event_id that settles later is still below the cursor and still forces a full rebuild. A stored snapshot without that cursor was written by older code, whose in-order replay could feed one of two same-millisecond rows twice and drop the other with the count still right, so the writer replaces it with one full rebuild.
+### Fix: fabric agent no longer drops every lease on a failed listener scan
+
+- `scan_once` ignored `ListenerInventory.complete`, so one timed-out or failed `ss`/`lsof` (an empty inventory) released every lease and stopped every forwarder, and the next cycle re-adopted them with new leases. A port is now treated as gone only on a complete scan.
+- At startup, a remembered forward port that cannot be rebound (or whose forwarder fails to start) now drops the store entry and closes its lease, so the next scan re-adopts the service with a working forwarder instead of advertising a dead URL.
 
 ### Fix: web packages bug-hunt (collaboration sign-in/out, room polling, composer, member routes, nav badge)
 

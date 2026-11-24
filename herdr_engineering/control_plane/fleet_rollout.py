@@ -22,7 +22,7 @@ REASONS = ("dirty_checkout", "not_on_main", "unpublished_commits", "busy", "time
            "apply_failed", "ssh_failed", "halted", "optional_unreachable", "not_published", "rate_limited",
            "ahead_of_target",
            "operator", "downgrade", "lock_invalid")
-HOST_ORDER = ("beast", "bender", "macbook-pro")
+HOST_ORDER = ("beast", "bender", "mac-studio", "macbook-pro")
 #: Health checks the host-apply step runs (spec section 5): the only names a check may carry.
 CHECK_NAMES = ("version_matches", "service_active", "gateway_registered", "parity_ok", "release_complete",
                "current_symlink", "version_smoke", "generation_receipt", "verify_ok", "feed_in_sync")
