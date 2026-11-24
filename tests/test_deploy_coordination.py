@@ -1,6 +1,7 @@
 """Real processes and kernel locks; Docker/health stay in disposable fixtures."""
 import fcntl
 import json
+import re
 import os
 import shutil
 import signal
@@ -261,6 +262,22 @@ def test_wrong_owner_cannot_clear_or_change_metadata(env):
         subprocess.run(["python3", str(helper), action, str(state(env)), "b" * 32, *extra],
                        check=True)
         assert owner.read_bytes() == before
+
+
+def test_every_lock_phase_deploy_sh_enters_is_one_deploy_state_accepts(env):
+    # deploy_lock_phase goes through deploy-state.py whenever the collab lock is held; a phase name the helper does not
+    # know aborts the deploy with "invalid phase" (predeploy-backup did exactly that on the artifact-host tests)
+    helper = DEPLOY.parent / "deploy-state.py"
+    phases = sorted(set(re.findall(r"^\s*deploy_lock_phase\s+([a-z-]+)", DEPLOY.read_text(), re.M)))
+    assert "predeploy-backup" in phases and "checkpoint-prewarm" in phases
+    state(env).mkdir(parents=True)
+    owner = state(env) / "rollout-owner.json"
+    subprocess.run(["python3", str(helper), "lock-start", str(state(env)), "a" * 32, "123"], check=True)
+    for phase in phases:
+        result = subprocess.run(["python3", str(helper), "lock-phase", str(state(env)), "a" * 32, phase],
+                                capture_output=True, text=True)
+        assert result.returncode == 0, f"{phase}: {result.stderr}"
+        assert json.loads(owner.read_text())["phase"] == phase
 
 
 @pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])

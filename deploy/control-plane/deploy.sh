@@ -886,6 +886,7 @@ pick_backup_script() {
   done
   return 0
 }
+BACKUP_SCRIPT="$(pick_backup_script)"
 
 # Prewarm with the TARGET image while the previous release still serves. Only the
 # protected config snapshot is mounted: compose run would create the web service's
@@ -897,7 +898,6 @@ if [ -n "$PREVIOUS_IMAGE" ] && grep -q '^def _cmd_cp_checkpoint(' "$WORK/herdr_e
   PREWARM_LOG="$ATTEMPT/checkpoint-prewarm.log"
   (umask 077; : > "$PREWARM_LOG")
   chmod 600 "$PREWARM_LOG"
-  BACKUP_SCRIPT="$(pick_backup_script)"
   CP_BACKUP_FILE=""
   if [ -z "$BACKUP_SCRIPT" ]; then
     echo "WARNING: neither this ref nor the installed copy of memory-backup.sh supports --target; no pre-migration dump could be taken for this legacy ref, continuing without one" >&2
@@ -1538,8 +1538,7 @@ if forward; then
       "check DNS, the SNI route to the edge and the certificate for the member host" >&2
   fi
   # the daily control-plane backup (database + object store); idempotent, loud but never fatal
-  BACKUP_SCRIPT="$(pick_backup_script)"
-  { [ -n "$BACKUP_SCRIPT" ] && "$BACKUP_SCRIPT" install --target control-plane >/dev/null; } \
+  { [ -n "${BACKUP_SCRIPT:-}" ] && "$BACKUP_SCRIPT" install --target control-plane >/dev/null; } \
     || echo "WARNING: could not install the control-plane backup timer; run deploy/control-plane/memory-backup.sh install --target control-plane" >&2
   if [ "$MEMORY" = 1 ]; then memory_phase || exit 4; fi
   exit 0
