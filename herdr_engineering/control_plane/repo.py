@@ -4116,8 +4116,11 @@ class ControlPlaneRepo:
         # hydrated from durable Postgres, image version/commit) is overlaid by
         # the HTTP server in api.ControlPlaneServer._health(), because the repo
         # itself cannot know about its source.
+        sink_health = getattr(self._sink, "write_health", None)
+        durable = sink_health() if callable(sink_health) else None
         return {
-            "status": "ok",
+            "status": "degraded" if durable and durable["degraded"] else "ok",
+            **({"durable_sink": durable} if durable else {}),
             "events": ({"ingested": self._durable_public_count,
                         "cached": len(self._event_order), "durable_total": self._durable_row_count}
                        if callable(getattr(self._durable_history, 'export_events', None))
