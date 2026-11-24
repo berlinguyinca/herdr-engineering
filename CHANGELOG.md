@@ -12,6 +12,11 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - Lab session exchange now requires `X-Nonce` and binds the ID token to it, as the public-claim and member exchanges already did.
 - `host_config.parse` refuses a `cognito.domain` that is not a bare https origin and a malformed `pool_id`, `web_client_id` or `client_ids` entry, instead of starting healthy with lab shares, the member UI, MCP and housekeeping silently off. Existing configs with a scheme-less domain must be corrected.
 - Known and unchanged: the "shared by" bar is injected into the author's own document and can be removed by that page's own script; a non-bypassable label needs a host-owned sandboxed-iframe wrapper (documented at `SHARED_BY_BAR`).
+### Fix: Slack approval of unseen text, calendar block-list alias, Rakazo first-bot cache
+
+- Slack ask: the Approve buttons are only offered when the command is shown in full; a long (truncated) command gets Deny only and a "cannot be approved from Slack" note, and an approve tap on such an ask is refused (`not_fully_shown`).
+- `CalendarPolicy`: blocking both `primary` and the primary's real id no longer blocks every other calendar.
+- Rakazo bridge: the first-bot cache is keyed by `(tenant, user)`, so two spaces of one account no longer share a cached bot id.
 
 ### Feature: periodic `herdr-handoff reap --apply` timer (opt-in, off by default)
 
