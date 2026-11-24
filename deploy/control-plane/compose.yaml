@@ -54,7 +54,7 @@ x-herdr-deploy-layout: 2
 services:
   # ---- control plane (bridge network) -------------------------------------
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
     container_name: herdr-cp-postgres
     restart: unless-stopped
     # Tuned for the 503 GiB NVMe master host (stock defaults were 128MB
@@ -544,11 +544,12 @@ services:
       retries: 18
 
   # ---- dev.lan front door (host network; was deploy/fabric-stack) -------------
-  # The worker mounts ./config.yaml (control plane); the fabric services mount
-  # the fabric config from ../fabric-stack. Same project, same rendered substitution file.
+  # The worker's config (control plane) and the fabric config (deploy/fabric-stack/config.yaml, read by
+  # fabric-gateway and herdr-web as /app/config.yaml) are both baked into the image: no relative bind mounts.
+  # Same project, same rendered substitution file.
 
   coredns:
-    image: coredns/coredns:1.11.4
+    image: coredns/coredns:1.11.4@sha256:4190b960ea90e017631e3e1a38eea28e98e057ab60d57d47b3db6e5cf77436f7
     container_name: herdr-coredns
     restart: unless-stopped
     network_mode: host
@@ -574,7 +575,6 @@ services:
         hard: 524288
     network_mode: host
     volumes:
-      - ../fabric-stack/config.yaml:/app/config.yaml:ro
       - herdr-state:/state
       # Certificates are issued and renewed ON THE HOST (the image has no certbot or tailscale CLI; see
       # deploy/fabric-stack/README.md "HTTPS on 443"). The gateway only reads them and reloads when the files change.
@@ -618,7 +618,6 @@ services:
     restart: unless-stopped
     network_mode: host
     volumes:
-      - ../fabric-stack/config.yaml:/app/config.yaml:ro
       # Agent Mine fleet store: the private web UI's /api/agent-mine reads
       # $HOME/.cache/agent-mine/fleet/ (the container runs as root, HOME=/root).
       # Bind the controller's fleet store read-only so the dashboard can serve the

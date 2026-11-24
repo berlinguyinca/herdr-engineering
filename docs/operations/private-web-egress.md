@@ -14,7 +14,7 @@ Explicitly selecting `deploy/control-plane/compose.web-egress.yaml` would keep
 
 - Network: `herdr-control-plane_web-egress`.
 - Stable Linux bridge: `br-herdr-cp-eg`.
-- Candidate CIDR: `172.31.252.0/29`, configurable through the override's
+- Candidate CIDR: `172.31.252.32/29`, configurable through the override's
   `HERDR_CP_WEB_EGRESS_CIDR` and the validator's matching `--cidr` argument.
 - `gw_priority: 100` selects this network as the default; existing default-network
   priority stays zero. Connected service routes remain on the existing network.
@@ -84,8 +84,8 @@ containers and the now-empty test network. No canary resources remain.
 
 | Check | Original default | New default |
 | --- | --- | --- |
-| Gateway | 172.16.4.1 | 172.31.252.1 |
-| Source toward 100.64.8.6 | 172.16.4.7 | 172.31.252.2 |
+| Gateway | 172.16.4.1 | 172.31.252.33 |
+| Source toward 100.64.8.6 | 172.16.4.7 | 172.31.252.34 |
 | Docker/external DNS | Resolved | Resolved |
 | Postgres TCP | Connected | Connected |
 | Object-store health | HTTP 200 | HTTP 200 |

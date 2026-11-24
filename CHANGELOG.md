@@ -5,6 +5,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: deploy compose mounts, subnet overlap and image pins (bug-hunt)
+
+- `fabric-gateway` and `herdr-web` no longer bind-mount `../fabric-stack/config.yaml` (it resolved into deploy.sh's deleted temporary worktree, so a container restart came back without its config). `deploy/fabric-stack/config.yaml` is baked into the image as `/app/config.yaml`; a route change (`fabric-stack.sh memory-route`) now ships by commit plus deploy. `test_recreated_services_have_no_relative_bind_mounts` now covers every service in deploy.sh's `APP_SERVICES`.
+- The private web-egress default moved from `172.31.252.0/29` to `172.31.252.32/29` (gateway .33, source .34): it sat inside the artifact host's fixed `172.31.252.0/28` edge network, so it could never be enabled beside it. A test asserts the fixed subnets are pairwise disjoint. A host that already runs egress on the old default keeps it only if the artifact host is not enabled; re-run `deploy.sh --memory-private-egress` to move.
+- The fabric image base (`python:3.12-slim`), `postgres:16-alpine`, `coredns:1.11.4` and the memory-client base are pinned by digest, and the runtime image installs under `deploy/fabric-stack/constraints.txt` exported from `uv.lock` (a test keeps it equal to a fresh export). Versions are unchanged. `minio/minio` stays pinned by exact tag only (its digest cannot be resolved from Docker Hub).
+
 ### Feature: periodic `herdr-handoff reap --apply` timer (opt-in, off by default)
 
 - `herdr-eng handoff-reap {run,status}` and `scripts/install-handoff-reap.sh` install a systemd user timer (Linux) or LaunchAgent (macOS) that closes panes replaced by confirmed handoffs, including those whose `confirm` was refused because the source pane was still working. Wired into `scripts/install.sh` (step 7f2) and, for Linux fleet hosts, `ansible/tasks/handoff-reap.yml` (`site.yml`, `fleet-sync.yml`).

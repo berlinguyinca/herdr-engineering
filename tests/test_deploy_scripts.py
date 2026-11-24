@@ -1448,12 +1448,21 @@ def test_link_remote_refuses_a_url_as_first_argument(env):
     assert not (ROOT / "http:").exists() and not list(env["home"].rglob("*cp.example.test*"))
 
 
+def _app_services_from_deploy_sh():
+    m = re.search(r"^APP_SERVICES=\(([^)]*)\)", (ROOT / "deploy/control-plane/deploy.sh").read_text(), re.M)
+    assert m, "APP_SERVICES not found in deploy.sh"
+    return m.group(1).split()
+
+
 def test_recreated_services_have_no_relative_bind_mounts():
     """deploy.sh runs compose from a temporary worktree: a relative bind source would
-    dangle (and be re-created empty by docker) after the worktree is removed."""
+    dangle (and be re-created empty by docker) after the worktree is removed.
+    Covers every service deploy.sh recreates (APP_SERVICES, read from deploy.sh) plus the collab services."""
     doc = yaml.safe_load((ROOT / "deploy/control-plane/compose.yaml").read_text())
     collab = yaml.safe_load((ROOT / "deploy/control-plane/compose.collab.yaml").read_text())
-    services = {n: doc["services"][n] for n in ("control-plane-web", "control-plane-worker", "llm-proxy")}
+    app = _app_services_from_deploy_sh()
+    assert {"fabric-gateway", "herdr-web"} <= set(app)
+    services = {n: doc["services"][n] for n in app}
     services.update(collab["services"])
     for name, svc in services.items():
         for vol in svc.get("volumes") or []:
@@ -1465,6 +1474,8 @@ def test_recreated_services_have_no_relative_bind_mounts():
     dockerfile = (ROOT / "deploy/fabric-stack/Dockerfile").read_text()
     assert "COPY deploy/control-plane/migrations/ ./control-plane/migrations/" in dockerfile
     assert "COPY deploy/control-plane/config.yaml ./control-plane/config.yaml" in dockerfile
+    # fabric-gateway and herdr-web read /app/config.yaml: it ships in the image, not a bind mount.
+    assert "COPY deploy/fabric-stack/config.yaml ./config.yaml" in dockerfile
 
 
 
@@ -2305,7 +2316,7 @@ def test_explicit_permission_recovery_uses_existing_lock_and_no_fleet_or_compose
     state=env['home']/'.local/state/herdr-engineering/deploys'
     state.mkdir(parents=True,mode=0o700)
     attempt=state/'attempt-recovery'
-    record=make_record('172.31.252.0/29','100.64.8.6/32','a'*32)
+    record=make_record('172.31.252.32/29','100.64.8.6/32','a'*32)
     record['network_id']='c'*64
     record['rule_may_exist']=True
     private_json(attempt/'web-egress/candidate.json',record)
@@ -2317,8 +2328,8 @@ def test_explicit_permission_recovery_uses_existing_lock_and_no_fleet_or_compose
 case "$*" in
   "-n -- /usr/sbin/ufw status") echo 'Status: inactive'; exit 0 ;;
   "-n -- /usr/sbin/ufw show added")
-    echo 'ufw allow in on br-herdr-cp-eg proto tcp from 172.31.252.0/29 to 100.64.8.6 port 443 comment herdr-cp-web-egress-v1'; exit 0 ;;
-  "-n -- /usr/sbin/ufw --force delete allow in on br-herdr-cp-eg proto tcp from 172.31.252.0/29 to 100.64.8.6/32 port 443 comment herdr-cp-web-egress-v1")
+    echo 'ufw allow in on br-herdr-cp-eg proto tcp from 172.31.252.32/29 to 100.64.8.6 port 443 comment herdr-cp-web-egress-v1'; exit 0 ;;
+  "-n -- /usr/sbin/ufw --force delete allow in on br-herdr-cp-eg proto tcp from 172.31.252.32/29 to 100.64.8.6/32 port 443 comment herdr-cp-web-egress-v1")
     echo owned-root-delete >> "{env['log']}"; exit 0 ;;
 esac
 exit 99
@@ -2393,3 +2404,70 @@ def test_explicit_no_egress_removes_selector_and_accepts_inactive_cleanup(env):
     assert 'root-read-status' in calls
     assert 'ROOT-EXECUTOR-FORBIDDEN' not in calls
     assert current.read_bytes()==before  # dry-run never revokes or rewrites policy
+
+
+# ------------------------- fixed docker subnets must never overlap
+
+def test_fixed_docker_subnets_are_pairwise_disjoint_and_egress_default_is_single_sourced():
+    """The artifact host's edge (/28) contained the private web-egress default (/29), so the documented
+    --memory-private-egress default could never be enabled beside the artifact host."""
+    import ipaddress
+
+    from herdr_engineering import web_egress
+
+    def default(path, anchor):
+        text = (ROOT / path).read_text()
+        m = re.search(anchor + r"[^\n]*?(\d+\.\d+\.\d+\.\d+/\d+)", text, re.M)
+        assert m, (path, anchor)
+        return m.group(1)
+
+    egress = {
+        "web_egress.py": web_egress.CIDR,
+        "deploy.sh": default("deploy/control-plane/deploy.sh", r"^MEMORY_PRIVATE_EGRESS_CIDR="),
+        "compose.web-egress.yaml": default("deploy/control-plane/compose.web-egress.yaml", r"HERDR_CP_WEB_EGRESS_CIDR"),
+    }
+    assert len(set(egress.values())) == 1, egress
+    nets = {
+        "artifact-edge": default("deploy/artifact-host/compose.yaml", r"HERDR_ARTIFACT_EDGE_SUBNET"),
+        "artifact-internal": default("deploy/artifact-host/compose.yaml", r"HERDR_ARTIFACT_INTERNAL_SUBNET"),
+        "collab-share": default("deploy/control-plane/compose.collab.yaml", r"- subnet:"),
+        "collab-fabric": default("deploy/control-plane/compose.collab-fabric.yaml", r"- subnet:"),
+        "web-egress": web_egress.CIDR,
+    }
+    parsed = {k: ipaddress.ip_network(v) for k, v in nets.items()}
+    names = sorted(parsed)
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            assert not parsed[a].overlaps(parsed[b]), (a, str(parsed[a]), b, str(parsed[b]))
+
+
+# ------------------------- reproducible image builds: pinned bases and dependencies
+
+def test_runtime_image_bases_are_pinned_by_digest():
+    """A mutable tag rebuilt a different image on different days. Every third-party image the control plane
+    runs or builds from carries a sha256 digest (the minio tag is the one documented exception: its digest
+    cannot be resolved from Docker Hub, where the project stopped publishing)."""
+    compose = yaml.safe_load((ROOT / "deploy/control-plane/compose.yaml").read_text())
+    images = {n: s["image"] for n, s in compose["services"].items() if "image" in s}
+    third_party = {n: i for n, i in images.items() if not i.startswith("herdr-")}
+    third_party.pop("rustfs")
+    assert {"postgres", "coredns"} <= set(third_party)
+    for name, image in third_party.items():
+        assert re.search(r"@sha256:[0-9a-f]{64}$", image), (name, image)
+    assert re.search(r"^ARG RUNTIME_BASE=\S+@sha256:[0-9a-f]{64}$",
+                     (ROOT / "deploy/fabric-stack/Dockerfile").read_text(), re.M)
+    assert re.search(r"^FROM \S+@sha256:[0-9a-f]{64}$",
+                     (ROOT / "deploy/control-plane/Dockerfile.memory-client").read_text(), re.M)
+
+
+def test_runtime_image_installs_from_the_exported_lock_constraints():
+    """pip must not resolve ranges at build time: the image installs under constraints exported from uv.lock,
+    and the committed file must equal a fresh export (so a dependency bump cannot skip it)."""
+    dockerfile = (ROOT / "deploy/fabric-stack/Dockerfile").read_text()
+    assert "COPY deploy/fabric-stack/constraints.txt" in dockerfile
+    assert re.search(r"pip install --no-cache-dir -c \S*constraints\.txt \".\[collab,review-gate,share\]\"", dockerfile)
+    fresh = subprocess.run(
+        ["uv", "export", "--frozen", "--no-dev", "--extra", "collab", "--extra", "review-gate", "--extra", "share",
+         "--no-emit-project", "--no-hashes", "--no-header", "--no-annotate"],
+        cwd=ROOT, capture_output=True, text=True, check=True).stdout
+    assert (ROOT / "deploy/fabric-stack/constraints.txt").read_text().split("\n", 3)[3] == fresh

@@ -114,12 +114,12 @@ memory_route() {
         enable)
             sed -i.bak -E "/$mark\$/ s/^( *)# - /\1- /" "$cfg" && rm -f "$cfg.bak"
             say "memory routes enabled in $cfg (https://memory.<domain> and https://memory.dev.lan -> 127.0.0.1:<memory port>)"
-            say "apply: recreate the fabric-gateway container the way you normally do (deploy/fabric-stack/README.md, 'HTTPS on 443');"
-            say "       it needs the compose variables deploy.sh renders (GATEWAY_BIND ...), so use the same invocation as for any gateway change"
+            say "apply: commit the change and run deploy.sh; config.yaml is baked into the herdr-engineering image, so"
+            say "       only a new image (deploy.sh will recreate fabric-gateway and herdr-web) carries it"
             ;;
         disable)
             sed -i.bak -E "/$mark\$/ s/^( *)- /\1# - /" "$cfg" && rm -f "$cfg.bak"
-            say "memory routes disabled in $cfg; apply by recreating fabric-gateway (deploy/fabric-stack/README.md)"
+            say "memory routes disabled in $cfg; apply by committing and running deploy.sh (config.yaml is baked into the image)"
             ;;
         status)
             grep "$mark" "$cfg" || echo "(no memory route lines in $cfg)"

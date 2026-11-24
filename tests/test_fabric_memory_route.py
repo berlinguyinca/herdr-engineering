@@ -62,7 +62,7 @@ def test_enable_and_disable_toggle_exactly_the_two_marked_lines(tree):
     assert r.returncode == 0, r.stderr
     assert routes(tmp) == ["bender.tail0c50da.ts.net=127.0.0.1:8787", "memory.local.metabolomics.us=127.0.0.1:8888",
                            "memory.dev.lan=127.0.0.1:8888"]
-    assert "recreate the fabric-gateway container" in r.stdout
+    assert "recreate fabric-gateway and herdr-web" in r.stdout
     assert script(tree, "status").stdout.count("herdr-memory-route") == 2
     assert script(tree, "disable").returncode == 0
     assert (tmp / "deploy/fabric-stack/config.yaml").read_text() == original

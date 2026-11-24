@@ -1,0 +1,20 @@
+# Exported from uv.lock; the runtime image installs under these pins (see Dockerfile).
+# Regenerate: uv export --frozen --no-dev --extra collab --extra review-gate --extra share
+#   --no-emit-project --no-hashes --no-header --no-annotate > body, then keep these 3 header lines.
+asyncpg==0.32.0
+boto3==1.43.125
+botocore==1.43.125
+cffi==2.1.1 ; platform_python_implementation != 'PyPy'
+cryptography==50.0.2
+jmespath==1.1.0
+msgpack==1.1.2
+nh3==0.3.7
+psycopg2-binary==2.9.13
+pycparser==3.12 ; implementation_name != 'PyPy' and platform_python_implementation != 'PyPy'
+pyjwt==2.15.1
+python-dateutil==2.9.0.post0
+pyyaml==6.0.3
+s3transfer==0.19.3
+six==1.17.0
+slack-sdk==3.45.0
+urllib3==2.8.0
