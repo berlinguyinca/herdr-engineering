@@ -3869,9 +3869,8 @@ def _cmd_dev_agent(args) -> int:
         str(Path.home() / ".local/share/herdr-engineering/state")))
     # Noise filter knobs (all optional, sensible defaults in AgentConfig):
     # extra excluded ports + the dev-port window the agent will register.
-    extra_exclude = frozenset(int(p) for p in fabric_cfg.get(
-        "agent_exclude_ports", []))
     try:
+        extra_exclude = parse_ports(fabric_cfg.get("agent_exclude_ports"), "agent_exclude_ports")
         agent_binaries = parse_agent_binaries(fabric_cfg.get("agent_binaries"))
         deny_processes = parse_deny_processes(fabric_cfg.get("agent_deny_processes"))
         adopt_mode = parse_adopt_mode(fabric_cfg.get("agent_adopt_mode"))

@@ -136,25 +136,35 @@ def parse_ports(value: Any, key: str) -> frozenset[int]:
         return frozenset()
     if not isinstance(value, (list, tuple)):
         raise ValueError(f"fabric.{key} must be a list of ports")
-    try:
-        ports = frozenset(int(p) for p in value if not isinstance(p, bool))
-    except (TypeError, ValueError):
-        raise ValueError(f"fabric.{key} must be a list of ports") from None
-    if len(ports) != len(value) or not all(0 < p < 65536 for p in ports):
-        raise ValueError(f"fabric.{key} must be a list of ports (1-65535)")
-    return ports
+    seen: set[int] = set()
+    for port in value:
+        if isinstance(port, bool) or not isinstance(port, int):
+            raise ValueError(f"fabric.{key} must be a list of integer ports, got {port!r}")
+        if not 0 < port < 65536:
+            raise ValueError(f"fabric.{key} port {port} is outside 1-65535")
+        if port in seen:
+            raise ValueError(f"fabric.{key} has duplicate port {port}")
+        seen.add(port)
+    return frozenset(seen)
 
 
-def parse_allow_processes(value: Any) -> tuple[str, ...]:
-    """``fabric.agent_allow_processes``: process-name fragments; ``None`` is none."""
+def _parse_process_names(value: Any, key: str,
+                         default: tuple[str, ...]) -> tuple[str, ...]:
+    """A ``fabric.<key>`` list of process-name fragments (a single string is
+    one). ``None`` keeps ``default``."""
     if value is None:
-        return ()
+        return default
     if isinstance(value, str):
         value = [value]
     if not isinstance(value, (list, tuple)) or not all(
             isinstance(v, str) and v.strip() for v in value):
-        raise ValueError("fabric.agent_allow_processes must be a list of process names")
+        raise ValueError(f"fabric.{key} must be a list of process names")
     return tuple(v.strip() for v in value)
+
+
+def parse_allow_processes(value: Any) -> tuple[str, ...]:
+    """``fabric.agent_allow_processes``: process-name fragments; ``None`` is none."""
+    return _parse_process_names(value, "agent_allow_processes", ())
 
 
 def process_denied(process: str | None, deny: tuple[str, ...]) -> bool:
@@ -591,14 +601,32 @@ def probe_web(port: int, timeout: float = 2.0) -> bool:
 _DEBUG_PROBE_MAX_BYTES = 65536
 
 
-def _get_json(port: int, path: str, timeout: float) -> Any:
-    """GET a small JSON document from 127.0.0.1; None on any failure."""
+class ProbeInconclusive(Exception):
+    """The identity probe could not tell what is listening (timeout, refused
+    connection, reset): unknown, never "safe". The scan retries next cycle."""
+
+
+def _get_json(port: int, path: str, timeout: float) -> tuple[Any, str]:
+    """GET a small JSON document from 127.0.0.1 as ``(json, Server header)``.
+
+    ``json`` is None when the server answered but not with JSON (404, HTML,
+    a non-HTTP banner): that is an answer. A transport failure raises
+    ``ProbeInconclusive``.
+    """
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}",
                                     timeout=timeout) as resp:
-            return json.loads(resp.read(_DEBUG_PROBE_MAX_BYTES))
-    except (OSError, ValueError, http.client.HTTPException):
-        return None
+            server = resp.headers.get("Server", "")
+            try:
+                return json.loads(resp.read(_DEBUG_PROBE_MAX_BYTES)), server
+            except ValueError:
+                return None, server
+    except urllib.error.HTTPError as exc:
+        return None, exc.headers.get("Server", "") if exc.headers else ""
+    except http.client.HTTPException:
+        return None, ""   # a live listener that does not speak HTTP
+    except (OSError, ValueError) as exc:
+        raise ProbeInconclusive(f"{type(exc).__name__}: {exc}") from None
 
 
 def probe_debug_surface(port: int, timeout: float = 0.5) -> str | None:
@@ -606,18 +634,25 @@ def probe_debug_surface(port: int, timeout: float = 0.5) -> str | None:
 
     Chrome DevTools Protocol answers ``/json/version`` with a
     ``webSocketDebuggerUrl``; the Node inspector answers it with a ``node.js``
-    ``Browser``; Jupyter (server, notebook, lab) answers ``/api`` with only a
-    ``version``. None when none of them match (or the port does not answer).
+    ``Browser``. Jupyter is a heuristic: ``/api`` answers only a ``version``
+    AND either the ``Server`` header names Jupyter/Tornado or ``/api/status``
+    has Jupyter's ``started``/``last_activity`` keys. None when none match
+    (a 404 or non-JSON answer is an answer). Raises ``ProbeInconclusive`` when
+    the port could not be asked.
     """
-    version = _get_json(port, "/json/version", timeout)
+    version, _ = _get_json(port, "/json/version", timeout)
     if isinstance(version, dict):
         if "webSocketDebuggerUrl" in version:
             return "Chrome DevTools Protocol endpoint (/json/version)"
         if str(version.get("Browser", "")).lower().startswith("node"):
             return "Node inspector (/json/version)"
-    api = _get_json(port, "/api", timeout)
+    api, server = _get_json(port, "/api", timeout)
     if isinstance(api, dict) and set(api) == {"version"}:
-        return "Jupyter notebook server (/api)"
+        if any(n in server.lower() for n in ("jupyter", "tornado")):
+            return "Jupyter notebook server (heuristic: /api and Server header)"
+        status, _ = _get_json(port, "/api/status", timeout)
+        if isinstance(status, dict) and {"started", "last_activity"} & set(status):
+            return "Jupyter notebook server (heuristic: /api and /api/status)"
     return None
 
 
@@ -860,14 +895,7 @@ def parse_agent_binaries(value: Any) -> tuple[str, ...]:
 def parse_deny_processes(value: Any) -> tuple[str, ...]:
     """``fabric.agent_deny_processes`` from YAML: a list of process-name
     fragments (a single string is one). ``None`` keeps the default."""
-    if value is None:
-        return DEFAULT_DENY_PROCESSES
-    if isinstance(value, str):
-        value = [value]
-    if not isinstance(value, (list, tuple)) or not all(
-            isinstance(v, str) and v.strip() for v in value):
-        raise ValueError("fabric.agent_deny_processes must be a list of process names")
-    return tuple(v.strip() for v in value)
+    return _parse_process_names(value, "agent_deny_processes", DEFAULT_DENY_PROCESSES)
 
 
 _SLOW_RETRY_S = (300.0, 900.0)  # then hourly
@@ -998,6 +1026,7 @@ class FabricAgent:
         self._probe_cache: dict[int, tuple[tuple, bool, float]] = {}
         self._debug_cache: dict[int, tuple[tuple, str | None, float]] = {}
         self._refused: dict[int, str] = {}
+        self._probe_unknown: set[int] = set()
         self._lock = threading.Lock()
         from .host_metrics import HostSampler, read_updates, read_versions
         self._sampler = HostSampler(agent_lookup=self._agent_for_pid,
@@ -1106,6 +1135,11 @@ class FabricAgent:
             port: cached for port, cached in self._probe_cache.items()
             if port in live_ports
         }
+        self._debug_cache = {
+            port: cached for port, cached in self._debug_cache.items()
+            if port in live_ports
+        }
+        self._probe_unknown &= live_ports
         registered: list[str] = []
         closed: list[str] = []
 
@@ -1149,7 +1183,7 @@ class FabricAgent:
                 if (port not in live_ports
                         or port in gateway_front
                         or process in _IGNORED_PROCESSES
-                        or process_denied(process, self.cfg.deny_processes)
+                        or self._process_denied(process)
                         or self._static_refusal(port, process) is not None
                         or self._origin_orphaned(port_s, entry)
                         or self._lease_expired(entry)):
@@ -1161,15 +1195,18 @@ class FabricAgent:
         for port in sorted(live_ports):
             if port <= 0:
                 continue
-            reason = self._static_refusal(port, listeners[port].get("process"))
-            if reason:
-                self._note_refused(port, reason)
-                continue
             if not self._is_dev_web_port(port):
                 continue
             if port in gateway_front:
                 # Reserved gateway front-door range: the gateway binds these on
                 # its bind hosts regardless of leases. Never adopt them.
+                continue
+            process = listeners[port].get("process")
+            if (process or "") in _IGNORED_PROCESSES or self._process_denied(process):
+                continue
+            reason = self._static_refusal(port, process)
+            if reason:
+                self._note_refused(port, reason)
                 continue
             if port in gateway_ext_ports:
                 # Skip only when the local listener is already reachable on the
@@ -1186,10 +1223,14 @@ class FabricAgent:
                     continue
             if not self._probe_web_cached(port, listeners[port]):
                 continue
-            reason = self._debug_surface_cached(port, listeners[port])
+            try:
+                reason = self._debug_surface_cached(port, listeners[port])
+            except ProbeInconclusive:
+                continue   # unknown is not safe: no adoption, retry next scan
             if reason:
                 self._note_refused(port, reason)
                 continue
+            self._refused.pop(port, None)
             entry = self._adopt(port, listeners[port])
             if entry:
                 registered.append(entry["label"])
@@ -1224,7 +1265,7 @@ class FabricAgent:
                 continue
             info = listeners[port]
             if ((info.get("process") or "") in _IGNORED_PROCESSES
-                    or process_denied(info.get("process"), self.cfg.deny_processes)):
+                    or self._process_denied(info.get("process"))):
                 continue
             if port in gateway_ext_ports:
                 addrs = (info.get("addrs") or set())
@@ -1349,9 +1390,25 @@ class FabricAgent:
         prior = self._debug_cache.get(port)
         if prior and prior[0] == fingerprint and now - prior[2] < 30.0:
             return prior[1]
-        reason = probe_debug_surface(port, timeout=min(self.cfg.probe_timeout, 0.5))
+        try:
+            reason = probe_debug_surface(port, timeout=min(self.cfg.probe_timeout, 0.5))
+        except ProbeInconclusive as exc:
+            if port not in self._probe_unknown:
+                self._probe_unknown.add(port)
+                log.info("could not identify what listens on port %d (%s); not publishing "
+                         "it until it answers", port, exc)
+            raise
+        self._probe_unknown.discard(port)
         self._debug_cache[port] = (fingerprint, reason, now)
         return reason
+
+    def _process_denied(self, process: str | None) -> bool:
+        """Denied by ``deny_processes``; an operator-allowed process
+        (``agent_allow_processes``) overrides the built-in defaults only."""
+        allowed = process_denied(process, self.cfg.allow_processes)
+        return any(process_denied(process, (name,))
+                   and not (allowed and name in DEFAULT_DENY_PROCESSES)
+                   for name in self.cfg.deny_processes)
 
     def _note_refused(self, port: int, reason: str) -> None:
         """Log one line per (port, reason) so an operator sees why it is unpublished."""
@@ -1379,16 +1436,19 @@ class FabricAgent:
     def _adopt(self, port: int,
                info: dict[str, Any]) -> dict[str, Any] | None:
         process = info.get("process")
-        reason = self._static_refusal(port, process) or self._debug_surface_cached(port, info)
-        if reason:  # no lease, no forwarder: nothing rewrites Host for this port
-            self._note_refused(port, reason)
-            return None
         if process and process in _IGNORED_PROCESSES:
             log.debug("ignoring container/VM networking shim %r on port %s",
                       process, port)
             return None
-        if process_denied(process, self.cfg.deny_processes):
+        if self._process_denied(process):
             log.debug("ignoring denylisted process %r on port %s", process, port)
+            return None
+        try:
+            reason = self._static_refusal(port, process) or self._debug_surface_cached(port, info)
+        except ProbeInconclusive:
+            return None
+        if reason:  # no lease, no forwarder: nothing rewrites Host for this port
+            self._note_refused(port, reason)
             return None
         label = (f"{self.cfg.label_prefix}"
                  f"{process or 'web'} on {self._machine} (port {port})")

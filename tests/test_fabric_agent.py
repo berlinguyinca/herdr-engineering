@@ -12,6 +12,8 @@ import threading
 import time
 import urllib.request
 
+import pytest
+
 import herdr_engineering.fabric_agent as fa
 from herdr_engineering.fabric import FabricClient
 from herdr_engineering.fabric_agent import (
@@ -1502,11 +1504,24 @@ def test_forwarder_stop_releases_port_immediately():
 # Debug / admin endpoints are never adopted (SECURITY.md: CDP/debug endpoints)
 # ---------------------------------------------------------------------------
 
-def _json_server(routes: dict[str, object], server_header: str = ""):
-    """A real loopback HTTP server answering GET <path> with JSON from routes."""
+def _json_server(routes: dict[str, object], server_header: str = "",
+                 hits: list[str] | None = None, stall: threading.Event | None = None):
+    """A real loopback HTTP server answering GET <path> with JSON from routes.
+
+    ``hits`` records every request path; the probe paths wait while ``stall``
+    is set, so a probe against it times out.
+    """
     class Handler(http.server.BaseHTTPRequestHandler):
+        def version_string(self):
+            return server_header or super().version_string()
+
         def do_GET(self):  # noqa: N802
-            body = routes.get(self.path.split("?")[0])
+            path = self.path.split("?")[0]
+            if hits is not None:
+                hits.append(path)
+            if stall is not None and stall.is_set() and path != "/":
+                time.sleep(1.0)
+            body = routes.get(path)
             if body is None:
                 self.send_response(404)
                 self.end_headers()
@@ -1543,7 +1558,20 @@ def _node_inspector_server():
 
 
 def _jupyter_server():
-    return _json_server({"/api": {"version": "2.14.0"}, "/": {"ok": True}})
+    return _json_server({"/api": {"version": "2.14.0"}, "/": {"ok": True}},
+                        server_header="TornadoServer/6.4")
+
+
+def _jupyter_status_server():
+    # No telling Server header, but /api/status has Jupyter's own keys.
+    return _json_server({"/api": {"version": "2.14.0"}, "/": {"ok": True},
+                         "/api/status": {"started": "t", "last_activity": "t",
+                                         "connections": 0, "kernels": 0}})
+
+
+def _version_only_app():
+    # An ordinary app whose /api returns just a version: not Jupyter.
+    return _json_server({"/api": {"version": "1.0"}, "/": {"ok": True}})
 
 
 def _ordinary_app():
@@ -1558,7 +1586,7 @@ def _leased_ports(gw) -> list[int]:
 
 def test_probe_debug_surface_names_each_debugger():
     cases = [(_cdp_server, "Chrome DevTools"), (_node_inspector_server, "Node inspector"),
-             (_jupyter_server, "Jupyter")]
+             (_jupyter_server, "Jupyter"), (_jupyter_status_server, "Jupyter")]
     for make, needle in cases:
         server, port = make()
         try:
@@ -1569,7 +1597,7 @@ def test_probe_debug_surface_names_each_debugger():
 
 
 def test_probe_debug_surface_passes_ordinary_apps(tmp_path):
-    for make in (_ordinary_app, lambda: _http_target(tmp_path)):
+    for make in (_ordinary_app, _version_only_app, lambda: _http_target(tmp_path)):
         server, port = make()
         try:
             assert fa.probe_debug_surface(port, timeout=0.5) is None
@@ -1577,13 +1605,176 @@ def test_probe_debug_surface_passes_ordinary_apps(tmp_path):
             server.shutdown()
 
 
-def test_probe_debug_surface_is_quiet_on_dead_and_raw_ports():
-    raw, raw_port = _raw_tcp_listener()
+def test_jupyter_reason_says_it_is_a_heuristic():
+    server, port = _jupyter_server()
     try:
-        assert fa.probe_debug_surface(raw_port, timeout=0.3) is None
+        assert "heuristic" in fa.probe_debug_surface(port, timeout=0.5)
+    finally:
+        server.shutdown()
+
+
+def test_probe_debug_surface_is_inconclusive_when_nothing_answers():
+    raw, raw_port = _raw_tcp_listener()   # accepts, never speaks: times out
+    try:
+        with pytest.raises(fa.ProbeInconclusive):
+            fa.probe_debug_surface(raw_port, timeout=0.3)
     finally:
         raw.close()
-    assert fa.probe_debug_surface(_free_port(), timeout=0.3) is None
+    with pytest.raises(fa.ProbeInconclusive):
+        fa.probe_debug_surface(_free_port(), timeout=0.3)
+
+
+def test_probe_debug_surface_treats_any_live_answer_as_not_a_debugger():
+    banner = _banner_listener(b"SSH-2.0-x\r\n")[0]
+    try:
+        assert fa.probe_debug_surface(banner.getsockname()[1], timeout=0.3) is None
+    finally:
+        banner.close()
+
+
+def test_a_timed_out_probe_is_retried_not_trusted_or_cached(tmp_path, monkeypatch, caplog):
+    gw = _FakeGateway()
+    stall = threading.Event()
+    stall.set()
+    server, port = _json_server({"/": {"ok": True}}, stall=stall)
+    monkeypatch.setattr(fa, "scan_listening_ports", lambda: _listeners({port: "app"}))
+    agent = _agent(tmp_path, gw)
+    try:
+        with caplog.at_level("INFO", logger="herdr_engineering.fabric_agent"):
+            agent.scan_once()
+            agent.scan_once()
+        assert _leased_ports(gw) == []
+        assert port not in agent._debug_cache
+        assert len([r for r in caplog.records if f"port {port}" in r.getMessage()
+                    and "could not identify" in r.getMessage()]) == 1
+        stall.clear()
+        agent.scan_once()
+        assert _leased_ports(gw) == [port]
+    finally:
+        server.shutdown()
+        agent.stop()
+        gw.stop()
+
+
+def test_a_404_on_the_probe_paths_is_an_answer_so_the_port_is_adopted(tmp_path, monkeypatch):
+    gw = _FakeGateway()
+    server, port = _json_server({"/": {"ok": True}})   # 404 on /json/version and /api
+    monkeypatch.setattr(fa, "scan_listening_ports", lambda: _listeners({port: "app"}))
+    agent = _agent(tmp_path, gw)
+    try:
+        agent.scan_once()
+        assert _leased_ports(gw) == [port]
+    finally:
+        server.shutdown()
+        agent.stop()
+        gw.stop()
+
+
+def test_ordinary_api_version_endpoint_is_not_refused(tmp_path, monkeypatch):
+    gw = _FakeGateway()
+    server, port = _version_only_app()
+    monkeypatch.setattr(fa, "scan_listening_ports", lambda: _listeners({port: "app"}))
+    agent = _agent(tmp_path, gw)
+    try:
+        agent.scan_once()
+        assert _leased_ports(gw) == [port]
+    finally:
+        server.shutdown()
+        agent.stop()
+        gw.stop()
+
+
+def test_ports_that_were_never_candidates_are_not_logged_as_refused(tmp_path, monkeypatch, caplog):
+    gw = _FakeGateway()
+    ephemeral, eph_port = _http_target(tmp_path)
+    excluded, exc_port = _http_target(tmp_path)
+    runner, runner_port = _http_target(tmp_path)
+    monkeypatch.setattr(fa, "scan_listening_ports", lambda: _listeners(
+        {eph_port: "chrome", exc_port: "thing", runner_port: "node (vitest 3"}))
+    agent = _agent(tmp_path, gw, adopt_mode="allowlist", ephemeral_min=1,
+                   exclude_ports=frozenset({gw.port, exc_port}))
+    try:
+        with caplog.at_level("INFO", logger="herdr_engineering.fabric_agent"):
+            agent.scan_once()
+        assert not [r for r in caplog.records if "refusing" in r.getMessage()]
+    finally:
+        for s in (ephemeral, excluded, runner):
+            s.shutdown()
+        agent.stop()
+        gw.stop()
+
+
+def test_test_runner_ports_get_no_identity_probe_and_the_cache_is_pruned(tmp_path, monkeypatch):
+    gw = _FakeGateway()
+    hits: list[str] = []
+    runner, runner_port = _json_server({"/": {"ok": True}}, hits=hits)
+    app, app_port = _json_server({"/": {"ok": True}})
+    live = {runner_port: "node (vitest 3", app_port: "shop"}
+    monkeypatch.setattr(fa, "scan_listening_ports", lambda: _listeners(live))
+    agent = _agent(tmp_path, gw)
+    try:
+        agent.scan_once()
+        assert hits == []
+        assert app_port in agent._debug_cache
+        live.pop(app_port)
+        agent.scan_once()
+        assert agent._debug_cache == {}
+    finally:
+        runner.shutdown()
+        app.shutdown()
+        agent.stop()
+        gw.stop()
+
+
+def test_a_stale_refusal_is_cleared_when_the_port_is_passed_to_adoption(tmp_path, monkeypatch):
+    gw = _FakeGateway()
+    server, port = _http_target(tmp_path)
+    monkeypatch.setattr(fa, "scan_listening_ports", lambda: _listeners({port: "app"}))
+    agent = _agent(tmp_path, gw, adopt_mode="allowlist")
+    try:
+        agent.scan_once()
+        assert port in agent._refused
+        agent.cfg = fa.replace(agent.cfg, allow_ports=frozenset({port}))
+        agent.scan_once()
+        assert _leased_ports(gw) == [port]
+        assert port not in agent._refused
+    finally:
+        server.shutdown()
+        agent.stop()
+        gw.stop()
+
+
+def test_an_explicitly_allowed_process_overrides_the_default_process_denylist(tmp_path, monkeypatch):
+    gw = _FakeGateway()
+    vite, vite_port = _http_target(tmp_path)
+    jest, jest_port = _http_target(tmp_path)
+    cdp, cdp_port = _cdp_server()
+    monkeypatch.setattr(fa, "scan_listening_ports", lambda: _listeners(
+        {vite_port: "node (vite 5", jest_port: "node (jest 29", cdp_port: "vite"}))
+    agent = _agent(tmp_path, gw, allow_processes=("vite",),
+                   deny_ports=frozenset())
+    try:
+        agent.scan_once()
+        assert _leased_ports(gw) == [vite_port]   # jest stays denied; a debugger stays refused
+    finally:
+        for s in (vite, jest, cdp):
+            s.shutdown()
+        agent.stop()
+        gw.stop()
+
+
+def test_allowed_process_never_overrides_the_port_denylist(tmp_path, monkeypatch):
+    gw = _FakeGateway()
+    vite, vite_port = _http_target(tmp_path)
+    monkeypatch.setattr(fa, "scan_listening_ports", lambda: _listeners({vite_port: "vite"}))
+    agent = _agent(tmp_path, gw, allow_processes=("vite",), deny_ports=frozenset({vite_port}))
+    try:
+        agent.scan_once()
+        assert _leased_ports(gw) == []
+    finally:
+        vite.shutdown()
+        agent.stop()
+        gw.stop()
 
 
 def test_default_deny_ports_cover_debuggers_databases_and_consoles():
@@ -1619,7 +1810,7 @@ def test_scan_never_adopts_debug_endpoints_and_logs_why(tmp_path, monkeypatch, c
         gw.stop()
 
 
-def test_denylisted_port_is_refused_with_a_logged_reason(tmp_path, monkeypatch, caplog):
+def test_denylisted_port_is_never_a_candidate_so_it_is_silent(tmp_path, monkeypatch, caplog):
     gw = _FakeGateway()
     server, port = _http_target(tmp_path)
     monkeypatch.setattr(fa, "scan_listening_ports", lambda: _listeners({port: "thing"}))
@@ -1628,6 +1819,9 @@ def test_denylisted_port_is_refused_with_a_logged_reason(tmp_path, monkeypatch, 
         with caplog.at_level("INFO", logger="herdr_engineering.fabric_agent"):
             agent.scan_once()
         assert _leased_ports(gw) == []
+        assert not [r for r in caplog.records if "refusing" in r.getMessage()]
+        with caplog.at_level("INFO", logger="herdr_engineering.fabric_agent"):
+            assert agent._adopt(port, {"addrs": {"127.0.0.1"}, "process": "thing"}) is None
         assert any(f"port {port}" in r.getMessage() and "denylist" in r.getMessage()
                    for r in caplog.records)
     finally:
@@ -1727,8 +1921,8 @@ def test_adoption_config_parsers():
             continue
         raise AssertionError(bad)
     assert fa.parse_ports(None, "x") == frozenset()
-    assert fa.parse_ports([3000, "4000"], "x") == frozenset({3000, 4000})
-    for bad in ([0], [70000], ["a"], "3000", [True]):
+    assert fa.parse_ports([3000, 4000], "x") == frozenset({3000, 4000})
+    for bad in ([0], [70000], ["a"], ["4000"], [3000.5], [3000.0], "3000", [True]):
         try:
             fa.parse_ports(bad, "x")
         except ValueError:
@@ -1736,3 +1930,13 @@ def test_adoption_config_parsers():
         raise AssertionError(bad)
     assert fa.parse_allow_processes(None) == ()
     assert fa.parse_allow_processes("vite") == ("vite",)
+    assert fa.parse_deny_processes(None) == fa.DEFAULT_DENY_PROCESSES
+    assert fa.parse_deny_processes(["a", " b "]) == ("a", "b")
+    with pytest.raises(ValueError, match="agent_allow_processes"):
+        fa.parse_allow_processes([1])
+    with pytest.raises(ValueError, match="agent_deny_processes"):
+        fa.parse_deny_processes([""])
+    with pytest.raises(ValueError, match="integer"):
+        fa.parse_ports([3000.5], "agent_allow_ports")
+    with pytest.raises(ValueError, match="duplicate port 3000"):
+        fa.parse_ports([3000, 3000], "x")
