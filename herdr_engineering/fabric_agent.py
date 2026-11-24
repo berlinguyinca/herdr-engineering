@@ -1037,24 +1037,9 @@ class FabricAgent:
         # The slow-data object last posted (or dropped after a 4xx): a new read
         # is due at once, the same one again only every host_slow_interval.
         self._slow_handled: dict[str, Any] | None = None
-        # Restore forwarders for loopback-only services survived a restart.
-        for port_s, entry in self._store.items():
-            if entry.get("fwd_port"):
-                fwd = AgentForwarder(config.tailnet_ip, int(port_s),
-                                     fabric_names=config.fabric_names(), fabric_domains=config.domains())
-                try:
-                    fwd.start()
-                    # Rebind to the remembered port when still free so the
-                    # registered target keeps working across restarts.
-                    if fwd.port != entry["fwd_port"]:
-                        fwd.stop()
-                        fwd = self._rebind(fwd, entry["fwd_port"], int(port_s))
-                        if fwd is None:
-                            continue
-                    self._forwards[int(port_s)] = fwd
-                except OSError as exc:
-                    log.warning("could not restore forwarder for port %s: %s",
-                                port_s, exc)
+        # Forwarders for loopback-only services that survived a restart are NOT
+        # started here: the first scan restores each one only after its port
+        # passes the debug-surface identity probe (see _restore_forward).
         # Report every currently-tracked service to the control plane so the
         # fleet Services page is fully populated across agent restarts (a
         # restart re-heartbeats these leases; it does not re-adopt them, so
@@ -1088,6 +1073,23 @@ class FabricAgent:
         tmp = self.cfg.store_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(self._store, indent=2))
         tmp.replace(self.cfg.store_path)
+
+    def _restore_forward(self, port_s: str, entry: dict[str, Any]) -> None:
+        """Start the tailnet forwarder a stored loopback lease had before a restart."""
+        fwd = AgentForwarder(self.cfg.tailnet_ip, int(port_s),
+                             fabric_names=self.cfg.fabric_names(), fabric_domains=self.cfg.domains())
+        try:
+            fwd.start()
+            # Rebind to the remembered port when still free so the
+            # registered target keeps working across restarts.
+            if fwd.port != entry["fwd_port"]:
+                fwd.stop()
+                fwd = self._rebind(fwd, entry["fwd_port"], int(port_s))
+                if fwd is None:
+                    return
+            self._forwards[int(port_s)] = fwd
+        except OSError as exc:
+            log.warning("could not restore forwarder for port %s: %s", port_s, exc)
 
     def _rebind(self, fwd: AgentForwarder, port: int,
                 target_port: int) -> AgentForwarder | None:
@@ -1189,6 +1191,22 @@ class FabricAgent:
                         or self._lease_expired(entry)):
                     self._release(port_s)
                     closed.append(port_s)
+                    continue
+                # A stored lease is re-identified like a new candidate: the
+                # probe is cached per listener identity (addrs, process, pid)
+                # for 30 s, so a replaced listener is asked again at once. Only
+                # a conclusive answer releases; an inconclusive one keeps the
+                # lease (and, after a restart, leaves the forwarder down).
+                try:
+                    reason = self._debug_surface_cached(port, listeners[port])
+                except ProbeInconclusive:
+                    continue
+                if reason:
+                    self._note_refused(port, reason)
+                    self._release(port_s)
+                    closed.append(port_s)
+                elif entry.get("fwd_port") and port not in self._forwards:
+                    self._restore_forward(port_s, entry)
 
         # 2) adopt new web services
         self._refused = {p: r for p, r in self._refused.items() if p in live_ports}

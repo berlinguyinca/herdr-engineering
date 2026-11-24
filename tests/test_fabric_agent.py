@@ -676,6 +676,7 @@ def test_forwarder_restored_across_restart_stays_live(tmp_path, monkeypatch):
         gw2 = _FakeGateway()
         agent2 = _agent(tmp_path, gw2)
         try:
+            agent2.scan_once()   # the identity probe passes, then it is restored
             restored = agent2._forwards.get(port)
             assert restored is not None, "forwarder not restored after restart"
             assert restored.port == fwd_port
@@ -1940,3 +1941,159 @@ def test_adoption_config_parsers():
         fa.parse_ports([3000.5], "agent_allow_ports")
     with pytest.raises(ValueError, match="duplicate port 3000"):
         fa.parse_ports([3000, 3000], "x")
+
+
+# ---------------------------------------------------------------------------
+# The identity probe also covers leases that are already stored
+# ---------------------------------------------------------------------------
+
+def _listeners_pid(port: int, pid: int) -> dict[int, dict]:
+    return {port: {"addrs": {"127.0.0.1"}, "process": "app", "pid": pid}}
+
+
+def _loopback_only(monkeypatch, port: int) -> None:
+    real_tcp_open = fa.tcp_open
+    monkeypatch.setattr(fa, "tcp_open", lambda host, p, timeout=1.0:
+                        False if p == port else real_tcp_open(host, p, timeout))
+
+
+def _seed_forwarded_lease(tmp_path, port: int, fwd_port: int) -> None:
+    entry = {"lease_id": "lease_old", "label": f"x (port {port})",
+             "external_port": 18001, "url": "http://dev.lan:18001",
+             "target_host": "127.0.0.1", "target_port": fwd_port,
+             "fwd_port": fwd_port, "process": "app", "last_hb": 0.0,
+             "registered_at": time.time()}
+    (tmp_path / "fabric-agent.json").write_text(json.dumps({str(port): entry}))
+
+
+def _serves(port: int) -> bool:
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=2) as resp:
+            return resp.status == 200
+    except OSError:
+        return False
+
+
+def test_a_leased_port_that_becomes_a_debugger_is_released_with_its_forwarder(
+        tmp_path, monkeypatch):
+    routes: dict[str, object] = {"/": {"ok": True}}
+    server, port = _json_server(routes)
+    _loopback_only(monkeypatch, port)
+    gw = _FakeGateway()
+    state = {"pid": 100}
+    monkeypatch.setattr(fa, "scan_listening_ports",
+                        lambda: _listeners_pid(port, state["pid"]))
+    agent = _agent(tmp_path, gw)
+    try:
+        agent.scan_once()
+        fwd_port = _store(tmp_path)[str(port)]["fwd_port"]
+        assert _serves(fwd_port)
+        # Same port, new process, now a Chrome DevTools endpoint.
+        routes["/json/version"] = {"webSocketDebuggerUrl": "ws://x/devtools/browser/a"}
+        state["pid"] = 200
+        summary = agent.scan_once()
+        assert summary["closed"] == [str(port)]
+        assert str(port) not in _store(tmp_path)
+        assert port not in agent._forwards
+        assert _leased_ports(gw) == []
+        assert not _serves(fwd_port)
+        assert "Chrome DevTools" in agent._refused[port]
+    finally:
+        server.shutdown()
+        agent.stop()
+        gw.stop()
+
+
+def test_a_leased_port_is_reprobed_when_the_cached_answer_expires(tmp_path, monkeypatch):
+    routes: dict[str, object] = {"/": {"ok": True}}
+    server, port = _json_server(routes)
+    gw = _FakeGateway()
+    monkeypatch.setattr(fa, "scan_listening_ports", lambda: _listeners_pid(port, 1))
+    agent = _agent(tmp_path, gw)
+    try:
+        agent.scan_once()
+        routes["/json/version"] = {"Browser": "node.js/v20.1.0"}
+        assert agent.scan_once()["closed"] == []   # same listener, answer still cached
+        fingerprint, reason, _ = agent._debug_cache[port]
+        agent._debug_cache[port] = (fingerprint, reason, time.monotonic() - 31.0)
+        assert agent.scan_once()["closed"] == [str(port)]
+        assert _leased_ports(gw) == []
+    finally:
+        server.shutdown()
+        agent.stop()
+        gw.stop()
+
+
+def test_a_leased_plain_http_app_is_kept(tmp_path, monkeypatch):
+    server, port = _ordinary_app()
+    gw = _FakeGateway()
+    state = {"pid": 1}
+    monkeypatch.setattr(fa, "scan_listening_ports",
+                        lambda: _listeners_pid(port, state["pid"]))
+    agent = _agent(tmp_path, gw)
+    try:
+        agent.scan_once()
+        state["pid"] = 2   # a new listener identity is probed again and passes
+        assert agent.scan_once()["closed"] == []
+        assert _leased_ports(gw) == [port]
+        assert str(port) in _store(tmp_path)
+    finally:
+        server.shutdown()
+        agent.stop()
+        gw.stop()
+
+
+def test_an_inconclusive_probe_keeps_a_stored_lease(tmp_path, monkeypatch):
+    raw, port = _raw_tcp_listener()   # accepts, never speaks: the probe times out
+    gw = _FakeGateway()
+    _seed_store(tmp_path, port, time.time())
+    monkeypatch.setattr(fa, "scan_listening_ports", lambda: _listeners({port: "node"}))
+    agent = _agent(tmp_path, gw, probe_timeout=0.2)
+    try:
+        assert agent.scan_once()["closed"] == []
+        assert str(port) in _store(tmp_path)
+    finally:
+        raw.close()
+        agent.stop()
+        gw.stop()
+
+
+def test_a_restart_does_not_serve_a_stored_debugger_lease(tmp_path, monkeypatch):
+    server, port = _cdp_server()
+    _loopback_only(monkeypatch, port)
+    fwd_port = _free_port()
+    _seed_forwarded_lease(tmp_path, port, fwd_port)
+    monkeypatch.setattr(fa, "scan_listening_ports", lambda: _listeners({port: "app"}))
+    gw = _FakeGateway()
+    agent = _agent(tmp_path, gw)
+    try:
+        assert not _serves(fwd_port)   # nothing is served before the first probe
+        summary = agent.scan_once()
+        assert summary["closed"] == [str(port)]
+        assert port not in agent._forwards
+        assert not _serves(fwd_port)
+        assert str(port) not in _store(tmp_path)
+    finally:
+        server.shutdown()
+        agent.stop()
+        gw.stop()
+
+
+def test_a_restart_serves_a_stored_plain_app_lease_after_the_first_probe(
+        tmp_path, monkeypatch):
+    server, port = _ordinary_app()
+    _loopback_only(monkeypatch, port)
+    fwd_port = _free_port()
+    _seed_forwarded_lease(tmp_path, port, fwd_port)
+    monkeypatch.setattr(fa, "scan_listening_ports", lambda: _listeners({port: "app"}))
+    gw = _FakeGateway()
+    agent = _agent(tmp_path, gw)
+    try:
+        assert not _serves(fwd_port)
+        agent.scan_once()
+        assert agent._forwards[port].port == fwd_port
+        assert _serves(fwd_port)
+    finally:
+        server.shutdown()
+        agent.stop()
+        gw.stop()

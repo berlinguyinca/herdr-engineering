@@ -34,9 +34,14 @@ answer and counts as "not a debugger". A refused port gets
 no lease, no forwarder and no `Host` rewrite. A port listening on the host but
 unpublished for one of these reasons is not repeated as a "no fabric lease" warning.
 An existing lease whose port becomes denied, excluded or not allowed is released on
-the next scan. The identity probes are made only when a port is first considered,
-so a service that starts answering as a debugger later keeps its lease until the
-listener changes or the agent restarts.
+the next scan. The identity probes also cover stored leases, including those adopted
+by an older agent: every scan re-asks for each leased port, cached for 30 seconds per
+listener identity (addresses, process, pid), so a replaced listener or a service that
+starts answering as a debugger loses its lease and forwarder within one scan. An
+inconclusive probe never releases a lease; it is retried next scan. After an agent
+restart, no forwarder for a stored loopback lease is started until the first scan has
+probed that port and found it not a debugger; a conclusive refusal releases the lease
+instead.
 
 ## Settings (`config.yaml`, `fabric:` section)
 
