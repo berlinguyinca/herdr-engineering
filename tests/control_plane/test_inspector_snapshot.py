@@ -175,8 +175,9 @@ class FakeConn:
     def __init__(self, rows):
         self.rows, self.saved = list(rows), None
 
-    async def fetch(self, sql, last, settle, limit):
-        return sorted((r for r in self.rows if r["sequence"] > last), key=lambda r: r["sequence"])[:limit]
+    async def fetch(self, sql, last, last_id, settle, limit):
+        key = lambda r: (r["sequence"], r.get("event_id", ""))      # noqa: E731
+        return sorted((r for r in self.rows if key(r) > (last, last_id)), key=key)[:limit]
 
     async def fetchval(self, sql, *args):
         if "inspector_snapshots" in sql:

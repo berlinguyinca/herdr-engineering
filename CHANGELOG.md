@@ -5,6 +5,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: inspector snapshot rebuild with archived rows, same-millisecond rows, and a missing snapshot table
+
+- The snapshot writer's full rebuild now also replays the rows the inspector archive moved into `fabric_events_archive`. Before, any archived row made the rebuilt count differ from the stored count, so the snapshot was never rewritten and boots fell back to the full replay.
+- The writer pages and replays on `(sequence, event_id)` instead of the millisecond `sequence` alone: rows written in the same millisecond are no longer skipped at a page boundary, and the in-order replay no longer feeds one of two tied rows twice and drops the other.
+- With `inspector_snapshots.enabled` and no `inspector_snapshots` table, the boot's snapshot lookup runs in a savepoint, so its failure no longer aborts the boot's transaction; every row loads, as documented.
+
 ### Fix: Slack approval of unseen text, calendar block-list alias, Rakazo first-bot cache
 
 - Slack ask: the Approve buttons are only offered when the command is shown in full; a long (truncated) command gets Deny only and a "cannot be approved from Slack" note, and an approve tap on such an ask is refused (`not_fully_shown`).

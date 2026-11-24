@@ -28,6 +28,22 @@ DEFAULT_INTERVAL_SECONDS = 600.0
 _COLUMNS = ("event_id, schema_version, source_timestamp, ingest_timestamp, entity_type, entity_id, mission_id, "
             "session_id, sequence, event_type, payload")
 _VALID = "entity_type = 'inspector' AND entity_id IS NOT NULL AND entity_id <> ''"
+_LIVE = "fabric_events"
+# Rows the archive job moved out of fabric_events still count toward a snapshot's event_count, so a full rebuild reads both.
+_WITH_ARCHIVE = f"(SELECT {_COLUMNS} FROM fabric_events UNION ALL SELECT {_COLUMNS} FROM fabric_events_archive) AS fe"
+
+
+async def _source(conn, archived: bool) -> str:
+    """The FROM expression a full rebuild reads: the live journal, plus the archive when it exists."""
+    if archived and await conn.fetchval("SELECT to_regclass('fabric_events_archive') IS NOT NULL"):
+        return _WITH_ARCHIVE
+    return _LIVE
+
+
+# Keyset condition on (sequence, event_id) with ``$1``/``$2``: the sequence is a millisecond clock, so rows tie on it and
+# paging on it alone would skip the rest of a tie that straddles a page boundary. ``sequence >= $1`` keeps the partial
+# sequence index usable.
+_AFTER = "sequence >= $1 AND (sequence, event_id) > ($1, $2)"
 
 
 def parse_inspector_snapshots(raw) -> dict:
@@ -174,7 +190,7 @@ class SnapshotWriter:
         self._shadow = shadow = self._make_store()
         fetched = 0
         try:
-            async for page in self._pages(conn, -1):
+            async for page in self._pages(conn, -1, archived=True):
                 await asyncio.to_thread(shadow.hydrate_delta, page)
                 fetched += len(page)
         except SnapshotStale as exc:
@@ -195,56 +211,60 @@ class SnapshotWriter:
         (about 80 bytes a row, instead of the row), a sort of those keys, then the rows fetched ``_PAGE`` at a time in
         key order. Ties on the key keep fabric-sequence order, as in the one-shot hydrate. Returns the rows replayed."""
         keys: list[tuple] = []
-        last = -1
+        last, last_id = 0, ""
+        source = await _source(conn, True)
         while True:
             page = await conn.fetch(
-                "SELECT sequence, source_timestamp, ingest_timestamp, "
+                "SELECT sequence, event_id, source_timestamp, ingest_timestamp, "
                 "CASE WHEN jsonb_typeof(payload->'_received_at') = 'number' THEN payload->>'_received_at' END AS ra, "
                 "CASE WHEN jsonb_typeof(payload->'_sequence') = 'number' THEN payload->>'_sequence' END AS sq "
-                f"FROM fabric_events WHERE {_VALID} AND sequence > $1 "
-                "AND ingest_timestamp < now() - make_interval(secs => $2) ORDER BY sequence LIMIT $3",
-                last, self.settle, _PAGE)
+                f"FROM {source} WHERE {_VALID} AND {_AFTER} "
+                "AND ingest_timestamp < now() - make_interval(secs => $3) ORDER BY sequence, event_id LIMIT $4",
+                last, last_id, self.settle, _PAGE)
             for r in page:
                 probe = {"sequence": int(r["sequence"]), "source_timestamp": r["source_timestamp"],
                          "ingest_timestamp": r["ingest_timestamp"],
                          "payload": {"_received_at": float(r["ra"]) if r["ra"] is not None else None,
                                      "_sequence": float(r["sq"]) if r["sq"] is not None else None}}
                 recv, seq = shadow._replay_order(probe)
-                keys.append((recv, seq, probe["sequence"]))
+                keys.append((recv, seq, probe["sequence"], r["event_id"]))
             if len(page) < _PAGE:
                 break
-            last = int(page[-1]["sequence"])
+            last, last_id = int(page[-1]["sequence"]), page[-1]["event_id"]
         keys.sort()
         replayed = 0
         for lo in range(0, len(keys), _PAGE):
-            wanted = [k[2] for k in keys[lo:lo + _PAGE]]
-            rows = await conn.fetch(f"SELECT {_COLUMNS} FROM fabric_events WHERE {_VALID} AND sequence = ANY($1::bigint[])",
-                                    wanted)
+            wanted = [(k[2], k[3]) for k in keys[lo:lo + _PAGE]]
+            rows = await conn.fetch(f"SELECT {_COLUMNS} FROM {source} WHERE {_VALID} AND (sequence, event_id) IN "
+                                    "(SELECT * FROM unnest($1::bigint[], $2::text[]))",
+                                    [w[0] for w in wanted], [w[1] for w in wanted])
             streams, _ = _rebuild_events([dict(r) for r in rows])
-            by_seq = {e["sequence"]: e for stream in streams.values() for e in stream}
-            batch = [by_seq[q] for q in wanted if q in by_seq]
+            by_key = {(e["sequence"], e["event_id"]): e for stream in streams.values() for e in stream}
+            batch = [by_key[q] for q in wanted if q in by_key]
             await asyncio.to_thread(shadow.hydrate, batch)
             replayed += len(batch)
         return replayed
 
-    async def _row_pages(self, conn, after: int):
-        """Raw inspector rows newer than ``after``, ``_PAGE`` rows at a time, in fabric-sequence order."""
-        last = after
+    async def _row_pages(self, conn, after: int, archived: bool = False):
+        """Raw inspector rows newer than ``after``, ``_PAGE`` rows at a time, in (fabric-sequence, event_id) order.
+        ``archived`` also reads the archive table (a full rebuild; an incremental fetch is above every archived row)."""
+        last, last_id = after + 1, ""         # (after + 1, "") sorts before every real row above ``after``
+        source = await _source(conn, archived)
         while True:
             page = await conn.fetch(
-                f"SELECT {_COLUMNS} FROM fabric_events WHERE {_VALID} AND sequence > $1 "
-                "AND ingest_timestamp < now() - make_interval(secs => $2) ORDER BY sequence LIMIT $3",
-                last, self.settle, _PAGE)
+                f"SELECT {_COLUMNS} FROM {source} WHERE {_VALID} AND {_AFTER} "
+                "AND ingest_timestamp < now() - make_interval(secs => $3) ORDER BY sequence, event_id LIMIT $4",
+                last, last_id, self.settle, _PAGE)
             if not page:
                 return
-            last = int(page[-1]["sequence"])
+            last, last_id = int(page[-1]["sequence"]), page[-1]["event_id"]
             yield [dict(r) for r in page]
             if len(page) < _PAGE:
                 return
 
-    async def _pages(self, conn, after: int):
+    async def _pages(self, conn, after: int, archived: bool = False):
         """Like :meth:`_row_pages`, each page folded into the shape a boot sees (via ``_rebuild_events``)."""
-        async for rows in self._row_pages(conn, after):
+        async for rows in self._row_pages(conn, after, archived):
             streams, _ = _rebuild_events(rows)
             yield [e for stream in streams.values() for e in stream]
 

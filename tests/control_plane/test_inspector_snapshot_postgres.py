@@ -118,3 +118,42 @@ def test_the_real_source_skips_covered_rows_and_boots_to_the_same_state(tmp_path
         assert events_loaded == loaded_less                      # the rows were skipped at load, then fetched back
         a, b = json.loads(refused), json.loads(full)
         assert a["sessions"] == b["sessions"] and a["watermark"] == b["watermark"] and a["count"] == b["count"]
+
+
+V2_COLUMNS_SQL = ("ALTER TABLE fabric_events ADD COLUMN causation_id text, ADD COLUMN correlation_id text, ADD COLUMN actor jsonb,"
+                  " ADD COLUMN visibility_scope text, ADD COLUMN evidence_refs jsonb, ADD COLUMN org_id text,"
+                  " ADD COLUMN project_id text, ADD COLUMN room_id text, ADD COLUMN workspace_id text,"
+                  " ADD COLUMN task_id text, ADD COLUMN agent_id text, ADD COLUMN trace_id text, ADD COLUMN projection_position bigint;")
+
+
+@pytest.mark.integration
+def test_a_boot_with_snapshots_enabled_but_no_snapshot_table_loads_every_row(tmp_path):
+    """The lookup runs inside the boot's repeatable-read transaction: a failed statement there must not abort the
+    event load that follows (the docstring promises a missing table means every row loads)."""
+    asyncpg = pytest.importorskip("asyncpg")
+    from herdr_engineering.control_plane.bridge import PostgresSource, load_into
+    from herdr_engineering.control_plane.repo import ControlPlaneRepo
+    fabric, v2 = tmp_path / "fabric.sql", tmp_path / "v2.sql"
+    fabric.write_text(FABRIC)
+    v2.write_text(V2_COLUMNS_SQL)
+    with private_postgres(fabric, v2) as dsn:                     # 0030 (inspector_snapshots) deliberately not applied
+        if dsn is None:
+            pytest.skip("no postgres binaries")
+        rows = stream(60, seed=3)
+
+        async def seed():
+            conn = await asyncpg.connect(dsn)
+            try:
+                for e in rows:
+                    await conn.execute(
+                        "INSERT INTO fabric_events (event_id, sequence, event_type, entity_type, entity_id, session_id, payload,"
+                        " source_timestamp, ingest_timestamp) VALUES ($1,$2,$3,'inspector',$4,$4,$5::jsonb,$6,$6)",
+                        f"id-{e['sequence']}", e["sequence"], e["event_type"], e["entity_id"], json.dumps(e["payload"]),
+                        datetime.fromisoformat(e["source_timestamp"]))
+            finally:
+                await conn.close()
+
+        asyncio.run(seed())
+        repo = ControlPlaneRepo(inspector_limits=LIMITS)
+        result = load_into(repo, PostgresSource(dsn=dsn, inspector_snapshots=True))
+    assert result["events"] == len(rows)

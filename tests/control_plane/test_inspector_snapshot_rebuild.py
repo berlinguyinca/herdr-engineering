@@ -45,8 +45,20 @@ def ingest_of(rows, skew=None):
 
 async def insert(conn, rows, ingest):
     for e in rows:
-        await conn.execute(INSERT, f"id-{e['sequence']}", e["sequence"], e["event_type"], e["entity_id"],
+        await conn.execute(INSERT, e.get("event_id", f"id-{e['sequence']}"), e["sequence"], e["event_type"], e["entity_id"],
                            json.dumps(e["payload"]), datetime.fromisoformat(e["source_timestamp"]), ingest(e))
+
+
+ARCHIVE_SQL = "CREATE TABLE fabric_events_archive (LIKE fabric_events INCLUDING DEFAULTS, archived_at timestamptz NOT NULL DEFAULT now());"
+
+
+def tied(rows, width=2):
+    """The rows with ``width`` consecutive rows sharing one fabric sequence (the journal stamps it in milliseconds, so
+    rows written in the same millisecond tie) and a distinct event_id each."""
+    out = []
+    for i, e in enumerate(rows):
+        out.append({**e, "sequence": i // width + 1, "event_id": f"ev-{i}"})
+    return out
 
 
 def run_rebuild(tmp_path, rows, page, ingest):
@@ -212,3 +224,63 @@ def test_a_deferred_tool_update_written_after_the_cursor_does_not_force_a_rebuil
     full = make_store()
     full.hydrate([{**e, "sequence": i + 1, "ingest_timestamp": None} for i, e in enumerate(journal)])
     assert canon(writer._shadow.export_state()) == canon(full.export_state())
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("page", [17, 1_000])
+def test_rebuild_keeps_rows_that_share_a_sequence_across_page_boundaries(tmp_path, page):
+    rows = tied(stream(300, seed=2))
+    ingest = ingest_of(rows)
+    writer, outcome, _ = run_rebuild(tmp_path, rows, page, ingest)
+    assert outcome.startswith("written")
+    assert canon(writer._shadow.export_state()) == canon(full_replay(rows, ingest).export_state())
+
+
+@pytest.mark.integration
+def test_in_order_replay_feeds_every_row_that_shares_a_sequence_exactly_once(tmp_path):
+    rows = tied(stream(300, seed=5), width=3)
+    for e in rows:
+        e["payload"].pop("_received_at", None)
+    rnd = random.Random(1)
+    skew = {i: rnd.randint(0, 3000) for i in range(len(rows))}
+    ingest_by_id = {e["event_id"]: datetime.fromtimestamp(T0 + skew[i], UTC) for i, e in enumerate(rows)}
+    ingest = lambda e: ingest_by_id[e["event_id"]]      # noqa: E731
+    writer, outcome, _ = run_rebuild(tmp_path, rows, 40, ingest)
+    assert outcome.startswith("written")
+    assert canon(writer._shadow.export_state()) == canon(full_replay(rows, ingest).export_state())
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("archived", [60, 400])
+def test_rebuild_with_archived_inspector_rows_replays_them_and_writes_the_snapshot(tmp_path, archived):
+    """The archive job moves inspector rows out of fabric_events but the snapshot's event_count still counts them, so a
+    rebuild that replays only the live rows can never match and the snapshot stays unwritten for good."""
+    asyncpg = pytest.importorskip("asyncpg")
+    rows = stream(400, seed=9)
+    ingest = ingest_of(rows)
+    fabric, archive = tmp_path / "fabric.sql", tmp_path / "archive.sql"
+    fabric.write_text(FABRIC)
+    archive.write_text(ARCHIVE_SQL)
+    with private_postgres(fabric, archive, MIGRATIONS / "0030_inspector_snapshots.sql", INDEX_MIGRATION) as dsn:
+        if dsn is None:
+            pytest.skip("no postgres binaries")
+
+        async def scenario():
+            conn = await asyncpg.connect(dsn)
+            try:
+                await insert(conn, rows, ingest)
+                await conn.execute("INSERT INTO fabric_events_archive SELECT *, now() FROM fabric_events "
+                                   "WHERE sequence <= $1", archived)
+                await conn.execute("DELETE FROM fabric_events WHERE sequence <= $1", archived)
+                writer = snap.SnapshotWriter(make_store, interval=0, settle=-10**9)
+                outcome = await writer.tick(conn)
+                row = await conn.fetchrow("SELECT watermark, event_count FROM inspector_snapshots WHERE id = 1")
+                return writer, outcome, dict(row) if row else None
+            finally:
+                await conn.close()
+
+        writer, outcome, written = asyncio.run(scenario())
+    assert outcome.startswith("written"), outcome
+    reference = full_replay(rows, ingest)
+    assert canon(writer._shadow.export_state()) == canon(reference.export_state())
+    assert written == {"watermark": reference.replay_watermark, "event_count": reference.replay_count}
