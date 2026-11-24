@@ -33,6 +33,16 @@ PYAPPROVED
 )" || return 1
     read -r MEMORY_PRIVATE_EGRESS MEMORY_PRIVATE_EGRESS_CIDR MEMORY_PRIVATE_EGRESS_GATEWAY WEB_EGRESS_GENERATION <<<"$values"
   fi
+  # An explicit enable on a host that already has an approved network keeps that network's subnet unless
+  # --memory-private-egress-cidr names another (the built-in default only seeds hosts with no approved network).
+  if [ "$MEMORY_PRIVATE_EGRESS" = 1 ] && [ "$MEMORY_PRIVATE_EGRESS_CIDR_SET" != 1 ] && [ -e "$WEB_EGRESS_CURRENT" ]; then
+    local kept
+    kept="$(web_egress_cmd approved --current "$WEB_EGRESS_CURRENT" 2>/dev/null | python3 -c '
+import json,sys
+v=json.load(sys.stdin)
+print(v["cidr"] if v.get("enabled") else "")' 2>/dev/null)" || kept=""
+    [ -z "$kept" ] || MEMORY_PRIVATE_EGRESS_CIDR="$kept"
+  fi
   WEB_EGRESS_COMPOSE_ENABLED="$MEMORY_PRIVATE_EGRESS"
   [ "$PROJECT" = herdr-control-plane ] || {
     echo "private egress supports only the canonical private control-plane project" >&2; return 1;

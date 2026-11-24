@@ -136,7 +136,7 @@ set -euo pipefail
 REF="origin/main"; DRY=0; FETCH=1; ALLOW_DIVERGENT=0; COLLAB_LOCK_WAIT=300; DEPLOY_LOCK_WAIT=600
 CHECKPOINT_LOCK_WAIT=420; PAUSE_WORKER=0; WORKER_PAUSED=0
 MEMORY_PRIVATE_EGRESS=auto; MEMORY_PRIVATE_EGRESS_RECOVER=""
-MEMORY_PRIVATE_EGRESS_CIDR="172.31.252.32/29"
+MEMORY_PRIVATE_EGRESS_CIDR="172.31.252.32/29"; MEMORY_PRIVATE_EGRESS_CIDR_SET=0
 MEMORY_PRIVATE_EGRESS_GATEWAY="${HERDR_CP_MEMORY_PRIVATE_EGRESS_GATEWAY:-}"
 MEMORY=0; MEMORY_CHECKOUT="${HERDR_MEMORY_CHECKOUT:-}"
 MEMORY_CLIENT_CONFIG="${HERDR_CP_MEMORY_CLIENT_CONFIG:-}"
@@ -155,7 +155,7 @@ while [ $# -gt 0 ]; do
     --memory-private-egress-recover) MEMORY_PRIVATE_EGRESS_RECOVER="${2:?needs the saved deploy attempt}"; shift 2 ;;
     --memory-private-egress) MEMORY_PRIVATE_EGRESS=1; shift ;;
     --no-memory-private-egress) MEMORY_PRIVATE_EGRESS=0; shift ;;
-    --memory-private-egress-cidr) MEMORY_PRIVATE_EGRESS_CIDR="${2:?needs a CIDR}"; shift 2 ;;
+    --memory-private-egress-cidr) MEMORY_PRIVATE_EGRESS_CIDR="${2:?needs a CIDR}"; MEMORY_PRIVATE_EGRESS_CIDR_SET=1; shift 2 ;;
     --memory-private-egress-gateway) MEMORY_PRIVATE_EGRESS_GATEWAY="${2:?needs an explicit IPv4/32}"; shift 2 ;;
     --with-memory) MEMORY=1; shift ;;
     --memory-checkout) MEMORY_CHECKOUT="${2:?--memory-checkout needs a value}"; shift 2 ;;

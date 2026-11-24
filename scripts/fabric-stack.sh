@@ -10,10 +10,11 @@
 #   ./scripts/fabric-stack.sh --replace  # also stop the OLD host-run services
 #   ./scripts/fabric-stack.sh down       # stop the stack
 #   ./scripts/fabric-stack.sh status     # show container + healthz state (+ Hindsight memory, when deployed)
-#   ./scripts/fabric-stack.sh memory-route enable|disable|status
+#   ./scripts/fabric-stack.sh memory-route enable [PORT]|disable|status
 #                                        # route https://memory.<domain> and https://memory.dev.lan to the loopback
-#                                        # Hindsight API through the gateway (deploy/fabric-stack/config.yaml `routes`);
-#                                        # edits the file only, then prints the gateway recreate command to run
+#                                        # Hindsight API (default port 8888) through the gateway. Writes the host-local
+#                                        # ~/.config/herdr-engineering/fabric/config.yaml (survives deploys; the shipped
+#                                        # config stays routes-off), then prints the gateway restart to run
 set -euo pipefail
 
 STACK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../deploy/fabric-stack" && pwd)"
@@ -109,22 +110,34 @@ memory_status() {
 }
 
 memory_route() {
-    local cfg="$STACK_DIR/config.yaml" mark='# herdr-memory-route'
+    # The shipped deploy/fabric-stack/config.yaml (baked into the image) keeps the memory routes OFF. They live in a
+    # host-local file the gateway container mounts and reads after the baked one, so a deploy never loses them.
+    local shipped="$STACK_DIR/config.yaml" mark='# herdr-memory-route'
+    local dir="$HOME/.config/herdr-engineering/fabric" port="${2:-}"; [ -n "$port" ] || port=8888
+    local local_cfg="$dir/config.yaml"
     case "${1:-status}" in
         enable)
-            sed -i.bak -E "/$mark\$/ s/^( *)# - /\1- /" "$cfg" && rm -f "$cfg.bak"
-            say "memory routes enabled in $cfg (https://memory.<domain> and https://memory.dev.lan -> 127.0.0.1:<memory port>)"
-            say "apply: commit the change and run deploy.sh; config.yaml is baked into the herdr-engineering image, so"
-            say "       only a new image (deploy.sh will recreate fabric-gateway and herdr-web) carries it"
+            case "$port" in ''|*[!0-9]*) echo "usage: $0 memory-route enable [PORT]  (control_plane.memory.port, default 8888)" >&2; exit 2 ;; esac
+            mkdir -p "$dir"
+            {
+                echo "# Host-local fabric routes, written by scripts/fabric-stack.sh memory-route (read by fabric-gateway after the"
+                echo "# baked config; replaces its routes list). Re-run 'memory-route enable' after the shipped routes change."
+                echo "fabric:"
+                echo "  routes:"
+                sed -n '/^  routes:/,/^  [a-z_]*:/p' "$shipped" | grep -E '^ *- "' | grep -v "$mark\$"
+                sed -n '/^  routes:/,/^  [a-z_]*:/p' "$shipped" | grep "$mark\$" | sed -E "s/^( *)# - /\1- /; s/:[0-9]+\"/:$port\"/"
+            } >"$local_cfg.new" && mv "$local_cfg.new" "$local_cfg"
+            say "memory routes enabled in $local_cfg (https://memory.<domain> and https://memory.dev.lan -> 127.0.0.1:$port)"
+            say "apply: docker restart herdr-fabric-gateway   (it re-reads the file; leases return when agents re-register)"
             ;;
         disable)
-            sed -i.bak -E "/$mark\$/ s/^( *)- /\1# - /" "$cfg" && rm -f "$cfg.bak"
-            say "memory routes disabled in $cfg; apply by committing and running deploy.sh (config.yaml is baked into the image)"
+            rm -f "$local_cfg"
+            say "memory routes disabled (removed $local_cfg); apply: docker restart herdr-fabric-gateway"
             ;;
         status)
-            grep "$mark" "$cfg" || echo "(no memory route lines in $cfg)"
+            if [ -f "$local_cfg" ]; then grep -E '^ *- "' "$local_cfg"; else echo "(memory routes off: no $local_cfg)"; fi
             ;;
-        *) echo "usage: $0 memory-route enable|disable|status" >&2; exit 2 ;;
+        *) echo "usage: $0 memory-route enable [PORT]|disable|status" >&2; exit 2 ;;
     esac
 }
 
@@ -164,7 +177,7 @@ case "$cmd" in
         stop_old_host_services
         ;;
     memory-route)
-        memory_route "${2:-status}"
+        memory_route "${2:-status}" "${3:-}"
         exit 0
         ;;
     *)

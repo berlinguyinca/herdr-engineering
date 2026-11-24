@@ -1,5 +1,5 @@
 # Exported from uv.lock; the runtime image installs under these pins (see Dockerfile).
-# Regenerate: uv export --frozen --no-dev --extra collab --extra review-gate --extra share
+# Regenerate: uv export --locked --no-dev --extra collab --extra review-gate --extra share
 #   --no-emit-project --no-hashes --no-header --no-annotate > body, then keep these 3 header lines.
 asyncpg==0.32.0
 boto3==1.43.125

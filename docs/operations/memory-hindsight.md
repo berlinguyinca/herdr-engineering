@@ -92,10 +92,11 @@ routed names:
 * DNS: CoreDNS already answers `*.dev.lan` with the gateway's tailnet IP, and `*.local.metabolomics.us` is published by
   `devfabric dns publish`. No record is added.
 * Certificates: both names are covered by the certificates the gateway already serves (SNI picks the certificate).
-* Route: `scripts/fabric-stack.sh memory-route enable` uncomments the two marked `routes` lines in
-  `deploy/fabric-stack/config.yaml` (`memory.<domain>=127.0.0.1:8888`, `memory.dev.lan=127.0.0.1:8888`); change the
-  port there if you changed `control_plane.memory.port`. Commit the change and deploy with `deploy.sh`: the config is baked into the image,
-  so that is what recreates `fabric-gateway`.
+* Route: `scripts/fabric-stack.sh memory-route enable [PORT]` (default 8888; pass `control_plane.memory.port`, e.g. 8897 on
+  bender) writes `~/.config/herdr-engineering/fabric/config.yaml` with the shipped routes plus
+  `memory.<domain>` and `memory.dev.lan` -> `127.0.0.1:PORT`. The gateway container mounts that directory read-only and
+  reads the file after the baked `/app/config.yaml`, so the setting survives deploys, is not in git, and the shipped
+  config stays routes-off. Apply with `docker restart herdr-fabric-gateway`; `memory-route disable` removes the file.
   Recreating the gateway drops its in-memory lease state until agents re-register (as noted in compose.yaml); do it in a
   quiet window. `memory-route disable` reverses it.
 * The herdr-memory client **refuses `http://` off loopback**; do not configure it otherwise. Be aware of existing
@@ -282,11 +283,11 @@ other tenant name is not visible until the tenant mapping is decided (spec quest
   exists is **restored from the agent state on restart**, so also remove that port's entry from
   `~/.local/share/herdr-engineering/state/fabric-agent.json` while the agent is stopped. Verify with
   `curl http://<tailnet-ip>:<port>/health` (must fail) and `ss -ltn | grep <port>` (loopback only).
-* **Routes on a running gateway.** `deploy/fabric-stack/config.yaml` is baked into the `herdr-engineering` image
-  (`/app/config.yaml`), not bind-mounted, so a route change takes effect only through a commit and a deploy
-  (`deploy.sh` recreates `fabric-gateway` and `herdr-web` with the new image; rollback restores the old routes).
-  Editing a checkout copy does not reach the running gateway. The recreate drops fabric leases until agents
-  re-register (about a minute).
+* **Routes on a running gateway.** The shipped `deploy/fabric-stack/config.yaml` is baked into the `herdr-engineering`
+  image (`/app/config.yaml`); host-specific routes live in `~/.config/herdr-engineering/fabric/config.yaml`, mounted at
+  `/fabric-local` and read after it (`memory-route enable [PORT]` writes it). After a change, `docker restart
+  herdr-fabric-gateway` (drops fabric leases until agents re-register, about a minute). A host that had routes enabled
+  in a checkout copy before this change must run `memory-route enable <port>` once before its first deploy of it.
 * **Clients.** `memory.local.metabolomics.us` carries a public certificate and works from any host; `memory.dev.lan`
   needs the private CA trusted. Keys are exported per tenant (`fleet config memory export-key`); never `personal` to an
   engineering harness.

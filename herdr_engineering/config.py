@@ -326,7 +326,8 @@ def _discover_config_sources() -> list[tuple[Path, bool]]:
     2. repository:     ``./config/herdr-engineering.yaml`` or ``./herdr-engineering.yaml``
        (untrusted: it is whatever checkout the command runs in)
     3. explicit env:   ``$HERDR_ENGINEERING_CONFIG`` (highest; the operator chose it, so it is machine config
-       even when it names a file inside the current directory)
+       even when it names a file inside the current directory). It may list several files separated by
+       ``os.pathsep`` (``:``); later ones override earlier ones and a missing one is skipped.
     """
     home = Path.home()
     candidates = [
@@ -336,7 +337,7 @@ def _discover_config_sources() -> list[tuple[Path, bool]]:
     ]
     env = os.environ.get("HERDR_ENGINEERING_CONFIG")
     if env:
-        candidates.append((Path(env), True))
+        candidates.extend((Path(part), True) for part in env.split(os.pathsep) if part)
     return [(c, trusted) for c, trusted in candidates if c.exists()]
 
 

@@ -5,6 +5,7 @@ import os
 import re
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -2393,6 +2394,26 @@ def test_ordinary_deploy_preserves_last_owned_egress_selection_without_flags(env
     assert current.read_bytes()==before
 
 
+def test_enabling_egress_on_an_existing_host_keeps_its_current_subnet_unless_asked(env):
+    """A host already on an older default subnet re-runs the documented enable command and stays where it is:
+    the default CIDR is only for hosts with no approved network (the CHANGELOG names this command)."""
+    current=_approved_private_egress(env)
+    before=current.read_bytes()
+    result=deploy(env,'--dry-run','--memory-private-egress','--memory-private-egress-gateway','100.71.1.7/32')
+    assert result.returncode==0,result.stderr
+    assert 'egress-env:172.30.254.0/29:' in env['log'].read_text()
+    assert current.read_bytes()==before
+
+
+def test_an_explicit_different_egress_cidr_on_an_existing_host_is_refused_until_disabled(env):
+    """Moving subnets is disable-then-enable: an explicit different CIDR must not silently re-plumb a live network."""
+    _approved_private_egress(env)
+    result=deploy(env,'--dry-run','--memory-private-egress','--memory-private-egress-gateway','100.71.1.7/32',
+                  '--memory-private-egress-cidr','172.30.254.8/29')
+    assert result.returncode!=0
+    assert 'Private egress transaction failed' in result.stderr
+
+
 def test_explicit_no_egress_removes_selector_and_accepts_inactive_cleanup(env):
     current=_approved_private_egress(env)
     before=current.read_bytes()
@@ -2466,8 +2487,16 @@ def test_runtime_image_installs_from_the_exported_lock_constraints():
     dockerfile = (ROOT / "deploy/fabric-stack/Dockerfile").read_text()
     assert "COPY deploy/fabric-stack/constraints.txt" in dockerfile
     assert re.search(r"pip install --no-cache-dir -c \S*constraints\.txt \".\[collab,review-gate,share\]\"", dockerfile)
+    # uv comes from the dev extra (pinned) and runs as a module of this interpreter: CI builds a pip venv and has
+    # no uv on PATH, and a test that skips there would protect nothing. --locked fails when uv.lock no longer
+    # matches pyproject.toml, so a pin bumped only in pyproject cannot pass here and break the image build.
     fresh = subprocess.run(
-        ["uv", "export", "--frozen", "--no-dev", "--extra", "collab", "--extra", "review-gate", "--extra", "share",
-         "--no-emit-project", "--no-hashes", "--no-header", "--no-annotate"],
-        cwd=ROOT, capture_output=True, text=True, check=True).stdout
-    assert (ROOT / "deploy/fabric-stack/constraints.txt").read_text().split("\n", 3)[3] == fresh
+        [sys.executable, "-m", "uv", "export", "--locked", "--no-dev", "--extra", "collab", "--extra", "review-gate",
+         "--extra", "share", "--no-emit-project", "--no-hashes", "--no-header", "--no-annotate"],
+        cwd=ROOT, capture_output=True, text=True)
+    assert fresh.returncode == 0, fresh.stderr
+
+    def pins(text):
+        return [line for line in text.splitlines() if line.strip() and not line.startswith("#")]
+
+    assert pins((ROOT / "deploy/fabric-stack/constraints.txt").read_text()) == pins(fresh.stdout)

@@ -49,7 +49,8 @@ COPY deploy/control-plane/config.yaml ./control-plane/config.yaml
 COPY deploy/control-plane/migrations/ ./control-plane/migrations/
 # The fabric config (gateway routes, domains) read by fabric-gateway and herdr-web as /app/config.yaml. Baked in
 # for the same reason: a relative bind mount of ../fabric-stack/config.yaml would dangle once deploy.sh removes its
-# temporary worktree. Changing a route is now a commit plus a deploy (it rolls back with the image).
+# temporary worktree. Host-specific routes are not baked: they come from the host-local file the gateway mounts
+# (scripts/fabric-stack.sh memory-route), read after this one.
 COPY deploy/fabric-stack/config.yaml ./config.yaml
 
 # Runtime state + config live here; both are provided at runtime by the stack

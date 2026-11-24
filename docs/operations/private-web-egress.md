@@ -82,10 +82,10 @@ resources, and no public ports. The first comparison published no ports at all.
 Cleanup in `finally` checked ownership labels before removing only those test
 containers and the now-empty test network. No canary resources remain.
 
-| Check | Original default | New default |
+| Check | Original default | New default (at the time) |
 | --- | --- | --- |
-| Gateway | 172.16.4.1 | 172.31.252.33 |
-| Source toward 100.64.8.6 | 172.16.4.7 | 172.31.252.34 |
+| Gateway | 172.16.4.1 | 172.31.252.1 |
+| Source toward 100.64.8.6 | 172.16.4.7 | 172.31.252.2 |
 | Docker/external DNS | Resolved | Resolved |
 | Postgres TCP | Connected | Connected |
 | Object-store health | HTTP 200 | HTTP 200 |
@@ -93,6 +93,10 @@ containers and the now-empty test network. No canary resources remain.
 | Host collaboration :9482 `/health` | HTTP 404 | HTTP 404 |
 | GitHub HTTPS | HTTP 200 | HTTP 200 |
 | Google OAuth host HTTPS `/` | HTTP 404 | HTTP 404 |
+
+The values above are what the canary measured, on `172.31.252.0/29`. The default was changed afterwards to
+`172.31.252.32/29` (gateway .33, source .34) because the old one sat inside the artifact host's fixed edge network; those
+addresses were never observed in a canary.
 | Gateway HTTPS, without a new UFW grant | Timeout | Timeout |
 | `host.docker.internal:9482` | Timeout | Timeout |
 
@@ -153,7 +157,10 @@ can select `--memory-private-egress` with
 `--memory-private-egress-gateway YOUR_ASSIGNED_PRIVATE_IPV4/32`. The latter may
 also come from the trusted host environment
 `HERDR_CP_MEMORY_PRIVATE_EGRESS_GATEWAY`. `--memory-private-egress-cidr CIDR`
-selects an explicit small candidate; no overlap is automatically worked around.
+selects an explicit small candidate; no overlap is automatically worked around. On a host that already has an
+approved network, `--memory-private-egress` without `--memory-private-egress-cidr` keeps that network's subnet (the
+built-in default only seeds hosts with none). To move subnets, run `--no-memory-private-egress` first and then enable
+with the new `--memory-private-egress-cidr`; naming a different CIDR while the old network exists is refused.
 On an untouched host, omitted flags add no override and cause zero network
 inspections or root calls. Once a policy is approved, an ordinary deploy with
 flags omitted preserves its verified owned `current.json` policy: destination,
