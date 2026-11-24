@@ -5,6 +5,13 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: collab task read and invite caps, scheduler lease ttl bound
+
+- `get_task` applies the same external-agent refusal (403) and hidden-task check as `list_tasks`.
+- `invite_by_email` of an already-signed-in user respects `max_members_per_room`: a full room records a pending invite instead (same reply, no sign-in oracle).
+- Scheduler lease heartbeat clamps `ttl` to 1..600 s and rejects non-numeric or non-finite values (`ValueError`) instead of storing an expiry decades away or overflowing.
+- `retention.py` docstring now says `apply_retention` is not applied in production; no deletion behaviour changed.
+
 ### Fix: Slack approval of unseen text, calendar block-list alias, Rakazo first-bot cache
 
 - Slack ask: the Approve buttons are only offered when the command is shown in full; a long (truncated) command gets Deny only and a "cannot be approved from Slack" note, and an approve tap on such an ask is refused (`not_fully_shown`).
