@@ -48,9 +48,32 @@ close|list`).
 - **Control API** — `FabricGateway` exposes a small HTTP control plane
   (`POST /register`, `POST /heartbeat`, `POST /close`, `GET /list`,
   `GET /resolve/<port>`, `GET /healthz`). It binds to the tailnet IP and/or
-  loopback only (private by default) and requires a bearer token when a token
-  is configured (`HERDR_ENGINEERING_FABRIC_TOKEN` or
-  `~/.config/herdr-engineering/fabric-token`; never in the repo).
+  loopback only (private by default) and requires a bearer token
+  (`HERDR_ENGINEERING_FABRIC_TOKEN`, host config `fabric.token`, or the file
+  `~/.config/herdr-engineering/fabric-token` / `HERDR_ENGINEERING_FABRIC_TOKEN_FILE`;
+  never in the repo). With none configured the gateway refuses to start unless
+  `--allow-open` is passed. Precedence is env var, then the token file (re-read per request,
+  must be a regular file, not a symlink, mode 0600, UTF-8), then host config `fabric.token`
+  (re-fetched every 300 s; a failed fetch fails closed, it never reads as "no token").
+  A token file at the default path beats host-config `fabric.token`: remove stale files before a rollout.
+  Replace the file atomically (temp file, then rename). Superseded tokens stay valid for an
+  hour, so rotation does not revoke a leaked token for that hour: for an emergency, restart
+  the gateway (the previous-token list lives in memory only). An unreadable file (not merely
+  missing) fails closed and the startup banner reports `control_auth: "unreadable"`.
+  `/healthz` answers `ok`, `role`, `epoch`, `node_id`, `auth` (no ports, leases or tokens) without a token; `FabricClient.healthz()` treats that as
+  "token not accepted" (`TokenNotAccepted`), which is different from "down": in an HA pair a
+  peer that is reachable but rejects our token (or a node that cannot read its own token) is never
+  counted toward `promote_after`; `/healthz` also gives `role`, `epoch`, `node_id` and `auth`
+  (not secret) so exactly one node stays active: a tokened node never yields to or yields
+  promotion to a tokenless one, equal tokens-states settle by epoch then node id. A loud
+  "HA PEER NOT READABLE" warning is printed; give both nodes the same token.
+  A token file with a mode wider than 0600 makes the gateway fail closed; clients warn once
+  (naming the file and `chmod 600`) and use host config. A whitespace-only file means no token.
+  `GET /resolve-loopback/<port>` and `POST /rewrite` need no token: session tools only get
+  `HERDR_ENGINEERING_FABRIC_URL` (non-secret), and both only map a loopback port to its fabric
+  address (what any session already sees). Without a token `/resolve-loopback` omits the lease
+  record, ambiguity messages stay generic and `/rewrite` takes at most 64 KiB; everything
+  else (`/list`, `/resolve`, `/names`, `/register`, ...) still needs the token.
 - **GatewayRouter** — dynamic per-lease listeners. Each leased external port
   is bound on every configured interface (loopback + tailnet) and proxied to
   the lease's `target_host:target_port` with `proxy_pair()` (shared with the
@@ -139,7 +162,7 @@ its next probe cycle via store reload.
 - Router and control API bind to loopback/tailnet only — no public listeners;
   public binds are refused (`DevServiceForwarder` and `GatewayRouter` both
   check).
-- Bearer token on the control API when configured; the token lives only in
+- Bearer token on the control API (fail closed unless `--allow-open`); the token lives only in
   the environment or a machine-local gitignored file.
 - The gateway is an operator service: start/stop is an explicit, logged
   action; leases are explicit; nothing is exposed implicitly.
