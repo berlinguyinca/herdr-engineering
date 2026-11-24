@@ -15,7 +15,8 @@ export function indexConfigStatus(status) {
   return { revision: status.revision, hasError: Boolean(status.last_error), byHost };
 }
 
-export function configNotice(idx) {
+export function configNotice(idx, loadError = null) {
+  if (loadError) return `<p class="hd-card__sub" role="status">Fleet config status could not be read (${esc(String(loadError))}); config badges are hidden</p>`;
   if (!idx || !idx.hasError) return '';
   return '<p class="hd-card__sub">Fleet config file has an error; hosts keep the last good revision</p>';
 }

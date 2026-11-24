@@ -13,6 +13,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - Lab session exchange now requires `X-Nonce` and binds the ID token to it, as the public-claim and member exchanges already did.
 - `host_config.parse` refuses a `cognito.domain` that is not a bare https origin and a malformed `pool_id`, `web_client_id` or `client_ids` entry, instead of starting healthy with lab shares, the member UI, MCP and housekeeping silently off. Existing configs with a scheme-less domain must be corrected. `fleet config` / deploy (`artifact_host_slices`) applies the same rule (one function, `cognito_values.py`, kept as two identical copies by a test), so a bad value fails the deploy up front instead of rolling back.
 - Known and unchanged: the "shared by" bar is injected into the author's own document and can be removed by that page's own script; a non-bypassable label needs a host-owned sandboxed-iframe wrapper (documented at `SHARED_BY_BAR`).
+### Fix: fabric agent no longer drops every lease on a failed listener scan
+
+- `scan_once` ignored `ListenerInventory.complete`, so one timed-out or failed `ss`/`lsof` (an empty inventory) released every lease and stopped every forwarder, and the next cycle re-adopted them with new leases. A port is now treated as gone only on a complete scan.
+- At startup, a remembered forward port that cannot be rebound (or whose forwarder fails to start) now drops the store entry and closes its lease, so the next scan re-adopts the service with a working forwarder instead of advertising a dead URL.
 
 ### Fix: web packages bug-hunt (collaboration sign-in/out, room polling, composer, member routes, nav badge)
 
