@@ -181,6 +181,17 @@ def slack_text(value: str, limit: int = _TEXT_MAX) -> str:
     return out
 
 
+_TRUNCATED = re.compile(r"\u2026\(\+\d+ chars\)$")
+
+
+def fully_shown(display: str) -> bool:
+    """True when ``slack_text(display)`` prints every character of ``display``.  The request row keeps only a
+    truncated rendering of a long command (marked ``...(+N chars)``), and Slack cuts at 300 characters again; a tap
+    approves the WHOLE command, so an approval is only offered for text the owner can read in full."""
+    return not _TRUNCATED.search(display) and not slack_text(display, _TEXT_MAX + 1).endswith("\u2026") \
+        and len(slack_text(display, _TEXT_MAX + 1)) <= _TEXT_MAX
+
+
 _QUESTION_TEXT = 1500
 _ANSWER_BYTES = 4096
 _ANSWER_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029]+")
@@ -992,7 +1003,11 @@ class SlackRuntime:
         lines = [f"*Approval needed* from worker `{slack_text(item.worker_id)}`"]
         if item.project:
             lines.append(f"Project: {slack_text(item.project)}")
+        shown = fully_shown(item.display)
         lines.append("```" + slack_text(item.display) + "```")
+        if not shown:
+            lines.append("*Too long to show in full: it cannot be approved from Slack.* Deny it, or have the worker "
+                         "request a shorter command.")
         lines.append(f"Why: {slack_text(item.why)}")
         value = button_value(ask)
 
@@ -1003,10 +1018,11 @@ class SlackRuntime:
                 out["style"] = style
             return out
 
+        buttons = ([button("Approve", "ask_approve", "primary")] if shown else []) + [button("Deny", "ask_deny", "danger")]
+        if shown:
+            buttons.append(button("Approve and remember", "ask_remember"))
         return [{"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(lines)}},
-                {"type": "actions", "elements": [button("Approve", "ask_approve", "primary"),
-                                                 button("Deny", "ask_deny", "danger"),
-                                                 button("Approve and remember", "ask_remember")]}]
+                {"type": "actions", "elements": buttons}]
 
     def _batch(self, item: _Queued, key: tuple[str, str, str, str, str], cfg: dict[str, Any], now: datetime,
                scope: str = "task") -> bool:
@@ -1096,6 +1112,8 @@ class SlackRuntime:
         if row.status != "pending":
             return self._close_stale(ask, row.display, row.status, uid)
         approve, remember = ASK_ACTIONS[action_id]
+        if approve and not fully_shown(row.display):          # never approve text the owner could not read
+            return self._refuse("not_fully_shown", ask, uid)
         try:
             record_owner_decision(self.store, self.service.config["grants"], now, ask.tenant_id, ask.user_id,
                                   ask.request_id, approve, f"slack:{uid}", provenance="owner_slack",

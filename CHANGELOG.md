@@ -9,6 +9,11 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 - `scripts/ci/unit-gates-applicable.sh unit` is now default-run with a short exempt list instead of an allow-list, so `herdr_artifact_host/`, `ansible/`, `skills/`, `scripts/*.sh`, `package.json`, `package-lock.json` and any new top-level path run the suite (they previously passed the required check with no tests; `main-moved-check.sh` shared the gap). A test checks every tracked file against the matcher.
 - `scripts/ci/module-gates.sh` no longer silently skips the scratch-retention and cargo-host gates when cargo is absent in CI: new `scripts/ci/require-cargo.sh` fails there unless `HERDR_ALLOW_NO_CARGO=1` is set explicitly.
+### Fix: Slack approval of unseen text, calendar block-list alias, Rakazo first-bot cache
+
+- Slack ask: the Approve buttons are only offered when the command is shown in full; a long (truncated) command gets Deny only and a "cannot be approved from Slack" note, and an approve tap on such an ask is refused (`not_fully_shown`).
+- `CalendarPolicy`: blocking both `primary` and the primary's real id no longer blocks every other calendar.
+- Rakazo bridge: the first-bot cache is keyed by `(tenant, user)`, so two spaces of one account no longer share a cached bot id.
 
 ### Feature: periodic `herdr-handoff reap --apply` timer (opt-in, off by default)
 
