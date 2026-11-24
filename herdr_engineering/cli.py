@@ -2714,9 +2714,15 @@ def _local_fabric_client():
         return None
     if not url:
         return None
+    from .fabric import TokenNotAccepted, TokenUnreadable
     try:
         FabricClient(url).healthz()
         return FabricClient(url)
+    except (TokenNotAccepted, TokenUnreadable) as exc:
+        # The gateway is there but this host's token does not work: say so instead of degrading silently.
+        print(f"herdr-eng: fabric gateway {url} NOT used, falling back to the local registry: {exc}",
+              file=sys.stderr, flush=True)
+        return None
     except Exception:
         return None  # gateway down: degrade to local mode, never break registration
 
@@ -3533,8 +3539,9 @@ def _cmd_dev_gateway(args) -> int:
     try:
         have_token = allow_open or bool(read_fabric_token())
     except OSError as exc:
-        raise SystemExit(f"fabric gateway: the control-API token file is unreadable ({exc.__class__.__name__}); "
-                         "fix it (a directory or wrong permissions?); refusing to start")
+        raise SystemExit(f"fabric gateway: the control-API token is unreadable ({exc}); "
+                         "fix it (token file: a regular 0600 file; host config: reachable control plane); "
+                         "refusing to start")
     if not have_token:
         raise SystemExit("fabric gateway: no control-API token configured. Set HERDR_ENGINEERING_FABRIC_TOKEN, "
                          "fabric.token, or write ~/.config/herdr-engineering/fabric-token "

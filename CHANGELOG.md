@@ -5,6 +5,8 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+- Fabric gateway token, review round 3: a host with no host.json is "no token" again (the memoised failure keeps `permanent`), so `--allow-open` serves; the host-config memo is race-free; a whitespace-only token file is "no token"; a negative or non-numeric Content-Length and a non-object JSON body are 400; HA with differing tokens ends with exactly one active node (`/healthz` carries role, epoch, node_id, auth) and a node that cannot read its own token never promotes; clients warn about a wide-mode token file and use host config, and `devfabric register` reports a rejected token instead of silently using the local registry; banner `control_auth` is `closed` for a tokenless gateway without `--allow-open`.
+
 ### Fix: fabric gateway control API fails closed and follows token rotation
 
 - The gateway served `/register`, `/heartbeat`, `/close` and `/list` unauthenticated whenever no token was configured, and `HERDR_ENGINEERING_FABRIC_TOKEN` (documented) was read nowhere. The token now comes from that env var, host config `fabric.token`, or the token file (`HERDR_ENGINEERING_FABRIC_TOKEN_FILE`, default `~/.config/herdr-engineering/fabric-token`), for the gateway and the agent client alike.

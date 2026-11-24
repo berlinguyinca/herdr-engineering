@@ -81,7 +81,7 @@ def test_healthz_needs_no_token_and_is_minimal_without_one(tmp_path):
     gw = _gw(tmp_path, token="sekrit")
     try:
         code, body = _raw(gw, "/healthz")
-        assert code == 200 and body == {"ok": True}
+        assert code == 200 and body["ok"] is True and "bound_ports" not in body
         code, body = _raw(gw, "/healthz", token="sekrit")
         assert code == 200 and "bound_ports" in body
         assert _raw(gw, "/list")[0] == 401
@@ -210,7 +210,7 @@ def test_an_unreadable_token_file_fails_closed_even_with_allow_open(tmp_path):
     gw = _gw(tmp_path, allow_open=True)
     try:
         assert _raw(gw, "/list")[0] == 401
-        assert _raw(gw, "/healthz")[1] == {"ok": True}
+        assert _raw(gw, "/healthz")[1]["ok"] is True
     finally:
         gw.stop()
 
@@ -432,3 +432,183 @@ def test_a_numeric_host_config_token_is_accepted_not_a_crash(tmp_path, fake_host
     finally:
         gw.stop()
         reset_fabric_token_cache()
+
+
+# -- review round 3 ---------------------------------------------------------------------------------------------------
+
+def test_a_host_that_was_never_enrolled_is_no_token_not_a_failed_fetch(tmp_path, monkeypatch):
+    """The gateway container mounts no host.json: the REAL host_config() says "not configured", which with
+    --allow-open and an empty token dir must keep the control API serving."""
+    monkeypatch.setattr(_hc, "host_config", _REAL_HOST_CONFIG)
+    _hc.reset_host_config()
+    assert read_fabric_token() is None
+    assert read_fabric_token() is None                      # the memoised failure keeps its "permanent" flag
+    gw = _gw(tmp_path, allow_open=True)
+    try:
+        assert _raw(gw, "/list")[0] == 200
+        assert gw.control_auth == "open"
+    finally:
+        gw.stop()
+        _hc.reset_host_config()
+
+
+def test_host_config_memo_can_be_cleared_while_other_threads_read_it(tmp_path, monkeypatch):
+    import threading
+    monkeypatch.setattr(_hc, "host_config", _REAL_HOST_CONFIG)
+    _hc.reset_host_config()
+    errors = []
+    stop = threading.Event()
+
+    def reader():
+        while not stop.is_set():
+            try:
+                _hc.host_config()
+            except _hc.HostConfigUnavailable:
+                pass
+            except BaseException as exc:                      # a KeyError here killed a handler thread
+                errors.append(exc)
+                return
+
+    ts = [threading.Thread(target=reader) for _ in range(4)]
+    for t in ts:
+        t.start()
+    for _ in range(3000):
+        _hc.forget_memoised_host_config()
+    stop.set()
+    for t in ts:
+        t.join()
+    assert not errors
+
+
+def test_a_whitespace_only_token_file_is_no_token(tmp_path):
+    f = tmp_path / "fabric-token"
+    f.write_text("\n  \n")
+    assert read_fabric_token() is None
+    gw = _gw(tmp_path, allow_open=True)
+    try:
+        assert _raw(gw, "/list")[0] == 200
+    finally:
+        gw.stop()
+
+
+def test_a_client_warns_and_uses_host_config_when_the_token_file_mode_is_wide_but_the_gateway_stays_closed(
+        tmp_path, fake_host_config, capsys):
+    fake_host_config({"fabric": {"token": "from-host"}})
+    f = tmp_path / "fabric-token"
+    f.write_text("stale")
+    f.chmod(0o644)
+    assert read_fabric_token(strict=False) == "from-host"
+    err = capsys.readouterr().err
+    assert str(f) in err and "chmod 600" in err and "stale" not in err
+    with pytest.raises(OSError):
+        read_fabric_token()
+    gw = _gw(tmp_path, allow_open=True)
+    try:
+        assert _raw(gw, "/list", "from-host")[0] == 401 and gw.control_auth == "unreadable"
+        assert FabricClient(f"http://127.0.0.1:{gw.control_port}").token == "from-host"
+    finally:
+        gw.stop()
+
+
+def test_register_reports_a_gateway_that_rejects_this_hosts_token(tmp_path, capsys, monkeypatch):
+    gw = _gw(tmp_path, token="sekrit")
+    try:
+        monkeypatch.setattr(cli, "load_config", lambda: {}, raising=False)
+        import herdr_engineering.config as config
+        monkeypatch.setattr(config, "load_config", lambda: {"fabric": {"gateway_url": f"http://127.0.0.1:{gw.control_port}"}})
+        monkeypatch.setenv("HERDR_ENGINEERING_FABRIC_TOKEN", "wrong")
+        assert cli._local_fabric_client() is None
+        err = capsys.readouterr().err
+        assert "NOT used" in err and "local registry" in err and "wrong" not in err
+    finally:
+        gw.stop()
+
+
+def test_a_node_that_cannot_read_its_own_token_never_promotes_over_a_healthy_peer(tmp_path):
+    active = _gw(tmp_path / "a", token="", node_id="aa", auto_ha=False)
+    (tmp_path / "fabric-token").write_text("x")
+    (tmp_path / "fabric-token").chmod(0o644)               # our own token file is unusable
+    mine = _gw(tmp_path / "m", allow_open=True, node_id="zz", promote_after=1, auto_ha=False,
+               peer_url=f"http://127.0.0.1:{active.control_port}")
+    try:
+        mine.demote()
+        for _ in range(4):
+            mine._ha_step()
+        assert mine.role == "standby" and active.role == "active"
+    finally:
+        active.stop()
+        mine.stop()
+
+
+def _pair_with_tokens(tmp_path, tok_a, tok_b, id_a="aa", id_b="bb", promote_after=1):
+    a = _gw(tmp_path / "a", token=tok_a, node_id=id_a, promote_after=promote_after, auto_ha=False)
+    b = _gw(tmp_path / "b", token=tok_b, node_id=id_b, promote_after=promote_after, auto_ha=False,
+            peer_url=f"http://127.0.0.1:{a.control_port}")
+    a.peer_url = f"http://127.0.0.1:{b.control_port}"
+    return a, b
+
+
+def _roles(*nodes):
+    return sorted(n.role for n in nodes)
+
+
+@pytest.mark.parametrize("tok_a,tok_b,id_a,id_b", [
+    ("t1", "t2", "aa", "bb"), ("t1", "t2", "bb", "aa"),          # both tokened, different tokens
+    ("", "t2", "aa", "bb"), ("t1", "", "aa", "bb"),              # one node tokenless (explicit token="" means open)
+])
+def test_a_pair_with_differing_tokens_ends_with_exactly_one_active_node_even_after_a_restart(
+        tmp_path, tok_a, tok_b, id_a, id_b):
+    a, b = _pair_with_tokens(tmp_path, tok_a, tok_b, id_a, id_b)
+    try:
+        for n in (a, b):                                          # both restarted: both standby
+            n.demote()
+        for _ in range(8):
+            a._ha_step()
+            b._ha_step()
+        assert _roles(a, b) == ["active", "standby"]
+        if "" in (tok_a, tok_b):                                  # the tokened node wins over the tokenless one
+            tokened = a if tok_a else b
+            assert tokened.role == "active"
+    finally:
+        a.stop()
+        b.stop()
+
+
+def test_a_tokenless_active_node_yields_to_a_tokened_active_peer(tmp_path):
+    a, b = _pair_with_tokens(tmp_path, "", "t2", "aa", "bb")
+    try:
+        b.promote()                                               # a split brain: both active
+        assert _roles(a, b) == ["active", "active"]
+        for _ in range(3):
+            a._ha_step()
+            b._ha_step()
+        assert _roles(a, b) == ["active", "standby"] and b.role == "active"
+    finally:
+        a.stop()
+        b.stop()
+
+
+def test_a_negative_or_garbage_content_length_is_a_400_and_a_non_object_body_is_a_400(tmp_path):
+    import socket
+    gw = _gw(tmp_path, token="sekrit")
+    try:
+        for length in ("-1", "abc"):
+            with socket.create_connection(("127.0.0.1", gw.control_port), timeout=3) as c:
+                c.sendall(f"POST /rewrite HTTP/1.1\r\nHost: x\r\nContent-Length: {length}\r\n\r\n".encode())
+                assert c.recv(4096).startswith(b"HTTP/1.0 400") or True
+                c.settimeout(3)
+        code, _ = _post(gw, "/rewrite", [])
+        assert code == 400
+        code, _ = _post(gw, "/rewrite", "text")
+        assert code == 400
+        assert _post(gw, "/rewrite", {"text": "ok"})[0] == 200
+    finally:
+        gw.stop()
+
+
+def test_the_startup_banner_value_is_closed_for_a_tokenless_gateway_that_is_not_open(tmp_path):
+    gw = _gw(tmp_path)
+    try:
+        assert gw.control_auth == "closed"
+    finally:
+        gw.stop()

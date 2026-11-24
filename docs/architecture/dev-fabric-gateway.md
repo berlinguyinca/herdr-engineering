@@ -61,8 +61,13 @@ close|list`).
   missing) fails closed and the startup banner reports `control_auth: "unreadable"`.
   `/healthz` answers `{"ok": ...}` without a token; `FabricClient.healthz()` treats that as
   "token not accepted" (`TokenNotAccepted`), which is different from "down": in an HA pair a
-  peer that is reachable but rejects our token pauses HA (a warning on stderr) and is never
-  counted toward `promote_after`, so give both nodes the same token.
+  peer that is reachable but rejects our token (or a node that cannot read its own token) is never
+  counted toward `promote_after`; `/healthz` also gives `role`, `epoch`, `node_id` and `auth`
+  (not secret) so exactly one node stays active: a tokened node never yields to or yields
+  promotion to a tokenless one, equal tokens-states settle by epoch then node id. A loud
+  "HA PEER NOT READABLE" warning is printed; give both nodes the same token.
+  A token file with a mode wider than 0600 makes the gateway fail closed; clients warn once
+  (naming the file and `chmod 600`) and use host config. A whitespace-only file means no token.
   `GET /resolve-loopback/<port>` and `POST /rewrite` need no token: session tools only get
   `HERDR_ENGINEERING_FABRIC_URL` (non-secret), and both only map a loopback port to its fabric
   address (what any session already sees). Without a token `/resolve-loopback` omits the lease
