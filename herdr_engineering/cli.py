@@ -560,9 +560,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--cwd", default=None, help="working directory of the session (default: the current one)")
     p2.add_argument("--json", action="store_true")
     p2.set_defaults(func=_cmd_handoff_context)
-    p2 = hsub.add_parser("context-hook", help="UserPromptSubmit hook body (opt-in): ask for /handoff when context is high; never fails")
-    p2.add_argument("harness", help="only claude is supported; anything else is a silent no-op so a hook never fails")
-    p2.set_defaults(func=_cmd_handoff_context_hook)
     p2 = hsub.add_parser("subagent-hook", help="SubagentStart/SubagentStop hook body: record running subagents per pane; never fails")
     p2.add_argument("phase", choices=("start", "stop"))
     p2.set_defaults(func=_cmd_handoff_subagent_hook)
@@ -575,7 +572,7 @@ def _build_parser() -> argparse.ArgumentParser:
                       help="wait until no subagent is live: exit 0 when idle, 3 on timeout")
     mode.add_argument("--purge", action="store_true", help="delete the pane's registry entries (pane closed)")
     p2.set_defaults(func=_cmd_handoff_subagents, subagents_parser=p2)
-    p2 = hsub.add_parser("auto", help="install, remove or check the opt-in context-hook in ~/.claude/settings.json; off/on switch a pane")
+    p2 = hsub.add_parser("auto", help="install, remove or check the SubagentStart/SubagentStop hooks in ~/.claude/settings.json (install and uninstall also remove the retired UserPromptSubmit reminder); off/on switch a pane")
     p2.add_argument("auto_action", choices=("install", "uninstall", "check", "off", "on"))
     p2.add_argument("--pane", default=None, help="off/on: pane id (default: $HERDR_PANE_ID)")
     p2.add_argument("--home", default=None, help="override $HOME (tests)")
@@ -584,9 +581,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--json", action="store_true")
     p2.set_defaults(func=_cmd_handoff_auto, auto_parser=p2)
     p2 = hsub.add_parser("controller", help="the auto-handoff controller: run it, or show whether it runs and its chains")
-    p2.add_argument("controller_action", choices=("run", "status"))
+    p2.add_argument("controller_action", choices=("run", "status", "link"))
     p2.add_argument("--once", action="store_true", help="run: one tick, then exit")
     p2.add_argument("--interval", type=float, default=5.0, help="run: seconds between ticks (default 5)")
+    p2.add_argument("--deploy-dir", default=None, help="link: the checkout's deploy/ directory holding the two plugins")
+    p2.add_argument("--herdr-eng", default=None, help="link: this install's own herdr-eng binary (default: the one on PATH)")
+    p2.add_argument("--stable-link", default=None, help="link: the herdr-eng a shell runs (default ~/.local/bin/herdr-eng); named in the "
+                                                        "manifests when it links to --herdr-eng")
+    p2.add_argument("--editable", action="store_true", help="link: say that this is a checkout (editable) install")
+    p2.add_argument("--herdr-bin", default=None, help="link: the herdr binary (default: $HERDR_BIN, else herdr)")
     p2.set_defaults(func=_cmd_handoff_controller)
 
     # handoff autopilot ----------------------------------------------------
@@ -750,7 +753,7 @@ def _build_parser() -> argparse.ArgumentParser:
                                         "plan/install/status/doctor/repair/uninstall")
     wsub = p.add_subparsers(dest="workflow_command", required=True)
     for name, helptext in (("plan", "show what install would change (read-only)"),
-                           ("install", "register the managed SessionStart/PreCompact/PreToolUse hooks in ~/.claude/settings.json"),
+                           ("install", "register the managed SessionStart/PreToolUse hooks in ~/.claude/settings.json"),
                            ("status", "managed-hook state (read-only)"),
                            ("doctor", "drift check"),
                            ("repair", "re-apply missing or drifted managed hooks"),
@@ -1617,9 +1620,14 @@ def _cmd_doctor(args) -> int:
     return doctor_main(args)
 
 
-def _cmd_handoff_context_hook(args) -> int:
-    from .handoff_context_hook import run_context_hook
-    return run_context_hook(args.harness)
+def _retired_context_hook() -> int:
+    """`handoff context-hook ...`: the retired 50% reminder. A settings.json that still names it calls it on every prompt until
+    `handoff auto install` / `workflow install` removes the entry, so it reads and drops stdin, prints nothing and exits 0."""
+    try:
+        sys.stdin.buffer.read()
+    except Exception:
+        pass
+    return 0
 
 
 def _cmd_handoff_harness(args) -> int:
@@ -1675,7 +1683,8 @@ def _cmd_handoff_auto(args) -> int:
     from . import handoff_auto_setup as ha
     home = Path(args.home) if args.home else None
     if args.auto_action == "check":
-        items = ha.check(home)
+        from .handoff_controller_state import check_items
+        items = [*ha.check(home), *check_items()]
     elif args.auto_action == "install" and args.subagents_only:
         items = ha.install_subagent_hooks(home, dry_run=args.dry_run)
     else:
@@ -1701,12 +1710,40 @@ def _cmd_handoff_auto_switch(args) -> int:
 
 
 def _cmd_handoff_controller(args) -> int:
+    if args.controller_action == "link":
+        return _cmd_handoff_controller_link(args)
     from .handoff_controller import run as controller
     if args.controller_action == "status":
         ctl = controller.build_controller(os.environ, require_binaries=False)
         print("\n".join(controller.status_lines(ctl.state_dir, ctl.log)))
         return 0
     return controller.serve(interval_s=args.interval, once=args.once)
+
+
+def _cmd_handoff_controller_link(args) -> int:
+    """Link the controller and session pane plugins into Herdr (idempotent). Exit 1 only when a link failed; a skip is exit 0."""
+    import shutil
+
+    from .fabric_join_setup import FAIL_ACTIONS
+    from .handoff_controller_state import choose_entry_point, default_deploy_dir, link_plugins
+    from .handoff_subagent_registry import state_root
+    own = args.herdr_eng or shutil.which("herdr-eng")
+    if not own:
+        print("herdr-eng is not on PATH; pass --herdr-eng with its absolute path", file=sys.stderr)
+        return 1
+    deploy = Path(args.deploy_dir) if args.deploy_dir else default_deploy_dir()
+    if not deploy.is_dir():
+        print(f"plugin sources not found at {deploy}; pass --deploy-dir", file=sys.stderr)
+        return 1
+    stable = Path(args.stable_link) if args.stable_link else Path.home() / ".local" / "bin" / "herdr-eng"
+    entry = choose_entry_point(stable, Path(own).absolute(), editable=args.editable)
+    for note in entry.notes:
+        print(note)
+    items = link_plugins(deploy, entry.path, data_dir=state_root(os.environ).parent / "plugins",
+                         herdr_bin=args.herdr_bin or os.environ.get("HERDR_BIN") or "herdr")
+    for item in items:
+        print(f"{item.action:10} {item.target}" + (f"  ({item.detail})" if item.detail else ""))
+    return 0 if all(i.action not in FAIL_ACTIONS for i in items) else 1
 
 
 def _cmd_handoff_subagent_hook(args) -> int:
@@ -2020,7 +2057,8 @@ def _cmd_workflow(args) -> int:
     if args.json:
         _print_json(res.to_dict())
     else:
-        print(f"{res.action:9} {res.path}" + (f"  [{res.state}]" if res.state != "absent" else ""))
+        print(f"{res.action:9} {res.path}" + (f"  [{res.state}]" if res.state != "absent" else "")
+              + (f"  {res.detail}" if res.detail else ""))
         if res.diff and (dry or cmd == "plan"):
             print(res.diff, end="")
     return 0 if res.ok else 1
@@ -6626,6 +6664,8 @@ def main(argv: list[str] | None = None) -> int:
     if communication_args[:1] == ["communications"]:
         from .communications import main as communications_main
         return communications_main(communication_args[1:])
+    if communication_args[:2] == ["handoff", "context-hook"]:
+        return _retired_context_hook()  # hidden: not a registered subcommand, so it takes any arguments
     parser = _build_parser()
     effective_argv = list(sys.argv[1:] if argv is None else argv)
     if effective_argv and effective_argv[0] == "assistant":

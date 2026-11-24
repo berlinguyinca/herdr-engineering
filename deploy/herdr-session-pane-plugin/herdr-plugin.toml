@@ -14,8 +14,9 @@ description = "Summary, handoff chain and CI of the focused session (1/2/3 or Ta
 placement = "split"
 command = ["herdr-eng", "side-pane", "run"]
 
-# Opens (or reopens) the side pane of the tab the action runs in. Herdr passes the tab as $HERDR_TAB_ID; `herdr-eng` is
-# looked up on the server's PATH, so install it where Herdr sees it (see docs/operations/handoff.md).
+# Opens (or reopens) the side pane of the tab the action runs in. Herdr passes the tab as $HERDR_TAB_ID; a bare `herdr-eng` is
+# looked up on the server's PATH; `herdr-eng handoff controller link` (run by scripts/install.sh) links a copy of this manifest whose
+# commands carry the absolute path instead (see docs/operations/handoff.md).
 [[actions]]
 id = "open"
 title = "Open session side pane"

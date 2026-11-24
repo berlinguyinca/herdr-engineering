@@ -23,7 +23,7 @@ PROMPT_MARKER = "❯"  # the input box row of Claude Code between two rules, a f
 _RULE = "─"  # the box is closed by a row of these
 _LINES_BELOW_CLOSING_RULE = 3  # the status line(s); anything more means the box is not last
 _SYNTHETIC_MODEL = "<synthetic>"  # zero-usage placeholder entries Claude Code writes for local events
-_USAGE_KEYS = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")  # as handoff_context_hook
+_USAGE_KEYS = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
 
 
 def _slug(cwd: Path) -> str:
