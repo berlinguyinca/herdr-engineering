@@ -196,17 +196,23 @@ same-origin reverse proxy for browser traffic that adds the key server-side:
   write actions; `*` = one path segment, trailing `**` = the rest). Anything else is 403
   at the proxy. No `operator_key_file` = read-only dashboard.
 - A client-supplied `X-API-Key` / `X-Forwarded-*` is dropped; the browser never sees a key.
-- A browser write (a mutation carrying `Origin`) must be same-origin with the proxy: the `Origin` host must equal
-  the `Host` the proxy receives (or be listed in `public_hosts`), and `Sec-Fetch-Site`, when sent, must not be
-  cross-site; otherwise 403 before the operator key is attached. `X-Forwarded-Host` is not trusted. Reach the proxy
-  directly (tailnet name, IP, `tailscale serve` or the fabric gateway, which forward `Host` unchanged) and nothing
-  needs configuring. A front that rewrites `Host` (nginx without `proxy_set_header Host $http_host`, an ingress) makes
-  every browser write 403 until you either keep the browser's `Host` or list the public name in `public_hosts`.
-- Optional hardening (both keys unset by default, which keeps today's behaviour): `public_hosts` lists the
-  `host[:port]` names the browser uses; once set, any request (read or write) whose `Host` is not an IP literal,
-  `localhost` or listed is 403 (DNS rebinding), and a listed name is accepted as `Origin` even if the front rewrote
-  `Host`. `public_scheme: https` additionally requires the `Origin` scheme to match; set it when TLS is terminated in
-  front of the proxy.
+- A browser write (a mutation carrying `Origin`) must be same-origin with the proxy: the `Origin` must equal the
+  `Host` the proxy receives (or name a `public_hosts` entry), and `Sec-Fetch-Site`, when sent, must not be
+  cross-site; otherwise 403 before the operator key is attached. `X-Forwarded-Host` is not trusted. The operator key
+  is also only attached with a proxy-made upstream `Origin` when the `Host` is an IP literal, `localhost` or listed in
+  `public_hosts`. For any other `Host` (a DNS name you did not list) the browser's `Origin` is forwarded unchanged, as
+  before this check, so the control plane's own Origin guards refuse the Origin-guarded writes (attention, scheduler,
+  architecture, ci, review-gate, artifacts, publications, ...) with 403, while writes the control plane never
+  Origin-guarded (sessions, library, assistants, ...) still work. **Reaching the dashboard by a DNS name therefore
+  needs `public_hosts`** for the guarded actions to work; by IP literal or `localhost` nothing needs configuring.
+- Optional hardening (both keys unset by default): `public_hosts` lists the names the browser uses as `host[:port]`.
+  An entry without a port matches any port; `:80` / `:443` are the same as no port for an `http` / `https` Origin.
+  Once set, any request (read or write) whose `Host` is not an IP literal, `localhost` or listed is 403 (DNS
+  rebinding), and an `Origin` naming a listed entry is accepted even if a front rewrote `Host`. A front that
+  rewrites `Host` (nginx without `proxy_set_header Host $http_host`, an ingress) sends its own upstream name
+  (e.g. `dashboard-proxy:8081`): list that too, or the whole dashboard is 403. `public_scheme: https` additionally
+  requires the scheme of an `Origin` that names a listed entry to match (set it when TLS is terminated in front of the
+  proxy); a direct `http` access by IP or `localhost` is not affected.
 
 ```yaml
 control_plane:

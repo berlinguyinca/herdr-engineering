@@ -7,10 +7,13 @@ control plane answers every browser request with 401. This proxy sits in front o
 * a mutating request is sent with the ``operator`` key only when ``METHOD /path`` matches the configured allowlist
   (default: the dashboard's own write actions); every other mutation is refused here with 403;
 * a mutation from a browser must be same-origin with the proxy itself (Origin netloc == Host or a configured
-  ``public_hosts`` entry, Origin scheme == ``public_scheme`` when set, Sec-Fetch-Site not cross-site) before the
-  operator key is attached, then goes upstream with an Origin the upstream accepts;
+  ``public_hosts`` entry, Origin scheme == ``public_scheme`` for a listed entry, Sec-Fetch-Site not cross-site) before
+  the operator key is attached. When the Host is an IP literal, localhost or listed, the Origin then goes upstream
+  rewritten to the upstream's own; for any other (by-name, unlisted) Host it goes upstream unchanged, exactly as before
+  this check existed, so the upstream's own Origin guards still refuse what they refused then;
 * with ``public_hosts`` set, a request whose Host is neither an IP literal, localhost nor listed is refused 403
-  before any key is attached (DNS rebinding);
+  before any key is attached (DNS rebinding). An entry without a port matches any port; ``:80``/``:443`` equal the
+  default port of the Origin's scheme;
 * a client-supplied ``X-API-Key`` (and ``X-Forwarded-*``) is always dropped, the browser never sees a key.
 
 Configuration is YAML only (``control_plane.dashboard_proxy``); the keys are read from 0600 files.
@@ -25,7 +28,10 @@ import stat
 import threading
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Literal, NamedTuple
 from urllib.parse import unquote, urlsplit
+
+from .host_literal import is_ip_or_localhost
 
 DEFAULT_UPSTREAM = "http://control-plane-web:8080"
 
@@ -65,7 +71,11 @@ _HOP_BY_HOP = frozenset({"connection", "keep-alive", "proxy-authenticate", "prox
 # Dropped on the way upstream in addition: the browser must never choose the credential or the client identity.
 _NEVER_FORWARD = frozenset({"x-api-key", "host", "content-length", "x-forwarded-for", "x-forwarded-host",
                             "x-forwarded-proto", "forwarded", "x-real-ip"})
+PublicScheme = Literal["http", "https"]
 _ORIGIN_SCHEMES = frozenset({"http", "https"})
+_DEFAULT_PORT = {"http": 80, "https": 443}
+# host[:port] as a browser sends it: a DNS name or IPv4 literal, or a bracketed IPv6 literal.
+_PUBLIC_HOST = re.compile(r"^(?:\[[0-9a-f:.]+\]|[a-z0-9_](?:[a-z0-9_.-]*[a-z0-9_])?)(?::\d{1,5})?$")
 _DRAIN_LIMIT = 8 * 1024 * 1024   # a refused request's body is read up to this much, so the 403 is not a reset
 _MAX_BODY = 128 * 1024 * 1024
 _ALLOW_ENTRY = re.compile(r"^(POST|PUT|PATCH|DELETE) (/\S*)$")
@@ -84,7 +94,7 @@ class DashboardProxySettings:
     upstream: str = DEFAULT_UPSTREAM
     allowlist: tuple[str, ...] = DEFAULT_OPERATOR_POST_ALLOWLIST
     public_hosts: tuple[str, ...] = ()
-    public_scheme: str | None = None
+    public_scheme: PublicScheme | None = None
 
 
 def parse_dashboard_proxy(raw) -> DashboardProxySettings | None:
@@ -111,10 +121,12 @@ def parse_dashboard_proxy(raw) -> DashboardProxySettings | None:
         raise ValueError("dashboard_proxy.operator_post_allowlist must be a list of 'METHOD /path' strings "
                          "(POST, PUT, PATCH or DELETE; * = one segment, trailing ** = the rest)")
     hosts = raw.get("public_hosts", [])
-    if not isinstance(hosts, list) or not all(isinstance(h, str) and h.strip() and "/" not in h for h in hosts):
-        raise ValueError("dashboard_proxy.public_hosts must be a list of 'host[:port]' strings")
+    if not isinstance(hosts, list) or not all(isinstance(h, str) and _PUBLIC_HOST.match(h.strip().lower())
+                                              for h in hosts):
+        raise ValueError("dashboard_proxy.public_hosts must be a list of 'host[:port]' strings (a name or IP, no "
+                         "scheme or path; leave the port off to match any port)")
     scheme = raw.get("public_scheme")
-    if scheme is not None and scheme not in _ORIGIN_SCHEMES:
+    if scheme is not None and (not isinstance(scheme, str) or scheme not in _ORIGIN_SCHEMES):
         raise ValueError("dashboard_proxy.public_scheme must be 'http' or 'https'")
     return DashboardProxySettings(viewer.strip(), operator.strip() if operator else None, upstream.rstrip("/"),
                                   tuple(allow), tuple(h.strip().lower() for h in hosts), scheme)
@@ -162,18 +174,56 @@ def operator_allowed(allowlist: tuple[str, ...], method: str, raw_path: str) -> 
     return any(_entry_matches(e, method, decoded) for e in allowlist)
 
 
+class HostEntry(NamedTuple):
+    name: str
+    port: int | None   # None: any port
+
+
+def _split_host(value: str, scheme: str = "") -> tuple[str, int | None] | None:
+    """(lowercase name, port) of ``host[:port]`` (port defaults from ``scheme`` when given), or None if malformed."""
+    try:
+        parts = urlsplit("//" + value)
+        name, port = parts.hostname, parts.port
+    except ValueError:
+        return None
+    if not name or parts.username is not None or parts.path or parts.query:
+        return None
+    return name, (port if port is not None else _DEFAULT_PORT.get(scheme))
+
+
+def parse_host_entries(hosts: tuple[str, ...]) -> tuple[HostEntry, ...]:
+    out = []
+    for h in hosts:
+        split = _split_host(h.strip().lower())
+        if split is not None:
+            out.append(HostEntry(*split))
+    return tuple(out)
+
+
+def _listed(entries: tuple[HostEntry, ...], name: str, port: int | None) -> bool:
+    """An entry without a port matches any port; ``port`` None (a Host header without one) is the 80/443 default."""
+    return any(e.name == name and (e.port is None or e.port == port or (port is None and e.port in (80, 443)))
+               for e in entries)
+
+
+def host_trusted(host: str | None, entries: tuple[HostEntry, ...]) -> bool:
+    """The Host is an IP literal, localhost or listed: a name a DNS-rebinding page cannot use."""
+    split = _split_host(host.strip().lower()) if host else None
+    return split is not None and (is_ip_or_localhost(split[0]) or _listed(entries, *split))
+
+
 class DashboardProxy:
     """Threaded reverse proxy. ``serve()`` blocks; ``shutdown()`` stops it."""
 
     def __init__(self, upstream: str, *, viewer_key: str, operator_key: str | None,
                  allowlist: tuple[str, ...], host: str = "0.0.0.0", port: int = 8081,
-                 public_hosts: tuple[str, ...] = (), public_scheme: str | None = None):
+                 public_hosts: tuple[str, ...] = (), public_scheme: PublicScheme | None = None):
         parts = urlsplit(upstream)
         self._scheme, self._up_host = parts.scheme, parts.hostname
         self._up_port = parts.port or (443 if parts.scheme == "https" else 80)
         self._up_netloc = parts.netloc
         self._viewer, self._operator, self._allowlist = viewer_key, operator_key, tuple(allowlist)
-        self._public_hosts = frozenset(h.lower() for h in public_hosts)
+        self._public_hosts = parse_host_entries(public_hosts)
         self._public_scheme = public_scheme
         self._ready = threading.Event()
         proxy = self
@@ -213,36 +263,40 @@ class DashboardProxy:
         return None, 405, "proxy: method not allowed"
 
 
-def host_refusal(host: str | None, public_hosts: frozenset[str]) -> str | None:
+def host_refusal(host: str | None, public_hosts: tuple[HostEntry, ...]) -> str | None:
     """With ``public_hosts`` configured, why this Host is not one the proxy answers to (None when it is).
 
-    Mirrors the control plane's ``_dashboard_host_ok``: an IP literal, localhost or a listed name; a bare DNS name that
-    is not listed is what a DNS-rebinding page uses."""
-    if not public_hosts:
-        return None
-    from .api import _dashboard_host_ok
-    if host and _dashboard_host_ok(host, public_hosts):
+    An IP literal, localhost or a listed name; a bare DNS name that is not listed is what a DNS-rebinding page uses.
+    Behind a front that rewrites Host, the name the front sends (``dashboard-proxy:8081``) must be listed too."""
+    if not public_hosts or host_trusted(host, public_hosts):
         return None
     return "proxy: host not allowed"
 
 
 def cross_origin_refusal(method: str, origin: str | None, host: str | None, fetch_site: str | None,
-                         public_hosts: frozenset[str] = frozenset(), public_scheme: str | None = None) -> str | None:
+                         public_hosts: tuple[HostEntry, ...] = (),
+                         public_scheme: PublicScheme | None = None) -> str | None:
     """Why a browser mutation is not same-origin with the proxy (None when it is, or is not a mutation).
 
-    Behind a front that rewrites Host, the browser's Origin names the public host: list it in ``public_hosts``."""
+    An Origin naming a ``public_hosts`` entry is accepted (its scheme must equal ``public_scheme`` when set); any
+    other Origin must equal the Host exactly. Behind a front that rewrites Host, list the public name."""
     if method not in _MUTATING:
         return None
     if fetch_site is not None and fetch_site.strip().lower() not in {"same-origin", "none"}:
         return "proxy: cross-site write refused"
-    if origin is not None:
+    if origin is None:
+        return None
+    refused = "proxy: cross-origin write refused"
+    try:
         parts = urlsplit(origin)
-        netloc = parts.netloc.lower()
-        if parts.scheme not in _ORIGIN_SCHEMES or (public_scheme and parts.scheme != public_scheme):
-            return "proxy: cross-origin write refused"
-        if netloc not in public_hosts and (not host or netloc != host.lower()):
-            return "proxy: cross-origin write refused"
-    return None
+        name, port = parts.hostname, parts.port
+    except ValueError:
+        return refused
+    if parts.scheme not in _ORIGIN_SCHEMES or not name:
+        return refused
+    if _listed(public_hosts, name, port if port is not None else _DEFAULT_PORT[parts.scheme]):
+        return refused if public_scheme and parts.scheme != public_scheme else None
+    return None if host and parts.netloc.lower() == host.strip().lower() else refused
 
 
 def _make_handler(proxy: DashboardProxy):
@@ -287,27 +341,30 @@ def _make_handler(proxy: DashboardProxy):
                 return self._refuse_unread(403, refusal)
             key, status, message = proxy.key_for(method, self.path)
             if key is None:
-                return self._refuse(status or 403, message)
+                return self._refuse_unread(status or 403, message)
             refusal = cross_origin_refusal(method, self.headers.get("Origin"), self.headers.get("Host"),
                                            self.headers.get("Sec-Fetch-Site"), proxy._public_hosts,
                                            proxy._public_scheme)
             if refusal:
                 return self._refuse_unread(403, refusal)
             if self.headers.get("Transfer-Encoding"):
-                return self._refuse(411, "proxy: chunked request bodies are not supported")
+                return self._refuse_unread(411, "proxy: chunked request bodies are not supported")
             try:
                 length = int(self.headers.get("Content-Length") or 0)
             except ValueError:
-                return self._refuse(400, "proxy: bad Content-Length")
+                return self._refuse_unread(400, "proxy: bad Content-Length")
             if length < 0 or length > _MAX_BODY:
-                return self._refuse(413, "proxy: request body too large")
+                return self._refuse_unread(413, "proxy: request body too large")
             body = self.rfile.read(length) if length else None
             headers = {k: v for k, v in self.headers.items()
                        if k.lower() not in _HOP_BY_HOP and k.lower() not in _NEVER_FORWARD}
             headers["X-API-Key"] = key
             headers["Host"] = proxy._up_netloc
-            if method in _MUTATING and self.headers.get("Origin") is not None:
-                # Already proven same-origin with the proxy; the upstream compares Origin with the Host it sees.
+            if (method in _MUTATING and self.headers.get("Origin") is not None
+                    and host_trusted(self.headers.get("Host"), proxy._public_hosts)):
+                # Proven same-origin with the proxy at an IP, localhost or listed name; the upstream compares Origin
+                # with the Host it sees. A by-name unlisted Host keeps its Origin: the upstream's guards refuse it
+                # there, exactly as before this check (a rebinding page gets no more than it did).
                 headers = {k: v for k, v in headers.items() if k.lower() != "origin"}
                 headers["Origin"] = f"{proxy._scheme}://{proxy._up_netloc}"
             headers["Connection"] = "close"

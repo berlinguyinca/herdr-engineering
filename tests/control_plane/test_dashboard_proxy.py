@@ -301,7 +301,8 @@ def _browser_post(px, path, *, origin, extra=None, content_type="application/jso
 
 def test_same_origin_browser_write_reaches_the_origin_guarded_upstream_route(cp, proxy):
     # /attention/* is Origin-guarded upstream (Origin netloc must equal Host); Host is rewritten to the upstream.
-    status, body = _browser_post(proxy, "/api/v1/attention/ack", origin=f"http://dash.example:{proxy.port}")
+    host = f"127.0.0.1:{proxy.port}"
+    status, body = _browser_post(proxy, "/api/v1/attention/ack", origin=f"http://{host}", host=host)
     assert status == 200 and json.loads(body)["reason"] == "not_current", body
 
 
@@ -319,7 +320,8 @@ def test_cross_origin_no_cors_write_to_an_upstream_unguarded_route_is_refused(pr
 
 @pytest.mark.parametrize("fetch_site", ["cross-site", "same-site"])
 def test_cross_site_fetch_metadata_is_refused(proxy, fetch_site):
-    status, _ = _browser_post(proxy, "/api/v1/attention/ack", origin=f"http://dash.example:{proxy.port}",
+    host = f"127.0.0.1:{proxy.port}"
+    status, _ = _browser_post(proxy, "/api/v1/attention/ack", origin=f"http://{host}", host=host,
                               extra={"Sec-Fetch-Site": fetch_site})
     assert status == 403
 
@@ -384,7 +386,10 @@ def test_parse_public_host_keys():
 
 
 @pytest.mark.parametrize("extra", [{"public_hosts": "dash"}, {"public_hosts": [""]}, {"public_hosts": [1]},
-                                   {"public_scheme": "ftp"}, {"public_scheme": 3}])
+                                   {"public_hosts": ["user@dash"]}, {"public_hosts": ["dash example"]},
+                                   {"public_hosts": ["dash.example:99999x"]},
+                                   {"public_scheme": "ftp"}, {"public_scheme": 3}, {"public_scheme": ["https"]},
+                                   {"public_scheme": {"a": 1}}])
 def test_parse_rejects_bad_public_host_keys(extra):
     with pytest.raises(ValueError):
         parse_dashboard_proxy({"viewer_key_file": "/k/v", **extra})
@@ -398,3 +403,88 @@ def _get(px, path, host):
         return resp.status, resp.read()
     finally:
         conn.close()
+
+
+# --- review round 2 ---
+
+def test_by_name_host_without_public_hosts_is_no_more_permissive_than_main(proxy):
+    """Main forwarded the browser Origin unchanged, so Origin-guarded upstream routes were 403 for a by-name Host
+    and unguarded ones were served. A DNS-rebinding page (Host == Origin == its own name) must not gain more."""
+    host = f"evil.example:{proxy.port}"
+    origin = f"http://{host}"
+    assert _browser_post(proxy, "/api/v1/attention/ack", origin=origin, host=host)[0] == 403
+    assert _browser_post(proxy, "/api/v1/scheduler/plan", origin=origin, host=host, body=b"{}")[0] == 403
+    assert _browser_post(proxy, "/api/v1/artifacts/x/approve", origin=origin, host=host, body=b"{}")[0] == 403
+    # main served an unguarded allowlisted route by name; so does this
+    assert _browser_post(proxy, "/api/v1/sessions/s1/messages", origin=origin, host=host,
+                         body=b'{"text": "hi"}')[0] != 403
+    # a write with no Origin (not a browser) is unchanged from main
+    assert _browser_post(proxy, "/api/v1/attention/ack", origin=None, host=host)[0] == 200
+
+
+def test_listed_name_gets_the_guarded_routes_by_name(cp):
+    px, thread = start_proxy(cp.port, public_hosts=("dash.example",))
+    try:
+        host = f"dash.example:{px.port}"
+        status, body = _browser_post(px, "/api/v1/attention/ack", origin=f"http://{host}", host=host)
+        assert status == 200 and json.loads(body)["reason"] == "not_current", body
+    finally:
+        px.shutdown()
+        thread.join(timeout=3)
+
+
+def test_internal_host_of_a_rewriting_front_works_when_listed(cp):
+    # nginx without proxy_set_header Host: the proxy sees the upstream-block name, the browser's Origin is public.
+    px, thread = start_proxy(cp.port, public_hosts=("dash.example", "dashboard-proxy"), public_scheme="https")
+    try:
+        status, body = _browser_post(px, "/api/v1/attention/ack", origin="https://dash.example",
+                                     host=f"dashboard-proxy:{px.port}")
+        assert status == 200 and json.loads(body)["reason"] == "not_current", body
+        assert _get(px, "/api/v1/sessions", f"dashboard-proxy:{px.port}")[0] == 200
+        assert _get(px, "/api/v1/sessions", f"other-internal:{px.port}")[0] == 403
+    finally:
+        px.shutdown()
+        thread.join(timeout=3)
+
+
+def test_portless_entry_matches_any_port_and_default_ports_equal_none(cp):
+    px, thread = start_proxy(cp.port, public_hosts=("dash.example", "tls.example:443"))
+    try:
+        host = f"dash.example:{px.port}"
+        assert _get(px, "/api/v1/sessions", host)[0] == 200
+        assert _browser_post(px, "/api/v1/attention/ack", origin=f"http://{host}", host=host)[0] == 200
+        # entry with the default port equals an Origin without a port
+        assert _browser_post(px, "/api/v1/attention/ack", origin="https://tls.example",
+                             host=f"127.0.0.1:{px.port}")[0] == 200
+        assert _browser_post(px, "/api/v1/attention/ack", origin="https://tls.example:444",
+                             host=f"127.0.0.1:{px.port}")[0] == 403
+    finally:
+        px.shutdown()
+        thread.join(timeout=3)
+
+
+def test_public_scheme_https_does_not_block_direct_http_access_by_ip(public_proxy):
+    host = f"127.0.0.1:{public_proxy.port}"
+    status, body = _browser_post(public_proxy, "/api/v1/attention/ack", origin=f"http://{host}", host=host)
+    assert status == 200 and json.loads(body)["reason"] == "not_current", body
+
+
+def test_allowlist_refusal_and_oversize_do_not_reset_a_sending_client(proxy):
+    status, _ = _browser_post(proxy, "/api/v1/ingest", origin=None, body=b"x" * (4 * 1024 * 1024),
+                              host=f"127.0.0.1:{proxy.port}")
+    assert status == 403
+    conn = http.client.HTTPConnection("127.0.0.1", proxy.port, timeout=10)
+    try:
+        conn.putrequest("POST", "/api/v1/attention/ack")
+        conn.putheader("Content-Length", str(129 * 1024 * 1024))
+        conn.putheader("Content-Type", "application/json")
+        conn.endheaders(b"x" * (8 * 1024 * 1024))
+        assert conn.getresponse().status == 413
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("origin", ["http://[x", "http://exa mple:99999999", "http://host:notaport"])
+def test_malformed_origin_is_403_not_a_dropped_connection(proxy, origin):
+    status, body = _browser_post(proxy, "/api/v1/attention/ack", origin=origin, host=f"127.0.0.1:{proxy.port}")
+    assert status == 403 and b"cross-origin" in body
