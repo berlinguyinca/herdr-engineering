@@ -877,6 +877,16 @@ if [ -n "$ABSENT" ]; then
   echo "missing service containers (will be created by this deploy): $ABSENT"
 fi
 
+# The backup script to run: the candidate's if it knows --target (a rollback by an older ref does not), else the installed
+# stable copy if it does, else none (empty): a legacy ref must stay deployable.
+pick_backup_script() {
+  local c
+  for c in "$WORK/deploy/control-plane/memory-backup.sh" "$HOME/.local/share/herdr-engineering/memory-backup.sh"; do
+    if [ -f "$c" ] && grep -q -- '--target' "$c"; then printf '%s\n' "$c"; return 0; fi
+  done
+  return 0
+}
+
 # Prewarm with the TARGET image while the previous release still serves. Only the
 # protected config snapshot is mounted: compose run would create the web service's
 # missing host bind directories before prewarm succeeded. Share the live web's
@@ -887,19 +897,28 @@ if [ -n "$PREVIOUS_IMAGE" ] && grep -q '^def _cmd_cp_checkpoint(' "$WORK/herdr_e
   PREWARM_LOG="$ATTEMPT/checkpoint-prewarm.log"
   (umask 077; : > "$PREWARM_LOG")
   chmod 600 "$PREWARM_LOG"
-  deploy_lock_phase checkpoint-prewarm
-  # The prewarm applies the candidate's migrations to the live database BEFORE the rollback point, and a rollback returns the
-  # image, not the schema: take a verified dump first (database only, newest five kept apart from the daily series), as the
-  # artifact host does in backup_ah_database. No dump, no migration.
-  echo "dumping the control-plane database before the migration"
-  if ! CP_BACKUP_OUT="$("$WORK/deploy/control-plane/memory-backup.sh" backup --target control-plane \
-      --prefix predeploy-controlplane --keep 5 --no-objects 2>&1)"; then
-    "$PY" "$STATE_HELPER" outcome "$ATTEMPT" prewarm_failed
-    echo "the control-plane database backup before the migration failed; nothing was migrated: $CP_BACKUP_OUT" >&2
-    exit 1
+  BACKUP_SCRIPT="$(pick_backup_script)"
+  CP_BACKUP_FILE=""
+  if [ -z "$BACKUP_SCRIPT" ]; then
+    echo "WARNING: neither this ref nor the installed copy of memory-backup.sh supports --target; no pre-migration dump could be taken for this legacy ref, continuing without one" >&2
+  else
+    deploy_lock_phase predeploy-backup
+    # The prewarm applies the candidate's migrations to the live database BEFORE the rollback point, and a rollback returns the
+    # image, not the schema: take a verified dump first (database only, newest five kept apart from the daily series), as the
+    # artifact host does in backup_ah_database. No dump, no migration.
+    echo "dumping the control-plane database before the migration"
+    if ! CP_BACKUP_OUT="$("$BACKUP_SCRIPT" backup --target control-plane \
+        --prefix predeploy-controlplane --keep 5 --no-objects 2>&1)"; then
+      "$PY" "$STATE_HELPER" outcome "$ATTEMPT" backup_failed
+      echo "the control-plane database backup before the migration failed; nothing was migrated: $CP_BACKUP_OUT" >&2
+      exit 1
+    fi
   fi
-  CP_BACKUP_FILE="$(printf '%s\n' "$CP_BACKUP_OUT" | sed -n 's/.*"path":"\([^"]*\)".*/\1/p' | head -n 1)"
-  echo "pre-migration dump: $CP_BACKUP_FILE"
+  deploy_lock_phase checkpoint-prewarm
+  if [ -n "$BACKUP_SCRIPT" ]; then
+    CP_BACKUP_FILE="$(printf '%s\n' "$CP_BACKUP_OUT" | sed -n 's/.*"path":"\([^"]*\)".*/\1/p' | head -n 1)"
+    echo "pre-migration dump: $CP_BACKUP_FILE"
+  fi
   echo "prewarming target projection checkpoint before host or service changes"
   if [ "$PAUSE_WORKER" = 1 ]; then
     if [ "$(docker inspect -f '{{.State.Running}}' herdr-cp-worker 2>/dev/null || true)" = true ]; then
@@ -923,7 +942,7 @@ if [ -n "$PREVIOUS_IMAGE" ] && grep -q '^def _cmd_cp_checkpoint(' "$WORK/herdr_e
     resume_worker
     "$PY" "$STATE_HELPER" outcome "$ATTEMPT" prewarm_failed
     echo "target projection checkpoint prewarm failed. Host files and services were not changed, but the prewarm applies migrations to the live database, so the database schema may have changed." >&2
-    echo "pre-migration dump: $CP_BACKUP_FILE (restore: docs/operations/control-plane-backup-restore.md). Reason and output saved in private log: $PREWARM_LOG" >&2
+    echo "pre-migration dump: ${CP_BACKUP_FILE:-none taken (legacy ref)} (restore: docs/operations/control-plane-backup-restore.md). Reason and output saved in private log: $PREWARM_LOG" >&2
     exit 1
   fi
   resume_worker
@@ -1484,7 +1503,8 @@ if forward; then
       "check DNS, the SNI route to the edge and the certificate for the member host" >&2
   fi
   # the daily control-plane backup (database + object store); idempotent, loud but never fatal
-  "$WORK/deploy/control-plane/memory-backup.sh" install --target control-plane >/dev/null \
+  BACKUP_SCRIPT="$(pick_backup_script)"
+  { [ -n "$BACKUP_SCRIPT" ] && "$BACKUP_SCRIPT" install --target control-plane >/dev/null; } \
     || echo "WARNING: could not install the control-plane backup timer; run deploy/control-plane/memory-backup.sh install --target control-plane" >&2
   if [ "$MEMORY" = 1 ]; then memory_phase || exit 4; fi
   exit 0

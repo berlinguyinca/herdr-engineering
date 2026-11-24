@@ -33,6 +33,8 @@ case "$*" in
   *"pg_restore -U"*) cat >/dev/null; [ -z "${{FAIL_RESTORE:-}}" ] || exit 1 ;;
   *"select count"*) echo "${{TABLES:-7}}" ;;
   *"printenv POSTGRES_USER"*) echo "${{CP_USER-cpadmin}}" ;;
+  *"du -sb"*) [ -z "${{NO_DU_B:-}}" ] || exit 1; printf "%s\\t/data\\n" "${{STORE_BYTES:-100}}" ;;
+  *"du -sk"*) printf "%s\\t/data\\n" "$(( ${{STORE_BYTES:-100}} / 1024 + 1 ))" ;;
   *"cp herdr-cp-rustfs:/data -"*) [ -z "${{FAIL_OBJECTS:-}}" ] || exit 1; tar -cf - -C "$OBJ_SRC" . ;;
 esac
 exit 0
@@ -234,12 +236,48 @@ def test_prefix_names_a_separate_retention_series_and_never_prunes_another(b):
     assert len(list(b.dest.glob("controlplane-2*.dump"))) == 3
 
 
-def test_object_archives_are_pruned_by_the_same_keep_count(b):
+def test_object_archives_are_pruned_by_their_own_keep_objects_count(b):
     b.dest.mkdir(mode=0o700)
-    for i in range(4):
+    for i in range(6):
         (b.dest / f"controlplane-objects-2026010{i}T000000.000000Z.tar").write_text("old")
     assert b.run("backup", "--target", "control-plane", "--dest", str(b.dest), "--keep", "2").returncode == 0
-    assert len(list(b.dest.glob("controlplane-objects-*.tar"))) == 2
+    assert len(list(b.dest.glob("controlplane-objects-*.tar"))) == 3          # --keep-objects defaults to 3
+    assert b.run("backup", "--target", "control-plane", "--dest", str(b.dest), "--keep-objects", "1").returncode == 0
+    assert len(list(b.dest.glob("controlplane-objects-*.tar"))) == 1
+
+
+def test_the_object_copy_is_refused_when_the_disk_cannot_hold_it_twice_over(b):
+    r = b.run("backup", "--target", "control-plane", "--dest", str(b.dest), STORE_BYTES=str(1 << 60))
+    assert r.returncode == 1
+    err = json.loads(r.stdout.splitlines()[-1])["error"]
+    assert "free" in err and str(1 << 60) in err and "database dump above is still valid" in err
+    assert len(list(b.dest.glob("controlplane-*.dump"))) == 1 and list(b.dest.glob("*.tar")) == []
+    assert "docker cp" not in b.log.read_text()
+
+
+def test_the_store_size_falls_back_to_du_sk_when_du_b_is_unsupported(b):
+    r = b.run("backup", "--target", "control-plane", "--dest", str(b.dest), NO_DU_B="1")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "du -sk" in b.log.read_text() and len(list(b.dest.glob("*.tar"))) == 1
+
+
+@pytest.mark.parametrize("prefix", ["has space", "star*", "../x", "a/b"])
+def test_an_invalid_prefix_is_refused_and_writes_nothing(b, prefix):
+    r = b.run("backup", "--dest", str(b.dest), "--prefix", prefix)
+    assert r.returncode == 2 and "--prefix" in r.stderr
+    assert not b.dest.exists() and "docker" not in b.log.read_text()
+
+
+@pytest.mark.parametrize("user", ["cp-admin", "cp.admin", "Cp_Admin1"])
+def test_a_legal_postgres_role_name_with_dash_or_dot_is_accepted(b, user):
+    r = b.run("backup", "--target", "control-plane", "--dest", str(b.dest), "--no-objects", CP_USER=user)
+    assert r.returncode == 0, r.stdout
+    assert f"pg_dump -U {user} -d herdr" in b.log.read_text()
+
+
+def test_a_rejected_container_user_is_named_in_the_error(b):
+    r = b.run("backup", "--target", "control-plane", "--dest", str(b.dest), CP_USER="bad user;x")
+    assert r.returncode == 1 and "bad user;x" in r.stdout and "is it running" not in r.stdout
 
 
 def test_control_plane_age_and_restore_test_use_the_control_plane_series(b):

@@ -2,7 +2,7 @@
 # Back up (and restore-test) a Postgres database of the control-plane project: the Hindsight memory database (default)
 # or, with `--target control-plane`, the main control-plane database and its object store.
 #
-#   memory-backup.sh backup        [--target T] [--dest DIR] [--container NAME] [--keep N] [--prefix P] [--no-objects]
+#   memory-backup.sh backup        [--target T] [--dest DIR] [--container NAME] [--keep N] [--keep-objects N] [--prefix P] [--no-objects]
 #   memory-backup.sh restore-test  [--target T] [--dest DIR] [--container NAME] [--prefix P]
 #   memory-backup.sh install       [--target T]   # stable script copy + the two user units, enable the timer
 #   memory-backup.sh age           [--target T] [--dest DIR] [--prefix P]   # seconds since the newest dump (exit 1: none)
@@ -22,8 +22,13 @@
 # WHOLE database (every tenant schema, not just public) inside the database container into an owner-only partial file,
 # `pg_restore --list` verifies the archive, the verified dump is renamed to <prefix>-<UTC stamp>.dump, and its sha256 is
 # reported as one JSON line. It never touches the live database. `--keep N` (default 14) prunes only older
-# <prefix>-*.dump (and <prefix>-objects-*.tar) files in DEST after a verified new one exists; `--keep 0` keeps everything.
-# --prefix names a separate series (deploy.sh uses predeploy-controlplane so its dumps are pruned apart from the daily ones).
+# <prefix>-*.dump files in DEST after a verified new one exists; `--keep 0` keeps everything.
+# --keep-objects N (default 3) is the separate retention of the object store tars (<prefix>-objects-*.tar), which are a full
+# copy of the store each; 0 keeps everything. Before writing a tar the script measures the store (`du -sb` in the container,
+# `du -sk` x 1024 where -b is unsupported) and the free space on DEST (`df -Pk`) and refuses the object copy, with a JSON error
+# naming both numbers, when free space is below 1.2 x the store size; the database dump taken just before stays valid.
+# --prefix (letters, digits, _ and - only) names a separate series (deploy.sh uses predeploy-controlplane so its dumps are
+# pruned apart from the daily ones).
 #
 # restore-test restores the newest dump into a uniquely named TEMPORARY database inside the same container, counts the
 # restored tables, and drops only that temporary database. The live database is never written.
@@ -35,19 +40,21 @@ set -euo pipefail
 umask 077
 
 ACTION="${1:-}"; [ $# -gt 0 ] && shift
-TARGET=memory; DEST=""; CONTAINER=""; KEEP=14; PREFIX=""; OBJECTS=1
+TARGET=memory; DEST=""; CONTAINER=""; KEEP=14; KEEP_OBJECTS=3; PREFIX=""; OBJECTS=1
 while [ $# -gt 0 ]; do
   case "$1" in
     --target) TARGET="${2:?--target needs a value}"; shift 2 ;;
     --dest) DEST="${2:?--dest needs a value}"; shift 2 ;;
     --container) CONTAINER="${2:?--container needs a value}"; shift 2 ;;
     --keep) KEEP="${2:?--keep needs a value}"; shift 2 ;;
+    --keep-objects) KEEP_OBJECTS="${2:?--keep-objects needs a value}"; shift 2 ;;
     --prefix) PREFIX="${2:?--prefix needs a value}"; shift 2 ;;
     --no-objects) OBJECTS=0; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
 [[ "$KEEP" =~ ^[0-9]+$ ]] || { echo "--keep needs a whole number" >&2; exit 2; }
+[[ "$KEEP_OBJECTS" =~ ^[0-9]+$ ]] || { echo "--keep-objects needs a whole number" >&2; exit 2; }
 case "$TARGET" in
   memory)        # the candidate's default directory, so both tools see the same files
     D_DEST="$HOME/.local/share/herdr-memory/backups"; D_CONTAINER=herdr-hindsight-db; D_PREFIX=memory
@@ -58,6 +65,7 @@ case "$TARGET" in
   *) echo "unknown target: $TARGET (memory | control-plane)" >&2; exit 2 ;;
 esac
 DEST="${DEST:-$D_DEST}"; CONTAINER="${CONTAINER:-$D_CONTAINER}"; PREFIX="${PREFIX:-$D_PREFIX}"
+[[ "$PREFIX" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "--prefix must be letters, digits, _ or -" >&2; exit 2; }
 OBJ_PATH=/data
 
 private_dest() {
@@ -70,11 +78,29 @@ private_dest() {
 resolve_user() {
   [ -n "$DB_USER" ] && return 0
   DB_USER="$(docker exec "$CONTAINER" printenv POSTGRES_USER 2>/dev/null || true)"
-  [[ "$DB_USER" =~ ^[A-Za-z0-9_]+$ ]] || { DB_USER=""; echo '{"error":"cannot read the database user from the container; is it running?"}'; return 1; }
+  if [ -z "$DB_USER" ]; then
+    echo '{"error":"cannot read the database user from the container; is it running?"}'; return 1
+  fi
+  [[ "$DB_USER" =~ ^[A-Za-z0-9_.-]+$ ]] || {
+    printf '{"error":"the container reports a database user this script will not use: %s"}\n' "$(printf '%s' "$DB_USER" | tr -c 'A-Za-z0-9_.@ ;-' '?')"
+    DB_USER=""; return 1
+  }
 }
 
 backup_objects() {
-  local part final stamp sum
+  local part final stamp sum store free_kb
+  # size check first: a full tar of the store, KEEP_OBJECTS copies deep, lives on the disk it protects
+  store="$(docker exec "$OBJ_CONTAINER" du -sb "$OBJ_PATH" 2>/dev/null | cut -f1 || true)"
+  if ! [[ "$store" =~ ^[0-9]+$ ]]; then
+    store="$(docker exec "$OBJ_CONTAINER" du -sk "$OBJ_PATH" 2>/dev/null | cut -f1 || true)"
+    [[ "$store" =~ ^[0-9]+$ ]] && store=$((store * 1024))
+  fi
+  free_kb="$(df -Pk "$DEST" | awk 'NR==2 {print $4}')"
+  if [[ "$store" =~ ^[0-9]+$ ]] && [[ "$free_kb" =~ ^[0-9]+$ ]] && [ $((free_kb * 1024)) -lt $((store + store / 5)) ]; then
+    printf '{"error":"Object store is %s bytes but only %s bytes are free in %s (need 1.2 x the store); object copy skipped; the database dump above is still valid"}\n' \
+      "$store" "$((free_kb * 1024))" "$DEST"
+    return 1
+  fi
   part="$(mktemp "$DEST/.partial-XXXXXX")"
   if ! docker cp "$OBJ_CONTAINER:$OBJ_PATH" - > "$part" 2>/dev/null || ! tar -tf "$part" >/dev/null 2>&1 || [ ! -s "$part" ]; then
     rm -f "$part"
@@ -86,15 +112,18 @@ backup_objects() {
   final="$DEST/$PREFIX-objects-$stamp.tar"
   mv "$part" "$final"
   printf '{"path":"%s","bytes":%s,"sha256":"%s","format_verified":true}\n' "$final" "$(stat -c %s "$final")" "$sum"
-  prune "$PREFIX-objects-*.tar"
+  prune "$PREFIX-objects-*.tar" "$KEEP_OBJECTS"
 }
 
-# prune <glob>: only same-pattern files, and only after a new verified one exists
+# prune <glob> <keep>: only same-pattern files in DEST (the prefix is validated), and only after a new verified one exists
 prune() {
-  if [ "$KEEP" -gt 0 ]; then
-    # shellcheck disable=SC2086,SC2012  # $1 is an intentional glob built from the validated prefix
-    # shellcheck disable=SC2086,SC2012  # $1 is an intentional glob built from the validated prefix
-    ls -1 "$DEST"/$1 2>/dev/null | sort | head -n "-$KEEP" | while IFS= read -r old; do rm -f -- "$old"; done
+  local keep="$2" old
+  local -a files=()
+  if [ "$keep" -gt 0 ]; then
+    while IFS= read -r old; do files+=("$old"); done < <(compgen -G "$DEST/$1" | sort)
+    if [ "${#files[@]}" -gt "$keep" ]; then
+      for old in "${files[@]:0:${#files[@]}-keep}"; do rm -f -- "$old"; done
+    fi
   fi
 }
 
@@ -115,7 +144,7 @@ backup() {
   final="$DEST/$PREFIX-$stamp.dump"
   mv "$part" "$final"
   printf '{"path":"%s","bytes":%s,"sha256":"%s","format_verified":true}\n' "$final" "$(stat -c %s "$final")" "$sum"
-  prune "$PREFIX-*.dump"
+  prune "$PREFIX-*.dump" "$KEEP"
   if [ "$OBJECTS" = 1 ]; then backup_objects; fi
 }
 

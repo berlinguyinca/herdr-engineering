@@ -90,10 +90,30 @@ def test_waiting_for_another_migrators_lock_times_out_instead_of_hanging(pg, sch
         await owner.execute("SELECT pg_advisory_lock($1)", MIGRATION_LOCK_KEY)
         try:
             with pytest.raises(asyncpg.exceptions.LockNotAvailableError):
-                await asyncio.wait_for(Migrator(waiter, lock_timeout_ms=300).apply(str(tmp_path)), timeout=10)
+                await asyncio.wait_for(Migrator(waiter, wait_timeout_ms=300).apply(str(tmp_path)), timeout=10)
         finally:
             await owner.execute("SELECT pg_advisory_unlock($1)", MIGRATION_LOCK_KEY)
         assert await Migrator(waiter).apply(str(tmp_path)) == ["0001_x.sql"]    # free again: applies normally
+        await owner.close()
+        await waiter.close()
+    asyncio.run(go())
+
+
+def test_a_starter_waits_for_a_sibling_longer_than_the_ddl_lock_timeout(pg, schema, tmp_path):
+    (tmp_path / "0001_x.sql").write_text("SELECT 1;")
+
+    async def go():
+        owner, waiter = await _connect(pg, schema), await _connect(pg, schema)
+        await owner.execute("SELECT pg_advisory_lock($1)", MIGRATION_LOCK_KEY)
+
+        async def release_later():
+            await asyncio.sleep(1.0)        # longer than the 300 ms DDL lock timeout below
+            await owner.execute("SELECT pg_advisory_unlock($1)", MIGRATION_LOCK_KEY)
+        release = asyncio.create_task(release_later())
+        applied = await asyncio.wait_for(
+            Migrator(waiter, lock_timeout_ms=300, wait_timeout_ms=10_000).apply(str(tmp_path)), timeout=15)
+        await release
+        assert applied == ["0001_x.sql"]
         await owner.close()
         await waiter.close()
     asyncio.run(go())

@@ -574,7 +574,7 @@ def test_a_failed_pre_migration_dump_stops_the_deploy_before_the_migration(env):
     assert "docker run " not in log and " up " not in log
     assert list(env["home"].glob(".local/share/herdr-engineering/backups/control-plane/.partial-*")) == []
     metadata = json.loads(next(state(env).glob("attempt-*/metadata.json")).read_text())
-    assert metadata["outcome"] == "prewarm_failed"
+    assert metadata["outcome"] == "backup_failed"        # nothing ran in the prewarm: not recorded as a prewarm failure
 
 
 def test_a_real_deploy_installs_the_control_plane_backup_timer_and_a_first_deploy_dumps_nothing(env):
