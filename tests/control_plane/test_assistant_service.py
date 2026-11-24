@@ -30,6 +30,7 @@ from herdr_engineering.control_plane.assistant import (
     OpenApiConnectorAdapter,
     PostgresStoreBackend,
     RateLimited,
+    StoreLoadError,
     assistant_config,
     redact_secrets,
 )
@@ -911,7 +912,8 @@ def test_postgres_backend_persist_never_raises():
         raise RuntimeError("db down")
     backend = PostgresStoreBackend("postgresql://u:p@h:5432/db", connect=connect)
     backend.persist({"x": 1})  # must not raise
-    assert backend.load() is None
+    with pytest.raises(StoreLoadError):   # an unreadable snapshot is not "no snapshot"
+        backend.load()
 
 
 def test_store_with_pg_backend_survives_restart():

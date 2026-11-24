@@ -1,0 +1,180 @@
+{
+ "branch": "main",
+ "changed_files": [
+  "CHANGELOG.md",
+  "docs/operations/ci-gates.md",
+  "scripts/ci/host-facts.sh",
+  "scripts/ci/pytest-parallel.sh",
+  "scripts/ci/pytest-rerun.sh",
+  "scripts/ci/unit-gates.sh",
+  "tests/test_ci_pytest_parallel.py",
+  "tests/test_ci_pytest_rerun.py"
+ ],
+ "commit": "f92088a45a3b2d91f3bdf486b8b830fb47ae33b9",
+ "created": 1795042752,
+ "deploy_task": "",
+ "deploy_to": "",
+ "errors": null,
+ "event": "pull_request",
+ "event_reason": [
+  ""
+ ],
+ "finished": 1795050537,
+ "forge_url": "https://github.com/berlinguyinca/herdr-engineering/pull/888",
+ "id": 16405,
+ "number": 1722,
+ "parent": 0,
+ "ref": "refs/pull/888/merge",
+ "refspec": "fix/unit-gates-worker-crash-rerun:main",
+ "rerun_count": 0,
+ "reviewed": 0,
+ "started": 1795042784,
+ "status": "killed",
+ "timestamp": 0,
+ "title": "fix(ci): rerun the parallel pytest pass once when xdist workers die",
+ "updated": 1795050537,
+ "version": "3.20.1",
+ "workflows": [
+  {
+   "agent_id": 12621,
+   "children": [
+    {
+     "exit_code": 0,
+     "finished": 1795042791,
+     "id": 55039,
+     "name": "checkout",
+     "pid": 4,
+     "pipeline_id": 16405,
+     "ppid": 1,
+     "started": 1795042785,
+     "state": "success",
+     "type": "commands",
+     "uuid": "01M7RE5EK1J0W28D8SXJSQNSK7"
+    },
+    {
+     "exit_code": 0,
+     "finished": 1795042821,
+     "id": 55040,
+     "name": "artifact-handoff-contracts",
+     "pid": 5,
+     "pipeline_id": 16405,
+     "ppid": 1,
+     "started": 1795042791,
+     "state": "success",
+     "type": "commands",
+     "uuid": "01M7RE5EK1J0W28D8SXNXA3N4E"
+    }
+   ],
+   "finished": 1795042821,
+   "id": 12503,
+   "name": "artifact-handoff",
+   "pid": 1,
+   "pipeline_id": 16405,
+   "started": 1795042784,
+   "state": "success"
+  },
+  {
+   "agent_id": 12620,
+   "children": [
+    {
+     "exit_code": 0,
+     "finished": 1795042792,
+     "id": 55041,
+     "name": "checkout",
+     "pid": 6,
+     "pipeline_id": 16405,
+     "ppid": 2,
+     "started": 1795042785,
+     "state": "success",
+     "type": "commands",
+     "uuid": "01M7RE5EK3PAV8Y6F852MN0NXG"
+    },
+    {
+     "exit_code": 0,
+     "finished": 1795042798,
+     "id": 55042,
+     "name": "structural-gates",
+     "pid": 7,
+     "pipeline_id": 16405,
+     "ppid": 2,
+     "started": 1795042792,
+     "state": "success",
+     "type": "commands",
+     "uuid": "01M7RE5EK3PAV8Y6F855ZF6RDR"
+    }
+   ],
+   "finished": 1795042798,
+   "id": 12504,
+   "name": "structural-gates",
+   "pid": 2,
+   "pipeline_id": 16405,
+   "started": 1795042784,
+   "state": "success"
+  },
+  {
+   "agent_id": 12625,
+   "children": [
+    {
+     "exit_code": 0,
+     "finished": 1795043343,
+     "id": 55043,
+     "name": "checkout",
+     "pid": 8,
+     "pipeline_id": 16405,
+     "ppid": 3,
+     "started": 1795043337,
+     "state": "success",
+     "type": "commands",
+     "uuid": "01M7RE5EK6FBN7MF7012CJKY0M"
+    },
+    {
+     "exit_code": 0,
+     "finished": 1795043344,
+     "id": 55044,
+     "name": "freshness",
+     "pid": 9,
+     "pipeline_id": 16405,
+     "ppid": 3,
+     "started": 1795043343,
+     "state": "success",
+     "type": "commands",
+     "uuid": "01M7RE5EK6FBN7MF7015VFKFNQ"
+    },
+    {
+     "exit_code": 0,
+     "finished": 1795043344,
+     "id": 55045,
+     "name": "applicability",
+     "pid": 10,
+     "pipeline_id": 16405,
+     "ppid": 3,
+     "started": 1795043344,
+     "state": "success",
+     "type": "commands",
+     "uuid": "01M7RE5EK6FBN7MF7017ZTVKH4"
+    },
+    {
+     "error": "Canceled",
+     "exit_code": 0,
+     "finished": 1795050537,
+     "id": 55046,
+     "name": "unit-gates",
+     "pid": 11,
+     "pipeline_id": 16405,
+     "ppid": 3,
+     "started": 1795043344,
+     "state": "killed",
+     "type": "commands",
+     "uuid": "01M7RE5EK6FBN7MF701AN588P5"
+    }
+   ],
+   "finished": 1795050537,
+   "id": 12505,
+   "name": "unit-gates",
+   "pid": 3,
+   "pipeline_id": 16405,
+   "started": 1795043337,
+   "state": "killed"
+  }
+ ]
+}

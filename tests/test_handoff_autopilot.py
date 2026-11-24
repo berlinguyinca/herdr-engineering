@@ -74,6 +74,9 @@ def host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
     # configured, so a leaked path makes an absent install look present, or the reverse.
     inherited = [
         "HERDR_HANDOFF_AUTOPILOT",
+        "HERDR_HANDOFF_AUTO",
+        "HERDR_PANE_ID",
+        "HERDR_BIN",
         "HERDR_ENG_BIN",
         "HERDR_ENG_ARGS",
         "HERDR_ENGINEERING_STATE",
@@ -838,8 +841,8 @@ def test_the_autopilot_and_the_managed_workflow_hooks_share_settings_json(host: 
 
     assert sorted(managed) == sorted(WORKFLOW_EVENTS), (sorted(managed), WORKFLOW_EVENTS)
     assert sorted(ours) == ["PreCompact", "Stop"], sorted(ours)
-    # Both PreCompact hooks are still in the same event list, in the order Claude runs them.
-    assert len(events["PreCompact"]) == 2, events["PreCompact"]
+    # The workflow hooks no longer manage PreCompact: the autopilot's is the only one.
+    assert len(events["PreCompact"]) == 1, events["PreCompact"]
 
     # Removing the autopilot must leave the workflow hooks exactly where they were.
     before = json.dumps(json.loads(settings.read_text())["hooks"]["SessionStart"], sort_keys=True)
@@ -850,9 +853,7 @@ def test_the_autopilot_and_the_managed_workflow_hooks_share_settings_json(host: 
     assert "herdr-workflow:managed" in after_text
     after = json.loads(after_text)["hooks"]
     assert json.dumps(after["SessionStart"], sort_keys=True) == before
-    assert [
-        c["command"] for group in after["PreCompact"] for c in group.get("hooks", [])
-    ] == managed["PreCompact"]
+    assert "PreCompact" not in after, list(after)
 
     # ... and the other way round: re-arming the autopilot then dropping the workflow hooks.
     assert _cli(["handoff", "autopilot", "install"], host["env"], host["work"]).returncode == 0
@@ -933,67 +934,14 @@ def test_the_claude_hook_command_survives_a_missing_cli(host: dict) -> None:
     assert control.returncode != 0, (control.returncode, control.stdout)
 
 
-def test_a_session_the_context_hook_already_warned_is_not_told_again(host: dict) -> None:
-    """`handoff context-hook claude` (opt-in, UserPromptSubmit) warns at half the window.
-
-    It keeps its own marker file in a different state directory, so the autopilot's
-    per-session budget never saw it: with both installed a session got one instruction
-    from each, which is the nagging the budget exists to prevent. The autopilot honours
-    the other mechanism's marker; a marker root that is not a directory is not a reason
-    to stall the decision.
-    """
-    write_config(host["home"], "handoff_autopilot:\n  enabled: true\n")
-    markers = host["tmp"] / "hero-state"
-    host["env"]["HERDR_ENGINEERING_STATE"] = str(markers)
-
-    def check(session: str) -> dict:
-        result = _cli(
-            [
-                "handoff",
-                "autopilot",
-                "check",
-                "--harness",
-                "claude",
-                "--session-id",
-                session,
-                "--tokens",
-                "185000",
-                "--context-window",
-                "200000",
-                "--json",
-            ],
-            host["env"],
-            host["work"],
-        )
-        assert result.returncode == 0, result.stdout + result.stderr
-        return json.loads(result.stdout)
-
-    assert check("session-a")["code"] == "context_is_full"
-
-    # The context hook got there first, on the same session.
-    (markers / "handoff-context").mkdir(parents=True)
-    (markers / "handoff-context" / "session-a.fired").write_text("")
-    warned = check("session-a")
-    assert warned["code"] == "already_triggered", warned
-    assert warned["trigger"] is False
-    assert not ha.state_path(host["home"]).exists(), "a warning is not a trigger"
-
-    # Another session is still told, and an unreadable marker root never blocks the decision.
-    assert check("session-b")["code"] == "context_is_full"
-    blocked = host["tmp"] / "blocked"
-    blocked.write_text("not a directory")
-    host["env"]["HERDR_ENGINEERING_STATE"] = str(blocked / "handoff-context")
-    assert check("session-c")["code"] == "context_is_full"
-
-
 def test_only_xdg_state_home_moves_the_trigger_ledger(
     host: dict, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """`XDG_STATE_HOME` moves the ledger; `HERDR_ENGINEERING_STATE` never touches it.
 
-    The two names look interchangeable and are not. `HERDR_ENGINEERING_STATE` is the *other*
-    mechanism's root: the directory holding `handoff context-hook` markers, read by
-    `_context_hook_warned()`. A probe that redirects it expecting to sandbox the ledger writes
+    The two names look interchangeable and are not. `HERDR_ENGINEERING_STATE` is another
+    root (the subagent registry and the handoff controller keep their state there; the retired
+    `handoff context-hook` kept its markers there). A probe that redirects it expecting to sandbox the ledger writes
     straight to the operator's real `$XDG_STATE_HOME/herdr-engineering/handoff-autopilot.json`
     and spends a trigger for a session that never happened - and that file is the audit record
     of when the machine took over on its own, the one artifact `uninstall` deliberately keeps.
@@ -1044,14 +992,15 @@ def test_status_names_both_state_roots_and_the_variable_that_moves_each(
 ) -> None:
     """`status` has to say where each kind of state lives, not just one of them.
 
-    The autopilot touches two directories, moved by two different variables: the trigger ledger
-    under `$XDG_STATE_HOME`, and the `handoff context-hook` markers under `$HERDR_ENGINEERING_STATE`.
-    The old output printed one unlabelled `state_path`, which read as "the state root" - so an
-    operator who redirected `$HERDR_ENGINEERING_STATE` to sandbox a test still spent real triggers
-    in the real ledger (#934, and the probe incident behind #933). A reader who cannot tell the
-    two apart cannot sandbox either safely, so both are printed with the variable that moves each.
+    Automatic handoffs resolve two directories, moved by two different variables: the trigger ledger
+    under `$XDG_STATE_HOME`, and this project's own state root - controller switch and subagent
+    registry - under `$HERDR_ENGINEERING_STATE`. The old output printed one unlabelled `state_path`,
+    which read as "the state root" - so an operator who redirected `$HERDR_ENGINEERING_STATE` to
+    sandbox a test still spent real triggers in the real ledger (#934, and the probe incident behind
+    #933). A reader who cannot tell the two apart cannot sandbox either safely, so both are printed
+    with the variable that moves each and what each holds.
     """
-    write_config(host["home"], "handoff_autopilot:\n  enabled: true\n")
+    write_config(host["home"], "handoff_autopilot:\n  enabled: true\n\n")
     markers = host["tmp"] / "marker-root"
     monkeypatch.setenv("HERDR_ENGINEERING_STATE", str(markers))
 
@@ -1059,40 +1008,42 @@ def test_status_names_both_state_roots_and_the_variable_that_moves_each(
 
     assert roots["trigger_ledger"]["path"] == str(ha.state_path(host["home"]))
     assert roots["trigger_ledger"]["moves_with"] == "XDG_STATE_HOME"
-    assert roots["context_hook_markers"]["path"] == str(markers / "handoff-context")
-    assert roots["context_hook_markers"]["moves_with"] == "HERDR_ENGINEERING_STATE"
-    assert roots["trigger_ledger"]["path"] != roots["context_hook_markers"]["path"], (
-        "one labelled root is the same bug as no labels: the reader cannot tell which file a variable moves"
+    assert roots["controller_state"]["path"] == str(markers)
+    assert roots["controller_state"]["moves_with"] == "HERDR_ENGINEERING_STATE"
+    assert roots["trigger_ledger"]["path"] != roots["controller_state"]["path"], (
+        "one labelled root is the same bug as no labels: the reader cannot tell which file a "
+        "variable moves"
     )
 
 
-def test_the_marker_root_status_prints_is_the_one_the_context_hook_writes(
+def test_the_controller_root_status_prints_is_the_one_the_controller_resolves(
     host: dict, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The reported marker root must be the real one, or the status view is a lie with a reason attached.
+    """The second root `status` names must be the directory the rest of the feature actually uses.
 
-    `handoff_context_hook` writes the per-session marker; `_context_hook_warned` reads it back so a
-    session with both triggers installed is not told twice. Both now resolve the directory through
-    one accessor - three copies of a default path drift, and the drift is silent: the autopilot
-    would read a directory the hook never wrote and warn a session all over again.
+    A root printed from a second copy of a default path is a lie with a label on it: the reader
+    redirects the directory `status` named while the controller switch and the subagent registry
+    carry on underneath another one, and nothing reports the mismatch. So `herdr_state_root` defers
+    to `handoff_subagent_registry.state_root` - the accessor the controller itself resolves through
+    - and this test pins the two together for both the default and a redirected root (#934).
     """
-    from herdr_engineering import handoff_context_hook as context_hook
+    from herdr_engineering import handoff_subagent_registry as registry
 
     for env in ({}, {"HERDR_ENGINEERING_STATE": str(host["tmp"] / "alt-root")}):
-        assert ha.context_hook_marker_root(env) == context_hook._state_dir(env), env
+        assert ha.herdr_state_root(env) == registry.state_root(env), env
 
-    root = ha.context_hook_marker_root({"HERDR_ENGINEERING_STATE": str(host["tmp"] / "alt-root")})
-    root.mkdir(parents=True)
-    (root / "session-a.fired").write_text("")
-    monkeypatch.setenv("HERDR_ENGINEERING_STATE", str(host["tmp"] / "alt-root"))
-    assert ha._context_hook_warned("session-a"), "the reader must look where the writer wrote"
+    alt = host["tmp"] / "alt-root"
+    monkeypatch.setenv("HERDR_ENGINEERING_STATE", str(alt))
+    roots = ha.status(home=host["home"])["state_roots"]
+    assert roots["controller_state"]["path"] == str(alt)
+    assert Path(roots["trigger_ledger"]["path"]) != Path(roots["controller_state"]["path"])
 
 
 def test_status_keeps_the_unlabelled_ledger_path_as_an_alias(host: dict) -> None:
     """`installed.state_path` and `ledger.path` stay, pointing at the trigger ledger.
 
     Scripts already read them; the labels arrive alongside rather than replacing them, and the
-    alias is documented to go away after a release of `state_roots` (#934).
+    alias is documented to go away one release after `state_roots` (#934).
     """
     status = ha.status(home=host["home"])
     assert status["installed"]["state_path"] == status["state_roots"]["trigger_ledger"]["path"]
@@ -1828,6 +1779,37 @@ def test_status_reports_obeyed_triggers_against_issued_ones(host: dict) -> None:
     assert report["uptake"]["told"] == 3, report["uptake"]
     assert report["uptake"]["taken"] == 1, report["uptake"]
     assert "1 of 3" in report["summary"], report["summary"]
+
+
+def test_a_stand_down_note_is_not_a_trigger_for_uptake(host: dict) -> None:
+    """A skip-only entry was never told anything, so it is not told, not pending and never taken."""
+    write_config(host["home"], "handoff_autopilot:\n  enabled: true\n")
+    ha.record_skip(session_id="s-managed", harness="claude", code="herdr_managed", reason="controller", home=host["home"])
+    ha.record_trigger(session_id="s-told", harness="claude", percent=88.0, prompt="go")
+    assert ha.status(home=host["home"])["uptake"] == {"told": 1, "taken": 0}
+
+    _envelope(
+        host["home"] / ".herdr" / "handoffs", handoff_id="handoff_managed", session_id="s-managed", state="queued"
+    )
+    path = ha.state_path(host["home"])
+    before = path.read_text()
+    assert ha.settle_uptake(home=host["home"]) is None, "the controller's handoff is not the autopilot's uptake"
+    assert path.read_text() == before
+    entry = json.loads(before)["sessions"]["s-managed"]
+    assert "taken_at" not in entry, entry
+    assert ha.status(home=host["home"])["uptake"] == {"told": 1, "taken": 0}
+
+
+def test_a_session_told_and_then_managed_still_counts_and_settles(host: dict) -> None:
+    write_config(host["home"], "handoff_autopilot:\n  enabled: true\n")
+    ha.record_trigger(session_id="s-both", harness="claude", percent=88.0, prompt="go")
+    ha.record_skip(session_id="s-both", harness="claude", code="herdr_managed", reason="controller", home=host["home"])
+    assert ha.status(home=host["home"])["uptake"] == {"told": 1, "taken": 0}
+    _envelope(host["home"] / ".herdr" / "handoffs", handoff_id="handoff_both", session_id="s-both", state="queued")
+    assert ha.settle_uptake(home=host["home"]) is not None
+    entry = json.loads(ha.state_path(host["home"]).read_text())["sessions"]["s-both"]
+    assert entry["taken_handoff"] == "handoff_both" and entry["skipped"]["code"] == "herdr_managed", entry
+    assert ha.status(home=host["home"])["uptake"] == {"told": 1, "taken": 1}
 
 
 def test_the_operator_doc_names_the_fields_that_measure_uptake() -> None:

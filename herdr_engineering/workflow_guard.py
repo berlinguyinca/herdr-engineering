@@ -31,7 +31,7 @@ TMP_REASON = ("Writing scratch files under /tmp is not allowed. Use a gitignored
 TOKEN_REASON = ("The push-approval token is for the human only: ask the user to run it with the `!` "
                 "prefix. Creating or editing it yourself defeats the guard.")
 MAIN_REASON = "Pushing to main/master is blocked. Push a feature branch and open a PR instead."
-HERDR_REASON = "pushing herdr-engineering needs explicit user approval"
+HERDR_REASON = "force or destructive push to herdr-engineering needs explicit user approval"
 UNKNOWN_REASON = ("Cannot tell which repository or branch this push targets (unresolved cd). "
                   "Confirm it does not push to main/master.")
 
@@ -148,6 +148,30 @@ def _split_commands(command: str) -> list[list[str]]:
     return _tokenize(_strip_heredocs(command).replace("\\\n", ""))
 
 
+# --all/--branches push every local branch, so a stray local main rides along unseen.
+_DESTRUCTIVE_LONG = ("--force", "--force-with-lease", "--force-if-includes", "--mirror", "--delete",
+                     "--prune", "--all", "--branches")
+_SHORT_DESTRUCTIVE = frozenset("fd")
+
+
+def _destructive_flag(arg: str) -> bool:
+    """True for a push option that forces, deletes or prunes (git accepts unique long prefixes)."""
+    if arg.startswith("--"):
+        name = arg.split("=", 1)[0]
+        return len(name) >= 3 and any(long.startswith(name) for long in _DESTRUCTIVE_LONG)
+    return arg.startswith("-") and len(arg) > 1 and bool(_SHORT_DESTRUCTIVE & set(arg[1:]))
+
+
+def _destructive_refspec(refspec: str) -> bool:
+    """``+src:dst`` forces; ``:dst`` (empty source) deletes the remote ref; a glob (``*``) can
+    match main without naming it."""
+    return refspec.startswith(("+", ":")) or "*" in refspec
+
+
+def _is_destructive(args: list[str]) -> bool:
+    return any(_destructive_flag(a) if a.startswith("-") else _destructive_refspec(a) for a in args)
+
+
 _GIT_PUSH = re.compile(r"\bgit\b[^;&|\n]*?\bpush\b([^;&|\n]*)")
 
 
@@ -162,14 +186,20 @@ def _fallback(command: str, cwd: str) -> Decision | None:
         words = [w.strip("'\"`") for w in m.group(1).split()]
         if any(_targets_protected(w, None) for w in words if w and not w.startswith("-")):
             return "deny", MAIN_REASON
+        if not _is_destructive([w for w in words if w]):
+            continue  # a plain non-main push to herdr-engineering is allowed
         url = _git(cwd, "remote", "get-url", "origin")
         if url and "herdr-engineering" in url:
             result = ("ask", HERDR_REASON)
     return result
 
 
-def _parse_push(argv: list[str]) -> tuple[str | None, list[str]] | None:
-    """For a ``git ... push ...`` argv return (-C dir, positional args after push) else None."""
+def _parse_push(argv: list[str]) -> tuple[str | None, list[str], bool] | None:
+    """For a ``git ... push ...`` argv return (-C dir, positional args after push, destructive).
+
+    ``destructive`` is true for any force/delete/mirror/prune option, a ``+`` refspec or an
+    empty-source (``:branch``) refspec.
+    """
     if not argv or os.path.basename(argv[0]) != "git":
         return None
     i, workdir = 1, None
@@ -189,6 +219,7 @@ def _parse_push(argv: list[str]) -> tuple[str | None, list[str]] | None:
         return None
     opts_with_value = {"--repo", "--receive-pack", "--exec", "-o", "--push-option"}
     pos: list[str] = []
+    destructive = False
     j = i + 1
     while j < len(argv):
         a = argv[j]
@@ -200,8 +231,11 @@ def _parse_push(argv: list[str]) -> tuple[str | None, list[str]] | None:
             continue
         if not a.startswith("-"):
             pos.append(a)
+        elif _destructive_flag(a):
+            destructive = True
         j += 1
-    return workdir, pos
+    destructive = destructive or any(_destructive_refspec(r) for r in pos[1:])
+    return workdir, pos, destructive
 
 
 def _git(repo: str, *args: str) -> str | None:
@@ -224,7 +258,8 @@ def _targets_protected(refspec: str, current: str | None) -> bool:
     return dst.removeprefix("refs/heads/") in _PROTECTED
 
 
-def _check_push(workdir: str | None, pos: list[str], cwd: str | None) -> Decision | None:
+def _check_push(workdir: str | None, pos: list[str], cwd: str | None,
+                destructive: bool = False) -> Decision | None:
     if workdir:
         repo = _norm(workdir, cwd) if cwd or os.path.isabs(workdir) else None
     else:
@@ -238,7 +273,7 @@ def _check_push(workdir: str | None, pos: list[str], cwd: str | None) -> Decisio
             return "ask", UNKNOWN_REASON
         return None
     url = _git(repo, "remote", "get-url", "origin")
-    if url and "herdr-engineering" in url:
+    if destructive and url and "herdr-engineering" in url:
         return "ask", HERDR_REASON
     return None
 
@@ -304,7 +339,7 @@ def _guard_argvs(argvs: list[list[str]], cwd: str | None, depth: int) -> Decisio
         else:
             parsed = _parse_push(argv)
             if parsed is not None:
-                d = _check_push(parsed[0], parsed[1], cwd)
+                d = _check_push(parsed[0], parsed[1], cwd, parsed[2])
         if d and d[0] == "deny":
             return d
         result = result or d

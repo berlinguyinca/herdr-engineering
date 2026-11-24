@@ -24,21 +24,33 @@ shares an artifact, publishes a report, opens a pull request against a protected
 touches `main`. Those stay human-approved publication actions, exactly as they were before the
 triggers existed — see [Handoffs](operations/handoff.md).
 
-Two other triggers write to the same `~/.claude/settings.json`, and they are separate installs:
+## Which policy applies where
 
-| Trigger | Installed by | Fires on | What it does |
+Exactly one policy hands a session off, chosen per session:
+
+| Where the session runs | Policy | Threshold |
+|---|---|---|
+| A Herdr pane: `HERDR_PANE_ID` is set and non-empty, a controller is running (its plugin being linked is not enough: it only starts when Herdr next starts), and the controller is not switched off for that pane | the [automatic handoff controller](operations/handoff.md#automatic-handoff-controller) | 80% |
+| Anywhere else: a plain terminal, a remote shell without `HERDR_PANE_ID`, a pane whose controller is switched off (`HERDR_HANDOFF_AUTO=0` or `handoff auto off`), or a host where no controller is running (plugin not linked, linked but Herdr not yet restarted, or the controller crashed) | this autopilot | `handoff_autopilot.context_percent`, 50% by default |
+
+In the first row the autopilot stands down: `check` and the hook answer code `herdr_controller_managed`
+(`trigger: false`) with the reason, `handoff autopilot status` shows it under `herdr_controller`, the
+Claude hook (`hook --record`) notes it in the trigger ledger once per session as `skipped` (Pi sessions show it in `status` and `check --json`, not in the ledger), and `doctor` reports `handoff-autopilot` as `ok`.
+The rule fails open: if the controller state cannot be read (Herdr not answering, an unreadable switch file),
+the autopilot keeps working, and it asks only when it would otherwise trigger, so a session below the threshold never runs `herdr plugin list`. No session is ever left without a policy. Every `handoff autopilot hook`
+path still exits 0.
+
+Other writers of `~/.claude/settings.json` are separate installs with their own markers, so installing one
+never rewrites another's hooks, and `install.sh` runs the workflow hooks (7c) before the autopilot (7e):
+
+| Install | Installed by | Fires on | What it does |
 |---|---|---|---|
 | `handoff autopilot install` (this page) | `install.sh`, default on | Pi `turn_end`; Claude `Stop`, `PreCompact` | tells the agent to run the handoff skill, once per session |
-| `workflow install` | `install.sh`, default on | Claude `SessionStart`, `PreCompact` | reminds the agent of the engineering defaults, and of `/handoff` before compaction; starts nothing |
-| `handoff context-hook claude` | never; paste the block into `~/.claude/settings.json` | Claude `UserPromptSubmit` | advises at half the window (default), once per session |
+| `workflow install` | `install.sh`, default on | Claude `SessionStart`, `PreToolUse` | reminds the agent of the engineering defaults and guards a few commands; starts nothing |
 
-Each installer owns its own marker, so installing one never rewrites or removes another's hook
-group, and `install.sh` runs the workflow hooks (7c) before the autopilot (7e). A session warned
-by the opt-in `context-hook` is not told again by the autopilot: `decide()` reads that trigger's
-`$HERDR_ENGINEERING_STATE/handoff-context/<session>.fired` marker before spending its own
-per-session budget. The reverse is not true — the `context-hook` does not read the autopilot's
-ledger, so a session already told at the threshold can still get the earlier advice on its next
-prompt. `docs/operations/workflow-hooks.md` covers the workflow reminder.
+The older opt-in `handoff context-hook claude` (`UserPromptSubmit`, 50%) is retired. A settings file that
+still names it keeps working (it exits 0 and prints nothing) until `handoff auto install` removes it.
+`docs/operations/workflow-hooks.md` covers the workflow hooks.
 
 ## What is installed
 
@@ -111,8 +123,8 @@ that from happening:
   environment variable) maps a model-name substring to its window, and a `[1m]` model is 1M out of
   the box. The answer reports `"source": "model"` and the model it matched.
 - usage beyond the assumed window proves the assumption wrong, so the measurement moves to
-  `large_context_window_tokens` (this mirrors the 1M switch the opt-in
-  `handoff context-hook claude` already makes). A session at 250k is therefore 25%, not 125% -
+  `large_context_window_tokens` (the same rule the retired
+  `handoff context-hook claude` applied). A session at 250k is therefore 25%, not 125% -
   and it is still a trigger candidate rather than an unusable reading.
 - declaring the real window ends the guessing: put `context_window_tokens: 1000000` in the config
   and every percentage is computed against it.
@@ -192,28 +204,39 @@ cat "${XDG_STATE_HOME:-$HOME/.local/state}"/herdr-engineering/handoff-autopilot.
 The ledger records, per session: how many times it was told to hand off, when, on which
 harness, the percent that triggered it, the boundary that noticed, and a hash of the
 instruction. `handoff autopilot uninstall` removes the extension and the hooks but keeps this
-file — it is the audit record of when the machine took over on its own.
+file — it is the audit record of when the machine took over on its own. A `skipped` note
+(the autopilot stood down for a Herdr-managed session) has no `count`: that session was never told, so
+it is not in `uptake.told`, is never stamped `taken_at`, and does not count in `doctor`.
 
 Only `XDG_STATE_HOME` moves that file. `HERDR_ENGINEERING_STATE` sounds like the same knob and is
-not: it relocates the *other* trigger's marker directory
-(`$HERDR_ENGINEERING_STATE/handoff-context/<session>.fired`), and the ledger keeps resolving
-through `XDG_STATE_HOME`. A probe that redirects `HERDR_ENGINEERING_STATE` to a scratch directory,
-expecting to sandbox itself, spends a real trigger against a session that never happened — and
-`uninstall` deliberately keeps whatever it writes. Sandbox with `XDG_STATE_HOME`:
+not: it relocates this project's own state root (`$HERDR_ENGINEERING_STATE`, default
+`~/.local/share/herdr-engineering/state`) — the handoff controller's per-pane switch and the
+subagent registry, which decide whether the autopilot acts in a pane at all — while the ledger keeps
+resolving through `XDG_STATE_HOME`. A probe that redirects `HERDR_ENGINEERING_STATE` to a scratch
+directory, expecting to sandbox itself, spends a real trigger against a session that never happened
+— and `uninstall` deliberately keeps whatever the ledger holds. Sandbox with `XDG_STATE_HOME`:
 
 ```bash
 XDG_STATE_HOME="$PWD/.tmp/autopilot-probe" herdr-eng handoff autopilot status --json
 ```
 
-`status` names both directories, so the choice is not a guess. Each root carries the variable that
-moves it:
+`status` names both roots, so the choice is not a guess. Each carries the variable that moves it and
+what lives under it:
 
 ```json
 "state_roots": {
-  "trigger_ledger":       { "path": "…/state/herdr-engineering/handoff-autopilot.json", "moves_with": "XDG_STATE_HOME" },
-  "context_hook_markers": { "path": "…/state/handoff-context",                          "moves_with": "HERDR_ENGINEERING_STATE" }
+  "trigger_ledger":   { "path": "…/state/herdr-engineering/handoff-autopilot.json", "moves_with": "XDG_STATE_HOME",
+                        "holds": "the record of every automatic trigger, kept through `uninstall`" },
+  "controller_state": { "path": "…/state",                                          "moves_with": "HERDR_ENGINEERING_STATE",
+                        "holds": "the handoff controller's per-pane switch and the subagent registry" }
 }
 ```
+
+The controller root is reported through the same accessor the controller resolves, not a second copy
+of the default path: a printed root that drifts from the written one is worse than no root at all,
+because the reader redirects a directory nothing uses. (The retired `handoff context-hook` kept
+per-session `<session>.fired` markers under this root; nothing writes them now, and old marker
+directories are inert.)
 
 `installed.state_path` and `ledger.path` still appear, both naming the trigger ledger. They are
 aliases kept for one release for scripts already reading them; `state_roots` replaces them.

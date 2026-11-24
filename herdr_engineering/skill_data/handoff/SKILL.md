@@ -43,7 +43,7 @@ Rules: never fabricate paths, hashes, URLs, counts or results; mark doubt in `un
 
 ## 4. Create and hand over
 
-1. Check the CLI: `herdr-handoff --version` must print `0.4.0` or newer (older versions lack the flags below, and pre-0.3.0 cannot close a replaced pane at all). If it is missing or older, stop and tell the user to update herdr-handoff; do not fall back to a thinner briefing silently.
+1. Check the CLI: `herdr-handoff --version` must print `0.5.0` or newer (older versions lack the flags below, and pre-0.3.0 cannot close a replaced pane at all). If it is missing or older, stop and tell the user to update herdr-handoff; do not fall back to a thinner briefing silently.
 2. Create, passing the JSON on stdin through a quoted heredoc:
    `herdr-handoff create --goal "<goal>" --source-harness <source> --target-harness <target> --from-json - <<'HANDOFF_EOF'` ... `HANDOFF_EOF`
    Add `--model <id>` only if the user asked for a model. The command prints the queued envelope; take `handoff_id` from it. A validation error means fix the briefing and retry.
@@ -77,4 +77,4 @@ working - report it, never `--allow-dirty-source` it away. Policy and opt-out:
 
 - Models: pass only what the user requested; opencode wants `provider/model`, and `herdr-handoff` drops a bare model for opencode with a note.
 - Automatic handoffs are installed by default (`scripts/install.sh` step 7e, after the workflow hooks in 7c): the Pi extension fires at `turn_end`, the Claude Code hooks at `Stop` and `PreCompact`, and all of them ask `herdr-eng handoff autopilot` what to do. Policy and opt-out: `docs/automatic-handoffs.md`; the check is `handoff-autopilot` in `herdr-eng doctor`.
-- `herdr-eng handoff context-hook claude` is the older, opt-in Claude `UserPromptSubmit` trigger. It is not installed by default; opt in as described in `docs/operations/handoff.md`.
+- Handing off because the context is large is the automatic handoff controller's job (`docs/operations/handoff.md`); use this skill when a person asks for a handoff.

@@ -222,9 +222,13 @@ def test_enroll_registers_routes_from_manifest(tmp_path, monkeypatch, capsys):
     from herdr_engineering.devfabric import DevServiceRegistry
     monkeypatch.setenv("HERDR_ENGINEERING_STATE", str(tmp_path / "state"))
     monkeypatch.setattr(cli, "_local_fabric_client", lambda: None)
+    # A port the OS just released, never a hardcoded one. The old value (39411) sat inside Linux's ephemeral
+    # range (32768-60999): on a loaded CI host an unrelated outbound socket could be squatting it,
+    # `_allocate_port` would take its documented fallback path, and the lookup below raised StopIteration (#873).
+    origin_port = _free_port()
     manifest = tmp_path / "origin.json"
     manifest.write_text(json.dumps({
-        "origin_port": 39411, "machine": "m1", "repo": "augur", "label": "L",
+        "origin_port": origin_port, "machine": "m1", "repo": "augur", "label": "L",
         "catchall": {"host": "127.0.0.1", "port": 3000},
         "routes": [{"prefix": "/api", "host": "127.0.0.1", "port": 8300}]}))
     rc = cli._cmd_dev_enroll(types.SimpleNamespace(
@@ -233,7 +237,19 @@ def test_enroll_registers_routes_from_manifest(tmp_path, monkeypatch, capsys):
         bind="127.0.0.1"))
     assert rc == 0
     reg = DevServiceRegistry()   # same (env) store
-    lease = next(cand for cand in reg.active_leases() if cand.external_port == 39411)
+    leases = reg.active_leases()
+    # Found by the identity enroll keys on, so a missing lease says which lease exists instead of raising
+    # StopIteration out of a generator the reader has to reconstruct.
+    lease = next((cand for cand in leases
+                  if cand.target_machine_id == "m1" and cand.target_port == 3000), None)
+    assert lease is not None, (
+        f"enroll registered no lease for m1/127.0.0.1:3000; active: "
+        f"{[(c.id, c.external_port, c.target_machine_id, c.target_port) for c in leases]}"
+    )
+    assert lease.external_port == origin_port, (
+        f"the manifest's origin port must be honored when it is bindable; "
+        f"asked for {origin_port}, got {lease.external_port}"
+    )
     assert [(r.prefix, r.port) for r in lease.routes] == [("/api", 8300)]
     assert lease.target_port == 3000            # catch-all
 

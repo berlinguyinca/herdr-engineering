@@ -54,6 +54,8 @@ DEFAULTS: dict[str, Any] = {
         "refuse_builds_percent": 90,
         "refuse_builds_min_free_gib": 50,
     },
+    # Periodic `herdr-handoff reap --apply` (herdr_engineering/handoff_reap.py). OFF until a host opts in.
+    "handoff_reap": {"enabled": False, "interval_minutes": 15, "legacy_roots": []},
     # Spec 02: on by default (local_only; shared cache/slurm stay off); validated by
     # build_cache_config.validate (fails closed). Opt out with ``enabled: false``.
     "fabric_build_cache": {

@@ -1,0 +1,330 @@
+[
+ {
+  "headRefName": "fix/cli-cwd-and-tailscale-doctor",
+  "mergedAt": "2026-11-19T04:18:53Z",
+  "number": 891,
+  "state": "MERGED",
+  "title": "fix: fleet status and doctor no longer depend on the cwd; gateway-monitor timer fires again",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/891"
+ },
+ {
+  "headRefName": "feat/handoff-harness-adapters",
+  "mergedAt": null,
+  "number": 890,
+  "state": "OPEN",
+  "title": "feat(handoff): per-harness adapters for automatic handoff (plan 0)",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/890"
+ },
+ {
+  "headRefName": "fix/scratch-reaper-cargo-1-100",
+  "mergedAt": null,
+  "number": 889,
+  "state": "OPEN",
+  "title": "fix(scratch-reaper): recognise cargo 1.100 build-dir layout",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/889"
+ },
+ {
+  "headRefName": "fix/unit-gates-worker-crash-rerun",
+  "mergedAt": null,
+  "number": 888,
+  "state": "OPEN",
+  "title": "fix(ci): rerun the parallel pytest pass once when xdist workers die",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/888"
+ },
+ {
+  "headRefName": "fix/ui-gates-always-report",
+  "mergedAt": "2026-11-19T03:03:46Z",
+  "number": 887,
+  "state": "MERGED",
+  "title": "fix(ci): make ui-gates report on every pull request",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/887"
+ },
+ {
+  "headRefName": "fix/always-on-codex-followups",
+  "mergedAt": null,
+  "number": 886,
+  "state": "OPEN",
+  "title": "fix(always-on-review): Codex follow-ups from #820 + claude failure diagnosability",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/886"
+ },
+ {
+  "headRefName": "fix/unit-gates-xdist-flakes",
+  "mergedAt": "2026-11-19T04:47:41Z",
+  "number": 885,
+  "state": "MERGED",
+  "title": "test: harden share.js parse timeout under xdist load",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/885"
+ },
+ {
+  "headRefName": "feat/automatic-handoff-triggers",
+  "mergedAt": null,
+  "number": 884,
+  "state": "OPEN",
+  "title": "feat(handoff): arm automatic handoffs at the context limit",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/884"
+ },
+ {
+  "headRefName": "fix/member-host-followups",
+  "mergedAt": "2026-11-18T19:37:59Z",
+  "number": 883,
+  "state": "MERGED",
+  "title": "fix(member-host): follow-ups from #852/#839 reviews",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/883"
+ },
+ {
+  "headRefName": "fix/guard-push-deny-override",
+  "mergedAt": "2026-11-19T03:29:05Z",
+  "number": 882,
+  "state": "MERGED",
+  "title": "fix(workflow): guard denies guarded pushes with a one-shot human override",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/882"
+ },
+ {
+  "headRefName": "feat/pin-herdr-memory-0.1.10",
+  "mergedAt": "2026-11-18T18:43:04Z",
+  "number": 879,
+  "state": "MERGED",
+  "title": "pin(herdr-memory): 0.1.8 \u2192 0.1.10 so doctor stops calling deployed hosts drifted",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/879"
+ },
+ {
+  "headRefName": "fix/member-secret-smoke-ticket",
+  "mergedAt": "2026-11-18T18:07:11Z",
+  "number": 878,
+  "state": "MERGED",
+  "title": "fix(members): member-secret smoke script uses a valid ticket id",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/878"
+ },
+ {
+  "headRefName": "fix/run-watched-review-nits",
+  "mergedAt": "2026-11-18T19:32:24Z",
+  "number": 877,
+  "state": "MERGED",
+  "title": "fix(ci): run-watched review nits from #824",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/877"
+ },
+ {
+  "headRefName": "fix/fleet-watch-followups-v2",
+  "mergedAt": "2026-11-18T17:24:09Z",
+  "number": 876,
+  "state": "MERGED",
+  "title": "fix(fleet-watch): review follow-ups on top of the self-restart (supersedes #825)",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/876"
+ },
+ {
+  "headRefName": "fix/llm-proxy-timeouts-and-reset-noise",
+  "mergedAt": "2026-11-18T06:30:46Z",
+  "number": 875,
+  "state": "MERGED",
+  "title": "fix: quiet client-disconnect noise; llm-proxy fallback timeout no longer caps body read",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/875"
+ },
+ {
+  "headRefName": "fix/cp-web-whois-socket",
+  "mergedAt": "2026-11-18T05:50:54Z",
+  "number": 872,
+  "state": "MERGED",
+  "title": "Mount fabric whois socket into control-plane-web for the phone bridge",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/872"
+ },
+ {
+  "headRefName": "chore/bump-herdr-handoff-pin",
+  "mergedAt": "2026-11-18T04:10:43Z",
+  "number": 871,
+  "state": "MERGED",
+  "title": "chore(handoff): pin herdr-handoff to the takeover subagent guard",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/871"
+ },
+ {
+  "headRefName": "fix/fleet-watch-autospec-smoke",
+  "mergedAt": "2026-11-18T03:35:34Z",
+  "number": 870,
+  "state": "MERGED",
+  "title": "fix(fleet-watch): resolve smoke launchers off PATH; autospec smoke is doctor",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/870"
+ },
+ {
+  "headRefName": "feat/handoff-subagent-registry",
+  "mergedAt": "2026-11-18T01:18:51Z",
+  "number": 869,
+  "state": "MERGED",
+  "title": "feat(handoff): per-pane subagent registry for the takeover guard",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/869"
+ },
+ {
+  "headRefName": "feat/handoff-auto-installer",
+  "mergedAt": "2026-11-17T23:28:24Z",
+  "number": 868,
+  "state": "MERGED",
+  "title": "feat(handoff): herdr-eng handoff auto install|uninstall|check",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/868"
+ },
+ {
+  "headRefName": "feat/fleet-watch-self-restart",
+  "mergedAt": "2026-11-18T00:56:26Z",
+  "number": 867,
+  "state": "MERGED",
+  "title": "fleet-watch: self-restart the watcher after a herdr-engineering self-update (#865)",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/867"
+ },
+ {
+  "headRefName": "feat/handoff-wait-for-subagents",
+  "mergedAt": "2026-11-17T23:26:14Z",
+  "number": 864,
+  "state": "MERGED",
+  "title": "feat(handoff): infer a 1M window and repeat an ignored context reminder",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/864"
+ },
+ {
+  "headRefName": "feat/handoff-wait-for-subagents",
+  "mergedAt": "2026-11-17T21:27:15Z",
+  "number": 863,
+  "state": "MERGED",
+  "title": "feat(handoff): wait for running subagents, opt-in context-threshold trigger",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/863"
+ },
+ {
+  "headRefName": "feat/pretooluse-guard-hooks",
+  "mergedAt": "2026-11-18T16:36:01Z",
+  "number": 862,
+  "state": "MERGED",
+  "title": "feat(workflow): blocking PreToolUse guard hooks for /tmp writes and pushes",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/862"
+ },
+ {
+  "headRefName": "feat/install-screenwright-latest",
+  "mergedAt": "2026-11-17T23:22:37Z",
+  "number": 861,
+  "state": "MERGED",
+  "title": "feat(install): always install the latest screenwright (tracks origin/main)",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/861"
+ },
+ {
+  "headRefName": "docs/agents-md",
+  "mergedAt": "2026-11-17T23:20:15Z",
+  "number": 860,
+  "state": "MERGED",
+  "title": "docs: repo-specific agent rules (AGENTS.md + CLAUDE.md)",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/860"
+ },
+ {
+  "headRefName": "fix/perf-inspector-durable-write-lock",
+  "mergedAt": "2026-11-17T19:44:35Z",
+  "number": 859,
+  "state": "MERGED",
+  "title": "fix(inspector): release the store lock while a durable write waits on the database",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/859"
+ },
+ {
+  "headRefName": "feat/claude-default-workflow-hooks",
+  "mergedAt": "2026-11-17T19:25:13Z",
+  "number": 858,
+  "state": "MERGED",
+  "title": "feat(workflow): managed Claude Code hooks for the default engineering workflow",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/858"
+ },
+ {
+  "headRefName": "feat/always-on-review-muse-opus-verify",
+  "mergedAt": "2026-11-18T06:10:04Z",
+  "number": 857,
+  "state": "MERGED",
+  "title": "feat(ci-review): tier-1 ensemble checked by Opus, poll scope, Muse serve unit",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/857"
+ },
+ {
+  "headRefName": "docs/system-graph-exec-log-p3",
+  "mergedAt": "2026-11-17T08:23:38Z",
+  "number": 856,
+  "state": "MERGED",
+  "title": "docs(spec): repair pass 3 \u2014 extraction, matrix, P0-P6 gate status, 192-test re-run",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/856"
+ },
+ {
+  "headRefName": "docs/system-graph-exec-log2",
+  "mergedAt": "2026-11-17T07:59:26Z",
+  "number": 855,
+  "state": "MERGED",
+  "title": "docs(spec): repair pass 2 \u2014 re-verify P0-P6 gates on current origin/main",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/855"
+ },
+ {
+  "headRefName": "docs/system-graph-exec-log",
+  "mergedAt": "2026-11-17T07:44:03Z",
+  "number": 854,
+  "state": "MERGED",
+  "title": "docs(spec): P0-P6 execution log + deploy routing verification",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/854"
+ },
+ {
+  "headRefName": "fix/auth-open-latency",
+  "mergedAt": "2026-11-17T16:29:31Z",
+  "number": 853,
+  "state": "MERGED",
+  "title": "fix(rakazo): auth/open audit write off the request path",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/853"
+ },
+ {
+  "headRefName": "feat/share-member-host",
+  "mergedAt": "2026-11-17T08:11:01Z",
+  "number": 852,
+  "state": "MERGED",
+  "title": "feat(share): serve the member UI on its own origin via control_plane.share.member_host",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/852"
+ },
+ {
+  "headRefName": "fix/artifact-host-pyjwt",
+  "mergedAt": "2026-11-17T06:13:23Z",
+  "number": 851,
+  "state": "MERGED",
+  "title": "fix(artifact-host): bump PyJWT to 2.15.1",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/851"
+ },
+ {
+  "headRefName": "fix/checkpoint-cli-valueerror-reason",
+  "mergedAt": "2026-11-17T05:21:31Z",
+  "number": 850,
+  "state": "MERGED",
+  "title": "fix(cli): control-plane checkpoint prints a redacted reason for any ValueError",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/850"
+ },
+ {
+  "headRefName": "fix/rollout-transient-unreachable",
+  "mergedAt": "2026-11-17T06:09:26Z",
+  "number": 849,
+  "state": "MERGED",
+  "title": "fix(fleet-rollout): stop flapping sessions on transient unresponsive rows",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/849"
+ },
+ {
+  "headRefName": "fix/ledger-gap-cap-on-close",
+  "mergedAt": "2026-11-17T03:32:17Z",
+  "number": 848,
+  "state": "MERGED",
+  "title": "fix(ledger): keep the 64-gap cap when a late arrival splits a gap",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/848"
+ },
+ {
+  "headRefName": "fix/rollout-host-pkg-fields",
+  "mergedAt": "2026-11-17T03:33:21Z",
+  "number": 847,
+  "state": "MERGED",
+  "title": "fix(fleet-rollout): ignore scripts/devDependencies when comparing Host package.json",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/847"
+ },
+ {
+  "headRefName": "fix/rollout-host-code-check",
+  "mergedAt": "2026-11-17T01:47:18Z",
+  "number": 846,
+  "state": "MERGED",
+  "title": "fix(fleet-rollout): accept hot-reloaded Host when its code is unchanged",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/846"
+ },
+ {
+  "headRefName": "feat/rakazo-default-assistant",
+  "mergedAt": null,
+  "number": 834,
+  "state": "CLOSED",
+  "title": "feat(rakazo): default assistant flag, open_owner allow-list, gateway XFF hardening",
+  "url": "https://github.com/berlinguyinca/herdr-engineering/pull/834"
+ }
+]

@@ -1,0 +1,11 @@
+[Summary] Handoffs ●  CI ● 
+────────────────────────────────────────────────────────────
+Goal
+Filter chips become single-select toggles
+Done
+· toggle groups + tests
+Now
+· full vitest run
+Next
+· push, PR, CI
+updated at handoff #3 (fallback briefing)

@@ -399,3 +399,55 @@ def test_http_terminal_publish_needs_a_host_token(http):
     assert status == 200 and out['session_id'] == SID
     full = h.call(BASE + '/summary', key='read', method='GET')[1]['full_report']
     assert full['state'] == 'done' and full['source'] == 'terminal'
+
+
+# -- the snapshot series: each terminal publish keeps its numbers on the durable event ---------------
+POINT = {'prompts': 5, 'events': 40, 'tool_calls': 9, 'tool_failures': 1, 'compactions': 0, 'agents': 0,
+         'worked_s': 600, 'fresh': 100, 'cached': 900, 'segments': 2, 'drift': False, 'coverage': 'complete',
+         'taken_at': '2026-01-01T09:00:00Z'}
+
+
+def test_terminal_publishes_build_a_snapshot_series_oldest_first(acknowledged_sink):
+    repo = ControlPlaneRepo(sink=acknowledged_sink)
+    native(repo)
+    svc = service(repo)
+    for i in range(3):
+        svc.publish('bender', {'agent': 'claude', 'target': 'abc-123', 'report': REPORT,
+                               'snapshot': {**POINT, 'prompts': 5 + i, 'taken_at': f'2026-01-01T09:0{i}:00Z'}})
+    got = svc.get(SID)
+    assert [s['prompts'] for s in got['snapshots']] == [5, 6, 7] and 'snapshot' not in got
+    assert got['snapshots'][0]['taken_at'] == '2026-01-01T09:00:00Z'
+    assert [s['prompts'] for s in service(repo).get(SID)['snapshots']] == [5, 6, 7]      # durable across a restart
+
+
+def test_a_hostile_snapshot_is_cleaned_or_dropped_and_never_blocks_the_report(acknowledged_sink):
+    repo = ControlPlaneRepo(sink=acknowledged_sink)
+    native(repo)
+    svc = service(repo)
+    svc.publish('bender', {'agent': 'claude', 'target': 'abc-123', 'report': REPORT,
+                           'snapshot': {**POINT, 'evil': '<script>alert(1)</script>', 'worked_s': '9', 'coverage': '<b>'}})
+    svc.publish('bender', {'agent': 'claude', 'target': 'abc-123', 'report': REPORT, 'snapshot': 'junk'})
+    svc.publish('bender', {'agent': 'claude', 'target': 'abc-123', 'report': REPORT})
+    got = svc.get(SID)
+    assert got['state'] == 'done' and len(got['snapshots']) == 1
+    (only,) = got['snapshots']
+    assert 'evil' not in only and only['worked_s'] is None and only['coverage'] is None
+
+
+def test_the_series_is_bounded(acknowledged_sink):
+    repo = ControlPlaneRepo(sink=acknowledged_sink)
+    native(repo)
+    svc = service(repo)
+    for i in range(sr.MAX_SNAPSHOTS + 3):
+        svc.publish('bender', {'agent': 'claude', 'target': 'abc-123', 'report': REPORT,
+                               'snapshot': {**POINT, 'prompts': i}})
+    got = svc.get(SID)['snapshots']
+    assert len(got) == sr.MAX_SNAPSHOTS and got[-1]['prompts'] == sr.MAX_SNAPSHOTS + 2
+
+
+def test_a_session_with_no_snapshots_has_none_in_its_report_view(acknowledged_sink):
+    repo = ControlPlaneRepo(sink=acknowledged_sink)
+    native(repo)
+    svc = service(repo)
+    svc.publish('bender', {'agent': 'claude', 'target': 'abc-123', 'report': REPORT})
+    assert 'snapshots' not in svc.get(SID)

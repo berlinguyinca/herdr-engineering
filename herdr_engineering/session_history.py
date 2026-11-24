@@ -514,6 +514,54 @@ def build_prompts(events: list[dict], *, text_limit: int = 400) -> tuple[list[di
     return prompts, total
 
 
+OUTLINE_CHUNKS = 20
+OUTLINE_FAILED = 3
+
+
+def _counts(events: list[dict]) -> dict:
+    """Totals over the full event list, so they do not depend on how the middle was trimmed."""
+    return {"tool_calls": sum(1 for e in events if e["kind"] == "tool_call"),
+            "tool_failures": sum(1 for e in events if e["kind"] == "tool_result" and e.get("ok") is False)}
+
+
+def build_outline(events: list[dict], lo: int, hi: int) -> list[dict]:
+    """What happened in ``events[lo:hi]`` (the span the trim left out), in at most ``OUTLINE_CHUNKS`` chunks.
+
+    Computed from the events alone: ranges, times, counts by kind, failed tool calls and the last assistant line.
+    Nothing in it is written by a model, and it is small enough to sit beside the trimmed events.
+    """
+    span = events[lo:hi]
+    if not span:
+        return []
+    size = -(-len(span) // OUTLINE_CHUNKS)
+    out = []
+    for start in range(0, len(span), size):
+        part = span[start:start + size]
+        counts: dict[str, int] = {}
+        for e in part:
+            counts[e["kind"]] = counts.get(e["kind"], 0) + 1
+        failed = [e for e in part if e["kind"] == "tool_result" and e.get("ok") is False]
+        last = next((e for e in reversed(part) if e["kind"] == "assistant" and e.get("text")), None)
+        times = [t for t in (normalize_ts(e.get("ts")) for e in part) if t]
+        out.append({"from": lo + start, "to": lo + start + len(part) - 1, "events": len(part),
+                    "ts_from": times[0] if times else None, "ts_to": times[-1] if times else None,
+                    "counts": counts, "failures": len(failed),
+                    "failed": [f"{e.get('tool') or 'tool'}: {e['text'][:120]}" for e in failed[:OUTLINE_FAILED]],
+                    "last_assistant": last["text"][:120] if last else None})
+    return out
+
+
+def _previous_snapshot(res: Resolution, home: Path) -> dict | None:
+    """The newest kept /summary snapshot of this session (read only), or None."""
+    if not (res.agent and res.session_id):
+        return None
+    try:
+        from . import summary_snapshots
+        return summary_snapshots.previous(summary_snapshots.cache_dir(home), res.agent, res.session_id)
+    except Exception:
+        return None
+
+
 def read_history(res: Resolution, *, home: Path | None = None, max_events: int = 400) -> dict:
     home = home or Path.home()
     gaps: list[str] = []
@@ -550,6 +598,7 @@ def read_history(res: Resolution, *, home: Path | None = None, max_events: int =
     dispatch_ts = [normalize_ts(e.get("ts")) for e in events if e["kind"] == "child_dispatch"]
     omitted = max(0, len(events) - max_events)
     shown = events if not omitted else events[:60] + events[-(max_events - 60):]
+    outline = build_outline(events, 60, 60 + omitted) if omitted else []
     return {
         "agent": res.agent, "session_id": res.session_id, "record": res.path, "method": res.method,
         "cwd": (cwds[-1] if cwds else None), "cwds": cwds,
@@ -557,6 +606,7 @@ def read_history(res: Resolution, *, home: Path | None = None, max_events: int =
         "compactions": len(compactions), "child_records": meta["child_records"],
         "prompts": prompts, "prompts_total": prompts_total, "dispatch_ts": dispatch_ts,
         "activity_ts": activity_ts, "usage": meta.get("usage", []),
+        "outline": outline, "counts": _counts(events), "previous_snapshot": _previous_snapshot(res, home),
         "coverage": {"verdict": verdict, "gaps": gaps},
         "read_only": True,
     }

@@ -1,0 +1,5 @@
+Captured 2026-11-18 from berlinguyinca/herdr-engineering with the owner's own gh login (read-only, no token stored):
+  gh pr list --repo berlinguyinca/herdr-engineering --state all --limit 40 --json number,title,headRefName,state,mergedAt,url,statusCheckRollup
+PRs kept: 890 (open, all green), 889 (a Woodpecker context FAILURE), 884 (a context PENDING), 862 (a context ERROR, merged), 891 (merged).
+URLs: https://github.com/berlinguyinca/herdr-engineering/pull/{890,889,884,862,891}
+Not in the rollup: a required context that never reported (e.g. ci/woodpecker/pr/ui-gates on PR 890); GitHub cannot list it.
