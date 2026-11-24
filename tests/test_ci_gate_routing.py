@@ -99,6 +99,15 @@ def applicability(repo: Path, sha: str, event: str = "pull_request", base: str =
     ".woodpecker/artifact-handoff.yml",
     "scripts/ci-pipeline-freshness.sh",      # not under scripts/ci/
     "scripts/ci/integrate-main.sh",
+    # Bug-hunt: these used to skip the required check because the unit gate was an allow-list. Default is now RUN.
+    "herdr_artifact_host/server.py",
+    "ansible/site.yml",
+    "skills/herdr/SKILL.md",                 # a skill's markdown is not a doc: tests read it
+    "scripts/install.sh",
+    "package.json",
+    "package-lock.json",
+    "schemas/new.json",
+    "a_brand_new_top_level_dir/anything.py", # drift guard: an unknown path must run the suite
 ])
 def test_a_change_that_can_affect_the_suite_runs_it(repo, path):
     result = applicability(repo, change(repo, path))
@@ -118,6 +127,55 @@ def test_a_change_that_cannot_affect_the_suite_is_skipped(repo, path):
     result = applicability(repo, change(repo, path))
     assert result.returncode == 3, (result.stdout, result.stderr)
     assert "skipping the suite" in result.stdout
+
+
+@pytest.mark.parametrize("path", [".gitignore", ".github/CODEOWNERS", "LICENSE", "docs/adr/x.png"])
+def test_the_explicit_exempt_list_is_skipped(repo, path):
+    assert applicability(repo, change(repo, path)).returncode == 3
+
+
+def _unit_gate_verdicts(paths: list[str]) -> tuple[dict[str, bool], list[str], list[str]]:
+    """Ask the real unit-gate matcher about every path in ONE shell; also return the script's own exempt prefixes and files.
+
+    The paths go in on stdin, and `path` is assigned per line before `herdr_covered_path` runs (the matcher reads the global
+    `path`). Output is `V<0|1> <path>` per verdict, then `P <prefix>` / `F <file>` lines for the exempt list the script defines.
+    """
+    script = (
+        f'src="$(sed -n "/^gate=/,/^label=/p" {APPLICABLE})"; eval "$src"; '
+        f'eval "$(sed -n "/^herdr_covered_path()/,/^}}/p" {APPLICABLE})"; '
+        'while IFS= read -r path; do if herdr_covered_path; then echo "V1 $path"; else echo "V0 $path"; fi; done; '
+        'while IFS= read -r e; do [ -n "$e" ] && echo "P $e"; done <<< "$EXEMPT_PREFIXES"; '
+        'while IFS= read -r e; do [ -n "$e" ] && echo "F $e"; done <<< "$EXEMPT_FILES"'
+    )
+    out = subprocess.run(["bash", "-c", script], input="\n".join(paths) + "\n", capture_output=True, text=True, check=True)
+    covered: dict[str, bool] = {}
+    prefixes: list[str] = []
+    files: list[str] = []
+    for line in out.stdout.splitlines():
+        tag, _, rest = line.partition(" ")
+        if tag in ("V0", "V1"):
+            covered[rest] = tag == "V1"
+        elif tag == "P":
+            prefixes.append(rest)
+        elif tag == "F":
+            files.append(rest)
+    return covered, prefixes, files
+
+
+def test_every_tracked_path_outside_the_exempt_list_runs_the_suite():
+    """Drift guard: ask the real matcher about every tracked file; only the script's own exempt list may be skipped."""
+    tracked = _tracked()
+    covered, prefixes, files = _unit_gate_verdicts(tracked)
+    assert set(covered) == set(tracked), "the matcher did not answer for every tracked path"
+    assert any(p.startswith("herdr_artifact_host/") for p in tracked), "vacuous: no tracked files found"
+    skipped = [p for p in tracked if not covered[p]]
+    # Allowed set is read from the script's EXEMPT_* (single source) plus its root-level-markdown rule.
+    unexpected = [p for p in skipped if not (p.startswith(tuple(prefixes)) or p in files or ("/" not in p and p.endswith(".md")))]
+    assert not unexpected, f"paths that skip the required unit gate: {unexpected[:10]}"
+    # Whatever the exempt list says, product code, tests, scripts and skills must never be skippable.
+    must_run = tuple(f"{d}/" for d in ("herdr_engineering", "herdr_artifact_host", "tests", "scripts", "skills", "ansible", "deploy"))
+    wrongly_skipped = [p for p in skipped if p.startswith(must_run)]
+    assert not wrongly_skipped, f"source paths exempted from the required unit gate: {wrongly_skipped[:10]}"
 
 
 def test_a_branch_identical_to_its_base_has_nothing_to_prove(repo):
