@@ -34,3 +34,11 @@ test('drifted-only filter hides components that match everywhere', () => {
 test('empty fleet explains how data arrives', () => {
   assert.match(renderFleetMatrix({ hosts: [], components: [] }), /No host has reported/);
 });
+
+test('an unknown cell state is escaped in the class attribute and never prints title="undefined"', () => {
+  const evil = { ...matrix, hosts: [{ host: 'bender', collected_at: null }],
+    components: [{ group: 'tools', name: 'x', reference: '1', hosts: { bender: { version: '1', state: 'x" onmouseover="y' } } }] };
+  const html = renderFleetMatrix(evil, {}, now);
+  assert.ok(!html.includes('" onmouseover='));
+  assert.ok(!html.includes('undefined'));
+});

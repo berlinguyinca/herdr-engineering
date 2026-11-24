@@ -23,7 +23,7 @@ event types `rollout.observed|planned|started|resumed|succeeded|halted|supersede
 | field | allowed values |
 |---|---|
 | `repo`, `trigger.repo`, `targets[].repo` | `autospec pi-engineering herdr-engineering ai-sync claude-config` |
-| `host`, `halted_at_host`, `log.host` | `beast bender macbook-pro` (a new fleet member needs a code change) |
+| `host`, `halted_at_host`, `log.host` | `beast bender mac-studio macbook-pro` (a new fleet member needs a code change) |
 | `status` | `pending precheck applying checking ok blocked failed unreachable skipped rolled_back` |
 | `reason` | `dirty_checkout not_on_main unpublished_commits busy timeout health_failed apply_failed ssh_failed halted optional_unreachable not_published rate_limited ahead_of_target operator downgrade lock_invalid` |
 | `trigger` | `repo`, `sha` (40 hex), optional `pr` (int), `merged_at` (UTC) - no title |

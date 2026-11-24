@@ -9,6 +9,17 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 - `herdr_artifact_host` housekeeping gains a `versions` duty: superseded versions (once a newer one is `version_grace`, default 1 h, old) and every version of a retracted or tombstoned artifact are marked `purged`, and the blobs only they used are deleted (row and file) under publish's per-sha lock. The current version of a live artifact, `legal_hold` artifacts, versions a pending or live share points at, and blobs a kept version still names are never touched. Before this, publishing repeatedly or deleting an artifact left every old blob on the volume while the quota counted only the current version, so one member could fill the disk. The orphan-blob sweep now ignores purged versions' manifests. `SweepReport` gains `versions_purged`.
 - `SyncedDirectory.groups` returns no groups for an account listed under `disabled` in `members.json` (the sync still lists it under its group), so a disabled account's member session and agent tokens are refused on the next recheck instead of waiting for housekeeping's revocation pass.
+### Fix: fabric agent no longer drops every lease on a failed listener scan
+
+- `scan_once` ignored `ListenerInventory.complete`, so one timed-out or failed `ss`/`lsof` (an empty inventory) released every lease and stopped every forwarder, and the next cycle re-adopted them with new leases. A port is now treated as gone only on a complete scan.
+- At startup, a remembered forward port that cannot be rebound (or whose forwarder fails to start) now drops the store entry and closes its lease, so the next scan re-adopts the service with a working forwarder instead of advertising a dead URL.
+
+### Fix: web packages bug-hunt (collaboration sign-in/out, room polling, composer, member routes, nav badge)
+
+- Collaboration: blocked site storage (`window.sessionStorage` throwing) no longer stops `collab-view.js`, and so the whole dashboard, from loading; it falls back to memory. Sign out now also ends the Cognito Hosted-UI session (`/logout?client_id=...&logout_uri=...`, `logout_uri` defaulting to `public_url`, which the user pool must list as an allowed sign-out URL). Every `CollabApi` call now times out after 30 s, so a half-open connection no longer freezes a room silently; `showRoom` removes its `focusout` listener on teardown instead of adding one per visit.
+- Composer: a message delivered after the composer was disposed mid-send no longer survives as the stored draft.
+- Dashboard: mission titles are refreshed after 60 s and a failed load is no longer cached as an empty map (`mission-titles.js`). The nav badge announces "N open, M critical" instead of "true critical".
+- Member page: a slow library load no longer repaints over a newer route.
 ### Fix: required `unit-gates` no longer skips PRs that touch untested-by-list paths; Rust module gates fail in CI without cargo
 
 - `scripts/ci/unit-gates-applicable.sh unit` is now default-run with a short exempt list instead of an allow-list, so `herdr_artifact_host/`, `ansible/`, `skills/`, `scripts/*.sh`, `package.json`, `package-lock.json` and any new top-level path run the suite (they previously passed the required check with no tests; `main-moved-check.sh` shared the gap). A test checks every tracked file against the matcher.
