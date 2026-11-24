@@ -36,6 +36,7 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 from ..version import __version__
 from .artifact_acl import is_agent_collaborator
 from .artifacts import ArtifactConflict, ArtifactError
+from .browser_guard import browser_write_refusal, host_ok
 from .envelope import EnvelopeConflict
 from .events import SequenceCollision
 from .federation import kind_for_role
@@ -227,21 +228,19 @@ class _DaemonThreadingServerV6(_DaemonThreadingServer):
 
 
 
-def _dashboard_host_ok(host_header, extra_hosts):
-    """A Host an attacker cannot make point here: an IP literal, localhost, or a configured name.
-    DNS rebinding needs a DNS name, so a bare name is refused unless the operator listed it."""
-    import ipaddress
-    host = host_header.strip().lower()
-    if host in extra_hosts:
-        return True
-    name = host[1:host.index("]")] if host.startswith("[") and "]" in host else host.rsplit(":", 1)[0] if host.count(":") == 1 else host
-    if name == "localhost":
-        return True
-    try:
-        ipaddress.ip_address(name)
-    except ValueError:
-        return False
-    return True
+_dashboard_host_ok = host_ok
+
+# Main-listener routes the browser defences do NOT apply to, by exact path. Each is called by something that is not a
+# browser and authenticates itself, so a browser-oriented check would only break it.
+_BROWSER_GUARD_EXEMPT = frozenset({
+    # GitHub posts here: no Origin, its own Host (the public webhook name) and a content type the operator picked
+    # in the GitHub settings. It is authenticated by the HMAC signature of the body, so rebinding is moot.
+    "/api/v1/intelligence/webhooks/github",
+})
+
+
+def _is_wildcard_bind(host):
+    return not host or str(host) in {"0.0.0.0", "::", "[::]"}
 
 def _content_length(raw):
     """Non-negative int, or None when the header is malformed (never raises)."""
@@ -743,6 +742,10 @@ class ControlPlaneServer:
                 self._wire_room_artifact_access(collab, artifact_store, artifact_acl, unified_workspace_config)
                 collab.quorum_config = review_quorum        # T15: review items and the "reviewed at head" evidence use the T06 policy
         self.host = host
+        # Host names the main listener answers to besides IP literals and localhost: the names the operator
+        # configured (control_plane.collab.dashboard_hosts / --collab-dashboard-host) and the name it is bound to.
+        self.allowed_hosts = self.collab_dashboard_hosts | (
+            frozenset() if _is_wildcard_bind(host) else frozenset({str(host).lower()}))
         self.port = port
         self.web_root = Path(web_root) if web_root else _WEB_ROOT
         self._subscribers = set()
@@ -2195,6 +2198,23 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                     return {"kind": kind, "id": f"key:{digest}", "authenticated_by": "api_key"}
             return {"kind": "unknown", "id": None, "authenticated_by": "none"}
 
+        def _main_listener_guard(self, writes):
+            """Refuse a request a hostile web page could have sent to the main listener; True when it did.
+
+            Every request needs a Host an attacker's DNS name cannot be (DNS rebinding); every state-changing
+            method (``writes``) also refuses cross-origin / cross-site browser requests and non-JSON browser
+            bodies. Agents and the CLI send no Origin, so they only need a Host the operator listed."""
+            if self._path_only() in _BROWSER_GUARD_EXEMPT:
+                return False
+            if not host_ok(self.headers.get("Host", ""), server.allowed_hosts):
+                self.close_connection = True
+                return self._deny(403, "host not allowed: add it to control_plane.collab.dashboard_hosts")
+            if writes:
+                refusal = browser_write_refusal(self.headers, server.allowed_hosts)
+                if refusal:
+                    return self._deny(*refusal)
+            return False
+
         def _deny(self, status, message):
             """Send the error response, close the connection, and report the refusal.
 
@@ -2655,6 +2675,8 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                 return self._rakazo()
             if self._is_collab_path():
                 return self._collab()
+            if self._main_listener_guard(writes=False):
+                return
             if self._path_only() == _FLEET_CONFIG_PATH:
                 return self._fleet_config_get()
             if self._path_only() in _DEPLOYMENT_HOST_GET_PATHS:      # host token, not X-API-Key
@@ -2709,6 +2731,8 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                 return self._deny(400, "ambiguous request framing")
             if self._is_collab_path():
                 return self._collab()
+            if self._main_listener_guard(writes=True):
+                return
             if self._path_only() == _FLEET_CONFIG_PATH + "/applied":
                 return self._fleet_config_applied()
             if self._path_only() == "/api/v1/intelligence/webhooks/github":
@@ -2863,6 +2887,8 @@ def _make_handler(server, public=False, operator=False, fabric=False):
             if (len(self.headers.get_all("Content-Length") or []) > 1
                     or "Transfer-Encoding" in self.headers):
                 return self._deny(400, "ambiguous request framing")
+            if self._main_listener_guard(writes=True):
+                return
             if self._path_only() == _FLEET_CONFIG_PATH + "/applied":
                 return self._fleet_config_applied()
             cleared = _DEPLOYMENT_REQUEST_PATH.match(self._path_only())

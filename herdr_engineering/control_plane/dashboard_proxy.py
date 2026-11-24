@@ -22,6 +22,8 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit
 
+from .browser_guard import browser_write_refusal, host_ok
+
 DEFAULT_UPSTREAM = "http://control-plane-web:8080"
 
 # "METHOD /path": ``*`` matches exactly one path segment, a trailing ``**`` matches one or more segments.
@@ -62,7 +64,7 @@ _NEVER_FORWARD = frozenset({"x-api-key", "host", "content-length", "x-forwarded-
                             "x-forwarded-proto", "forwarded", "x-real-ip"})
 _MAX_BODY = 128 * 1024 * 1024
 _ALLOW_ENTRY = re.compile(r"^(POST|PUT|PATCH|DELETE) (/\S*)$")
-_SETTINGS_KEYS = frozenset({"viewer_key_file", "operator_key_file", "upstream", "operator_post_allowlist"})
+_SETTINGS_KEYS = frozenset({"viewer_key_file", "operator_key_file", "upstream", "operator_post_allowlist", "allowed_hosts"})
 
 
 class ProxyConfigError(Exception):
@@ -75,6 +77,8 @@ class DashboardProxySettings:
     operator_key_file: str | None = None
     upstream: str = DEFAULT_UPSTREAM
     allowlist: tuple[str, ...] = DEFAULT_OPERATOR_POST_ALLOWLIST
+    # DNS names the dashboard is opened by (the proxy's own public names). IP literals and localhost always work.
+    allowed_hosts: tuple[str, ...] = ()
 
 
 def parse_dashboard_proxy(raw) -> DashboardProxySettings | None:
@@ -100,8 +104,11 @@ def parse_dashboard_proxy(raw) -> DashboardProxySettings | None:
     if not isinstance(allow, list) or not all(isinstance(v, str) and _ALLOW_ENTRY.match(v) for v in allow):
         raise ValueError("dashboard_proxy.operator_post_allowlist must be a list of 'METHOD /path' strings "
                          "(POST, PUT, PATCH or DELETE; * = one segment, trailing ** = the rest)")
+    hosts = raw.get("allowed_hosts", [])
+    if not isinstance(hosts, list) or not all(isinstance(v, str) and v.strip() for v in hosts):
+        raise ValueError("dashboard_proxy.allowed_hosts must be a list of host names")
     return DashboardProxySettings(viewer.strip(), operator.strip() if operator else None, upstream.rstrip("/"),
-                                  tuple(allow))
+                                  tuple(allow), tuple(h.strip().lower() for h in hosts))
 
 
 def read_key_file(path: str) -> str:
@@ -150,12 +157,14 @@ class DashboardProxy:
     """Threaded reverse proxy. ``serve()`` blocks; ``shutdown()`` stops it."""
 
     def __init__(self, upstream: str, *, viewer_key: str, operator_key: str | None,
-                 allowlist: tuple[str, ...], host: str = "0.0.0.0", port: int = 8081):
+                 allowlist: tuple[str, ...], host: str = "0.0.0.0", port: int = 8081,
+                 allowed_hosts: tuple[str, ...] = ()):
         parts = urlsplit(upstream)
         self._scheme, self._up_host = parts.scheme, parts.hostname
         self._up_port = parts.port or (443 if parts.scheme == "https" else 80)
         self._up_netloc = parts.netloc
         self._viewer, self._operator, self._allowlist = viewer_key, operator_key, tuple(allowlist)
+        self.allowed_hosts = frozenset(h.lower() for h in allowed_hosts)
         self._ready = threading.Event()
         proxy = self
 
@@ -214,6 +223,14 @@ def _make_handler(proxy: DashboardProxy):
 
         def _forward(self) -> None:
             method = self.command
+            # The proxy attaches a credential, so a hostile web page must not be able to drive it: a Host that
+            # is not ours (DNS rebinding) is refused on every method, and a browser write must be same-origin.
+            if not host_ok(self.headers.get("Host", ""), proxy.allowed_hosts):
+                return self._refuse(403, "proxy: host not allowed (dashboard_proxy.allowed_hosts)")
+            if method in _MUTATING:
+                refusal = browser_write_refusal(self.headers, proxy.allowed_hosts)
+                if refusal:
+                    return self._refuse(refusal[0], "proxy: " + refusal[1])
             key, status, message = proxy.key_for(method, self.path)
             if key is None:
                 return self._refuse(status or 403, message)
@@ -230,6 +247,9 @@ def _make_handler(proxy: DashboardProxy):
                        if k.lower() not in _HOP_BY_HOP and k.lower() not in _NEVER_FORWARD}
             headers["X-API-Key"] = key
             headers["Host"] = proxy._up_netloc
+            if self.headers.get("Origin") is not None:
+                # Already checked against OUR Host above; the upstream compares Origin with the Host it sees.
+                headers["Origin"] = f"{proxy._scheme}://{proxy._up_netloc}"
             headers["Connection"] = "close"
             if body is not None:
                 headers["Content-Length"] = str(len(body))
@@ -283,4 +303,5 @@ def build_from_settings(settings: DashboardProxySettings, host: str, port: int) 
     viewer = read_key_file(settings.viewer_key_file)
     operator = read_key_file(settings.operator_key_file) if settings.operator_key_file else None
     return DashboardProxy(settings.upstream, viewer_key=viewer, operator_key=operator,
-                          allowlist=settings.allowlist, host=host, port=port)
+                          allowlist=settings.allowlist, host=host, port=port,
+                          allowed_hosts=settings.allowed_hosts)

@@ -278,3 +278,58 @@ def test_settings_built_from_key_files_proxy_a_real_server(cp, tmp_path):
     finally:
         px.shutdown()
         thread.join(timeout=3)
+
+
+# ---- browser defences: the proxy attaches the operator key, so a hostile web page must not drive it ----
+
+SEND = "/api/v1/sessions/s1/messages"
+
+
+def test_a_cross_origin_write_never_gets_the_operator_key(cp, proxy):
+    status, body = call(proxy.port, "POST", SEND, headers={"Origin": "https://evil.example"}, body={})
+    assert status == 403 and b"cross-origin" in body
+
+
+def test_a_cross_site_write_without_origin_is_refused(proxy):
+    status, body = call(proxy.port, "POST", SEND, headers={"Sec-Fetch-Site": "cross-site"}, body={})
+    assert status == 403 and b"cross-site" in body
+
+
+def test_a_browser_write_that_is_not_json_is_refused(proxy):
+    origin = f"http://127.0.0.1:{proxy.port}"
+    conn = http.client.HTTPConnection("127.0.0.1", proxy.port, timeout=10)
+    conn.request("POST", SEND, body=b"{}", headers={"Origin": origin, "Content-Type": "text/plain"})
+    assert conn.getresponse().status == 415
+    conn.close()
+
+
+def test_a_rebound_host_is_refused_even_for_reads(proxy):
+    for method in ("GET", "POST"):
+        status, body = call(proxy.port, method, "/api/v1/sessions", headers={"Host": "evil.example"}, body=None)
+        assert status == 403 and b"host not allowed" in body
+
+
+def test_the_dashboard_itself_still_works_same_origin(cp, proxy):
+    origin = f"http://127.0.0.1:{proxy.port}"
+    status, _ = call(proxy.port, "POST", "/api/v1/attention/ack", body={},
+                     headers={"Origin": origin, "Sec-Fetch-Site": "same-origin"})
+    assert status not in (401, 403)       # the upstream saw an Origin equal to its own Host, with the key
+    assert call(proxy.port, "GET", "/api/v1/sessions", headers={"Origin": origin})[0] == 200
+
+
+def test_a_configured_proxy_name_is_accepted(cp):
+    px, thread = start_proxy(cp.port)
+    px.allowed_hosts = frozenset({"dash.lan"})
+    try:
+        assert call(px.port, "GET", "/api/v1/sessions", headers={"Host": "dash.lan"})[0] == 200
+        assert call(px.port, "GET", "/api/v1/sessions", headers={"Host": "dash.lan:81"})[0] == 200
+    finally:
+        px.shutdown()
+        thread.join(timeout=3)
+
+
+def test_allowed_hosts_is_a_setting():
+    s = parse_dashboard_proxy({"viewer_key_file": "/k/v", "allowed_hosts": ["Dash.LAN"]})
+    assert s.allowed_hosts == ("dash.lan",)
+    with pytest.raises(ValueError):
+        parse_dashboard_proxy({"viewer_key_file": "/k/v", "allowed_hosts": "dash.lan"})
