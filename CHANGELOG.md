@@ -18,6 +18,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - `herdr_linux`/`herdr_macos` roles: the "Install Herdr" / "Install Pi" tasks installed nothing yet reported changed; they are now "Verify" tasks that only report: when the pinned herdr or pi is missing or another version they print a `DRIFT:` line (shown by a following "Report ... drift" task, since an ok task's stderr is hidden) and never fail the host or stop the fleet update (nothing in the role installs them, the operator does). Hosts no longer report changed for them.
 - `fleet-join.sh`: `--user` no longer overwrites the exported `USER` seen by ansible; the lease count prints once.
 - `collab-worker.sh`: task ids that are not plain tokens are skipped (they were written as file names), a JSON-RPC error reply no longer ends the worker loop, and one malformed task (for example null text) is logged to stderr and skipped instead of starving the good tasks in the same reply; skipped invalid ids are logged too. A task entry that is not an object, or has a non-integer `attempt`, is skipped the same way. The script is edited in its template (`packages/collab-scripts.js`) and regenerated into `deploy/control-plane/collab-worker.sh` and `packages/collab-scripts/worker.sh`.
+### Fix: fabric agent no longer drops every lease on a failed listener scan
+
+- `scan_once` ignored `ListenerInventory.complete`, so one timed-out or failed `ss`/`lsof` (an empty inventory) released every lease and stopped every forwarder, and the next cycle re-adopted them with new leases. A port is now treated as gone only on a complete scan.
+- At startup, a remembered forward port that cannot be rebound (or whose forwarder fails to start) now drops the store entry and closes its lease, so the next scan re-adopts the service with a working forwarder instead of advertising a dead URL.
 
 ### Fix: web packages bug-hunt (collaboration sign-in/out, room polling, composer, member routes, nav badge)
 

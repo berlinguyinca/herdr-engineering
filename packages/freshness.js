@@ -24,6 +24,15 @@ export function freshnessState({ now, last, error = null, interval = 5000, conta
   return now - last > 2 * interval ? 'stale' : 'fresh';
 }
 
+// Text of the chip in two parts: a short state label (the only part that changes with the state, so the only
+// part a screen reader should announce) and the ticking detail, which rewrites every second.
+export function freshnessParts({ state, ago, error, detail, waiting }) {
+  const label = state === 'error' ? 'error' : state === 'stale' ? 'stale' : waiting ? 'waiting for first update' : 'live';
+  let rest = state === 'error' ? ` · ${error} · ${ago}` : state === 'stale' ? ` · ${ago}` : waiting ? '' : ` · ${ago}`;
+  if (detail) rest += ` · ${detail}`;
+  return { label, rest };
+}
+
 const Base = typeof HTMLElement === 'undefined' ? class {} : HTMLElement;
 
 // A chip that several independent sources feed: each calls ok/fail and the chip is red as long as
@@ -55,6 +64,8 @@ export class HerdrFreshness extends Base {
     this._state = null;
     this._detail = '';
     this._warn = false;
+    this._labelEl = null;
+    this._detailEl = null;
   }
 
   get interval() {
@@ -101,12 +112,20 @@ export class HerdrFreshness extends Base {
       : `updated ${age < 60 ? `${age}s` : age < 3600 ? `${Math.floor(age / 60)}m` : `${Math.floor(age / 3600)}h`} ago`;
     let state = freshnessState({ now: Date.now(), last: this._last, error: this._error, interval: this.interval });
     if (state !== 'error' && this._warn) state = 'stale';
-    let text = state === 'error' ? `error · ${this._error} · ${ago}` : state === 'stale' ? `stale · ${ago}` : age == null ? 'waiting for first update' : `live · ${ago}`;
-    if (this._detail) text += ` · ${this._detail}`;
+    const { label, rest } = freshnessParts({ state, ago, error: this._error, detail: this._detail, waiting: age == null });
+    const text = label + rest;
     if (state !== this._state) { this._state = state; this.setAttribute('data-state', state); }
+    if (!this._labelEl) {
+      // The label is the live region's content; the ticking detail opts out so only state changes are announced.
+      this.textContent = '';
+      this._labelEl = document.createElement('span'); this._labelEl.setAttribute('data-fresh-label', '');
+      this._detailEl = document.createElement('span'); this._detailEl.setAttribute('data-fresh-detail', ''); this._detailEl.setAttribute('aria-live', 'off');
+      this.append(this._labelEl, this._detailEl);
+    }
+    if (this._labelEl.textContent !== label) this._labelEl.textContent = label;
     if (text !== this._text) {
-      this._text = text; this.textContent = text; this.title = text;
-      if (this._last == null && this._error == null) this.insertAdjacentHTML('beforeend', loadingProgress('first update'));
+      this._text = text; this._detailEl.textContent = rest; this.title = text;
+      if (this._last == null && this._error == null) this._detailEl.insertAdjacentHTML('beforeend', loadingProgress('first update'));
     }
   }
 }
