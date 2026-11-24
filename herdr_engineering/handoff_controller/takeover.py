@@ -157,7 +157,7 @@ def run_takeover(ref: SessionRef, adapter: HarnessAdapter, handoff_id: str, cfg:
                             view.successor_id, colour, reason, context_pct, view.child_pane or pane,
                             view.child_session_id)
         log.append(made)
-        if colour is not None:  # every terminal event: the drain is over either way
+        if colour is Colour.GREEN:  # only a closed source may drop its subagents' record; red and orange leave them running
             try:
                 finish(ref.pane_id, env)
             except Exception:  # noqa: BLE001 - cleanup must not change the outcome

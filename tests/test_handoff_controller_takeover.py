@@ -49,6 +49,7 @@ from herdr_engineering.handoff_controller.takeover import (
     stuck_reason,
 )
 from herdr_engineering.handoff_subagent_registry import record as record_subagent
+from herdr_engineering.handoff_subagent_registry import status as subagent_status
 from tests.handoff_controller_herdr import IsolatedHerdr, isolated_herdr, wait_for
 from tests.test_handoff_controller_briefing import _cli_prefix
 
@@ -467,8 +468,9 @@ def test_no_way_forward_is_red_with_reason(server: IsolatedHerdr, handoff: Hando
 
 
 @herdr_server
-def test_finish_runs_for_every_terminal_event_and_the_gate_registry_is_purged(
+def test_a_terminal_event_that_leaves_the_source_open_keeps_the_gate_registry(
         server: IsolatedHerdr, handoff: HandoffCli, tmp_path: Path) -> None:
+    """Red or orange leaves the source pane and its subagents running; only a close may purge their record."""
     work, store = make_repo(tmp_path, dirty=True), tmp_path / "store"
     source = start_idle(server)
     handoff_id = new_record(handoff, store, source, work)
@@ -478,8 +480,25 @@ def test_finish_runs_for_every_terminal_event_and_the_gate_registry_is_purged(
     assert any(registry.rglob("a1"))
     done = run_takeover(make_ref(source, work), ADAPTER, handoff_id, ControllerConfig(max_attempts=1), EventLog(store),
                         handoff, server.cli, store_root=store, worktree=work, push_allowed=True, env=state, **FAST)
-    assert done.event == "handoff.stuck"  # a terminal event that is not a success still ends the drain
-    assert not any(registry.rglob("a1"))
+    assert done.event == "handoff.stuck"
+    assert source in panes(server)
+    assert any(registry.rglob("a1"))  # the subagent is still alive, so a later chain must still see it
+
+
+@herdr_server
+def test_a_closed_source_purges_the_gate_registry(server: IsolatedHerdr, handoff: HandoffCli, tmp_path: Path) -> None:
+    work, store = make_repo(tmp_path, dirty=False), tmp_path / "store"
+    source = start_idle(server)
+    handoff_id = new_record(handoff, store, source, work)
+    state = {**server.env, "HERDR_ENGINEERING_STATE": str(tmp_path / "state"), "HERDR_PANE_ID": source}
+    record_subagent("start", json.dumps({"agent_id": "a1", "agent_type": "x"}), state)
+    record_subagent("stop", json.dumps({"agent_id": "a1", "agent_type": "x"}), state)
+    assert subagent_status(source, state).known  # the pane's record exists, with nothing live in it
+    done = run_takeover(make_ref(source, work), ADAPTER, handoff_id, ControllerConfig(), EventLog(store), handoff,
+                        server.cli, store_root=store, worktree=work, push_allowed=True, env=state, **FAST)
+    assert (done.event, done.colour) == ("handoff.succeeded", Colour.GREEN), done
+    assert source not in panes(server)
+    assert not subagent_status(source, state).known  # a reused pane id starts clean
 
 
 # --- no herdr server: herdr-handoff that fails or hangs ---------------------------------------------------------------
