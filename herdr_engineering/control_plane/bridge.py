@@ -147,7 +147,7 @@ class DurableSource:
         raise NotImplementedError
 
 
-def env_seconds(name: str, default: float, *, allow_zero: bool = False) -> float:
+def env_seconds(name: str, default: float | None, *, allow_zero: bool = False) -> float | None:
     """Seconds from the environment; the default when unset, unreadable or not positive (zero only if ``allow_zero``)."""
     try:
         value = float(os.environ.get(name, ""))
@@ -156,9 +156,6 @@ def env_seconds(name: str, default: float, *, allow_zero: bool = False) -> float
     return value if value > 0 or (allow_zero and value == 0) else default
 
 
-#: Upper bound on one wait for a coroutine on the shared loop (seconds). Generous because the same runner serves the
-#: projection recovery reads; the durable sink passes its own, much shorter bound. Override: HERDR_CP_BRIDGE_WAIT_TIMEOUT_S.
-BRIDGE_WAIT_TIMEOUT_S = 600.0
 
 
 class _LoopRunner:
@@ -176,13 +173,14 @@ class _LoopRunner:
         self._thread.start()
 
     def run(self, coro: Any, timeout: float | None = None):
-        """Run ``coro`` on the loop and wait at most ``timeout`` seconds (the bridge default when None).
+        """Run ``coro`` on the loop and wait at most ``timeout`` seconds (forever when None, unless the opt-in
+        HERDR_CP_BRIDGE_WAIT_TIMEOUT_S is set; projection recovery reads must not be cut short).
 
         On timeout the coroutine is cancelled and ``TimeoutError`` is raised, so a hung database never holds the caller."""
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
         try:
             return future.result(timeout if timeout is not None
-                                 else env_seconds("HERDR_CP_BRIDGE_WAIT_TIMEOUT_S", BRIDGE_WAIT_TIMEOUT_S))
+                                 else env_seconds("HERDR_CP_BRIDGE_WAIT_TIMEOUT_S", None))
         except TimeoutError:
             future.cancel()
             raise

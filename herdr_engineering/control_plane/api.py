@@ -1757,9 +1757,9 @@ class ControlPlaneServer:
         the O(1) degraded flags the full /health reports, so a gate on the probe still
         sees them. Capabilities are only for callers with a valid role."""
         h = {"status": "ok", "version": __version__, "commit": _COMMIT}
-        sink_health = getattr(self.repo._sink, "write_health", None)
-        if callable(sink_health) and sink_health()["degraded"]:
-            h["status"] = "degraded"        # O(1): counters only, no detail for unkeyed callers
+        sink_health = self.repo.durable_sink_health()
+        if sink_health and sink_health["degraded"]:
+            h["durable_sink_degraded"] = True   # O(1): a flag only, no detail for unkeyed callers
         if self.collab is not None and self.collab.degraded:
             h["collab_degraded"] = True
         if self.repo.agent_identities.conflict_count:

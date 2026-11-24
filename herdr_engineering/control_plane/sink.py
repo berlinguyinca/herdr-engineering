@@ -10,6 +10,7 @@ was ingested.
 """
 from __future__ import annotations
 
+import contextlib
 import copy
 import json
 import logging
@@ -40,8 +41,7 @@ SINK_WAIT_TIMEOUT_S = 15.0       # HERDR_CP_SINK_WAIT_TIMEOUT_S: the caller's wa
 #: After a failed write, best-effort writes are skipped (counted as dropped) for this long, so a hung database costs
 #: the repo's event lock one timeout, not one per event. HERDR_CP_SINK_RETRY_COOLDOWN_S (0 disables).
 SINK_RETRY_COOLDOWN_S = 5.0
-#: A failing sink stays "degraded" in health this long after its last failure unless a write succeeds sooner.
-SINK_DEGRADED_WINDOW_S = 300.0
+SINK_TERMINATE_TIMEOUT_S = 2.0   # waiting for the loop to terminate a discarded connection
 SINK_LOG_INTERVAL_S = 30.0       # at most one failure log line per interval
 
 
@@ -100,6 +100,9 @@ class DurableEventSink:
             runner = _LoopRunner()
             wait = env_seconds("HERDR_CP_SINK_WAIT_TIMEOUT_S", SINK_WAIT_TIMEOUT_S)
             run = lambda coro: runner.run(coro, timeout=wait)  # noqa: E731
+            self._terminate_run = lambda coro: runner.run(coro, timeout=SINK_TERMINATE_TIMEOUT_S)  # noqa: E731
+        else:
+            self._terminate_run = run
         self._dsn = dsn
         self._conn = conn
         self._run = run
@@ -124,9 +127,8 @@ class DurableEventSink:
 
         The reason is the exception class and a category only (never a message), so no DSN or credential can reach it."""
         with self._stats_lock:
-            recent = (self._last_failure_mono is not None and self._failing_since_success
-                      and time.monotonic() - self._last_failure_mono < SINK_DEGRADED_WINDOW_S)
-            return {"degraded": bool(recent), "failed_writes": self._failed, "dropped_events": self._dropped,
+            # degraded until a write succeeds: elapsed time alone proves nothing about the database
+            return {"degraded": self._failing_since_success, "failed_writes": self._failed, "dropped_events": self._dropped,
                     "last_failure_at": self._last_failure_wall, "last_failure_reason": self._last_failure_reason,
                     "last_success_at": self._last_success_wall}
 
@@ -138,7 +140,7 @@ class DurableEventSink:
     def _note_failure(self, exc: BaseException, what: str) -> None:
         if isinstance(exc, TimeoutError):
             category = "timeout"
-        elif isinstance(exc, (OSError, ConnectionError)) or type(exc).__module__.startswith("asyncpg"):
+        elif isinstance(exc, OSError) or type(exc).__module__.startswith("asyncpg"):
             category = "database"
         else:
             category = "error"
@@ -166,8 +168,11 @@ class DurableEventSink:
         conn = self._store._conn
         if not self._dsn or conn is None:
             return                      # an injected connection cannot be reopened
+
+        async def terminate():
+            conn.terminate()            # on the loop: asyncio transports are not thread-safe
         try:
-            conn.terminate()
+            self._terminate_run(terminate())
         except Exception:               # noqa: BLE001 - already unusable
             pass
         self._conn = None
@@ -216,8 +221,8 @@ class DurableEventSink:
         """Persist a command receipt, propagating failure before side effects."""
         try:
             result = self._write_event(ev)
-        except EventAlreadyStored:
-            raise                       # a duplicate, not a failed write
+        except (EventAlreadyStored, AgentIdentityConflict, ValueError):
+            raise                       # a duplicate or a rejected request, not a failed write (conflicts are ValueErrors)
         except Exception as exc:
             self._note_failure(exc, f"event {ev.get('event_id')}")
             raise
@@ -315,9 +320,11 @@ class DurableEventSink:
                 yield [json.loads(row["payload"]) if isinstance(row["payload"], str)
                        else dict(row["payload"]) for row in rows]
                 self._call(conn.execute("COMMIT"))
-            except BaseException:
-                if self._store._conn is conn:       # a timeout already discarded (terminated) the connection
-                    self._call(conn.execute("ROLLBACK"))
+            except BaseException as exc:
+                if self._store._conn is conn and not isinstance(exc, TimeoutError):
+                    # best effort: a failing rollback must not mask the original error
+                    with contextlib.suppress(Exception):
+                        self._call(conn.execute("ROLLBACK"))
                 raise
 
     def scheduler_leases(self):
@@ -355,6 +362,12 @@ class DurableEventSink:
     def record_source_state(self, state: dict) -> None:
         """Best-effort upsert of per-source ingest state (fabric_event_sources)."""
         import json
+        with self._stats_lock:
+            skip = time.monotonic() < self._retry_after
+            if skip:
+                self._dropped += 1
+        if skip:
+            return
         try:
             with self._write_lock:
                 self._ensure_store()
@@ -372,7 +385,11 @@ class DurableEventSink:
 
     def prune_events_before(self, entity_type: str, cutoff: datetime) -> None:
         """Delete one entity type's durable events older than ``cutoff`` (retention)."""
-        with self._write_lock:
-            self._ensure_store()
-            self._call(self._store._conn.execute(
-                prune_events_sql(self._events_table), entity_type, cutoff))
+        try:
+            with self._write_lock:
+                self._ensure_store()
+                self._call(self._store._conn.execute(
+                    prune_events_sql(self._events_table), entity_type, cutoff))
+        except Exception as exc:
+            self._note_failure(exc, f"retention prune of {entity_type}")
+            raise

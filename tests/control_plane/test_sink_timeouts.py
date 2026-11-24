@@ -107,14 +107,14 @@ def test_failure_log_is_rate_limited_without_traceback(fast, blackhole, caplog):
 
 def test_repo_health_reports_degraded_sink(fast, blackhole):
     repo = ControlPlaneRepo(sink=DurableEventSink(blackhole))
-    assert repo.health()["status"] == "ok"
+    assert repo.health()["status"] == "ok" and "durable_sink_degraded" not in repo.health()
     repo.create_mission("x")                            # the sink write fails; the repo carries on
     h = repo.health()
-    assert h["status"] == "degraded" and h["durable_sink"]["failed_writes"] >= 1
+    assert h["status"] == "ok" and h["durable_sink_degraded"] is True and h["durable_sink"]["failed_writes"] >= 1
     assert ControlPlaneRepo().health().get("durable_sink") is None
 
 
-def test_health_endpoints_report_degraded(fast, blackhole):
+def test_health_endpoints_flag_degraded_and_keep_status_ok(fast, blackhole):
     repo = ControlPlaneRepo(sink=DurableEventSink(blackhole))
     repo.create_mission("x")
     srv = ControlPlaneServer(repo)
@@ -124,7 +124,7 @@ def test_health_endpoints_report_degraded(fast, blackhole):
         for path in ("/api/v1/health?probe=1", "/api/v1/health"):
             with urllib.request.urlopen(f"http://127.0.0.1:{srv.port}{path}", timeout=5) as r:
                 body = json.loads(r.read())
-            assert body["status"] == "degraded", path
+            assert body["status"] == "ok" and body["durable_sink_degraded"] is True, path
             assert "s3cretpw" not in json.dumps(body)
     finally:
         srv.shutdown()
@@ -160,3 +160,36 @@ def test_blocked_insert_times_out_discards_connection_and_recovers(fast, tmp_pat
         ids = [r["event_id"] for r in rows]
         assert ids[0] == "e0" and ids[-1] == "e2" and set(ids) <= {"e0", "e1", "e2"}
         runner.run(locker.close())
+
+
+def test_business_errors_are_not_write_failures(fast):
+    sink = DurableEventSink()
+    bad = {"entity_type": "agent_identity", "entity_id": "a1", "event_type": "wrong", "payload": {}}
+    with pytest.raises(ValueError):
+        sink.record_required(bad)
+    h = sink.write_health()
+    assert h["failed_writes"] == 0 and h["degraded"] is False and sink._retry_after == 0.0
+
+
+def test_degraded_stays_until_a_write_succeeds(fast, blackhole):
+    sink = DurableEventSink(blackhole)
+    sink.record(dict(EV))
+    sink._last_failure_mono -= 10_000                   # long past any time window
+    assert sink.write_health()["degraded"] is True
+
+
+def test_source_state_honours_the_retry_cooldown(fast, blackhole, monkeypatch):
+    monkeypatch.setenv("HERDR_CP_SINK_RETRY_COOLDOWN_S", "30")
+    sink = DurableEventSink(blackhole)
+    sink.record(dict(EV))
+    t0 = time.monotonic()
+    sink.record_source_state({"source": "s", "last_sequence": 1, "last_seen_at": "2026-01-01T00:00:00+00:00", "gaps": []})
+    assert time.monotonic() - t0 < 0.5
+    h = sink.write_health()
+    assert h["failed_writes"] == 1 and h["dropped_events"] == 2
+
+
+def test_bridge_wait_bound_is_opt_in(monkeypatch):
+    monkeypatch.setenv("HERDR_CP_BRIDGE_WAIT_TIMEOUT_S", "0.2")
+    with pytest.raises(TimeoutError):
+        _LoopRunner().run(asyncio.sleep(30))
