@@ -1,0 +1,25 @@
+id = "herdr.session-pane"
+name = "HerdR Session Side Pane"
+version = "0.1.0"
+min_herdr_version = "0.9.1"
+description = "A read-only side pane per tab: the focused session's summary, handoff chain and CI"
+platforms = ["linux", "macos"]
+
+# The pane itself: a split running the herdr-eng viewer. q closes it; `herdr-eng side-pane ensure --tab TAB_ID` reopens it.
+# The handoff controller opens one per tab through `herdr_engineering.side_pane.ensure`.
+[[panes]]
+id = "session-pane"
+title = "Session"
+description = "Summary, handoff chain and CI of the focused session (1/2/3 or Tab switch, q closes the pane)"
+placement = "split"
+command = ["herdr-eng", "side-pane", "run"]
+
+# Opens (or reopens) the side pane of the tab the action runs in. Herdr passes the tab as $HERDR_TAB_ID; a bare `herdr-eng` is
+# looked up on the server's PATH; `herdr-eng handoff controller link` (run by scripts/install.sh) links a copy of this manifest whose
+# commands carry the absolute path instead (see docs/operations/handoff.md).
+[[actions]]
+id = "open"
+title = "Open session side pane"
+description = "Open the session side pane of this tab, also after it was closed"
+contexts = ["tab", "pane"]
+command = ["sh", "-c", "exec herdr-eng side-pane ensure --tab \"$HERDR_TAB_ID\""]

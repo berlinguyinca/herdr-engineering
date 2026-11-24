@@ -1473,3 +1473,26 @@ def test_lease_loaded_after_reboot_is_heartbeated_on_first_cycle(tmp_path, monke
         server.shutdown()
         agent.stop()
         gw.stop()
+
+
+def test_forwarder_stop_releases_port_immediately():
+    """stop() must free the listening port at once, not after the accept
+    loop's poll timeout: close() alone leaves the socket listening while the
+    accept thread is blocked inside accept(), so an agent restarting right
+    after a stop() could not rebind the remembered forward port (flaky
+    test_forwarder_restored_across_restart_stays_live under load)."""
+    import socket
+    import time
+
+    for _ in range(5):
+        fwd = fa.AgentForwarder("127.0.0.1", 9).start()
+        port = fwd.port
+        time.sleep(0.05)  # let the accept thread block in accept()
+        fwd.stop()
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            probe.bind(("127.0.0.1", port))
+            probe.listen(1)  # fails with EADDRINUSE while the old listener lives
+        finally:
+            probe.close()

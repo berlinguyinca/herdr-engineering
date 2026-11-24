@@ -18,8 +18,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from .. import summary_report as runner
+from .. import summary_snapshots
 from .redact import redact_text
 
+MAX_SNAPSHOTS = summary_snapshots.MAX_SNAPSHOTS
 _EVENTS = {"SummaryReportCompleted": "done", "SummaryReportFailed": "failed"}
 QUEUE_GRACE_S = 90          # a host that has not claimed a request by now is not running a worker
 RUN_GRACE_S = 60            # slack on top of the summarizer timeout before a claimed job is abandoned
@@ -142,12 +144,26 @@ class SummaryReportService:
             unsaved = self._unsaved.get(session_id)
         if unsaved:
             return dict(unsaved)
-        for event in reversed(self.repo.stream("session", session_id)):
+        stream = self.repo.stream("session", session_id)
+        for event in reversed(stream):
             state = _EVENTS.get(event.get("event_type"))
             if state:
                 body = _payload(event)
-                return {"state": state, **{k: v for k, v in body.items() if k not in ("actor", "host_id")}}
+                view = {"state": state, **{k: v for k, v in body.items() if k not in ("actor", "host_id", "snapshot")}}
+                snapshots = self._snapshots(stream)
+                return {**view, "snapshots": snapshots} if snapshots else view
         return {"state": "idle"}
+
+    @staticmethod
+    def _snapshots(stream):
+        """The numbers of every terminal publish, oldest first: the history the dashboard plots."""
+        points = []
+        for event in stream:
+            if event.get("event_type") == "SummaryReportCompleted":
+                point = summary_snapshots.clean_point(_payload(event).get("snapshot"))
+                if point:
+                    points.append(point)
+        return points[-MAX_SNAPSHOTS:]
 
     # -- starting -----------------------------------------------------------------
     def _target(self, session):
@@ -240,10 +256,12 @@ class SummaryReportService:
         if len(matches) > 1:
             raise ReportRefused(409, "More than one dashboard agent matches that session.", reason="ambiguous_session")
         session_id = matches[0]["session_id"]
+        point = summary_snapshots.clean_point(body.get("snapshot"))     # numbers only; a bad one never blocks the report
         self._finish(session_id, {"operation_id": f"terminal-{datetime.now(UTC).strftime('%Y%m%dT%H%M%S%f')}",
                                   "host_id": host_id, "started_at": _now(), "basis_seq": self._basis_seq(session_id)},
                      "SummaryReportCompleted",
-                     {"report": report, "harness": agent, "source": "terminal", "generated_at": _now()},
+                     {"report": report, "harness": agent, "source": "terminal", "generated_at": _now(),
+                      **({"snapshot": point} if point else {})},
                      close_job=False)               # a run that is still open for this session keeps going
         return 200, {"ok": True, "session_id": session_id}
 

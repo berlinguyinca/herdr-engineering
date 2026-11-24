@@ -734,6 +734,13 @@ class AgentForwarder:
     def stop(self) -> None:
         self._stopping.set()
         if self._listener is not None:
+            # close() alone leaves the socket listening while the accept thread
+            # is blocked in accept() (up to its poll timeout), so the port would
+            # stay taken; shutdown() wakes accept and releases it at once.
+            try:
+                self._listener.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
             try:
                 self._listener.close()
             except OSError:

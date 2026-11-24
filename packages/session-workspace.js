@@ -13,6 +13,7 @@ import {recordOutcome} from './record-state.js';
 import {fixOutcome, fixError, FIX_LABELS, FIX_LOCKED} from './summary-fix-status.js';
 import {reportView, reportStartError, OPEN_STATES} from './summary-report-status.js';
 import {parseReport, staleness, elapsedLabel, nearestTurn, TIMESTAMP} from './summary-report-parse.js';
+import {plotHtml} from './summary-snapshot-plot.js';
 import {morph} from './patch.js';
 import {enter,skeleton} from './motion.js';
 
@@ -248,7 +249,7 @@ export function mountSessionWorkspace(host,client,session,{connect=connectEvents
       const key=String(x.n||x.title),wasOpen=sectionsOpen.get(key);
       return `<details class="sw-report-section" data-section="${esc(key)}"${(wasOpen??(SECTION_OPEN.has(x.n)))?' open':''}><summary>${x.n?`${x.n}. `:''}${esc(x.title)}</summary><div class="conversation-markdown">${renderMarkdown(x.body,markdown)}</div></details>`;
     }).join(''):`<div class="conversation-markdown">${view.report?renderMarkdown(view.report,markdown):''}</div>`;
-    box.innerHTML=`${view.status?`<p class="sw-report-status"${view.error?' role="alert"':' role="status"'}>${esc(view.status)}${timer}</p>`:''}${view.report?`${strip}${resume}<details data-report${open===false?'':' open'}><summary>Full session report</summary>${actions}<div class="sw-report-body">${sections}</div></details>`:''}`;
+    box.innerHTML=`${view.status?`<p class="sw-report-status"${view.error?' role="alert"':' role="status"'}>${esc(view.status)}${timer}</p>`:''}${view.report?`${strip}${resume}<details data-report${open===false?'':' open'}><summary>Full session report</summary>${actions}<div class="sw-report-body">${sections}</div></details>${plotHtml(view.snapshots,esc)}`:''}`;
     const body=box.querySelector('.sw-report-body');if(body){body.scrollTop=scroll;linkTimestamps(body);}
   }
   async function startReport(){

@@ -33,10 +33,83 @@ def test_install_creates_managed_entries(home):
     res = inst(home).install()
     assert res.ok and res.action == "create"
     hooks = json.loads(settings(home).read_text())["hooks"]
-    assert set(hooks) == {"SessionStart", "PreCompact", "PreToolUse"}
-    cmd = hooks["PreCompact"][0]["hooks"][0]["command"]
+    assert set(hooks) == {"SessionStart", "PreToolUse"}
+    cmd = hooks["SessionStart"][0]["hooks"][0]["command"]
     assert wh.MARKER in cmd and cmd.startswith("[ -x /opt/herdr-eng ] && ") and cmd.count("|| true") == 1
-    assert "workflow hook PreCompact" in cmd
+    assert "workflow hook SessionStart" in cmd
+
+
+def test_precompact_not_installed(home):
+    assert wh.EVENTS == ("SessionStart", "PreToolUse")
+    inst(home).install()
+    assert "PreCompact" not in json.loads(settings(home).read_text())["hooks"]
+    assert not hasattr(wh, "PRECOMPACT_MESSAGE")
+
+
+OLD_PRECOMPACT = {"hooks": [{"type": "command", "timeout": 3,
+                             "command": f"[ -x /opt/herdr-eng ] && /opt/herdr-eng workflow hook PreCompact || true # {wh.MARKER}"}]}
+FOREIGN_PRECOMPACT = {"matcher": "auto", "hooks": [{"type": "command", "command": "my-own-precompact"}]}
+
+
+def backups(home):
+    d = home / ".local" / "share" / "herdr-engineering" / "workflow" / "backups"
+    return sorted(p.name for p in d.iterdir()) if d.is_dir() else []
+
+
+def test_install_removes_old_managed_precompact_only(home):
+    old = {"model": "x", "hooks": {"PreCompact": [FOREIGN_PRECOMPACT, OLD_PRECOMPACT],
+                                   "Stop": [{"hooks": [{"type": "command", "command": "mine"}]}]}}
+    settings(home).write_text(json.dumps(old, indent=2))
+    res = inst(home).install()
+    assert res.ok and res.action in ("create", "update")
+    data = json.loads(settings(home).read_text())
+    assert data["hooks"]["PreCompact"] == [FOREIGN_PRECOMPACT]
+    assert data["hooks"]["Stop"] == old["hooks"]["Stop"] and data["model"] == "x"
+    assert set(data["hooks"]) == {"PreCompact", "Stop", "SessionStart", "PreToolUse"}
+    assert json.loads((home / ".local/share/herdr-engineering/workflow/backups/settings.json.bak").read_text()) == old
+
+
+def test_old_managed_precompact_alone_is_dropped_with_its_event(home):
+    settings(home).write_text(json.dumps({"hooks": {"PreCompact": [OLD_PRECOMPACT]}}))
+    inst(home).install()
+    assert "PreCompact" not in json.loads(settings(home).read_text())["hooks"]
+
+
+def test_precompact_entry_mixing_managed_and_foreign_hooks_loses_only_the_managed_one(home):
+    mixed = {"matcher": "auto", "hooks": [OLD_PRECOMPACT["hooks"][0], FOREIGN_PRECOMPACT["hooks"][0]]}
+    hand_edited = {"hooks": [{"type": "command", "command": f"my-edit # {wh.MARKER}"}]}
+    settings(home).write_text(json.dumps({"hooks": {"PreCompact": [mixed, hand_edited]}}))
+    inst(home).install()
+    kept = json.loads(settings(home).read_text())["hooks"]["PreCompact"]
+    assert kept == [{"matcher": "auto", "hooks": [FOREIGN_PRECOMPACT["hooks"][0]]}, hand_edited]
+
+
+def test_second_install_after_migration_is_noop_and_makes_no_backup(home):
+    settings(home).write_text(json.dumps({"hooks": {"PreCompact": [OLD_PRECOMPACT]}}))
+    inst(home).install()
+    before, names = settings(home).read_bytes(), backups(home)
+    assert len(names) == 1
+    res = inst(home).install()
+    assert res.action == "noop" and settings(home).read_bytes() == before and backups(home) == names
+
+
+def test_doctor_flags_a_leftover_managed_precompact(home):
+    inst(home).install()
+    data = json.loads(settings(home).read_text())
+    data["hooks"]["PreCompact"] = [OLD_PRECOMPACT]
+    settings(home).write_text(json.dumps(data))
+    assert inst(home).doctor()["overall"] == "stale"
+    assert inst(home).install(dry_run=True).action == "update"
+    inst(home).repair()
+    assert inst(home).doctor()["ok"]
+
+
+def test_uninstall_removes_leftover_managed_precompact(home):
+    user = {"hooks": {"PreCompact": [FOREIGN_PRECOMPACT]}}
+    settings(home).write_text(json.dumps({"hooks": {"PreCompact": [FOREIGN_PRECOMPACT, OLD_PRECOMPACT]}}))
+    inst(home).install()
+    inst(home).uninstall()
+    assert json.loads(settings(home).read_text()) == user
 
 
 def test_second_install_is_noop(home):
@@ -98,7 +171,7 @@ def run_hook(event, stdin="{}"):
 def test_session_start_reminder_is_short_and_covers_defaults():
     ctx = run_hook("SessionStart")["hookSpecificOutput"]["additionalContext"]
     assert len(ctx.splitlines()) <= 15
-    for needle in ("sonnet", "verify", "never push herdr-engineering", "/tmp", "woodpecker", "/handoff"):
+    for needle in ("sonnet", "verify", "never push main", "never force-push", "/tmp", "woodpecker"):
         assert needle in ctx.lower()
     assert run_hook("SessionStart")["hookSpecificOutput"]["hookEventName"] == "SessionStart"
 
@@ -106,13 +179,16 @@ def test_session_start_reminder_is_short_and_covers_defaults():
 def test_session_start_says_not_to_ask_about_settled_choices():
     ctx = run_hook("SessionStart")["hookSpecificOutput"]["additionalContext"].lower()
     assert "do not ask the user about choices these defaults already settle" in ctx
-    assert "run /handoff yourself, without asking" in ctx
 
 
-def test_precompact_instructs_agent_to_handoff_without_asking():
-    msg = run_hook("PreCompact")["systemMessage"]
-    assert "Run /handoff yourself" in msg and "without asking" in msg
-    assert "background subagents" in msg and "herdr-handoff create" not in msg
+def test_reminder_does_not_mention_handoff():
+    assert "handoff" not in wh.REMINDER.lower()
+    assert "handoff" not in run_hook("SessionStart")["hookSpecificOutput"]["additionalContext"].lower()
+
+
+def test_old_precompact_hook_command_is_a_silent_noop():
+    out = io.StringIO()
+    assert wh.run_hook("PreCompact", io.StringIO("{}"), out) == 0 and out.getvalue() == ""
 
 
 def test_hook_never_fails_on_bad_input():
@@ -158,7 +234,7 @@ def test_generated_command_executes_via_sh(home):
     assert done.returncode == 0, done.stderr
     out = json.loads(done.stdout)
     assert out["hookSpecificOutput"]["hookEventName"] == "SessionStart"
-    assert "/handoff" in out["hookSpecificOutput"]["additionalContext"]
+    assert "handoff" not in out["hookSpecificOutput"]["additionalContext"].lower()
 
 
 def test_generated_command_with_missing_executable_is_silent_noop(home):

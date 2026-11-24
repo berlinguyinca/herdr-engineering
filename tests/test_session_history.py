@@ -442,3 +442,55 @@ def test_activity_times_survive_the_event_trim(tmp_path):
     _jl(tmp_path / ".claude/projects/-w/big.jsonl", rows)
     out = sh.read_history(sh.resolve(agent="claude", session="big", home=tmp_path), home=tmp_path)
     assert len(out["events"]) < 500 and len(out["activity_ts"]) == 500
+
+
+# --- whole-session coverage: outline of the elided middle, full-list counts, previous snapshot ---
+
+def _long_claude(tmp_path, n=500, sid="long"):
+    rows = []
+    for i in range(n):
+        rows.append({"type": "user", "timestamp": f"2026-01-01T09:{i // 60:02d}:{i % 60:02d}Z",
+                     "message": {"content": f"prompt {i}"}})
+    _jl(tmp_path / f".claude/projects/-w/{sid}.jsonl", rows)
+    return sh.resolve(agent="claude", session=sid, home=tmp_path)
+
+
+def test_outline_covers_the_whole_omitted_middle_in_bounded_chunks(tmp_path):
+    res = _long_claude(tmp_path)
+    out = sh.read_history(res, home=tmp_path, max_events=100)
+    outline = out["outline"]
+    assert 1 <= len(outline) <= 20
+    assert outline[0]["from"] == 60 and outline[-1]["to"] == 500 - 40 - 1
+    assert all(a["to"] + 1 == b["from"] for a, b in zip(outline, outline[1:]))
+    assert sum(c["events"] for c in outline) == out["events_omitted_from_middle"]
+    assert outline[0]["counts"]["user"] == outline[0]["events"] and outline[0]["ts_from"].startswith("2026-01-01T")
+
+
+def test_outline_is_empty_when_nothing_is_omitted(tmp_path):
+    res = _long_claude(tmp_path, n=20)
+    assert sh.read_history(res, home=tmp_path)["outline"] == []
+
+
+def test_outline_and_counts_report_failed_tool_calls_in_the_middle(tmp_path):
+    rows = [{"type": "user", "timestamp": "2026-01-01T09:00:00Z", "message": {"content": "go"}}]
+    for i in range(150):
+        rows.append({"type": "assistant", "timestamp": "2026-01-01T09:01:00Z", "message": {"content": [
+            {"type": "tool_use", "id": f"t{i}", "name": "Bash", "input": {"command": f"run {i}"}}]}})
+        rows.append({"type": "user", "timestamp": "2026-01-01T09:01:01Z", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": f"t{i}", "content": f"boom {i}", "is_error": i % 10 == 0}]}})
+    _jl(tmp_path / ".claude/projects/-w/f.jsonl", rows)
+    out = sh.read_history(sh.resolve(agent="claude", session="f", home=tmp_path), home=tmp_path, max_events=100)
+    assert out["counts"] == {"tool_calls": 150, "tool_failures": 15}      # over the full list, not the trim
+    failed = sum(c["failures"] for c in out["outline"])
+    assert 0 < failed <= 15 and all(len(c["failed"]) <= 3 for c in out["outline"])
+
+
+def test_previous_snapshot_is_none_without_a_store_and_read_from_one(tmp_path):
+    from herdr_engineering import summary_snapshots as ss
+    res = _long_claude(tmp_path, n=30)
+    assert sh.read_history(res, home=tmp_path)["previous_snapshot"] is None
+    point = {"prompts": 30, "events": 30, "tool_calls": 0, "tool_failures": 0, "coverage": "complete"}
+    ss.record(tmp_path / ".cache/herdr-engineering/summary", "claude", "long", point,
+              "# Session summary\nEvidence coverage: complete")
+    prev = sh.read_history(res, home=tmp_path)["previous_snapshot"]
+    assert prev["n"] == 1 and prev["count"] == 1 and prev["events"] == 30 and prev["report"].startswith("# Session summary")

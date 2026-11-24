@@ -238,9 +238,44 @@ def _viewer_argv(file, pane_id, peer=None, kind="view"):
     return argv + ["--peer", peer] if peer else argv
 
 
-def _default_history(agent, session_id):
-    res = sh.resolve(agent=agent, session=session_id)
-    return sh.read_history(res)
+def _default_history(agent, session_id, home=None):
+    res = sh.resolve(agent=agent, session=session_id, home=home)
+    return sh.read_history(res, home=home)
+
+
+def _once(call):
+    """``call`` made at most once; a later call returns its result, or raises the same exception again."""
+    box = []
+
+    def cached(*args):
+        if not box:
+            try:
+                box.append((True, call(*args)))
+            except Exception as exc:
+                box.append((False, exc))
+        ok, value = box[0]
+        if ok:
+            return value
+        raise value
+    return cached
+
+
+def _record_snapshot(directory, agent, session_id, report, history, graph):
+    """Keep this publish as one more snapshot: ``(result for publish, the stored point or None)``. Never raises."""
+    from . import summary_snapshots as ss
+    try:
+        data = history(agent, session_id)
+    except Exception as exc:
+        return {"ok": False, "error": exc.__class__.__name__}, None
+    point = ss.snapshot_point(data, graph)
+    if point is None or not data.get("events_total"):
+        return {"ok": False, "error": "no_history"}, None
+    try:
+        stored = ss.record(directory, agent, session_id, point, report)
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "error": exc.__class__.__name__}, None
+    count = len(ss.load(ss.store_path(directory, agent, session_id)))
+    return {"ok": True, "n": stored["n"], "count": count}, {k: v for k, v in stored.items() if k != "report"}
 
 
 def _close_if_alive(sidecar, run, env, herdr):
@@ -416,6 +451,16 @@ def _view(draw, out, viewer, title, scroll, run, herdr, close_pane, peer_pane, p
         _close_panes(run, herdr, peer_pane, close_pane)
 
 
+def _snapshot_plot(file, width, unicode, color):
+    """The history of snapshots, drawn under the report (read only; none stored means nothing to draw)."""
+    from . import summary_snapshots as ss
+    from .snapshot_plot import render_snapshot_plot
+    try:
+        return render_snapshot_plot(ss.series(ss.load(ss.snapshots_file(file))), width, unicode=unicode, color=color)
+    except Exception:
+        return []
+
+
 def view_report(file, *, close_pane=None, peer_pane=None, run=subprocess.run, out=None, herdr="herdr",
                 viewer=None):
     """Show the Markdown report ``file`` full screen, re-wrapped whenever the pane is resized.
@@ -433,12 +478,15 @@ def view_report(file, *, close_pane=None, peer_pane=None, run=subprocess.run, ou
         _close_panes(run, herdr, peer_pane, close_pane)
         return 1
 
+    unicode = "utf" in (getattr(out, "encoding", None) or "utf-8").lower()
+
     def draw(width, _height):
         try:                                   # re-read: a republish rewrites the file under a live viewer
             text = Path(file).read_text()
         except OSError:
             text = "(the report file is no longer available)"
-        return render_markdown(text, width=min(max(width - 2, 40), 110), color=color).split("\n")
+        lines = render_markdown(text, width=min(max(width - 2, 40), 110), color=color).split("\n")
+        return lines + _snapshot_plot(file, min(max(width - 2, 1), 110), unicode, color)
     return _view(draw, out, viewer or run_viewer, "session summary", True, run, herdr, close_pane, peer_pane,
                  pidfile=str(file) + ".viewer.pid")
 
@@ -511,19 +559,27 @@ def publish_report(agent, session_id, text, *, home=None, environ=None, run=subp
     os.chmod(file, 0o600)
     out = {"ok": False, "file": str(file), "dashboard": {"ok": False, "skipped": True},
            "pane": {"ok": False, "skipped": True}, "graph": {"ok": False, "skipped": True}}
+    pane_id = env.get("HERDR_PANE_ID")
+    hist = _once(history or (lambda a, s: _default_history(a, s, home)))
+    build = _once(lambda: _build_graph(file, raw_graph, agent, session_id, hist))
+    graph = None
+    if pane and pane_id:
+        try:                                   # the snapshot records the validated graph, so build it first
+            graph = build()
+        except Exception:                      # reported by _open_panes through the same cached call
+            graph = None
+    out["snapshot"], point = _record_snapshot(file.parent, agent, session_id, report, hist, graph)
     if dashboard:
         try:
             if load_config is None:
                 from .host_config import load_host_config as load_config
-            status, body = post(load_config(), {"agent": agent, "target": session_id, "report": report})
+            status, body = post(load_config(), {"agent": agent, "target": session_id, "report": report,
+                                                **({"snapshot": point} if point else {})})
             out["dashboard"] = {"ok": status == 200, **({} if status == 200 else {"error": body.get("reason") or f"http_{status}"})}
         except Exception as exc:                       # no host config, network down, ...
             out["dashboard"] = {"ok": False, "error": exc.__class__.__name__}
-    pane_id = env.get("HERDR_PANE_ID")
     if pane and pane_id:
-        out["pane"], out["graph"] = _open_panes(
-            file, pane_id, env, run, "herdr",
-            lambda: _build_graph(file, raw_graph, agent, session_id, history or _default_history))
+        out["pane"], out["graph"] = _open_panes(file, pane_id, env, run, "herdr", build)
     elif pane:
         out["pane"] = {"ok": False, "error": "not_in_a_herdr_pane"}
     if not (pane and pane_id):

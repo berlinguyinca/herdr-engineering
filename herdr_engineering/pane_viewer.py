@@ -11,6 +11,7 @@ import select
 import signal
 import sys
 import termios
+import time
 import tty
 from collections.abc import Callable
 
@@ -56,13 +57,23 @@ def _fit(line: str, width: int) -> str:
 
 
 def run_viewer(render: Callable[[int, int], list[str]], *, scroll: bool, title: str = "", fd_in: int = 0,
-               out=None, size: Callable[[], tuple[int, int]] | None = None) -> int:
+               out=None, size: Callable[[], tuple[int, int]] | None = None, refresh_s: float | None = None,
+               on_text: Callable[[str], bool] | None = None, quit_ignored_s: float = 0.0, lone_quit: bool = False,
+               clock: Callable[[], float] = time.monotonic, on_quit: Callable[[], None] | None = None) -> int:
     """Show ``render(width, height)`` full screen until the reader quits; returns 0 on quit, 1 on error.
 
     ``height`` is the body height (the screen minus the footer line). A resize makes ``render`` run again at the new
     size, with the reader kept at the same fraction of the document. The terminal is restored on every exit path.
+
+    ``refresh_s`` redraws that often even when nothing was typed; ``on_text`` sees every typed chunk before the built-in
+    keys and returns True to redraw (q still quits). Both default to off.
+
+    ``quit_ignored_s`` ignores quit keys for that long after the viewer started (a pane that got the focus by accident is
+    not closed by a stray key); ``lone_quit`` makes only a chunk that is one quit key a quit (pasted text and terminal
+    replies that contain a q are not); ``on_quit`` is called just before a quit key ends the viewer.
     """
     out = out or sys.stdout
+    started = clock()
 
     def terminal_size() -> tuple[int, int]:
         if size:
@@ -100,7 +111,9 @@ def run_viewer(render: Callable[[int, int], list[str]], *, scroll: bool, title: 
                 top = min(round(fraction * len(lines)), max(len(lines) - body, 0))
                 _draw(out, lines, top, width, body, scroll, title)
                 dirty = False
-            ready, _, _ = select.select([fd_in, wake_r], [], [])
+            ready, _, _ = select.select([fd_in, wake_r], [], [], refresh_s)
+            if not ready:
+                dirty = True
             if wake_r in ready:
                 while True:
                     try:
@@ -114,8 +127,14 @@ def run_viewer(render: Callable[[int, int], list[str]], *, scroll: bool, title: 
                 if not data:
                     return 0
                 moved = False
+                if on_text is not None and on_text(data.decode("utf-8", "ignore")):
+                    dirty = True
                 for action in _parse_keys(data):
                     if action == "quit":
+                        if clock() - started < quit_ignored_s or (lone_quit and len(data) != 1):
+                            continue
+                        if on_quit is not None:
+                            on_quit()
                         return 0
                     if not scroll:
                         continue
