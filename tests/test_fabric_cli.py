@@ -99,7 +99,7 @@ def _run_gateway(monkeypatch, capsys, tmp_path, *extra):
     seen["hook"] = lambda: None
     monkeypatch.setattr("time.sleep", fake_sleep)
     port = _free_port()
-    argv = ["devfabric", "gateway", "--bind", "127.0.0.1", "--control-port", str(port), "--url-base", "dev.test", *extra]
+    argv = ["devfabric", "gateway", "--bind", "127.0.0.1", "--control-port", str(port), "--url-base", "dev.test", "--allow-open", *extra]
     return argv, seen, port
 
 
@@ -139,7 +139,7 @@ def test_gateway_tls_flags_serve_https_and_both_flags_are_required(monkeypatch, 
     assert seen["banner"]["https"] is True and "plain http also accepted" in seen["banner"]["note"]
     assert results["status"].startswith(b"HTTP/1.")                       # the gateway command really terminates TLS
     with pytest.raises(SystemExit, match="together"):
-        cli.main(["devfabric", "gateway", "--bind", "127.0.0.1", "--tls-cert", str(cert)])
+        cli.main(["devfabric", "gateway", "--bind", "127.0.0.1", "--allow-open", "--tls-cert", str(cert)])
 
 
 def test_gateway_allow_flags_and_config_enable_enforcement(monkeypatch, capsys, tmp_path):

@@ -40,7 +40,7 @@ def _http_target(tmp_path):
     return server, server.server_address[1]
 
 
-def _gateway(tmp_path, *, port=0, token=None, probe_interval=0.5, ttl=5,
+def _gateway(tmp_path, *, port=0, token="", probe_interval=0.5, ttl=5,
              target_host="127.0.0.1", url_base="dev.test",
              port_range: tuple[int, int] | None = None):
     registry = DevServiceRegistry(store_path=tmp_path / "leases.json",
@@ -387,7 +387,7 @@ def _make_host_handler(gw: _FakeGatewayForHostHeader):
 
         def do_GET(self):
             gw.last_host_header = self.headers.get("Host")
-            body = b'{"ok": true}'
+            body = b'{"ok": true, "bound_ports": []}'
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))

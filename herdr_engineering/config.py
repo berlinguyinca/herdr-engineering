@@ -165,6 +165,12 @@ DEFAULTS: dict[str, Any] = {
         # services on ports in [agent_web_port_min, agent_ephemeral_min) that
         # are not in agent_exclude_ports (well-known daemons are also skipped).
         "agent_exclude_ports": [],
+        # "denylist" adopts every web port not denied (default); "allowlist"
+        # adopts only agent_allow_ports and processes in agent_allow_processes.
+        # Debugger/notebook probes and the port denylist apply in both modes.
+        "agent_adopt_mode": "denylist",
+        "agent_allow_ports": [],
+        "agent_allow_processes": [],
         # Process-name fragments never auto-leased (null = built-in list of
         # test/dev servers: vitest, jest, playwright, vite, next-server, ...).
         "agent_deny_processes": None,
