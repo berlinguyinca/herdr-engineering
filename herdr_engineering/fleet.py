@@ -20,6 +20,7 @@ import os
 import re
 import subprocess
 import sys
+import unicodedata
 from pathlib import Path
 
 from .fleet_inventory import add_host, write_host_vars
@@ -620,6 +621,21 @@ def parse_stage_error(*streams: str) -> dict | None:
 
 
 _STAGE_ERROR_CODES = frozenset({"managed_release_dirty"})
+_ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-_]")
+
+
+def printable_text(value) -> str:
+    """Remote-derived text made safe to store and print.
+
+    ANSI escapes are removed and every other control or format character (newlines, NUL,
+    bidi overrides, ...) becomes a space, so remote output cannot forge lines or recolour
+    the operator's terminal.
+    """
+    text = _ANSI.sub("", str(value))
+    text = "".join(
+        " " if unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp") else c for c in text
+    )
+    return re.sub(r" {2,}", " ", text).strip()
 
 
 def _bounded_stage_error(code: str, detail: dict) -> dict:
@@ -629,8 +645,10 @@ def _bounded_stage_error(code: str, detail: dict) -> dict:
     error = detail.get("error")
     return {
         "code": code,
-        "error": error[:500] if isinstance(error, str) else "",
-        "files": [f[:200] for f in files[:20] if isinstance(f, str)] if isinstance(files, list) else [],
+        "error": printable_text(error)[:500] if isinstance(error, str) else "",
+        "files": [printable_text(f)[:200] for f in files[:20] if isinstance(f, str)]
+        if isinstance(files, list)
+        else [],
     }
 
 

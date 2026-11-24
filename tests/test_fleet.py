@@ -442,6 +442,22 @@ def test_stage_error_marker_only_passes_bounded_text_fields(tmp_path, monkeypatc
     assert len(result['files']) <= 20 and all(isinstance(f, str) and len(f) <= 200 for f in result['files'])
 
 
+def test_stage_error_marker_strips_control_characters_and_ansi_escapes(tmp_path, monkeypatch):
+    repo = _fake_repo(tmp_path)
+    monkeypatch.setenv('HERDR_ENGINEERING_REPO', str(repo))
+    marker = _forged_marker({
+        'files': ['ok.txt', '\x1b[31mred\x1b[0m.txt', 'a\nb\r\x00c', 'bidi\u202eevil'],
+        'error': 'dirty:\x1b[2J\nFORGED LINE\x07',
+    })
+    monkeypatch.setattr(fleet, '_run', lambda cmd, **kw: (3, marker, ''))
+    result = fleet.stage_pi_runtime(REVISION, host='fry')
+    text = result['error'] + ''.join(result['files'])
+    assert not any(ord(c) < 32 or ord(c) == 127 or c in '\u202e' for c in text)
+    assert '[31m' not in text and '[2J' not in text
+    assert result['files'][:2] == ['ok.txt', 'red.txt']
+    assert result['error'].startswith('dirty:')
+
+
 def test_stage_pi_rejects_host_patterns_and_moving_refs(tmp_path, monkeypatch):
     repo = _fake_repo(tmp_path)
     monkeypatch.setenv('HERDR_ENGINEERING_REPO', str(repo))

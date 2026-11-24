@@ -1103,13 +1103,7 @@ def _session(plan, state, transport, target, root, save):
         )
 
 
-_UNPRINTABLE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-_]|[^\x20-\x7e\u00a0-\U0010ffff]|[\x7f-\x9f]")
-
-
-def _printable(text) -> str:
-    """Remote-derived text made safe to store and print: ANSI escapes and control characters
-    (newlines included) become spaces."""
-    return re.sub(r" +", " ", _UNPRINTABLE.sub(" ", str(text))).strip()
+_printable = fleet.printable_text
 
 
 def _note_unreachable(state, note):
@@ -1158,7 +1152,7 @@ def apply_rollout(store, rollout_id, *, transport=None, stage=None):
                     if report.get("ok") is not True and report.get("code") == DIRTY_RELEASE:
                         host_state.update(
                             status="blocked",
-                            error=str(report.get("error") or "managed release is dirty")[:500],
+                            error=_printable(report.get("error") or "managed release is dirty")[:500],
                             nextStep=(
                                 "inspect and commit or move the local changes in "
                                 f"~/.local/share/herdr-engineering/pi/releases/{plan['revision']} "

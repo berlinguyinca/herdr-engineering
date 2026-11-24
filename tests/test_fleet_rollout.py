@@ -2901,3 +2901,21 @@ def test_transiently_unreachable_native_session_never_queries_the_pane(tmp_path)
     assert dead["lastUnreachableAt"]
     assert not first["hosts"]["bender"].get("coverageErrors")
     assert first["hosts"]["bender"]["status"] != "complete"
+
+
+def test_dirty_release_error_is_sanitised_before_it_is_stored(tmp_path):
+    store, plan = setup_rollout(tmp_path)
+    wire = Wire()
+    wire.offline.clear()
+    wire.stage = lambda revision, *, host, inventory: {
+        "ok": False,
+        "rc": 3,
+        "code": "managed_release_dirty",
+        "files": ["a"],
+        "error": "managed release is dirty: \x1b[31mevil\x1b[0m\nINJECTED\x07; local work preserved",
+    }
+    state = apply(store, plan, wire)["hosts"]["bender"]
+    assert state["status"] == "blocked"
+    assert not any(ord(c) < 32 or ord(c) == 127 for c in state["error"])
+    assert "\x1b" not in state["error"] and "[31m" not in state["error"]
+    assert "evil" in state["error"]
