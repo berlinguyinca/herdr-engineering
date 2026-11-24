@@ -579,6 +579,7 @@ def _agent_setup(monkeypatch, tmp_path, live, loader_cfgs):
 
         def retarget(self, client, cp, key=None):
             self.client = client
+            log.setdefault("pinned", []).append(client._token)
             log["clients"].append((client.gateway_url, client.token))
             log["cps"].append(cp)
             log.setdefault("keys", []).append(key)
@@ -622,7 +623,8 @@ def test_fabric_agent_follows_rotated_token_and_url(monkeypatch, tmp_path):
     climod, log = _agent_setup(monkeypatch, tmp_path, live, [_fab("http://gw1:29999", "placeholder-host-two")])
     assert climod.main(["devfabric", "agent"]) == 0
     assert log["clients"][0] == ("http://gw1:29999", "placeholder-host-one")
-    assert log["clients"][-1] == ("http://gw1:29999", "placeholder-host-two")
+    # the rebuilt client pins no token: it resolves env, file, then the host config like any client
+    assert len(log["clients"]) >= 2 and log["pinned"] == [None]
 
 
 def test_fabric_agent_cache_fallback_and_transient_keep_live_config(monkeypatch, tmp_path):
