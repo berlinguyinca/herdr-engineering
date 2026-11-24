@@ -199,19 +199,25 @@ class DevServiceRegistry:
         gateway restart never loses leases an overlapping process persisted
         (e.g. a register served by an old process that was mid-shutdown).
         """
-        try:
-            mtime = self._sig()
-        except OSError:
-            return False
-        if mtime == self._loaded_mtime:
-            return False
-        self._loaded_mtime = mtime
-        try:
-            data = json.loads(self._path.read_text())
-        except Exception:
-            return False
-        with self._lock:
-            self._leases = _parse_leases(data)
+        with self._lock:  # signature check, read and swap are one step: an older read never replaces newer state
+            try:
+                mtime = self._sig()
+            except OSError:
+                return False
+            if mtime == self._loaded_mtime:
+                return False
+            self._loaded_mtime = mtime
+            try:
+                data = json.loads(self._path.read_text())
+            except Exception:
+                return False
+            fresh = _parse_leases(data)
+            for lid, lease in fresh.items():  # health is in-memory only: keep it for leases that survive
+                old = self._leases.get(lid)
+                if old is not None:
+                    lease.health_last_ok_at = old.health_last_ok_at
+                    lease.health_last_error = old.health_last_error
+            self._leases = fresh
         self._prune_expired()
         return True
 
@@ -665,23 +671,9 @@ class _Activity:
     def __init__(self) -> None:
         self.last = time.monotonic()
         self.stop = threading.Event()
-        # When the client first sent something the backend has not answered yet.
-        self.unanswered_since: float | None = None
 
     def touch(self) -> None:
         self.last = time.monotonic()
-
-    def sent_upstream(self) -> None:
-        if self.unanswered_since is None:
-            self.unanswered_since = time.monotonic()
-
-    def answered(self) -> None:
-        self.unanswered_since = None
-
-    def wedged(self, idle: float) -> bool:
-        """The client has been waiting longer than ``idle`` for ANY byte from the backend."""
-        since = self.unanswered_since
-        return since is not None and time.monotonic() - since > idle
 
     def expired(self, idle: float) -> bool:
         return time.monotonic() - self.last > idle
@@ -734,19 +726,15 @@ def _send_all(dst: socket.socket, data: bytes, act: _Activity, idle: float) -> N
 
 
 def _pump(src: socket.socket, dst: socket.socket, act: _Activity, idle: float,
-          prefix: bytes = b"", role: str = "") -> None:
+          prefix: bytes = b"") -> None:
     """Copy ``src`` -> ``dst``. A recv timeout is NOT an end of stream: the pipe
     ends only when the connection as a whole (either direction) has been idle
-    for ``idle`` seconds, so one-way streams (SSE, downloads) keep flowing.
-
-    ``role`` "up" (client -> backend) / "down" (backend -> client) also tracks
-    whether the backend answers: a backend that swallows the client's bytes but
-    sends nothing back for ``idle`` seconds is wedged, and ends the pipe even
-    though the client keeps sending."""
+    for ``idle`` seconds, so one-way streams (SSE, downloads, a long upload to a
+    backend that answers only at the end) keep flowing. A wedged backend (one
+    that stops accepting bytes) is caught by write progress: ``_send_all``
+    gives up once ``idle`` seconds pass without the socket taking a byte."""
     try:
         if prefix:
-            if role == "up":
-                act.sent_upstream()
             _send_all(dst, prefix, act, idle)
         while not act.stop.is_set():
             try:
@@ -754,20 +742,13 @@ def _pump(src: socket.socket, dst: socket.socket, act: _Activity, idle: float,
             except TimeoutError as exc:
                 if exc.errno is not None:
                     raise  # ETIMEDOUT from TCP keepalive: the peer is gone
-                if act.expired(idle) or act.wedged(idle):
+                if act.expired(idle):
                     act.stop.set()
                     break
                 continue
             if not data:
                 break  # orderly half-close: the other direction may continue
             act.touch()
-            if role == "up":
-                act.sent_upstream()
-                if act.wedged(idle):
-                    act.stop.set()
-                    break
-            elif role == "down":
-                act.answered()
             _send_all(dst, data, act, idle)
     except (OSError, ValueError):
         # This direction is dead; the other one keeps draining (an origin that
@@ -799,9 +780,9 @@ def _run_pipe(client: socket.socket, target: socket.socket, inactivity_timeout: 
     for s in (client, target):
         enable_keepalive(s)
         s.settimeout(poll)
-    t1 = threading.Thread(target=_pump, args=(client, target, act, inactivity_timeout, client_prefix, "up"),
+    t1 = threading.Thread(target=_pump, args=(client, target, act, inactivity_timeout, client_prefix),
                           daemon=True)
-    t2 = threading.Thread(target=_pump, args=(target, client, act, inactivity_timeout, b"", "down"),
+    t2 = threading.Thread(target=_pump, args=(target, client, act, inactivity_timeout, b""),
                           daemon=True)
     t1.start()
     t2.start()
@@ -840,9 +821,11 @@ def _log_devfabric(component: str, level: str, msg: str, *args) -> None:
 
 
 def _send_http_502(client: socket.socket, reason: str = "backend unavailable",
-                   status: str = "502 Bad Gateway") -> None:
+                   status: str = "502 Bad Gateway", act: _Activity | None = None) -> None:
     """Send a short HTTP 502 so HTTP clients fail cleanly instead of seeing a
     raw TCP reset. Best effort: non-HTTP clients just get a close."""
+    if act is not None:
+        act.stop.set()  # stop the pump polling this socket before its timeout is switched
     body = f"{reason}\n".encode()
     head = (
         b"HTTP/1.1 " + status.encode() + b"\r\n"
@@ -1029,14 +1012,20 @@ def rewriting_pipe(client: socket.socket, target: socket.socket, port: int, exte
             resp_head, body = _read_head_polled(target, act, response_timeout)
         except TimeoutError as exc:
             if exc.errno is None:
-                _send_http_502(client, "origin did not answer in time", status="504 Gateway Timeout")
+                _send_http_502(client, "origin did not answer in time", status="504 Gateway Timeout", act=act)
             else:  # TCP keepalive gave up on the origin
-                _send_http_502(client, "origin connection lost")
+                _send_http_502(client, "origin connection lost", act=act)
             raise
-        if not resp_head and not body and act.stop.is_set():
-            # The upload pump's idle clock expired together with the head deadline
-            # and half-closed the origin, which then closed: that is a timeout.
-            _send_http_502(client, "origin did not answer in time", status="504 Gateway Timeout")
+        except OSError:  # e.g. ECONNRESET before any head byte
+            _send_http_502(client, "origin connection lost", act=act)
+            raise
+        if not resp_head and not body:
+            if act.stop.is_set():
+                # The upload pump's idle clock expired together with the head deadline
+                # and half-closed the origin, which then closed: that is a timeout.
+                _send_http_502(client, "origin did not answer in time", status="504 Gateway Timeout", act=act)
+            else:  # the origin closed without sending a head byte
+                _send_http_502(client, "origin closed the connection without a response", act=act)
             return
         if rewrite_head and resp_head.endswith(b"\r\n\r\n"):
             resp_head = rewrite_response_head(resp_head[:-4], port, external,

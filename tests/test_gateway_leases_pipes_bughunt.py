@@ -189,12 +189,12 @@ def _stream_through(pipe_fn, idle):
 
 
 def test_proxy_pair_keeps_streaming_when_only_one_direction_is_active():
-    got, sent = _stream_through(lambda c, t, idle: proxy_pair(c, t, inactivity_timeout=idle), 0.5)
+    got, sent = _stream_through(lambda c, t, idle: proxy_pair(c, t, inactivity_timeout=idle), 2.0)
     assert len(got) == sent
 
 
 def test_prefixed_pipe_keeps_streaming_when_only_one_direction_is_active():
-    got, sent = _stream_through(lambda c, t, idle: prefixed_pipe(c, t, inactivity_timeout=idle), 0.5)
+    got, sent = _stream_through(lambda c, t, idle: prefixed_pipe(c, t, inactivity_timeout=idle), 2.0)
     assert len(got) == sent
 
 
@@ -494,20 +494,20 @@ def test_rewriting_pipe_answers_504_not_an_empty_reply_when_the_origin_closes_on
         c_user.close()
 
 
-# -- re-review: a wedged backend ends the pipe while the client keeps sending ---------------------
+# -- re-review: a backend that stops accepting bytes ends the pipe (write progress) ---------------------
 
 def _wedged_backend_pipe(pipe_fn):
     c_user, c_proxy = socket.socketpair()
-    t_proxy, t_backend = socket.socketpair()  # t_backend never reads and never writes
-    pt = threading.Thread(target=pipe_fn, args=(c_proxy, t_proxy, 0.5), daemon=True)
+    t_proxy, t_backend = socket.socketpair()  # t_backend never reads (its buffer fills)
+    pt = threading.Thread(target=pipe_fn, args=(c_proxy, t_proxy, 1.0), daemon=True)
     pt.start()
     done = threading.Event()
 
     def chatter() -> None:
         try:
             while not done.is_set():
-                c_user.sendall(b"ping")
-                time.sleep(0.1)
+                c_user.sendall(b"p" * 65536)  # fills the backend socket's buffer: no write progress
+                time.sleep(0.05)
         except OSError:
             pass
 
@@ -521,11 +521,11 @@ def _wedged_backend_pipe(pipe_fn):
     return ended
 
 
-def test_proxy_pair_ends_when_the_backend_is_wedged_while_the_client_keeps_sending():
+def test_proxy_pair_ends_when_the_backend_stops_accepting_bytes_while_the_client_keeps_sending():
     assert _wedged_backend_pipe(lambda c, t, idle: proxy_pair(c, t, inactivity_timeout=idle))
 
 
-def test_prefixed_pipe_ends_when_the_backend_is_wedged_while_the_client_keeps_sending():
+def test_prefixed_pipe_ends_when_the_backend_stops_accepting_bytes_while_the_client_keeps_sending():
     assert _wedged_backend_pipe(lambda c, t, idle: prefixed_pipe(c, t, client_prefix=b"hello",
                                                                  inactivity_timeout=idle))
 
@@ -533,7 +533,7 @@ def test_prefixed_pipe_ends_when_the_backend_is_wedged_while_the_client_keeps_se
 def test_proxy_pair_keeps_a_conversation_alive_where_the_backend_answers_regularly():
     c_user, c_proxy = socket.socketpair()
     t_proxy, t_backend = socket.socketpair()
-    pt = threading.Thread(target=proxy_pair, args=(c_proxy, t_proxy), kwargs={"inactivity_timeout": 0.5},
+    pt = threading.Thread(target=proxy_pair, args=(c_proxy, t_proxy), kwargs={"inactivity_timeout": 2.0},
                           daemon=True)
     pt.start()
 
@@ -547,7 +547,7 @@ def test_proxy_pair_keeps_a_conversation_alive_where_the_backend_answers_regular
 
     threading.Thread(target=echo, daemon=True).start()
     c_user.settimeout(5)
-    for _ in range(8):  # 8 * ~0.3s well past the 0.5s idle bound
+    for _ in range(10):  # 10 * ~0.3s well past the 2s idle bound
         c_user.sendall(b"hi")
         assert c_user.recv(100) == b"hi"
         time.sleep(0.1)
@@ -641,3 +641,136 @@ def test_registry_resolve_port_holds_the_lock(tmp_path):
         blocked = t.is_alive()
     t.join(5)
     assert blocked and results == [lease]
+
+
+# -- round 4 -------------------------------------------------------------------------------------
+
+def test_a_long_upload_to_a_backend_that_answers_only_at_the_end_is_not_cut():
+    c_user, c_proxy = socket.socketpair()
+    t_proxy, t_backend = socket.socketpair()
+    pt = threading.Thread(target=proxy_pair, args=(c_proxy, t_proxy), kwargs={"inactivity_timeout": 1.0},
+                          daemon=True)
+    pt.start()
+    got = []
+
+    def backend() -> None:  # reads the whole body, answers only when the client half-closes
+        while chunk := t_backend.recv(65536):
+            got.append(chunk)
+        t_backend.sendall(b"done")
+        t_backend.shutdown(socket.SHUT_WR)
+
+    threading.Thread(target=backend, daemon=True).start()
+    for _ in range(15):  # ~3 s of upload, three times the idle bound, the backend silent throughout
+        c_user.sendall(b"x" * 1000)
+        time.sleep(0.2)
+    c_user.shutdown(socket.SHUT_WR)
+    c_user.settimeout(10)
+    assert c_user.recv(100) == b"done"
+    assert sum(map(len, got)) == 15000
+    pt.join(10)
+    c_user.close()
+    t_backend.close()
+
+
+@pytest.mark.parametrize("how", ["close", "reset"])
+def test_rewriting_pipe_answers_502_when_the_origin_closes_or_resets_before_a_head(how):
+    import struct
+    c_user, c_proxy = socket.socketpair()
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    t_proxy = socket.create_connection(listener.getsockname())
+    t_backend, _ = listener.accept()
+    c_user.sendall(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+
+    def origin() -> None:
+        t_backend.recv(65536)
+        if how == "reset":
+            t_backend.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        t_backend.close()
+
+    threading.Thread(target=origin, daemon=True).start()
+    rewriting_pipe(c_proxy, t_proxy, 80, "dev.test:80", inactivity_timeout=5.0, response_timeout=5.0)
+    c_user.settimeout(5)
+    assert c_user.recv(4096).startswith(b"HTTP/1.1 502")
+    c_user.close()
+    listener.close()
+
+
+def test_reload_never_replaces_newer_state_and_keeps_health(tmp_path):
+    reg = _reg(tmp_path)
+    keep = reg.register(target_machine_id="k", target_host="127.0.0.1", target_port=9000)
+    reg.mark_health(keep.id, True)
+    stop = threading.Event()
+    errors: list[BaseException] = []
+
+    def beat() -> None:
+        try:
+            while not stop.is_set():
+                reg.heartbeat(keep.id)
+                reg.reload_if_changed()
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    workers = [threading.Thread(target=beat, daemon=True) for _ in range(4)]
+    for w in workers:
+        w.start()
+    ids = []
+    for i in range(25):
+        ids.append(reg.register(target_machine_id=f"m{i}", target_host="127.0.0.1", target_port=9100 + i).id)
+    stop.set()
+    for w in workers:
+        w.join(10)
+    assert not errors
+    fresh = _reg(tmp_path)
+    assert {lease.id for lease in fresh.active_leases()} >= set(ids) | {keep.id}
+    reg2 = _reg(tmp_path)
+    reg2.mark_health(keep.id, True)
+    stamp = reg2.get(keep.id).health_last_ok_at
+    reg.register(target_machine_id="other", target_host="127.0.0.1", target_port=9999)  # store changes
+    reg2.reload_if_changed()
+    assert reg2.get(keep.id).health_last_ok_at == stamp
+
+
+def test_heartbeat_loop_retries_a_forwarder_that_failed_to_bind(tmp_path):
+    from herdr_engineering.cli import heartbeat_local_leases
+    from herdr_engineering.devfabric import forwarder_for
+    reg = _reg(tmp_path)
+    a = reg.register(target_machine_id="x", target_host="127.0.0.1", target_port=9001, preferred_port=26600)
+    fwd = {}
+    state = {"a": {"lease_id": a.id, "port": a.external_port}}
+    squatter = socket.socket()  # holds the port the lease will move to
+    try:
+        reg.close(a.id)
+        b = reg.register(target_machine_id="y", target_host="127.0.0.1", target_port=9002, preferred_port=26600)
+        assert b.external_port == 26600
+        fwd["a"] = forwarder_for(a, bind_host="127.0.0.1").start()  # still listening on the old port
+        target = next(p for p in range(26700, 26999) if _can_bind(p))
+        reg.port_free = lambda p: p == target  # the registry believes only this port is free
+        squatter.bind(("127.0.0.1", target))
+        squatter.listen(1)
+        heartbeat_local_leases(reg, state, fwd=fwd, bind="127.0.0.1")
+        assert fwd.get("a") is None and state["a"]["port"] == 26600  # bind failed: port not recorded
+        squatter.close()
+        heartbeat_local_leases(reg, state, fwd=fwd, bind="127.0.0.1")
+        assert fwd["a"] is not None and state["a"]["port"] == target
+    finally:
+        squatter.close()
+        for f in fwd.values():
+            if f is not None:
+                f.stop()
+
+
+def test_heartbeat_loop_keeps_renewing_later_leases_when_one_cannot_be_reregistered(tmp_path):
+    from herdr_engineering.cli import heartbeat_local_leases
+    reg = _reg(tmp_path)
+    a = reg.register(target_machine_id="x", target_host="127.0.0.1", target_port=9001, preferred_port=26600)
+    c = reg.register(target_machine_id="z", target_host="127.0.0.1", target_port=9003)
+    state = {"a": {"lease_id": a.id, "port": a.external_port}, "c": {"lease_id": c.id, "port": c.external_port}}
+    reg.close(a.id)
+    reg.register(target_machine_id="y", target_host="127.0.0.1", target_port=9002, preferred_port=26600)
+    before = reg.get(c.id).expires_at
+    time.sleep(0.01)
+    reg.port_free = lambda p: False  # the range is exhausted: re-registering "a" raises ConflictError
+    heartbeat_local_leases(reg, state)
+    assert reg.get(c.id).expires_at > before

@@ -23,10 +23,13 @@ import sys
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .handoff_adapters.base import Harness
 from .version import __version__
+
+if TYPE_CHECKING:
+    from .devfabric import DevServiceForwarder, DevServiceLease, DevServiceRegistry
 
 # The central fleet file, alone in its own directory (deploy.sh mounts the directory).
 # Same value as fleet_config_cli.DEFAULT_CONFIG_PATH (not imported: keeps startup light).
@@ -795,7 +798,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--process"); p2.add_argument("--label")
     p2.add_argument("--route", action="append", default=None, metavar="PREFIX=HOST:PORT",
                     help="same-origin route (repeatable): a path prefix -> backend, "
-                         "e.g. /api=api:8300. The --host/--port is the catch-all. "
+                         "e.g. /api=127.0.0.1:8300. HOST must be an IP literal or localhost "
+                         "(the gateway refuses named hosts). The --host/--port is the catch-all. "
                          "Makes this a multi-backend same-origin app edge.")
     p2.add_argument("--preferred-port", type=int, default=None,
                     help="pin the origin's external dev port (default: match --port, "
@@ -2892,7 +2896,7 @@ def _spec_from_manifest(m: dict) -> dict:
     }
 
 
-def _renew_local(reg, lease_id: str):
+def _renew_local(reg: DevServiceRegistry, lease_id: str) -> DevServiceLease | None:
     """Heartbeat a local lease; if its port went to another lease while it
     lapsed (heartbeat returns None) re-register it onto a fresh port. A lease
     missing from the registry stays None (the next sync re-enrolls it)."""
@@ -2906,7 +2910,8 @@ def _renew_local(reg, lease_id: str):
     return renewed
 
 
-def _renew_serving_origin(reg, lease_id: str, bound_port: int, forwarder, bind: str):
+def _renew_serving_origin(reg: DevServiceRegistry, lease_id: str, bound_port: int,
+                          forwarder: DevServiceForwarder, bind: str) -> tuple[int, DevServiceForwarder]:
     """One renewal cycle of ``enroll --serve``. Returns (bound_port, forwarder).
 
     The port is tracked by the caller, not read off a lease object captured at
@@ -2942,33 +2947,47 @@ def heartbeat_local_leases(reg, state: dict, fwd: dict | None = None,
     from .devfabric import _now_iso, _parse_time
     now = _parse_time(_now_iso())
     for key, st in state.items():
-        lid = st["lease_id"]
-        lease = reg.get(lid)
-        lapsed = lease is not None and _parse_time(lease.expires_at) < now
-        old_port = st.get("port")
-        renewed = _renew_local(reg, lid)
-        if renewed is None:
+        try:
+            _heartbeat_one_local(reg, key, st, now, fwd, bind)
+        except Exception as exc:  # noqa: BLE001 - one lease must not stop the others renewing
             logging.getLogger("herdr.cli").warning(
-                "lease %s missing from the registry while the forwarder "
-                "still serves it (clobbered or pruned); the next sync will "
-                "re-enroll it", lid)
-        elif lapsed:
-            logging.getLogger("herdr.cli").warning(
-                "lease %s lapsed (expired while the forwarder held the "
-                "port); renewed now", lid)
-        if renewed is not None and old_port is not None \
-                and renewed.external_port != old_port:
-            logging.getLogger("herdr.cli").warning(
-                "lease %s moved from port %s to %s on renewal", lid,
-                old_port, renewed.external_port)
-            st["port"] = renewed.external_port
-            if fwd is not None and fwd.get(key) is not None:
-                try:
-                    fwd[key].stop()
-                except Exception:
-                    pass
-                fwd.pop(key, None)
-                _ensure_origin_forwarder(fwd, key, renewed, bind)
+                "renewing lease %s failed: %s", st.get("lease_id"), exc)
+
+
+def _heartbeat_one_local(reg, key: str, st: dict, now, fwd: dict | None, bind: str) -> None:
+    from .devfabric import _parse_time
+    log = logging.getLogger("herdr.cli")
+    lid = st["lease_id"]
+    lease = reg.get(lid)
+    lapsed = lease is not None and _parse_time(lease.expires_at) < now
+    old_port = st.get("port")
+    renewed = _renew_local(reg, lid)
+    if renewed is None:
+        log.warning(
+            "lease %s missing from the registry while the forwarder "
+            "still serves it (clobbered or pruned); the next sync will "
+            "re-enroll it", lid)
+    elif lapsed:
+        log.warning(
+            "lease %s lapsed (expired while the forwarder held the "
+            "port); renewed now", lid)
+    if renewed is None or old_port is None or renewed.external_port == old_port:
+        return
+    log.warning("lease %s moved from port %s to %s on renewal", lid, old_port, renewed.external_port)
+    if fwd is not None and key in fwd:  # a failed earlier start leaves None: retry it too
+        if fwd[key] is not None:
+            try:
+                fwd[key].stop()
+            except Exception:
+                pass
+        fwd.pop(key, None)
+        err = _ensure_origin_forwarder(fwd, key, renewed, bind)
+        if err is not None:
+            # Keep the old port recorded so the next cycle sees the move again and retries.
+            log.warning("forwarder for lease %s could not bind port %s: %s; retrying next cycle",
+                        lid, renewed.external_port, err)
+            return
+    st["port"] = renewed.external_port
 
 
 def _ensure_origin_forwarder(fwd: dict, key: str, lease, bind: str):
