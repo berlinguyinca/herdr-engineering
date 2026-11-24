@@ -22,6 +22,14 @@ export function authorizeUrl(cfg, redirectUri, state, challenge) {
   return `${cfg.hosted_ui_domain.replace(/\/$/, '')}/oauth2/authorize?${q}`;
 }
 
+// Ends the Cognito Hosted-UI session too (clearing local tokens alone leaves its cookie, so the next person to press
+// "Sign in" on a shared machine would be signed straight back in as the previous user). Falls back to the registered
+// callback address, which the IdP must also list as an allowed sign-out URL.
+export function logoutUrl(cfg) {
+  const q = new URLSearchParams({ client_id: cfg.client_id, logout_uri: cfg.logout_uri || cfg.public_url });
+  return `${cfg.hosted_ui_domain.replace(/\/$/, '')}/logout?${q}`;
+}
+
 export function parseRedirect(search) {
   const q = new URLSearchParams(search);
   if (q.get('error')) return { error: q.get('error_description') || q.get('error') };
@@ -76,8 +84,10 @@ function lineageQuery(room, o, extra = {}) {
 
 export class CollabApi {
   // getTokens = null selects the same-origin dashboard mode: no bearer token, the dashboard proxy authenticates.
-  constructor(getTokens, fetchFn = (...a) => fetch(...a), base = '/api/v1/collab') {
-    this.getTokens = getTokens; this.fetch = fetchFn; this.base = base;
+  // timeoutMs bounds every call (the room long-poll waits 8 s server-side), so a half-open connection fails and is retried
+  // by the caller instead of freezing the page forever.
+  constructor(getTokens, fetchFn = (...a) => fetch(...a), base = '/api/v1/collab', { timeoutMs = 30000 } = {}) {
+    this.getTokens = getTokens; this.fetch = fetchFn; this.base = base; this.timeoutMs = timeoutMs;
   }
   async call(method, path, body, signal) {
     const t = this.getTokens ? this.getTokens() : null;
@@ -86,7 +96,7 @@ export class CollabApi {
       method,
       headers: { ...(t ? { Authorization: `Bearer ${t.access}` } : {}), ...(body ? { 'Content-Type': 'application/json' } : {}) },
       body: body ? JSON.stringify(body) : undefined,
-      signal,
+      signal: AbortSignal.any([AbortSignal.timeout(this.timeoutMs), ...(signal ? [signal] : [])]),
     });
     if (res.status === 401) throw new AuthError('session expired');
     const data = await res.json().catch(() => ({}));
