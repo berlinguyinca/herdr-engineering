@@ -10,6 +10,11 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - `fabric-gateway` and `herdr-web` no longer bind-mount `../fabric-stack/config.yaml` (it resolved into deploy.sh's deleted temporary worktree, so a container restart came back without its config). `deploy/fabric-stack/config.yaml` is baked into the image as `/app/config.yaml`; a route change (`fabric-stack.sh memory-route`) now ships by commit plus deploy. `test_recreated_services_have_no_relative_bind_mounts` now covers every service in deploy.sh's `APP_SERVICES`.
 - The private web-egress default moved from `172.31.252.0/29` to `172.31.252.32/29` (gateway .33, source .34): it sat inside the artifact host's fixed `172.31.252.0/28` edge network, so it could never be enabled beside it. A test asserts the fixed subnets are pairwise disjoint. A host that already runs egress on the old default keeps it only if the artifact host is not enabled; re-run `deploy.sh --memory-private-egress` to move.
 - The fabric image base (`python:3.12-slim`), `postgres:16-alpine`, `coredns:1.11.4` and the memory-client base are pinned by digest, and the runtime image installs under `deploy/fabric-stack/constraints.txt` exported from `uv.lock` (a test keeps it equal to a fresh export). Versions are unchanged. `minio/minio` stays pinned by exact tag only (its digest cannot be resolved from Docker Hub).
+### Fix: Slack approval of unseen text, calendar block-list alias, Rakazo first-bot cache
+
+- Slack ask: the Approve buttons are only offered when the command is shown in full; a long (truncated) command gets Deny only and a "cannot be approved from Slack" note, and an approve tap on such an ask is refused (`not_fully_shown`).
+- `CalendarPolicy`: blocking both `primary` and the primary's real id no longer blocks every other calendar.
+- Rakazo bridge: the first-bot cache is keyed by `(tenant, user)`, so two spaces of one account no longer share a cached bot id.
 
 ### Feature: periodic `herdr-handoff reap --apply` timer (opt-in, off by default)
 
