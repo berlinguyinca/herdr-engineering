@@ -30,19 +30,19 @@
   ansible.builtin.shell: |
     set -e
     if ! command -v herdr >/dev/null 2>&1 || ! herdr --version 2>/dev/null | grep -q "{{ herdr_pinned_version }}"; then
-      echo "herdr install required: {{ herdr_pinned_version }}" >&2
-      exit 1   # nothing here installs it (staging does): a missing or mismatched runtime must fail the host, not report changed
-    fi
+      echo "DRIFT: herdr {{ herdr_pinned_version }} is not installed (missing or another version)" >&2
+    fi   # report only, never fail: nothing in this role installs herdr (the operator does); a missing or other version must not stop the fleet update
   changed_when: false
+  failed_when: false
 
 - name: "Verify Pi is present"
   ansible.builtin.shell: |
     set -e
     if ! command -v pi >/dev/null 2>&1; then
-      echo "pi install required" >&2
-      exit 1   # nothing here installs it (staging does): a missing runtime must fail the host, not report changed
-    fi
+      echo "DRIFT: pi is not on this play's PATH" >&2
+    fi   # report only, never fail: nothing in this role installs pi (the operator does)
   changed_when: false
+  failed_when: false
 
 - name: "Clone berlinguyinca/pi-engineering"
   ansible.builtin.git:

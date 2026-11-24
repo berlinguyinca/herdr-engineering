@@ -134,6 +134,36 @@ def test_monitor_does_not_flag_a_healthy_container(tmp_path):
     assert "gateway-not-healthy" not in row["reasons"]
 
 
+def test_monitor_counts_only_contention_events_inside_each_window(tmp_path):
+    from datetime import UTC, datetime, timedelta
+
+    def line(event: str, age: timedelta) -> str:
+        ts = (datetime.now(UTC) - age).isoformat(timespec="milliseconds")
+        return json.dumps({"event": event, "ts": ts, "host": "h"}, sort_keys=True)
+
+    gates = tmp_path / "state" / "build-gates"
+    gates.mkdir(parents=True)
+    (gates / "telemetry.jsonl").write_text(
+        "\n".join(
+            [
+                line("contention", timedelta(minutes=10)),  # in both windows
+                line("contention", timedelta(hours=5)),  # 24h only
+                line("contention", timedelta(hours=40)),  # neither
+                line("acquired", timedelta(minutes=1)),  # not contention
+                line("released", timedelta(minutes=2)),
+            ]
+        )
+        + "\n"
+    )
+    env = _env(tmp_path, HERDR_STATE_DIR=str(tmp_path / "state"))
+    env["HERDR_GATEWAY_CONTAINER"] = "herdr-no-such-gateway"
+    r = subprocess.run(
+        ["bash", str(MONITOR), "--json"], env=env, capture_output=True, text=True, timeout=60
+    )
+    row = json.loads(r.stdout.strip().splitlines()[-1])
+    assert (row["gate_contention_1h"], row["gate_contention_24h"]) == (1, 2), row
+
+
 # --------------------------------------------------------------------------- 21 fabric-stack
 
 
@@ -186,6 +216,46 @@ def test_status_surfaces_a_compose_error_instead_of_stack_not_running(tmp_path):
     assert "stack not running" not in r.stdout
 
 
+def _stack_with_docker(tmp_path: Path, docker_body: str, *args: str):
+    """Run fabric-stack.sh with a recording `docker` helper in place of the real one."""
+    tree = _stack_tree(tmp_path)
+    bindir = tmp_path / "bin"
+    calls = tmp_path / "calls.log"
+    _helper(bindir, "docker", f'echo "docker $*" >> {calls}\n{docker_body}\n')
+    _helper(bindir, "tailscale", "echo 100.64.0.9\n")
+    _helper(bindir, "systemctl", f'echo "systemctl $*" >> {calls}\nexit 0\n')
+    _helper(bindir, "pgrep", f'echo "pgrep $*" >> {calls}\nexit 0\n')
+    _helper(bindir, "pkill", f'echo "pkill $*" >> {calls}\nexit 0\n')
+    _helper(bindir, "curl", f'echo "curl $*" >> {calls}\nexit 0\n')
+    _helper(bindir, "dig", f'echo "dig $*" >> {calls}\nexit 0\n')
+    r = subprocess.run(
+        ["bash", str(tree / "scripts" / "fabric-stack.sh"), *args],
+        env=_env(tmp_path, bindir),
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    return r, calls.read_text() if calls.exists() else ""
+
+
+def test_up_replace_builds_the_image_before_stopping_the_old_services(tmp_path):
+    r, calls = _stack_with_docker(tmp_path, "exit 0", "up-replace")
+    assert r.returncode == 0, r.stderr
+    lines = calls.splitlines()
+    build = next(i for i, c in enumerate(lines) if c.startswith("docker") and " build " in c + " ")
+    stop = next(i for i, c in enumerate(lines) if c.startswith(("pkill", "systemctl --user stop")))
+    assert build < stop, calls
+
+
+def test_status_goes_on_to_healthz_and_dns_when_compose_cannot_render(tmp_path):
+    r, calls = _stack_with_docker(
+        tmp_path, 'case "$*" in *" ps"*) echo "compose render error" >&2; exit 1;; esac', "status"
+    )
+    assert r.returncode != 0
+    assert "compose render error" in r.stderr
+    assert "curl" in calls and "dig" in calls, calls  # the other checks still ran
+
+
 def test_up_never_removes_orphans_and_names_its_services():
     text = (ROOT / "scripts" / "fabric-stack.sh").read_text()
     code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
@@ -224,19 +294,15 @@ def test_a_failing_restart_restores_the_symlink_and_the_roll_goes_on(tmp_path):
         'src="$1"; dest="${2#*:}"; exec cp "$src" "$dest"\n',
     )
     # restart of the plugin unit fails on host alpha only (HOME differs per host: HOSTMARK file).
-    _helper(
-        bindir,
-        "systemctl",
-        'if [ "$2" = restart ] && [ -e "$HOME/.fail-restart" ]; then exit 1; fi\nexit 0\n',
-    )
     home = tmp_path / "home"
     cfg = home / ".config" / "herdr-engineering"
     cfg.mkdir(parents=True)
     (cfg / "host.json").write_text("{}")
     (home / ".fail-restart").write_text("x")
-    (bindir / "python3").symlink_to(
-        "/usr/bin/python3"
-    )  # the system python has pip; the dev venv may not
+    system_python = shutil.which("python3", path="/usr/bin:/bin")
+    if system_python is None:
+        pytest.skip("needs a system python3 (the dev venv may lack pip)")
+    (bindir / "python3").symlink_to(system_python)
     # Both targets share one HOME, so the failure is one-shot: the first restart consumes the marker (alpha fails).
     _helper(
         bindir,
@@ -250,7 +316,11 @@ def test_a_failing_restart_restores_the_symlink_and_the_roll_goes_on(tmp_path):
     prev = home / ".local/share/herdr-cp-feed-plugin-releases/previous"
     prev.mkdir(parents=True)
     cur.symlink_to(prev)
+    # A pinned PATH and no agent config roots: the roll must not reach the developer's real herdr/claude/codex/pi.
     env = _env(tmp_path, bindir, HERDR_FLEET_HOSTS=str(hosts))
+    env["PATH"] = f"{bindir}:/usr/bin:/bin"
+    for name in ("CODEX_HOME", "CLAUDE_CONFIG_DIR", "PI_CODING_AGENT_DIR"):
+        env.pop(name, None)
     r = subprocess.run(
         ["bash", str(AGENTS), "--no-fetch", "--ref", "HEAD"],
         env=env,
@@ -260,6 +330,9 @@ def test_a_failing_restart_restores_the_symlink_and_the_roll_goes_on(tmp_path):
         cwd=ROOT,
     )
     assert r.returncode != 0  # alpha failed
+    assert "plugin: NOT active, restoring" in r.stderr, (
+        r.stderr
+    )  # ...because its restart failed, nothing else
     out = log.read_text() if log.exists() else r.stderr + r.stdout
     assert "beta.test" in out and "beta.test: mkdir" in out, (
         r.stderr
@@ -267,6 +340,51 @@ def test_a_failing_restart_restores_the_symlink_and_the_roll_goes_on(tmp_path):
     assert re.search(r"alpha\.test: ln -sfn \S*/previous ", out), (
         out
     )  # alpha was put back where it was
+
+
+def test_a_failed_ssh_for_the_feed_dir_copies_nothing_to_the_host_root(tmp_path):
+    bindir = tmp_path / "bin"
+    scp_log = tmp_path / "scp.log"
+    _helper(
+        bindir,
+        "ssh",
+        'while [ "${1#-}" != "$1" ]; do [ "$1" = -o ] && shift; shift; done\n'
+        'host="$1"; shift\n'
+        'case "$*" in "echo "*herdr-service-metadata/releases/*) exit 255;; esac\n'
+        'exec bash -c "$*"\n',
+    )
+    _helper(
+        bindir,
+        "scp",
+        'while [ "${1#-}" != "$1" ]; do [ "$1" = -o ] && shift; shift; done\n'
+        f'echo "$2" >> {scp_log}\n'
+        'src="$1"; dest="${2#*:}"; [ "$dest" != / ] || exit 1; exec cp "$src" "$dest"\n',
+    )
+    _helper(bindir, "systemctl", "exit 0\n")
+    (bindir / "python3").symlink_to("/usr/bin/python3")
+    home = tmp_path / "home"
+    cfg = home / ".config" / "herdr-engineering"
+    cfg.mkdir(parents=True)
+    (cfg / "host.json").write_text("{}")
+    (home / ".local/share/herdr-service-metadata/releases").mkdir(parents=True)
+    hosts = tmp_path / "hosts.txt"
+    hosts.write_text("alpha|alpha.test|systemd\n")
+    env = _env(tmp_path, bindir, HERDR_FLEET_HOSTS=str(hosts))
+    env["PATH"] = f"{bindir}:/usr/bin:/bin"
+    for name in ("CODEX_HOME", "CLAUDE_CONFIG_DIR", "PI_CODING_AGENT_DIR"):
+        env.pop(name, None)
+    r = subprocess.run(
+        ["bash", str(AGENTS), "--no-fetch", "--ref", "HEAD"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=180,
+        cwd=ROOT,
+    )
+    scp = scp_log.read_text() if scp_log.exists() else ""
+    assert "alpha.test:/" not in scp.splitlines(), scp  # nothing is sent to the host root
+    assert "ownership feed: FAILED" in r.stderr, r.stderr
+    assert r.returncode != 0
 
 
 # --------------------------------------------------------------------------- 45 collab-sync
@@ -325,12 +443,12 @@ def test_a_failed_once_leaves_no_temp_dir_in_the_sync_dir(tmp_path):
 
 @pytest.mark.parametrize("role", ["herdr_linux", "herdr_macos"])
 @pytest.mark.parametrize("task_name,binary", [("Verify Herdr", "herdr"), ("Verify Pi", "pi")])
-def test_missing_runtime_fails_the_task_instead_of_reporting_changed(
+def test_a_missing_runtime_is_reported_as_drift_and_never_fails_the_host(
     tmp_path, role, task_name, binary
 ):
     tasks = yaml.safe_load((ROOT / "ansible" / "roles" / role / "tasks" / "main.yml").read_text())
     task = next(t for t in tasks if t["name"].startswith(task_name))
-    assert "ignore_errors" not in task
+    assert task["failed_when"] is False and task["changed_when"] is False
     script = task["ansible.builtin.shell"].replace("{{ herdr_pinned_version }}", "0.9.1")
     empty = tmp_path / "empty"
     empty.mkdir()
@@ -342,7 +460,29 @@ def test_missing_runtime_fails_the_task_instead_of_reporting_changed(
         capture_output=True,
         text=True,
     )
-    assert r.returncode != 0 and "required" in r.stderr
+    assert r.returncode == 0 and "DRIFT" in r.stderr, (r.returncode, r.stderr)
+
+
+@pytest.mark.parametrize("role", ["herdr_linux", "herdr_macos"])
+def test_another_herdr_version_is_drift_and_the_pinned_one_is_quiet(tmp_path, role):
+    tasks = yaml.safe_load((ROOT / "ansible" / "roles" / role / "tasks" / "main.yml").read_text())
+    task = next(t for t in tasks if t["name"].startswith("Verify Herdr"))
+    script = task["ansible.builtin.shell"].replace("{{ herdr_pinned_version }}", "0.9.1")
+    bindir = tmp_path / "bin"
+    for tool in ("bash", "grep"):
+        bindir.mkdir(exist_ok=True)
+        (bindir / tool).symlink_to(shutil.which(tool))
+    out = {}
+    for version in ("0.1.0", "0.9.1"):
+        _helper(bindir, "herdr", f'echo "herdr {version}"\n')
+        r = subprocess.run(
+            [str(bindir / "bash"), "-c", script],
+            env={"PATH": str(bindir)},
+            capture_output=True,
+            text=True,
+        )
+        out[version] = (r.returncode, "DRIFT" in r.stderr)
+    assert out == {"0.1.0": (0, True), "0.9.1": (0, False)}
 
 
 # --------------------------------------------------------------------------- 48 fleet-join
@@ -489,3 +629,26 @@ def test_worker_refuses_a_task_id_that_is_not_a_plain_token(tmp_path):
         (tmp_path / "tmpdir").glob("escaped*")
     )  # "../../escaped" resolves to TMPDIR/escaped
     assert "ok-1 done" in r.stdout and "escaped" not in r.stdout
+
+
+def test_worker_runs_good_tasks_beside_a_malformed_one(tmp_path):
+    seen: list[str] = []
+    srv = _serve(
+        [
+            _tasks_reply(
+                [
+                    {"task_id": "bad-1", "text": None, "attempt": 1},
+                    {"task_id": "good-1", "text": "x", "attempt": 1},
+                    {"task_id": "../evil", "text": "x", "attempt": 1},
+                ]
+            ),
+        ],
+        seen,
+    )
+    try:
+        r = _run_worker(tmp_path, srv, 12)
+    finally:
+        srv.shutdown()
+    assert "good-1 done" in r.stdout, (r.stdout, r.stderr)
+    assert "bad-1" in r.stderr  # the skipped task is named, not dropped silently
+    assert "../evil" in r.stderr or "evil" in r.stderr

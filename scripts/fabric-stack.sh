@@ -134,7 +134,8 @@ memory_route() {
 }
 
 status() {
-    "${COMPOSE[@]}" ps || { echo "docker compose failed (see the error above); the stack state is unknown" >&2; exit 1; }
+    local rc=0
+    "${COMPOSE[@]}" ps || { echo "docker compose failed (see the error above); the stack state is unknown" >&2; rc=1; }
     say "hindsight memory (optional profile):"
     memory_status
     say "gateway healthz:"
@@ -146,6 +147,7 @@ status() {
     else
         getent hosts dev.lan || echo "(no getent result)"
     fi
+    return "$rc"
 }
 
 down() { "${COMPOSE[@]}" stop coredns fabric-gateway herdr-web; }  # not the control plane
@@ -158,6 +160,7 @@ case "$cmd" in
         ;;
     up-replace)
         write_env; gen_coredns; preflight   # before anything is stopped: a failure here leaves the old services up
+        "${COMPOSE[@]}" build fabric-gateway   # build first: a failed build leaves the old services running
         stop_old_host_services   # must free ports 8787/29999/18000+ first
         up
         ;;

@@ -8,13 +8,16 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 ### Fix: operator scripts and ansible runtime checks
 
 - `monitor-fabric-gateway.sh`: an `unhealthy` container is now reported degraded (the old `*healthy*` match also matched `unhealthy`), and `--json` no longer breaks when the contention telemetry has no events.
-- `fabric-stack.sh`: `up`, `up-replace` and `down` check that compose can render before anything is stopped (the old host services are no longer stopped first only for the build to fail), `up` names its own services and never passes `--remove-orphans`, and `status` shows a compose error instead of "stack not running". The compose variables still come from `deploy/control-plane/deploy.sh`.
+- `fabric-stack.sh`: `up`, `up-replace` and `down` check that compose can render before anything is stopped (the old host services are no longer stopped first only for the build to fail), `up` names its own services and never passes `--remove-orphans`, `up-replace` builds the gateway image before it stops the old services, and `status` shows a compose error instead of "stack not running" and still runs the healthz and DNS checks (exiting non-zero at the end). The compose variables still come from `deploy/control-plane/deploy.sh`.
 - `install.sh`: the Tailscale auth key reaches `tailscale up` as a 0600 file (`--auth-key=file:`), not in argv or the sudo log.
 - `deploy-fleet-agents.sh`: a failing step on one host marks that host failed, restores its previous plugin/feed symlink, and the roll continues with the next host instead of aborting under `set -e`.
+- `monitor-fabric-gateway.sh`: `gate_contention_1h` and `gate_contention_24h` count only `contention` events by their `ts`, inside 1 h and 24 h respectively (the 1 h counter used to count every telemetry line, the 24 h one every event ever).
+- `deploy-fleet-agents.sh`: the ownership feed no longer copies the wheel to `host:/` when resolving the release directory over ssh fails; every early return in the plugin and feed rolls now prints `FAILED`.
+- `install.sh`: the temporary Tailscale key file is removed on any exit, and a failed `tailscale up` shows its error.
 - `collab-sync.sh`: a failed `once` no longer leaves a `.tmp.*` directory in the sync dir each minute; stale ones are removed.
-- `herdr_linux`/`herdr_macos` roles: the "Install Herdr" / "Install Pi" tasks installed nothing yet reported changed; they are now "Verify" tasks that fail the host when the pinned herdr or pi is missing (staging installs them). Operators will see such hosts fail instead of reporting updated.
+- `herdr_linux`/`herdr_macos` roles: the "Install Herdr" / "Install Pi" tasks installed nothing yet reported changed; they are now "Verify" tasks that only report: when the pinned herdr or pi is missing or another version they print a `DRIFT:` line and never fail the host or stop the fleet update (nothing in the role installs them, the operator does). Hosts no longer report changed for them.
 - `fleet-join.sh`: `--user` no longer overwrites the exported `USER` seen by ansible; the lease count prints once.
-- `collab-worker.sh`: task ids that are not plain tokens are skipped (they were written as file names), and a JSON-RPC error reply no longer ends the worker loop.
+- `collab-worker.sh`: task ids that are not plain tokens are skipped (they were written as file names), a JSON-RPC error reply no longer ends the worker loop, and one malformed task (for example null text) is logged to stderr and skipped instead of starving the good tasks in the same reply; skipped invalid ids are logged too.
 
 ### Fix: assistant store snapshot loading, ordering and locking
 
