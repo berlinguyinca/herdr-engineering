@@ -46,7 +46,7 @@ code, pre, kbd, samp {
 
 /* Visible focus ring (Spec §88 a11y) — never removed */
 :focus-visible {
-  outline: 2px solid var(--accent);
+  outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
 }
 
@@ -91,7 +91,7 @@ code, pre, kbd, samp {
 .hd-btn--sm { min-height: var(--control-h-sm); padding: 0 10px; }
 .hd-btn--icon { width: var(--control-h); padding: 0; }
 .hd-btn--icon.hd-btn--sm { width: var(--control-h-sm); }
-.hd-btn:focus-visible, .hd-tabs > :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.hd-btn:focus-visible, .hd-tabs > :focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
 .hd-btn:disabled, .hd-btn[aria-disabled="true"] { opacity: .55; cursor: default; }
 
 .hd-tabs { display: flex; flex-wrap: wrap; gap: 6px; }

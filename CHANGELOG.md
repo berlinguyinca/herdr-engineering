@@ -17,6 +17,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - ACL grants refuse a non-finite or out-of-range `expires_at` (400) before touching the maps, and the registry write runs under the ACL lock so concurrent grant/revoke persist in the order they apply.
 - Report routes that answer before reading a POST body (build status, build, unknown path, report creation) close the connection; `too_large` is answered only for an artifact with a stored file (a report with no current file stays 404); a 10+ digit Content-Length is 413, not 400.
 - S3 client: 5 s connect timeout, botocore's own 60 s read timeout and default retries (a 30 s read timeout cut large uploads short).
+### Fix: fabric agent no longer drops every lease on a failed listener scan
+
+- `scan_once` ignored `ListenerInventory.complete`, so one timed-out or failed `ss`/`lsof` (an empty inventory) released every lease and stopped every forwarder, and the next cycle re-adopted them with new leases. A port is now treated as gone only on a complete scan.
+- At startup, a remembered forward port that cannot be rebound (or whose forwarder fails to start) now drops the store entry and closes its lease, so the next scan re-adopts the service with a working forwarder instead of advertising a dead URL.
 
 ### Fix: web packages bug-hunt (collaboration sign-in/out, room polling, composer, member routes, nav badge)
 
