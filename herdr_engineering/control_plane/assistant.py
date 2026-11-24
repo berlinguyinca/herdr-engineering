@@ -47,7 +47,6 @@ from urllib.parse import urlsplit
 
 from . import placement, slurm_placement
 from .assistant_briefs import TeamBriefRecord, TeamBriefService, team_briefs_config
-from .external_actions import EXTERNAL_KINDS, ExternalActionService, external_actions_config
 from .assistant_hub.actiongrants import ActionEvidence, ActionGrant, ActionRequestRow, as_utc
 from .assistant_hub.deploycheck import FINAL as DEPLOY_FINAL
 from .assistant_hub.deploycheck import DeployCheck, sanitize_check
@@ -57,6 +56,7 @@ from .assistant_hub.slack_asks import SlackAsk
 from .assistant_hub.verbs import Verb
 from .assistant_hub.vetoes import FIXED_VETOES
 from .assistant_hub.workers import Enrollment, Worker
+from .external_actions import EXTERNAL_KINDS, ExternalActionService, external_actions_config
 from .inference_models import RETRY_CODES, ModelResolver
 from .reminders import REMINDER_TOOLS, ReminderError
 from .reminders import run_tool as run_reminder_tool
@@ -2064,12 +2064,18 @@ def _urllib_transport(url: str, method: str, headers: dict[str, str],
         return {"status": resp.status, "body": resp.read().decode(errors="replace")}
 
 
+class StoreLoadError(RuntimeError):
+    """The stored snapshot could not be read. Not the same as "no snapshot yet": running on regardless would let the
+    next mutation overwrite the real data with an empty store."""
+
+
 class StoreBackend:
     """Durable persistence for the assistant store snapshot."""
     def persist(self, snapshot: dict[str, Any]) -> None:
         raise NotImplementedError
 
     def load(self) -> dict[str, Any] | None:
+        """The stored snapshot, None when there is none; raise ``StoreLoadError`` when it cannot be read."""
         raise NotImplementedError
 
     def persist_required(self, snapshot: dict[str, Any]) -> None:
@@ -2117,6 +2123,8 @@ class PostgresStoreBackend(StoreBackend):
             conn.close()
 
     def load(self) -> dict[str, Any] | None:
+        """The stored snapshot, or None when there is no row yet. An unreadable snapshot raises ``StoreLoadError``:
+        it must never look like "no snapshot", or the next mutation would overwrite the real data."""
         try:
             conn = self._open()
             try:
@@ -2130,8 +2138,8 @@ class PostgresStoreBackend(StoreBackend):
                 return data if isinstance(data, (dict, list)) else json.loads(data)
             finally:
                 conn.close()
-        except Exception:  # noqa: BLE001
-            return None
+        except Exception as exc:  # noqa: BLE001
+            raise StoreLoadError(f"assistant snapshot could not be read ({type(exc).__name__})") from None
 
 
 class ConnectorAdapter:
@@ -2305,13 +2313,31 @@ class AssistantStore:
         self.audit_sink: Callable[[dict[str, Any]], None] | None = None
         self.audit_key: bytes = b""           # optional HMAC key (read from a file named in YAML by the service)
         self._lock = threading.RLock()
+        # Backend writes are serialized and ordered: each snapshot gets a sequence number under ``_lock``, and a write
+        # whose snapshot is older than one already written is dropped (the newer one contains its change).
+        self._persist_gate = threading.Lock()
+        self._persist_seq = 0
+        self._persisted_seq = 0
 
     # -- durable snapshots (R1) ----------------------------------------------
+    def _numbered_snapshot(self) -> tuple[int, dict[str, Any]]:
+        with self._lock:
+            self._persist_seq += 1
+            return self._persist_seq, self.snapshot()
+
+    def _write_ordered(self, write: Callable[[dict[str, Any]], None]) -> None:
+        seq, snap = self._numbered_snapshot()
+        with self._persist_gate:
+            if seq < self._persisted_seq:
+                return
+            write(snap)
+            self._persisted_seq = seq
+
     def _after_mutation(self) -> None:
         if self._persist_path:
             self.persist()
         if self._persist_backend is not None:
-            self._persist_backend.persist(self.snapshot())
+            self._write_ordered(self._persist_backend.persist)
 
     @staticmethod
     def _e_to_dict(e: Any) -> dict[str, Any]:
@@ -2797,7 +2823,7 @@ class AssistantStore:
             self.persist()
             return
         if self._persist_backend is not None:
-            self._persist_backend.persist_required(self.snapshot())
+            self._write_ordered(self._persist_backend.persist_required)
             return
         raise RuntimeError("acknowledged assistant persistence is required")
 
@@ -2921,10 +2947,11 @@ class AssistantStore:
         return a
 
     def list_assistants(self, *, tenant_id: str, user_id: str) -> list[Assistant]:
-        return sorted(
-            [a for a in self.assistants.values()
-             if a.tenant_id == tenant_id and a.user_id == user_id],
-            key=lambda a: a.created_at)
+        with self._lock:
+            return sorted(
+                [a for a in self.assistants.values()
+                 if a.tenant_id == tenant_id and a.user_id == user_id],
+                key=lambda a: a.created_at)
 
     # -- threads --------------------------------------------------------------
     def put_thread(self, t: AssistantThread) -> None:
@@ -2940,11 +2967,12 @@ class AssistantStore:
 
     def list_threads(self, *, tenant_id: str, user_id: str,
                      assistant_id: str | None = None) -> list[AssistantThread]:
-        return sorted(
-            [t for t in self.threads.values()
-             if t.tenant_id == tenant_id and t.user_id == user_id
-             and (assistant_id is None or t.assistant_id == assistant_id)],
-            key=lambda t: t.last_activity_at, reverse=True)
+        with self._lock:
+            return sorted(
+                [t for t in self.threads.values()
+                 if t.tenant_id == tenant_id and t.user_id == user_id
+                 and (assistant_id is None or t.assistant_id == assistant_id)],
+                key=lambda t: t.last_activity_at, reverse=True)
 
     # -- messages --------------------------------------------------------------
     def put_message(self, m: AssistantMessage) -> None:
@@ -2954,9 +2982,10 @@ class AssistantStore:
 
     def list_messages(self, thread_id: str, *, tenant_id: str, user_id: str) -> list[AssistantMessage]:
         t = self.get_thread(thread_id, tenant_id=tenant_id, user_id=user_id)
-        return sorted(
-            [m for m in self.messages.values() if m.thread_id == t.thread_id],
-            key=lambda m: m.created_at)
+        with self._lock:
+            return sorted(
+                [m for m in self.messages.values() if m.thread_id == t.thread_id],
+                key=lambda m: m.created_at)
 
     # -- runs -----------------------------------------------------------------
     def put_run(self, r: AssistantRun) -> None:
@@ -2983,11 +3012,12 @@ class AssistantStore:
 
     def list_runs(self, *, tenant_id: str, user_id: str,
                   assistant_id: str | None = None) -> list[AssistantRun]:
-        return sorted(
-            [r for r in self.runs.values()
-             if r.tenant_id == tenant_id and r.user_id == user_id
-             and (assistant_id is None or r.assistant_id == assistant_id)],
-            key=lambda r: r.created_at, reverse=True)
+        with self._lock:
+            return sorted(
+                [r for r in self.runs.values()
+                 if r.tenant_id == tenant_id and r.user_id == user_id
+                 and (assistant_id is None or r.assistant_id == assistant_id)],
+                key=lambda r: r.created_at, reverse=True)
 
     # -- actions / grants / approvals ------------------------------------------
     def put_action(self, a: AssistantAction) -> None:
@@ -3015,11 +3045,12 @@ class AssistantStore:
 
     def list_grants(self, *, tenant_id: str, user_id: str,
                     assistant_id: str | None = None) -> list[AssistantGrant]:
-        return sorted(
-            [g for g in self.grants.values()
-             if g.tenant_id == tenant_id and g.user_id == user_id
-             and (assistant_id is None or g.assistant_id == assistant_id)],
-            key=lambda g: g.created_at)
+        with self._lock:
+            return sorted(
+                [g for g in self.grants.values()
+                 if g.tenant_id == tenant_id and g.user_id == user_id
+                 and (assistant_id is None or g.assistant_id == assistant_id)],
+                key=lambda g: g.created_at)
 
     def put_approval(self, a: AssistantApproval) -> None:
         with self._lock:
@@ -3031,11 +3062,12 @@ class AssistantStore:
 
     def list_approvals(self, *, tenant_id: str, user_id: str,
                        state: str | None = None) -> list[AssistantApproval]:
-        return sorted(
-            [a for a in self.approvals.values()
-             if a.tenant_id == tenant_id and a.user_id == user_id
-             and (state is None or a.decision == state)],
-            key=lambda a: a.created_at, reverse=True)
+        with self._lock:
+            return sorted(
+                [a for a in self.approvals.values()
+                 if a.tenant_id == tenant_id and a.user_id == user_id
+                 and (state is None or a.decision == state)],
+                key=lambda a: a.created_at, reverse=True)
 
     # -- memory ----------------------------------------------------------------
     def put_memory(self, m: AssistantMemory) -> None:
@@ -3048,9 +3080,10 @@ class AssistantStore:
     def search_memory(self, *, tenant_id: str, user_id: str, assistant_id: str,
                       query: str, limit: int = 5) -> list[AssistantMemory]:
         terms = [t.lower() for t in query.split() if t]
-        rows = [m for m in self.memory.values()
-                if m.tenant_id == tenant_id and m.user_id == user_id
-                and m.assistant_id == assistant_id]
+        with self._lock:
+            rows = [m for m in self.memory.values()
+                    if m.tenant_id == tenant_id and m.user_id == user_id
+                    and m.assistant_id == assistant_id]
         scored = []
         for m in rows:
             hay = m.content.lower()
@@ -3081,11 +3114,12 @@ class AssistantStore:
 
     def list_routines(self, *, tenant_id: str, user_id: str,
                       assistant_id: str | None = None) -> list[AssistantRoutine]:
-        return sorted(
-            [r for r in self.routines.values()
-             if r.tenant_id == tenant_id and r.user_id == user_id
-             and (assistant_id is None or r.assistant_id == assistant_id)],
-            key=lambda r: r.created_at)
+        with self._lock:
+            return sorted(
+                [r for r in self.routines.values()
+                 if r.tenant_id == tenant_id and r.user_id == user_id
+                 and (assistant_id is None or r.assistant_id == assistant_id)],
+                key=lambda r: r.created_at)
 
     # -- connectors ---------------------------------------------------------------
     def put_connector(self, c: Connector) -> None:
@@ -3101,10 +3135,11 @@ class AssistantStore:
         return c
 
     def list_connectors(self, *, tenant_id: str, user_id: str) -> list[Connector]:
-        return sorted(
-            [c for c in self.connectors.values()
-             if c.tenant_id == tenant_id and c.user_id == user_id],
-            key=lambda c: c.created_at)
+        with self._lock:
+            return sorted(
+                [c for c in self.connectors.values()
+                 if c.tenant_id == tenant_id and c.user_id == user_id],
+                key=lambda c: c.created_at)
 
     def put_proposal_required(self, x: AssistantProposal) -> None:
         """Store one proposal and acknowledge durable persistence, or raise (and leave the store as it was). External actions record
@@ -3210,10 +3245,11 @@ class AssistantStore:
         return d
 
     def list_delegations(self, *, tenant_id: str, user_id: str) -> list[DelegationRequest]:
-        return sorted(
-            [d for d in self.delegations.values()
-             if d.tenant_id == tenant_id and d.user_id == user_id],
-            key=lambda d: d.created_at, reverse=True)
+        with self._lock:
+            return sorted(
+                [d for d in self.delegations.values()
+                 if d.tenant_id == tenant_id and d.user_id == user_id],
+                key=lambda d: d.created_at, reverse=True)
 
     def put_proposal(self, x: AssistantProposal) -> None:
         with self._lock:
@@ -3954,7 +3990,9 @@ class AssistantService:
         grant, preauthorized = self._apply_rule(tenant_id, user_id, tool_id, scope, grant, preauthorized)
 
         # Reuse identity, but never reuse stale authorization.
-        for existing in self.store.actions.values():
+        with self.store._lock:
+            known_actions = list(self.store.actions.values())
+        for existing in known_actions:
             if existing.idempotency_key != idempotency_key or existing.run_id != run_id:
                 continue
             if existing.request_hash != request_hash:
@@ -4064,9 +4102,10 @@ class AssistantService:
         if not self._is_approver(user_id):
             return own
         seen = {a.approval_id for a in own}
-        extra = [a for a in self.store.approvals.values()
-                 if a.tenant_id == tenant_id and a.approval_id not in seen
-                 and (state is None or a.decision == state)]
+        with self.store._lock:
+            extra = [a for a in self.store.approvals.values()
+                     if a.tenant_id == tenant_id and a.approval_id not in seen
+                     and (state is None or a.decision == state)]
         return sorted(own + extra, key=lambda a: a.created_at, reverse=True)
 
     def decide_approval(self, approval_id: str, *, tenant_id: str, user_id: str,
@@ -4076,39 +4115,40 @@ class AssistantService:
         self._require_enabled()
         if decision not in ("approved", "denied"):
             raise AssistantError("decision must be 'approved' or 'denied'")
-        approval = self.store.get_approval(approval_id)
-        if approval.tenant_id != tenant_id or not (
-                approval.user_id == user_id or self._is_approver(user_id)):
-            raise AssistantNotFound("approval not found")
-        if approval.decision != "pending":
-            raise AssistantError(f"approval already {approval.decision}")
-        action = self.store.get_action(approval.action_id)
-        if approval.expires_at <= self.now() or (
-                action.expires_at is not None and action.expires_at <= self.now()):
-            approval.decision = "expired"
+        with self.store._lock:     # check-then-write: two concurrent decisions on one approval must not both pass
+            approval = self.store.get_approval(approval_id)
+            if approval.tenant_id != tenant_id or not (
+                    approval.user_id == user_id or self._is_approver(user_id)):
+                raise AssistantNotFound("approval not found")
+            if approval.decision != "pending":
+                raise AssistantError(f"approval already {approval.decision}")
+            action = self.store.get_action(approval.action_id)
+            if approval.expires_at <= self.now() or (
+                    action.expires_at is not None and action.expires_at <= self.now()):
+                approval.decision = "expired"
+                self.store.put_approval(approval)
+                raise AssistantError("approval expired; request a new one")
+            if (decision == "approved" and tool_sensitive(action.tool_id)
+                    and not self.config["actions"]["allow_self_approval"]
+                    and actor == (approval.requested_by or approval.user_id)):
+                self.store.audit_record(tenant_id=tenant_id, user_id=approval.user_id, actor=actor,
+                                        action="assistant.approval.self_approval_refused",
+                                        subject_id=approval_id)
+                raise AssistantForbidden("the approver must differ from the requester for this action")
+            if action.status != "requested":
+                raise AssistantError(f"the action is {action.status}; request it again")
+            approval.decision = decision
+            approval.decision_at = self.now()
+            approval.actor_id = actor
             self.store.put_approval(approval)
-            raise AssistantError("approval expired; request a new one")
-        if (decision == "approved" and tool_sensitive(action.tool_id)
-                and not self.config["actions"]["allow_self_approval"]
-                and actor == (approval.requested_by or approval.user_id)):
+            action.status = "approved" if decision == "approved" else "denied"
+            if decision == "approved":
+                action.evidence_ref = f"approval:{approval.approval_id}"
+            self.store.put_action(action)
             self.store.audit_record(tenant_id=tenant_id, user_id=approval.user_id, actor=actor,
-                                    action="assistant.approval.self_approval_refused",
+                                    action="assistant.approval." + decision,
                                     subject_id=approval_id)
-            raise AssistantForbidden("the approver must differ from the requester for this action")
-        if action.status != "requested":
-            raise AssistantError(f"the action is {action.status}; request it again")
-        approval.decision = decision
-        approval.decision_at = self.now()
-        approval.actor_id = actor
-        self.store.put_approval(approval)
-        action.status = "approved" if decision == "approved" else "denied"
-        if decision == "approved":
-            action.evidence_ref = f"approval:{approval.approval_id}"
-        self.store.put_action(action)
-        self.store.audit_record(tenant_id=tenant_id, user_id=approval.user_id, actor=actor,
-                                action="assistant.approval." + decision,
-                                subject_id=approval_id)
-        return approval
+            return approval
 
     # -- executing what was approved ---------------------------------------------------------------------------
     def _action_owner(self, action: AssistantAction) -> tuple[str, str, str] | None:
