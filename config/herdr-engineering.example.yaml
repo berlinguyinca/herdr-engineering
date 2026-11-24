@@ -37,7 +37,7 @@ fabric:
   probe_interval_seconds: 15
   # token is a secret: set HERDR_ENGINEERING_FABRIC_TOKEN or write it to
   # ~/.config/herdr-engineering/fabric-token (never in this file)
-  # empty token = control API unauthenticated (fine on a private tailnet;
+  # no token = the gateway refuses to start unless run with --allow-open (unauthenticated; loopback/private tailnet only;
   # set one before exposing the control port further)
 
 # Host-visible central scheduler settings. Server admission and limits belong

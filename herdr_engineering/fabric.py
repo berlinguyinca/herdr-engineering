@@ -19,6 +19,7 @@ from the environment or a machine-local file, never from the repo).
 """
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import socket
@@ -39,13 +40,23 @@ from .fabric_named import AcceptBackoff
 _FABRIC_TOKEN_FILE = os.path.join("~", ".config", "herdr-engineering", "fabric-token")
 
 
+_FABRIC_TOKEN_ENV = "HERDR_ENGINEERING_FABRIC_TOKEN"
+_FABRIC_TOKEN_FILE_ENV = "HERDR_ENGINEERING_FABRIC_TOKEN_FILE"
+_TOKEN_ROTATION_GRACE_SECONDS = 300.0
+
+
 def read_fabric_token() -> str | None:
+    """The fabric bearer token: env var, then host config ``fabric.token``, then the token file
+    (``HERDR_ENGINEERING_FABRIC_TOKEN_FILE`` or ``~/.config/herdr-engineering/fabric-token``)."""
     from .host_config import host_value
+    env = os.environ.get(_FABRIC_TOKEN_ENV, "").strip()
+    if env:
+        return env
     tok = host_value("fabric.token")
     if tok:
         return tok
     try:
-        with open(os.path.expanduser(_FABRIC_TOKEN_FILE)) as f:
+        with open(os.path.expanduser(os.environ.get(_FABRIC_TOKEN_FILE_ENV) or _FABRIC_TOKEN_FILE)) as f:
             return f.read().strip() or None
     except OSError:
         return None
@@ -371,7 +382,8 @@ class FabricGateway:
                  auto_ha: bool = True, url_aliases: tuple[str, ...] = (),
                  named_domain: str | None = None, named_port: int = 443,
                  apex_upstream: tuple[str, int] | None = None,
-                 host_routes: dict[str, tuple[str, int]] | None = None) -> None:
+                 host_routes: dict[str, tuple[str, int]] | None = None,
+                 allow_open: bool = False) -> None:
         self.registry = registry
         registry.port_free = router.can_bind
         # Stable service-name URLs (https://<service>.<named_domain>[:named_port]); off unless a domain is given
@@ -416,11 +428,44 @@ class FabricGateway:
         # falling back to the tailnet IP or the control host).
         self.url_base = url_base or magicdns_name() or tailnet_ipv4() or control_host
         self.probe_interval = probe_interval
-        self.token = token if token is not None else read_fabric_token()
+        # token="" is an explicit "no auth" (tests, loopback tools); allow_open lets a gateway with no token
+        # configured serve open. Otherwise a missing token rejects every control request (fail closed).
+        self._fixed_token = token
+        self.allow_open = allow_open or token == ""
+        self._token_lock = threading.Lock()
+        self._last_token: str | None = None
+        self._prev_token: tuple[str, float] | None = None   # (token, accepted until monotonic)
         self._httpd: ThreadingHTTPServer | None = None
         self._probe_thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._sync_router()
+
+    @property
+    def token(self) -> str | None:
+        """The current bearer token. Re-read on every use so a rotated env-less source (the token file) is
+        followed without a restart; once a token has been seen it is never forgotten (a vanished file must not
+        reopen the API)."""
+        if self._fixed_token is not None:
+            return self._fixed_token or None
+        fresh = read_fabric_token()
+        with self._token_lock:
+            if fresh and fresh != self._last_token:
+                if self._last_token:
+                    self._prev_token = (self._last_token, time.monotonic() + _TOKEN_ROTATION_GRACE_SECONDS)
+                self._last_token = fresh
+            return self._last_token
+
+    def accepts(self, presented: str | None) -> bool:
+        """True when ``presented`` matches the current token (or the previous one inside the rotation grace)."""
+        current = self.token
+        if not current:
+            return self.allow_open
+        presented = presented or ""
+        if hmac.compare_digest(presented.encode(), current.encode()):
+            return True
+        with self._token_lock:
+            prev = self._prev_token
+        return bool(prev and time.monotonic() < prev[1] and hmac.compare_digest(presented.encode(), prev[0].encode()))
 
     # -- router sync -------------------------------------------------------
     def _sync_router(self) -> None:
@@ -796,13 +841,19 @@ def _make_handler(gateway: FabricGateway):
             self.wfile.write(body)
 
         def _authorized(self) -> bool:
-            if not gateway.token:
-                return True  # token-less mode (loopback-only deployments)
             header = self.headers.get("Authorization", "")
-            return header == f"Bearer {gateway.token}"
+            presented = header[7:] if header.startswith("Bearer ") else None
+            return gateway.accepts(presented)
 
         def do_GET(self) -> None:  # noqa: N802 (http.server API)
-            if not self._authorized():
+            authorized = self._authorized()
+            if self.path == "/healthz" and not authorized:
+                # Container healthchecks carry no token: say only whether the gateway is alive.
+                front = gateway.named_front
+                ok = front is None or front.healthy()
+                self._send(200 if ok else 503, {"ok": ok})
+                return
+            if not authorized:
                 self._send(401, {"error": "unauthorized"})
                 return
             if self.path == "/list":

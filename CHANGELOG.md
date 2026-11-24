@@ -5,6 +5,14 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: fabric gateway control API fails closed and follows token rotation
+
+- The gateway served `/register`, `/heartbeat`, `/close` and `/list` unauthenticated whenever no token was configured, and `HERDR_ENGINEERING_FABRIC_TOKEN` (documented) was read nowhere. The token now comes from that env var, host config `fabric.token`, or the token file (`HERDR_ENGINEERING_FABRIC_TOKEN_FILE`, default `~/.config/herdr-engineering/fabric-token`), for the gateway and the agent client alike.
+- `herdr-eng devfabric gateway` refuses to start with no token unless `--allow-open` is passed (same convention as the ingest/relay `--allow-open`); a library gateway with no token rejects every control request. Tokens are compared in constant time.
+- The token is re-read per request: a rotated file is followed without a restart, the previous token is accepted for 5 minutes, and a token seen once is never forgotten (a deleted file does not reopen the API).
+- `/healthz` needs no token: unauthenticated callers (the container healthcheck) get `{"ok": ...}` only; authenticated callers get the full payload.
+- `deploy/control-plane/compose.yaml` mounts `~/.config/herdr-engineering/fabric-gateway` at `/run/fabric` and keeps `--allow-open` for the rollout; see the PR for the order.
+
 ### Feature: periodic `herdr-handoff reap --apply` timer (opt-in, off by default)
 
 - `herdr-eng handoff-reap {run,status}` and `scripts/install-handoff-reap.sh` install a systemd user timer (Linux) or LaunchAgent (macOS) that closes panes replaced by confirmed handoffs, including those whose `confirm` was refused because the source pane was still working. Wired into `scripts/install.sh` (step 7f2) and, for Linux fleet hosts, `ansible/tasks/handoff-reap.yml` (`site.yml`, `fleet-sync.yml`).

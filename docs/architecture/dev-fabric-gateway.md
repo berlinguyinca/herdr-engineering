@@ -48,9 +48,12 @@ close|list`).
 - **Control API** — `FabricGateway` exposes a small HTTP control plane
   (`POST /register`, `POST /heartbeat`, `POST /close`, `GET /list`,
   `GET /resolve/<port>`, `GET /healthz`). It binds to the tailnet IP and/or
-  loopback only (private by default) and requires a bearer token when a token
-  is configured (`HERDR_ENGINEERING_FABRIC_TOKEN` or
-  `~/.config/herdr-engineering/fabric-token`; never in the repo).
+  loopback only (private by default) and requires a bearer token
+  (`HERDR_ENGINEERING_FABRIC_TOKEN`, host config `fabric.token`, or the file
+  `~/.config/herdr-engineering/fabric-token` / `HERDR_ENGINEERING_FABRIC_TOKEN_FILE`;
+  never in the repo). With none configured the gateway refuses to start unless
+  `--allow-open` is passed. The file is re-read per request, so rotation needs no
+  restart. `/healthz` answers `{"ok": ...}` without a token.
 - **GatewayRouter** — dynamic per-lease listeners. Each leased external port
   is bound on every configured interface (loopback + tailnet) and proxied to
   the lease's `target_host:target_port` with `proxy_pair()` (shared with the
@@ -139,7 +142,7 @@ its next probe cycle via store reload.
 - Router and control API bind to loopback/tailnet only — no public listeners;
   public binds are refused (`DevServiceForwarder` and `GatewayRouter` both
   check).
-- Bearer token on the control API when configured; the token lives only in
+- Bearer token on the control API (fail closed unless `--allow-open`); the token lives only in
   the environment or a machine-local gitignored file.
 - The gateway is an operator service: start/stop is an explicit, logged
   action; leases are explicit; nothing is exposed implicitly.
