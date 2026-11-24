@@ -14,6 +14,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - `host_config.parse` refuses a `cognito.domain` that is not a bare https origin and a malformed `pool_id`, `web_client_id` or `client_ids` entry, instead of starting healthy with lab shares, the member UI, MCP and housekeeping silently off. Existing configs with a scheme-less domain must be corrected. `fleet config` / deploy (`artifact_host_slices`) applies the same rule (one function, `cognito_values.py`, kept as two identical copies by a test), so a bad value fails the deploy up front instead of rolling back.
 - Known and unchanged: the "shared by" bar is injected into the author's own document and can be removed by that page's own script; a non-bypassable label needs a host-owned sandboxed-iframe wrapper (documented at `SHARED_BY_BAR`).
 
+### Fix: web packages bug-hunt (collaboration sign-in/out, room polling, composer, member routes, nav badge)
+
+- Collaboration: blocked site storage (`window.sessionStorage` throwing) no longer stops `collab-view.js`, and so the whole dashboard, from loading; it falls back to memory. Sign out now also ends the Cognito Hosted-UI session (`/logout?client_id=...&logout_uri=...`, `logout_uri` defaulting to `public_url`, which the user pool must list as an allowed sign-out URL). Every `CollabApi` call now times out after 30 s, so a half-open connection no longer freezes a room silently; `showRoom` removes its `focusout` listener on teardown instead of adding one per visit.
+- Composer: a message delivered after the composer was disposed mid-send no longer survives as the stored draft.
+- Dashboard: mission titles are refreshed after 60 s and a failed load is no longer cached as an empty map (`mission-titles.js`). The nav badge announces "N open, M critical" instead of "true critical".
+- Member page: a slow library load no longer repaints over a newer route.
 ### Fix: required `unit-gates` no longer skips PRs that touch untested-by-list paths; Rust module gates fail in CI without cargo
 
 - `scripts/ci/unit-gates-applicable.sh unit` is now default-run with a short exempt list instead of an allow-list, so `herdr_artifact_host/`, `ansible/`, `skills/`, `scripts/*.sh`, `package.json`, `package-lock.json` and any new top-level path run the suite (they previously passed the required check with no tests; `main-moved-check.sh` shared the gap). A test checks every tracked file against the matcher.

@@ -315,7 +315,7 @@ export function mountComposer(host, options = {}) {
     try {
       const receipt = await options.onSend(text, attachments.map((a) => a.artifact));
       if (receipt?.status === 'failed' || receipt?.status === 'error') throw new Error(receipt.error || 'Delivery failed');
-      if (disposed) return;
+      if (disposed) { try { if (storageKey) storage?.removeItem(storageKey); } catch { /* storage unavailable */ } return; }   // delivered: dispose() already saved it as a draft
       input.value = ''; undo = []; redo = []; current = snapshot(); changed(); flagged = false; attachments.forEach(revoke); attachments = [];
       message(receipt?.message || (receipt?.status === 'delivered' ? 'Delivered' : receipt?.status === 'accepted' ? 'Accepted; waiting for delivery.' : 'Sent'));
     } catch (error) { if (!disposed) message(error.message || 'Send failed. Your draft is saved.', true); }
