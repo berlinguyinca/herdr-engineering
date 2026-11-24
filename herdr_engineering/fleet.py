@@ -21,28 +21,30 @@ import subprocess
 import sys
 from pathlib import Path
 
+from .fleet_inventory import add_host, write_host_vars
 from .herdr_adapter import NativeHerdrAdapter
 
 #: LaunchAgent installed by `scripts/fleet-auto-update-macos.sh`; a test holds the two together so
 #: `fleet update` cannot look for a label the installer never writes.
 LAUNCHD_LABEL = "com.herdr-engineering.fleet-auto-update"
 
-try:  # reuse the private-inventory helper from scripts/ (may live beside repo)
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
-    from fleet_inventory import add_host, list_hosts, write_host_vars
-except Exception:  # pragma: no cover - best effort; inventory is optional
-    def add_host(*a, **k):  # type: ignore
-        raise RuntimeError("scripts/fleet_inventory.py not importable")
-
-    def write_host_vars(*a, **k):  # type: ignore
-        raise RuntimeError("scripts/fleet_inventory.py not importable")
-
-    def list_hosts(*a, **k):  # type: ignore
-        return []
-
-
 class FleetError(Exception):
     pass
+
+
+def devfabric_leases(timeout: int = 60) -> list[dict]:
+    """Active fabric leases, read through `herdr-eng devfabric list --json` (never the native `herdr`).
+
+    Runs this interpreter's own package so the installed copy answers for itself.
+    """
+    proc = subprocess.run([sys.executable, "-m", "herdr_engineering.cli", "devfabric", "list", "--json"],
+                          capture_output=True, text=True, timeout=timeout)
+    if proc.returncode != 0:
+        raise FleetError(f"devfabric list failed (rc={proc.returncode}): {proc.stderr.strip()[-300:]}")
+    data = json.loads(proc.stdout)
+    if isinstance(data, dict):
+        data = data.get("leases") or []
+    return data if isinstance(data, list) else []
 
 
 def repo_root() -> Path:
@@ -288,8 +290,7 @@ def fleet_join(*, ssh_target: str, label: str | None = None, os_name: str = "lin
 
     # 4) verify registration with the fabric gateway
     try:
-        adapter = NativeHerdrAdapter(herdr_bin=herdr_bin)
-        leases = adapter.devfabric_list()
+        leases = devfabric_leases()
         registered = any(
             (str(lease.get("machine_id", "")) == host
              or str(lease.get("target", {})).find(host) >= 0)
@@ -320,6 +321,11 @@ def _refresh_controller_handoff(root: Path, report: dict) -> None:
             f"{sys.executable}); the pinned dependency may be stale - run "
             "scripts/install-handoff.sh and check `herdr-eng doctor`; fleet hosts are not covered "
             "by this step (issue #799)")
+
+
+def _cleanup_job_wanted(cleanup: object) -> bool:
+    """Build-hygiene's rule for keeping the cleanup job: anything but an explicit ``enabled: false``."""
+    return not isinstance(cleanup, dict) or bool(cleanup.get("enabled", True))
 
 
 def fleet_update(*, host: str | None = None, gateway: str = DEFAULT_GATEWAY,
@@ -447,17 +453,10 @@ def fleet_update(*, host: str | None = None, gateway: str = DEFAULT_GATEWAY,
 
     from .config import load_config
     cleanup = load_config().get("build_cleanup", {})
-    roots = cleanup.get("roots", []) if isinstance(cleanup, dict) else []
-    enabled = (isinstance(cleanup, dict) and cleanup.get("enabled") is True
-               and isinstance(roots, list) and bool(roots)
-               and all(isinstance(path, str) and path.strip() for path in roots))
-    installer = root / "scripts" / "build-cleanup.sh"
-    if enabled and installer.exists():
-        ok, _ = step("controller_cleanup", ["bash", str(installer)], 120)
-        if not ok:
-            return report
-
-    elif not enabled and sys.platform.startswith("linux"):
+    # The same rule build-hygiene applies: only an explicit `enabled: false` removes the job (empty roots
+    # still sweep the managed targets), so the disable below never fights the re-enable that follows.
+    job_wanted = _cleanup_job_wanted(cleanup)
+    if not job_wanted and sys.platform.startswith("linux"):
         loaded, value, _ = _run(["systemctl", "--user", "show",
                                  "herdr-eng-build-cleanup.service",
                                  "-p", "LoadState", "--value"], timeout=30)
@@ -466,6 +465,11 @@ def fleet_update(*, host: str | None = None, gateway: str = DEFAULT_GATEWAY,
                          "--now", "herdr-eng-build-cleanup.service"], 120)
             if not ok:
                 return report
+
+    # Disk hygiene is on by default: the cleanup job (systemd on Linux, launchd on macOS) and the managed
+    # cargo launcher, all written by build-hygiene (it resolves the herdr-eng executable and skips a stale
+    # virtualenv's; the old systemd script did neither). Non-fatal - `herdr-eng doctor` reports a gap.
+    step("controller_build_hygiene", [sys.executable, "-m", "herdr_engineering.cli", "build-hygiene", "install"], 120)
 
     # Refresh whichever unattended updater the controller actually has loaded - the installer
     # holds the unit/plist templates, so a schedule or working-directory change reaches a host

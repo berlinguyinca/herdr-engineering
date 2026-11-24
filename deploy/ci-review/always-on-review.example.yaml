@@ -19,7 +19,12 @@ backfill: false                          # true: ignore the enrollment time (onl
                                          # A capped comment is skipped with a log line; statuses are still posted.
 state_dir: ~/.local/state/herdr-review   # locks, state.json (cooldowns), reviews.jsonl (one line per review), worktrees/
 post: false                              # key 1 of 2 for posting; key 2 is the --post flag
-clone: ~/IdeaProjects/herdr-engineering  # a clone with `origin` = GitHub; claude/pi get a detached worktree of the PR head
+clone: ~/IdeaProjects/herdr-engineering  # a clone with `origin` = GitHub; claude/pi get a detached worktree of the PR head.
+                                         # Used only for the repo its origin names; any other repo reviewed by this config
+                                         # (per-PR Woodpecker runs, `poll` of several repos) gets its own clone:
+# clones:                                # optional explicit per-repo clones: [{repo: OWNER/NAME, path: DIR}]
+#   - {repo: berlinguyinca/other, path: ~/clones/other.git}
+# clone_url: https://github.com/{repo}.git   # otherwise a bare clone is made here under state_dir/clones/ on first use
 
 # By default tier 2 reviews a head without waiting for its checks. Set wait_for_green: true to restore the
 # green-only gate: tier 2 then runs only on a head whose gates are green on that exact SHA (commit status context

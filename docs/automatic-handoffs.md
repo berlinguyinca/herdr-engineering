@@ -149,6 +149,12 @@ skill is the only component that knows how to prove a takeover, and the CLI stil
 `launch_unconfirmed`, `launch_failed`, `source_close_failed` and `source_dirty` (whose reason
 names whether the work is uncommitted, unpushed, or unknown to git).
 
+The instruction also spells out this session's id in the `herdr-handoff create` command it
+offers, because the agent runs what it is told to run and a handoff created without
+`--session-id` names no session. An unattributed envelope is invisible twice over: the
+underway suppression cannot see it, and the ledger cannot tell an obeyed trigger from an
+ignored one.
+
 ## Failure modes
 
 | Situation | Behaviour |
@@ -187,6 +193,64 @@ The ledger records, per session: how many times it was told to hand off, when, o
 harness, the percent that triggered it, the boundary that noticed, and a hash of the
 instruction. `handoff autopilot uninstall` removes the extension and the hooks but keeps this
 file — it is the audit record of when the machine took over on its own.
+
+Only `XDG_STATE_HOME` moves that file. `HERDR_ENGINEERING_STATE` sounds like the same knob and is
+not: it relocates the *other* trigger's marker directory
+(`$HERDR_ENGINEERING_STATE/handoff-context/<session>.fired`), and the ledger keeps resolving
+through `XDG_STATE_HOME`. A probe that redirects `HERDR_ENGINEERING_STATE` to a scratch directory,
+expecting to sandbox itself, spends a real trigger against a session that never happened — and
+`uninstall` deliberately keeps whatever it writes. Sandbox with `XDG_STATE_HOME`:
+
+```bash
+XDG_STATE_HOME="$PWD/.tmp/autopilot-probe" herdr-eng handoff autopilot status --json
+```
+
+`install` rewrites `~/.claude/settings.json` in place through a temp file in the same directory,
+preserving the file's existing mode, its unrelated keys and every foreign hook group, but it takes
+no backup of its own; copy the file first if it holds anything you cannot reconstruct.
+
+## Whether it worked
+
+An audit trail of when the machine took over is only half the question; the other half is
+whether the session obeyed. `status` answers it:
+
+```bash
+herdr-eng handoff autopilot status --json   # "uptake": {"told": 12, "taken": 3}
+```
+
+A session is counted as taken up when a handoff envelope naming it exists in any state, so a
+session that finished the takeover and closed its pane still counts. The envelope has to
+postdate the trigger — a handoff that was already there when the instruction was issued is not
+evidence the instruction worked — and where several name the same session the newest wins. The
+stamp lands on the ledger entry the next time any session reaches a boundary (`check`, `record`
+or a Claude hook):
+
+```json
+"s-example": {
+  "count": 1,
+  "last_percent": 88.4,
+  "taken_at": "2026-11-22T08:12:04.113117+00:00",
+  "taken_handoff": "handoff_1a2b3c",
+  "taken_state": "queued"
+}
+```
+
+An entry with no `taken_at` was told and never handed off. The stamp is written once, against
+the first envelope that appeared, so a later handoff in the same session does not move the
+date. Measurement writes only when there is something new to record, so a host with no
+sessions running keeps showing the old numbers rather than stale-looking ones.
+
+Read the pair together. If `taken` stays at zero while `told` climbs, the threshold fires and
+the instruction does not work: either the trigger is far too early (the session has plenty of
+room and ignores it), or the instruction loses to whatever the agent was doing. Lower
+`context_percent` only after that number is nonzero — a threshold tuned against an unmeasured
+signal is a guess.
+
+Uptake depends on attribution. A handoff whose envelope carries no session id cannot be tied
+to a trigger, so `herdr-handoff create` needs `--session-id`, which is what the instruction
+passes. Envelopes are read from the worktree's `.herdr/handoffs`, `~/.herdr/handoffs` and the
+shared store (`$XDG_DATA_HOME/herdr-handoff/store`), each in the `outbox/` layout the CLI
+writes, and the session id is accepted from the top level of the envelope or from `source`.
 
 ## Checking the trigger itself
 

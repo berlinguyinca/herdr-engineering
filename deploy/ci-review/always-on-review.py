@@ -38,6 +38,7 @@ import os
 import re
 import secrets
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -85,7 +86,12 @@ DEFAULTS: dict = {
                                         # are left alone; True restores reviewing every open PR of a newly listed repo
     "max_comments_per_hour": None,      # None = no cap; else PR comments this script posts per rolling hour
     "post": False,                      # with the --post flag, the second of the two keys that allow any posting
-    "clone": "",                        # a clone the claude/pi backends create read-only worktrees from
+    "host_lock_wait_s": 0,              # seconds a review waits for the host's one review slot (0: skip when taken);
+                                        # set per run by `review --host-lock-wait`, not a YAML key
+    "clone": "",                        # a clone the claude/pi backends create read-only worktrees from (for the repo its
+                                        # origin names; any other repo gets `clones` or a managed clone, see clone_for_review)
+    "clones": [],                       # [{repo: OWNER/NAME, path: DIR}]: the clone to use for that repo
+    "clone_url": "https://github.com/{repo}.git",   # where a managed bare clone (state_dir/clones/) is made from
     "gates": {"wait_for_green": False,  # true: tier 2 waits until the gates below are green on the head; false: reviews at once
               "required": [], "when_present": []},   # with wait_for_green: required must be success; when_present only if it exists
     "poll": {"max_per_run": 5, "pending_stale_minutes": 120, "cooldown_failures": 3, "cooldown_minutes": 60},
@@ -130,6 +136,16 @@ def _valid_budget(b) -> bool:
         return False
 
 
+def _null_means_default(over: dict, key: str, subkeys: tuple[str, ...]) -> None:
+    """`risky:` or `risky: {codex: null}` in YAML is an empty block, not a wrong type: drop it so the defaults apply."""
+    if key in over and over[key] is None:
+        del over[key]
+    elif isinstance(over.get(key), dict):
+        for sub in subkeys:
+            if sub in over[key] and over[key][sub] is None:
+                del over[key][sub]
+
+
 def load_config(path: str | None) -> dict:
     over: dict = {}
     if path:
@@ -139,6 +155,7 @@ def load_config(path: str | None) -> dict:
             raise Refused(f"config: cannot read {path}: {e}") from e
         if not isinstance(over, dict):
             raise Refused("config: the file must hold a mapping")
+    _null_means_default(over, "risky", ("codex",))
     cfg = ai.merge(DEFAULTS, over)
     _check_prompt(cfg, Path(path).resolve().parent if path else Path.cwd())
     _check_passes_and_replay(cfg)
@@ -245,6 +262,14 @@ def _check_passes_and_replay(cfg: dict) -> None:
         names.append(x["name"])
     if len(set(names)) != len(names):
         raise Refused("config: tiers.tier2.passes names must differ")
+    cl = cfg["clones"]
+    if not isinstance(cl, list) or any(
+            not isinstance(c, dict) or sorted(c) != ["path", "repo"] or not isinstance(c["repo"], str)
+            or not ai.REPO_RE.fullmatch(c["repo"]) or not isinstance(c["path"], str) or not c["path"] for c in cl):
+        raise Refused("config: clones must be a list of {repo: OWNER/NAME, path: DIR}")
+    cu = cfg["clone_url"]
+    if not isinstance(cu, str) or cu.count("{repo}") != 1 or any(ch in cu for ch in " \t\n\r") or "@" in cu.split("{repo}")[0] or cu.startswith("-"):
+        raise Refused("config: clone_url must be a URL with exactly one {repo} and no credentials")
     rv = cfg["replay"]["reviewers"]
     if not isinstance(rv, list) or not all(isinstance(x, str) and x for x in rv):
         raise Refused("config: replay.reviewers must be a list of logins")
@@ -350,9 +375,15 @@ def _check_reviewers(cfg: dict) -> None:
 def _check_risky(cfg: dict) -> None:
     r = cfg["risky"]
     globs = r["globs"]
-    if not isinstance(globs, list) or not all(isinstance(g, str) and g.strip() and not g.startswith("/")
-                                              and ".." not in g.split("/") for g in globs):
-        raise Refused("config: risky.globs must be a list of repo-relative globs (no leading /, no ..)")
+    if not isinstance(globs, list):
+        raise Refused(f"config: risky.globs must be a list of glob strings, not {type(globs).__name__}")
+    for i, g in enumerate(globs):
+        if not isinstance(g, str):
+            raise Refused(f"config: risky.globs[{i}] must be a string, not {type(g).__name__}")
+        if not g.strip() or g.startswith("/") or ".." in g.split("/"):
+            raise Refused(f"config: risky.globs[{i}] must be a repo-relative glob (not empty, no leading /, no ..)")
+        if "**" in g and set(g) <= {"*", "/"}:
+            raise Refused(f"config: risky.globs[{i}] ({g!r}) would match every path and make every PR risky")
     c = r["codex"]
     if not isinstance(c["wrapper"], list) or not all(isinstance(x, str) for x in c["wrapper"]):
         raise Refused("config: risky.codex.wrapper must be a list of strings")
@@ -872,7 +903,81 @@ def child_env() -> dict[str, str]:
     return {k: os.environ[k] for k in CHILD_ENV_KEYS if k in os.environ}
 
 
-def run_reviewer(argv: list[str], cwd: Path, stdin: str | None, time_cap_s: float) -> tuple[str, float]:
+class UsageLimit(ReviewFailed):
+    """The reviewer's account is out of quota. Not a strike against the PR (nothing is wrong with it), and the poll
+    stops launching more reviews of that tier. `bucket` names the quota that ran out when it is not the tier's own
+    (Codex has its own: "codex")."""
+    bucket: str | None = None
+
+
+USAGE_LIMIT_RE = re.compile(r"hit your.{0,40}limit|usage limit", re.I)
+FAIL_TAIL_MAX = 300
+
+
+def one_line(raw: bytes | str, limit: int = FAIL_TAIL_MAX) -> str:
+    """Untrusted reviewer text as data for a log line: redacted, control characters (escape sequences, newlines) turned
+    into spaces, cut to `limit`."""
+    text = raw if isinstance(raw, str) else raw.decode("utf-8", "replace")
+    return re.sub(r"\s+", " ", re.sub(r"[\x00-\x1f\x7f]", " ", ai.redact(text))).strip()[:limit]
+
+
+def usage_limit_text(text: str) -> bool:
+    return USAGE_LIMIT_RE.search(text) is not None
+
+
+def jsonl_error_messages(out: bytes) -> str:
+    """The messages of the error events (`error`, `turn.failed`) in a JSONL event stream. Nothing else in the stream:
+    command output and agent messages carry text of the PR under review."""
+    msgs = []
+    for line in out.decode("utf-8", "replace").splitlines():
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(e, dict) and e.get("type") in ("error", "turn.failed"):
+            m = e.get("message") if isinstance(e.get("message"), str) else (
+                e["error"].get("message") if isinstance(e.get("error"), dict) else None)
+            if isinstance(m, str):
+                msgs.append(m)
+    return " ".join(msgs)
+
+
+def _exit_failure(name: str, rc: int, out: bytes, err: bytes, json_events: bool = False) -> ReviewFailed:
+    """The failure of a reviewer that exited non-zero. claude prints its errors to STDOUT, so when stderr is empty the
+    tail comes from the first 300 characters of stdout. A usage-limit message becomes a UsageLimit. With json_events
+    (codex --json) stdout is an event stream full of the PR's own text: only stderr and the error events are used."""
+    text = jsonl_error_messages(out) if json_events else one_line(out, 2000)
+    tail = one_line(err[-2000:]) or one_line(text)
+    if usage_limit_text(one_line(err, 2000) + " " + one_line(text, 2000)):
+        return UsageLimit(f"usage-limit: {name} exited {rc}: {tail}")
+    return ReviewFailed(f"{name} exited {rc}: {tail}")
+
+
+def _with_stdout(e: ReviewFailed, out: bytes | None) -> ReviewFailed:
+    """The stdout the process wrote before it failed, kept for what it reported (Codex's token usage)."""
+    e.stdout = (out or b"")[:OUTPUT_MAX].decode("utf-8", "replace")
+    return e
+
+
+# Runs next to a reviewer, in the reviewer's session: when the process that started the reviewer is gone for any reason
+# (a CI cancel that kills only the pipeline's own process group, SIGKILL, a crash) it kills the reviewer's whole group.
+WATCHDOG = (
+    "import os,signal,sys,time\n"
+    "parent, group = int(sys.argv[1]), int(sys.argv[2])\n"
+    "while os.getppid() == parent:\n"
+    "    try:\n"
+    "        os.killpg(group, 0)\n"
+    "    except ProcessLookupError:\n"
+    "        sys.exit(0)\n"
+    "    time.sleep(0.5)\n"
+    "try:\n"
+    "    os.killpg(group, signal.SIGKILL)\n"
+    "except ProcessLookupError:\n"
+    "    pass\n")
+
+
+def run_reviewer(argv: list[str], cwd: Path, stdin: str | None, time_cap_s: float,
+                 json_events: bool = False) -> tuple[str, float]:
     """The one subprocess boundary: scrubbed env, own process group (killed whole on the time cap), bounded output."""
     t = time.monotonic()
     try:
@@ -881,15 +986,21 @@ def run_reviewer(argv: list[str], cwd: Path, stdin: str | None, time_cap_s: floa
                              start_new_session=True)
     except OSError as e:
         raise ReviewFailed(f"cannot start {argv[0]}: {type(e).__name__}") from None
+    dog = subprocess.Popen([sys.executable, "-c", WATCHDOG, str(os.getpid()), str(p.pid)], env=child_env(),
+                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           start_new_session=True)
     try:
         out, err = p.communicate(stdin.encode() if stdin is not None else None, timeout=time_cap_s)
     except subprocess.TimeoutExpired:
         os.killpg(p.pid, signal.SIGKILL)
-        p.communicate()
-        raise ReviewFailed(f"the review took longer than the time cap ({time_cap_s:.0f}s); killed") from None
+        out, _ = p.communicate()
+        raise _with_stdout(ReviewFailed(f"the review took longer than the time cap ({time_cap_s:.0f}s); killed"),
+                           out) from None
+    finally:
+        dog.kill()
+        dog.wait()
     if p.returncode != 0:
-        tail = ai.redact(err.decode("utf-8", "replace")[-300:]).replace("\n", " ")
-        raise ReviewFailed(f"{Path(argv[0]).name} exited {p.returncode}: {tail}")
+        raise _with_stdout(_exit_failure(Path(argv[0]).name, p.returncode, out, err, json_events), out)
     if len(out) > OUTPUT_MAX:
         raise ReviewFailed("the reviewer's output is larger than any verdict can be")
     return out.decode("utf-8", "replace"), time.monotonic() - t
@@ -920,6 +1031,8 @@ class ClaudeBackend:
             raise ReviewFailed("claude did not answer with JSON") from None
         if not isinstance(d, dict) or d.get("is_error"):
             why = ai.redact(str(d.get("result", ""))[:200]) if isinstance(d, dict) else "?"
+            if usage_limit_text(why):
+                raise UsageLimit(f"usage-limit: claude reported an error: {one_line(why)}")
             raise ReviewFailed(f"claude reported an error: {why}")
         answer = d.get("structured_output") if isinstance(d.get("structured_output"), dict) else d.get("result", "")
         models = list(d.get("modelUsage") or {})
@@ -959,6 +1072,14 @@ def register_pi_secret(model: str) -> None:
             ai.REDACT.add(key)
     except (OSError, ValueError, AttributeError):
         pass
+
+
+def register_env_tokens() -> None:
+    """GH_TOKEN / GITHUB_TOKEN join the redaction set at startup, whichever backend runs: the wrapper's token file
+    value arrives as GH_TOKEN, and a claude or codex reviewer that was prompt-injected could echo it. Never raises."""
+    for name in ("GH_TOKEN", "GITHUB_TOKEN"):
+        if len(os.environ.get(name, "")) >= 8:
+            ai.REDACT.add(os.environ[name])
 
 
 def register_gh_secret() -> None:
@@ -1405,7 +1526,7 @@ def _run_tier1(cfg, gh, pr, repo, n, sha, tier, state, key, started, post_on) ->
         raise ReviewFailed("the diff is empty")
     req = ReviewRequest(repo, n, sha, str(pr.get("title", "")), str(pr.get("body") or ""), "", diff or "",
                         sorted(f.path for f in files))
-    with Worktree(cfg, n, sha, str(pr.get("baseRefName", "main"))) as wt:
+    with Worktree(cfg, n, sha, str(pr.get("baseRefName", "main")), repo=repo) as wt:
         if diff is None:
             req.diff = local_diff(wt)
             req.files = sorted(f.path for f in ai.parse_diff(req.diff))
@@ -1432,7 +1553,10 @@ def _run_tier1(cfg, gh, pr, repo, n, sha, tier, state, key, started, post_on) ->
 
 def glob_regex(glob: str) -> re.Pattern[str]:
     """`**/` = any directories (or none), `**` = anything, `*` = anything but `/`, `?` = one non-`/` character.
+    A trailing `/` means everything below: `deploy/` is `deploy/**`.
     Case-insensitive: a path that only differs in case still counts as risky."""
+    if glob.endswith("/"):
+        glob = glob.rstrip("/") + "/**"
     out, i = "", 0
     while i < len(glob):
         if glob.startswith("**/", i):
@@ -1529,15 +1653,36 @@ class CodexBackend:
         with tempfile.TemporaryDirectory(prefix="codex-review-") as d:
             schema, out = Path(d) / "schema.json", Path(d) / "answer.txt"
             schema.write_text(json.dumps(GATEWAY_SCHEMA))
-            stdout, took = run_reviewer(self.argv(schema, out, req.worktree), req.worktree, self.prompt(req),
-                                        time_cap_s)
-            usage = codex_usage(stdout)
+            try:
+                stdout, took = run_reviewer(self.argv(schema, out, req.worktree), req.worktree, self.prompt(req),
+                                            time_cap_s, json_events=True)
+            except ReviewFailed as e:
+                if isinstance(e, UsageLimit):
+                    e.bucket = "codex"
+                raise self._with_spend(e, getattr(e, "stdout", "")) from None
+            try:
+                usage = codex_usage(stdout)
+            except ReviewFailed as e:
+                raise _with_stdout(e, b"") from None            # implausible counts: nothing to account
             try:
                 answer = out.read_text(errors="replace")
             except OSError:
-                raise ReviewFailed("codex wrote no answer") from None
-        cost = codex_cost_usd(self.ccfg, usage)
-        return RawReview(answer, self.ccfg["model"] or "codex", took, {**usage, "cost_usd": cost})
+                raise self._with_spend(ReviewFailed("codex wrote no answer"), stdout) from None
+        return RawReview(answer, self.ccfg["model"] or "codex", took, self._priced(usage))
+
+    def _priced(self, usage: dict) -> dict:
+        return {**usage, "cost_usd": codex_cost_usd(self.ccfg, usage)}
+
+    def _with_spend(self, e: ReviewFailed, stdout: str) -> ReviewFailed:
+        """A failed run still spent what its tokens say: attach them (priced) so the failure is logged and counted.
+        No parsable tokens means unknown: attach nothing and let the log line say so, never a guessed cost."""
+        try:
+            usage = codex_usage(stdout)
+        except ReviewFailed:
+            usage = {}
+        if usage:
+            e.usage = self._priced(usage)
+        return e
 
 
 def codex_budget_left(cfg: dict) -> str | None:
@@ -1568,7 +1713,8 @@ def codex_review(cfg: dict, req: ReviewRequest, tier_name: str, post_on: bool, s
     try:
         raw = CodexBackend(c).review(req, c["time_cap_s"])
     except ReviewFailed as e:
-        log("not-run", why=str(e)[:200])
+        spent = getattr(e, "usage", None)
+        log("not-run", why=str(e)[:200], **({"usage": spent} if spent else {"usage_unknown": True}))
         raise
     usage = raw.usage
     try:
@@ -1583,7 +1729,8 @@ def codex_review(cfg: dict, req: ReviewRequest, tier_name: str, post_on: bool, s
             # a block that leaves nothing standing must never become a success
             raise ReviewFailed("codex said block but none of its blockers could be verified in this PR")
     except ReviewFailed as e:
-        log("not-run", why=str(e)[:200], usage=usage)
+        log("not-run", why=str(e)[:200], **({"usage": usage} if usage.get("cost_usd") is not None else
+                                             {"usage": usage, "usage_unknown": True}))
         raise
     log("reviewed", usage=usage, blocking=sum(f.severity == "blocking" for f in v.findings), downgraded=n,
         findings=log_findings(v.findings))
@@ -1598,10 +1745,20 @@ def make_backend(cfg: dict, tier: dict) -> Backend:
 
 # ---------------- git worktree ----------------
 
-def git(args: list[str], cwd: Path | str) -> str:
-    p = subprocess.run(["git", *args], cwd=cwd, capture_output=True, timeout=300, env=child_env())
+def git(args: list[str], cwd: Path | str, auth: bool = False) -> str:
+    """Run git with the scrubbed environment. `auth=True` (only for the fetch of a PR's refs, never for the reviewer)
+    also passes the GitHub token the credential helper `gh auth git-credential` needs on a host without a gh login."""
+    env = child_env()
+    if auth:
+        env.update({k: os.environ[k] for k in ("GH_TOKEN", "GITHUB_TOKEN") if k in os.environ})
+    if auth and args[:1] == ["fetch"]:
+        # reset any helper from the user's global/system config (a `store` helper would persist the token in
+        # the operator's own clone), then name the gh helper
+        args = ["-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential", *args]
+    p = subprocess.run(["git", *args], cwd=cwd, capture_output=True, timeout=300, env=env)
     if p.returncode != 0:
-        raise ReviewFailed(f"git {args[0]} failed: {ai.redact(p.stderr.decode('utf-8', 'replace')[-200:])}")
+        sub = next((a for i, a in enumerate(args) if not a.startswith("-") and (i == 0 or args[i - 1] != "-c")), "?")
+        raise ReviewFailed(f"git {sub} failed: {ai.redact(p.stderr.decode('utf-8', 'replace')[-200:])}")
     return p.stdout.decode("utf-8", "replace").strip()
 
 
@@ -1621,18 +1778,75 @@ def is_git_clone(path: Path) -> bool:
     return git_dir == root if bare else (root / ".git").exists()
 
 
+GITHUB_ORIGIN_RE = re.compile(r"(?:https?://(?:[^/@]+@)?github\.com/|git@github\.com:|ssh://git@github\.com/)"
+                              r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?")
+
+
+def origin_repo(clone: Path) -> str:
+    """OWNER/NAME of the GitHub repository the clone's `origin` names, read raw from its config (url rewrites such as
+    insteadOf are not applied), or "" when origin is missing or is not a github.com URL."""
+    p = subprocess.run(["git", "config", "--get", "remote.origin.url"], cwd=clone, capture_output=True, timeout=60,
+                       env=child_env())
+    m = GITHUB_ORIGIN_RE.fullmatch(p.stdout.decode("utf-8", "replace").strip()) if p.returncode == 0 else None
+    return m.group(1) if m else ""
+
+
+def managed_clone(cfg: dict, repo: str) -> Path:
+    """The bare clone this script keeps for `repo` under state_dir/clones/, created on first use from `clone_url` with
+    the gh credential helper (so a private repo works with the host's gh login or GH_TOKEN). Created under a lock, so a
+    timer sweep and a CI-triggered review never both clone it."""
+    root = ai.expand(cfg["state_dir"]) / "clones"
+    path = root / (repo.replace("/", "__") + ".git")
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with open(root / (path.name + ".lock"), "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        if not is_git_clone(path):
+            shutil.rmtree(path, ignore_errors=True)
+            # `-c credential.helper=` first resets any helper from the user's global config, so a `store` or `cache`
+            # helper never gets to keep the token; only gh's helper is asked.
+            git(["-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential", "clone", "--bare",
+                 "--quiet", "--no-tags", "--", cfg["clone_url"].replace("{repo}", repo), str(path)], root, auth=True)
+            git(["config", "--replace-all", "credential.helper", ""], path)
+            git(["config", "--add", "credential.helper", "!gh auth git-credential"], path)
+    return path
+
+
+def clone_for_review(cfg: dict, repo: str) -> Path:
+    """The clone a review of `repo` takes its worktree from, so one installed command and one config serve every repo:
+    a `clones` entry for the repo; else `clone` unless its origin names a different GitHub repo (an origin that is not
+    a github.com URL, such as a local path, is trusted as before); else a managed bare clone of the repo."""
+    for c in cfg["clones"]:
+        if c["repo"].lower() == repo.lower():
+            path = ai.expand(c["path"])
+            if not is_git_clone(path):
+                raise Refused(f"config: the clones entry for {repo} is not a git clone")
+            return path
+    if cfg["clone"]:
+        path = ai.expand(cfg["clone"])
+        if not is_git_clone(path):
+            raise Refused("config: clone must name a git clone, bare or not (the claude and pi backends need one)")
+        named = origin_repo(path)
+        if not named or named.lower() == repo.lower():
+            return path
+    return managed_clone(cfg, repo)
+
+
 class Worktree:
     """A fresh detached worktree of exactly the pinned head, read-only fetched, removed afterwards."""
 
-    def __init__(self, cfg: dict, pr: int, sha: str, base_ref: str, base_sha: str = "", replay: bool = False):
+    def __init__(self, cfg: dict, pr: int, sha: str, base_ref: str, base_sha: str = "", replay: bool = False,
+                 repo: str = ""):
         """replay=True is for the replay harness: the head need only be reachable from refs/pull/N/head (a PR's older
         head, not its latest), `base_sha` (if given) fixes the base, and the fetched refs have their own names."""
-        clone = cfg["clone"]
-        if not clone or not is_git_clone(ai.expand(clone)):
-            raise Refused("config: clone must name a git clone, bare or not (the claude and pi backends need one)")
+        if repo:                                        # a live review: the clone that belongs to this repository
+            clone = clone_for_review(cfg, repo)
+        else:                                           # replay resolves its clone itself (clone_for)
+            clone = cfg["clone"]
+            if not clone or not is_git_clone(ai.expand(clone)):
+                raise Refused("config: clone must name a git clone, bare or not (the claude and pi backends need one)")
         if not BASE_RE.fullmatch(base_ref):
             raise ReviewFailed("the PR's base ref is not a plain branch name")
-        self.clone, self.pr, self.sha, self.base_ref = ai.expand(clone), pr, sha, base_ref
+        self.clone, self.pr, self.sha, self.base_ref = ai.expand(str(clone)), pr, sha, base_ref
         self.path = ai.expand(cfg["state_dir"]) / "worktrees" / f"pr{pr}-{sha[:12]}-{secrets.token_hex(3)}"
         self.base_sha, self.replay, self.want_base = "", replay, base_sha
         self.pr_ref, self.base_ref_name = f"refs/herdr-review/{'replay-' if replay else ''}pr-{pr}", \
@@ -1652,20 +1866,20 @@ class Worktree:
     def _enter(self) -> Worktree:
         ref = self.pr_ref
         if self.replay:
-            git(["fetch", "--no-tags", "--quiet", "origin", f"+refs/pull/{self.pr}/head:{ref}"], self.clone)
+            git(["fetch", "--no-tags", "--quiet", "origin", f"+refs/pull/{self.pr}/head:{ref}"], self.clone, auth=True)
             git(["cat-file", "-e", f"{self.sha}^{{commit}}"], self.clone)          # an older head of the PR is fine
             if self.want_base:
                 git(["cat-file", "-e", f"{self.want_base}^{{commit}}"], self.clone)
                 self.base_sha = git(["merge-base", self.sha, self.want_base], self.clone)
             else:
                 git(["fetch", "--no-tags", "--quiet", "origin", f"+refs/heads/{self.base_ref}:{self.base_ref_name}"],
-                    self.clone)
+                    self.clone, auth=True)
                 self.base_sha = git(["merge-base", self.sha, self.base_ref_name], self.clone)
             if self.base_sha == self.sha:
                 raise ReviewFailed("the case has an empty diff (the head is already in the base); give base_sha")
         else:
             git(["fetch", "--no-tags", "--quiet", "origin", f"+refs/pull/{self.pr}/head:{ref}",
-                 f"+refs/heads/{self.base_ref}:{self.base_ref_name}"], self.clone)
+                 f"+refs/heads/{self.base_ref}:{self.base_ref_name}"], self.clone, auth=True)
             if git(["rev-parse", ref], self.clone) != self.sha:
                 raise HeadMoved("the fetched PR head is not the pinned SHA")
             self.base_sha = git(["merge-base", self.sha, self.base_ref_name], self.clone)
@@ -1759,7 +1973,7 @@ class State:
 
     def failed_here(self, key: str, sha: str) -> bool:
         e = self.get(key)
-        return e.get("failures", 0) > 0 and e.get("failure_sha") == sha
+        return (e.get("failures", 0) > 0 and e.get("failure_sha") == sha) or e.get("limit_sha") == sha
 
     def cooling(self, key: str, sha: str, cfg: dict) -> bool:
         e = self.get(key)
@@ -1851,7 +2065,58 @@ def upsert_comment(gh, repo: str, n: int, context: str, body: str, mk: str | Non
 
 # ---------------- one review ----------------
 
-def review_tier(cfg: dict, repo: str, n: int, tier_name: str, post_flag: bool, force: bool = False) -> int:
+def host_lock(cfg: dict, wait_s: float):
+    """The host-wide review slot: one review at a time per host, whoever started it (a Woodpecker step, the timer sweep,
+    a person). Waits up to `wait_s` seconds, polling; returns the held file or None if the slot stayed taken."""
+    deadline = time.monotonic() + wait_s
+    while True:
+        held = ai.lock(cfg, "host-review")
+        if held is not None or time.monotonic() >= deadline:
+            return held
+        time.sleep(min(2.0, max(0.05, deadline - time.monotonic())))
+
+
+def clean_stale(cfg: dict) -> None:
+    """Remove what a killed review left: worktrees under state_dir/worktrees and refs/herdr-review/* in the clones.
+    Called only while holding the host lock (no other review is live here); skipped while a replay runs."""
+    replay = ai.lock(cfg, "always-on-replay")
+    if replay is None:
+        return
+    try:
+        state = ai.expand(cfg["state_dir"])
+        shutil.rmtree(state / "worktrees", ignore_errors=True)
+        clones = [ai.expand(c["path"]) for c in cfg["clones"]]
+        if cfg["clone"]:
+            clones.append(ai.expand(cfg["clone"]))
+        clones += sorted((state / "clones").glob("*.git"))
+        for clone in clones:
+            if not is_git_clone(clone):
+                continue
+            if clone.parent == state / "clones":        # only the managed clones: never touch the operator's own
+                subprocess.run(["git", "worktree", "prune"], cwd=clone, capture_output=True, timeout=120,
+                               env=child_env())
+            refs = subprocess.run(["git", "for-each-ref", "--format=%(refname)", "refs/herdr-review"], cwd=clone,
+                                  capture_output=True, timeout=120, env=child_env()).stdout.decode().split()
+            for r in refs:
+                subprocess.run(["git", "update-ref", "-d", r], cwd=clone, capture_output=True, timeout=60,
+                               env=child_env())
+    finally:
+        replay.close()
+
+
+_CLEANED = False
+
+
+def clean_stale_once(cfg: dict) -> None:
+    """clean_stale at most once per process (a `review --tier all` runs two tiers under the same slot)."""
+    global _CLEANED
+    if not _CLEANED:
+        _CLEANED = True
+        clean_stale(cfg)
+
+
+def review_tier(cfg: dict, repo: str, n: int, tier_name: str, post_flag: bool, force: bool = False,
+                codex_blocked: bool = False) -> int:
     global LAST_RESULT
     LAST_RESULT = None
     assert_not_replaying("a review of a live pull request")
@@ -1863,6 +2128,13 @@ def review_tier(cfg: dict, repo: str, n: int, tier_name: str, post_flag: bool, f
     held = ai.lock(cfg, f"{repo}#{n}")
     if held is None:
         ai.say(f"{repo}#{n}: another run holds this PR; skipped")
+        return SKIPPED
+    slot = host_lock(cfg, cfg["host_lock_wait_s"])
+    if slot is None:
+        held.close()
+        if cfg["host_lock_wait_s"] > 0:
+            raise ReviewFailed(f"waited {cfg['host_lock_wait_s']:.0f}s for the host's review slot; giving up")
+        ai.say(f"{repo}#{n}: another review holds this host's slot; skipped")
         return SKIPPED
     post_on = post_allowed(cfg, post_flag)
     gh = ai.Gh(dry_run=not post_on)
@@ -1896,13 +2168,17 @@ def review_tier(cfg: dict, repo: str, n: int, tier_name: str, post_flag: bool, f
             ai.say(f"{key} @ {sha[:12]}: {tier_name} daily budget exhausted (${spent:.2f} of ${budget:.2f} spent today, "
                    "UTC); review skipped, status unchanged")
             return SKIPPED
+        clean_stale_once(cfg)                           # only a run that will review; no-op runs leave things alone
         backend = None if ensemble else make_backend(cfg, tier)
         try:
             if ensemble:
                 return _run_tier1(cfg, gh, pr, repo, n, sha, tier, state, key, started, post_on)
-            return _run(cfg, gh, pr, repo, n, sha, tier_name, tier, backend, post_on, state, key, started)
+            return _run(cfg, gh, pr, repo, n, sha, tier_name, tier, backend, post_on, state, key, started, force,
+                        codex_blocked)
         except (ReviewFailed, Refused) as e:
-            if isinstance(e, ReviewFailed):
+            if isinstance(e, UsageLimit):               # out of quota is nobody's strike; just retry next time
+                state.put(key, limit_sha=sha)
+            elif isinstance(e, ReviewFailed):
                 old = state.get(key)
                 count = old.get("failures", 0) + 1 if old.get("failure_sha") == sha else 1
                 state.put(key, failures=count, last_failure=time.time(), failure_sha=sha)
@@ -1917,6 +2193,7 @@ def review_tier(cfg: dict, repo: str, n: int, tier_name: str, post_flag: bool, f
                  **({"usage": e.usage} if getattr(e, "usage", None) else {}))
         return MOVED
     finally:
+        slot.close()
         held.close()
 
 
@@ -1929,6 +2206,34 @@ class PassesResult:
     downgraded: int
     partial: str = ""                   # why a later pass did not complete ("" = all did); the verdict is then incomplete
     unverified: bool = False            # a pass said block, but every blocker it raised failed the evidence rule
+
+
+def verdict_to_json(v: Verdict) -> dict:
+    return {"head_sha": v.head_sha, "verdict": v.verdict, "findings": [dataclasses.asdict(f) for f in v.findings],
+            "checked": list(v.checked), "checked_items": list(v.checked_items),
+            "tier1_checks": [dict(c) for c in v.tier1_checks]}
+
+
+def verdict_from_json(d: dict) -> Verdict:
+    """What verdict_to_json wrote to state.json. A damaged entry raises (the caller then reviews afresh)."""
+    return Verdict(d["head_sha"], d["verdict"], tuple(Finding(**f) for f in d["findings"]), tuple(d["checked"]),
+                   tuple(d["checked_items"]), tuple(dict(c) for c in d["tier1_checks"]))
+
+
+def remembered_opus(state: State, key: str, sha: str, base_sha: str, tier: dict) -> PassesResult | None:
+    """The clean Opus approve of exactly this head and base that a risky review saved when only Codex failed to run; the retry
+    then runs Codex alone. Another head or base (a retarget), another model, or a damaged entry means Opus reviews again."""
+    e = state.get(key).get("opus_approved")
+    try:
+        if (not isinstance(e, dict) or e.get("sha") != sha or e.get("base_sha") != base_sha
+                or e.get("tier_model") != tier["model"]):
+            return None
+        v = verdict_from_json(e["verdict"])
+        if v.head_sha != sha or v.verdict != "approve":
+            return None
+        return PassesResult(v, str(e["model"]), {}, [], int(e["downgraded"]))      # usage {}: billed when it ran
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 def _sum_usage(parts: list[dict]) -> dict:
@@ -2009,7 +2314,8 @@ def local_diff(wt: Worktree) -> str:
     return git(["diff", "--no-color", "--no-ext-diff", wt.base_sha, wt.sha], wt.path) + "\n"
 
 
-def _run(cfg, gh, pr, repo, n, sha, tier_name, tier, backend, post_on, state, key, started) -> int:
+def _run(cfg, gh, pr, repo, n, sha, tier_name, tier, backend, post_on, state, key, started, force=False,
+         codex_blocked=False) -> int:
     global LAST_RESULT
     context = tier["context"]
     diff = github_diff(gh, repo, n)                  # None: too large for GitHub; read it from the worktree instead
@@ -2020,7 +2326,8 @@ def _run(cfg, gh, pr, repo, n, sha, tier_name, tier, backend, post_on, state, ke
         raise ReviewFailed("the diff is empty")
     index = {f.path: f for f in files}
     risky = tier_name == "tier2" and bool(risky_paths(cfg, files))
-    if risky and (why := codex_budget_left(cfg)):
+    if risky and (why := codex_budget_left(cfg) or ("codex is out of quota for this poll run" if codex_blocked
+                                                     else None)):
         ai.say(f"{key} @ {sha[:12]}: {why}; review skipped, status unchanged")
         return SKIPPED
     if post_on:
@@ -2035,7 +2342,7 @@ def _run(cfg, gh, pr, repo, n, sha, tier_name, tier, backend, post_on, state, ke
         req.candidates = tuple(t1["candidates"])
     codex: tuple[Verdict, dict, str, int] | None = None
     if backend.needs_worktree or diff is None or risky:
-        with Worktree(cfg, n, sha, str(pr.get("baseRefName", "main"))) as wt:
+        with Worktree(cfg, n, sha, str(pr.get("baseRefName", "main")), repo=repo) as wt:
             if diff is None:
                 req.diff = local_diff(wt)
                 files = ai.parse_diff(req.diff)
@@ -2044,10 +2351,17 @@ def _run(cfg, gh, pr, repo, n, sha, tier_name, tier, backend, post_on, state, ke
                 index = {f.path: f for f in files}
                 req.files = sorted(index)
                 risky = tier_name == "tier2" and bool(risky_paths(cfg, files))
+                if risky and codex_blocked:
+                    ai.say(f"{key} @ {sha[:12]}: codex is out of quota for this poll run; review skipped")
+                    return SKIPPED
                 ai.say(f"{repo}#{n}: the diff is over GitHub's limit; reviewing the local diff of {len(files)} files")
             req.worktree, req.base_sha = wt.path, wt.base_sha
             req.log = git(["log", "--format=%h %s", f"{wt.base_sha}..{sha}"], wt.path)
-            result = run_passes(cfg, tier, backend, req, wt.path if backend.needs_worktree else None)
+            result = None if (force or not risky) else remembered_opus(state, key, sha, wt.base_sha, tier)
+            if result is not None:
+                ai.say(f"{key} @ {sha[:12]}: Opus already approved this head; running Codex only")
+            else:
+                result = run_passes(cfg, tier, backend, req, wt.path if backend.needs_worktree else None)
             # Risky paths: Opus must have approved cleanly first (a block already decides failure, and an incomplete
             # review stays pending), then Codex reviews the same head and its verdict is merged in.
             if risky and not result.partial and not result.unverified and decide(
@@ -2056,6 +2370,9 @@ def _run(cfg, gh, pr, repo, n, sha, tier_name, tier, backend, post_on, state, ke
                     codex = codex_review(cfg, req, tier_name, post_on, started)
                 except ReviewFailed as e:
                     e.usage = result.usage              # Opus ran and billed; Codex logged its own spend
+                    state.put(key, opus_approved={"sha": sha, "base_sha": wt.base_sha, "tier_model": tier["model"], "model": result.model,
+                                                  "downgraded": result.downgraded,
+                                                  "verdict": verdict_to_json(result.verdict)})
                     raise
     else:
         result = run_passes(cfg, tier, backend, req, None)
@@ -2099,7 +2416,7 @@ def _run(cfg, gh, pr, repo, n, sha, tier_name, tier, backend, post_on, state, ke
         else:
             ai.say(f"{key} @ {sha[:12]}: max_comments_per_hour reached; comment skipped, status still posted")
     post_status(gh, repo, sha, context, decision, url)
-    state.put(key, failures=0, **({} if post_on else {"dry_sha": sha}))
+    state.put(key, failures=0, opus_approved=None, limit_sha=None, **({} if post_on else {"dry_sha": sha}))
     LAST_RESULT = {"repo": repo, "pr": n, "sha": sha, "tier": tier_name, "state": decision.state,
                    "description": decision.description, "blocking": list(decision.blocking),
                    "dropped": list(decision.dropped), "dry_run": not post_on, "posted": gh.posted}
@@ -2677,6 +2994,15 @@ def poll_prs(cfg: dict, state: State, repo: str, prs: list[dict]) -> list[dict]:
     return out
 
 
+def stuck_last(state: State, repo: str, prs: list[dict]) -> list[dict]:
+    """PRs whose tier-2 review last stopped on a usage limit (for this very head) go after the others, so one stuck
+    risky PR is retried only once the rest have had their turn (and their share of max_per_run)."""
+    def stuck(p: dict) -> bool:
+        return state.get(f"{repo}#{p.get('number')}#tier2").get("limit_sha") == p.get("headRefOid")
+
+    return sorted(prs, key=stuck)                                         # stable: number order within each group
+
+
 def poll(cfg: dict, repos: list[str], post_flag: bool) -> int:
     held = ai.lock(cfg, "always-on-poll")
     if held is None:
@@ -2685,6 +3011,7 @@ def poll(cfg: dict, repos: list[str], post_flag: bool) -> int:
     post_on = post_allowed(cfg, post_flag)
     ai.say(f"poll: {'POSTING enabled' if post_on else 'DRY RUN: nothing will be posted'}")
     gh, worst, done, state = ai.Gh(dry_run=True), OK, 0, State(cfg)
+    out_of_quota: set[str] = set()          # quotas ("tier1", "tier2", "codex") that reported a usage limit this run
     try:
         for repo in repos:
             try:
@@ -2696,12 +3023,14 @@ def poll(cfg: dict, repos: list[str], post_flag: bool) -> int:
                 ai.say(f"{repo}: {e}")
                 worst = FAILED
                 continue
-            for p in prs:
+            for p in stuck_last(state, repo, prs):
                 for tier_name in ("tier1", "tier2"):
+                    if tier_name in out_of_quota:
+                        continue
                     if done >= cfg["poll"]["max_per_run"]:
                         ai.say("max_per_run reached; the rest waits for the next poll")
                         return worst
-                    rc = _poll_one(cfg, repo, int(p["number"]), tier_name, post_flag)
+                    rc = _poll_one(cfg, repo, int(p["number"]), tier_name, post_flag, out_of_quota)
                     done += rc not in (SKIPPED,)
                     worst = FAILED if rc in (FAILED, REFUSED) else worst
         return worst
@@ -2709,9 +3038,17 @@ def poll(cfg: dict, repos: list[str], post_flag: bool) -> int:
         held.close()
 
 
-def _poll_one(cfg: dict, repo: str, n: int, tier_name: str, post_flag: bool) -> int:
+def _poll_one(cfg: dict, repo: str, n: int, tier_name: str, post_flag: bool,
+              out_of_quota: set[str] | None = None, force: bool = False) -> int:
     try:
-        return review_tier(cfg, repo, n, tier_name, post_flag)
+        return review_tier(cfg, repo, n, tier_name, post_flag, force,
+                           codex_blocked="codex" in (out_of_quota or ()))
+    except UsageLimit as e:
+        bucket = e.bucket or tier_name
+        ai.say(f"{repo}#{n} {tier_name}: {e}; no further {bucket} reviews in this poll run")
+        if out_of_quota is not None:
+            out_of_quota.add(bucket)
+        return FAILED
     except Refused as e:
         ai.say(f"{repo}#{n} {tier_name}: refused: {e}")
         return REFUSED
@@ -2748,6 +3085,9 @@ def show_command(cfg: dict, tier_name: str) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    global _CLEANED
+    _CLEANED = False                                    # once per invocation
+    register_env_tokens()
     ap = argparse.ArgumentParser(prog="always-on-review.py", description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("poll")
@@ -2756,6 +3096,9 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--repo", required=True)
     r.add_argument("--pr", required=True, type=int)
     r.add_argument("--tier", choices=["tier1", "tier2", "all"], default="all")
+    r.add_argument("--host-lock-wait", type=float, default=0, metavar="SECONDS",
+                   help="wait this long for the host's one review slot (default 0: skip when it is taken; a wait that "
+                        "runs out fails the review)")
     r.add_argument("--force", action="store_true", help="review even a head that already has a terminal status")
     s = sub.add_parser("show-command", help="print the reviewer's command line without running it")
     s.add_argument("--tier", choices=["tier1", "tier2", "codex"], required=True)
@@ -2778,6 +3121,8 @@ def main(argv: list[str] | None = None) -> int:
     for x in (p, r):
         x.add_argument("--post", action="store_true", help="allow posting (also needs `post: true` in the config)")
     a = ap.parse_args(argv)
+    if a.cmd in ("poll", "review"):
+        register_gh_secret()                            # the sweep has no wrapper: the operator's own gh login too
     try:
         if a.cmd == "corpus":
             return corpus_build(a.repo, a.since, Path(a.out), frozenset(load_config(a.config)["replay"]["reviewers"]))
@@ -2795,7 +3140,9 @@ def main(argv: list[str] | None = None) -> int:
         if a.cmd == "show-command":
             return show_command(cfg, a.tier)
         if a.cmd == "review":
-            rcs = [review_tier(cfg, a.repo, a.pr, t, a.post, a.force)
+            cfg["host_lock_wait_s"] = float(a.host_lock_wait)
+            # each tier on its own, as poll does: a failing advisory tier 1 never keeps tier 2 from running
+            rcs = [_poll_one(cfg, a.repo, a.pr, t, a.post, force=a.force)
                    for t in (["tier1", "tier2"] if a.tier == "all" else [a.tier])]
             ran = [c for c in rcs if c != SKIPPED]
             return max(ran) if ran else SKIPPED

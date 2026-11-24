@@ -1,7 +1,6 @@
 """Spec 05: cleanup honors registry leases. Real sqlite registry, real child owner.
 
-``_process_paths`` is neutralised (like in test_build_cleanup.py) so only the lease
-guard decides; thresholds are forced through the real policy parameters.
+Thresholds are forced through the real policy parameters; targets are built by a real cargo.
 """
 import os
 import subprocess
@@ -13,32 +12,34 @@ import pytest
 
 from herdr_engineering import build_cleanup as cleanup
 from herdr_engineering import build_registry as br
+from tests.real_cargo import build
 
-FORCE = {"high_water": 1, "low_water": 0, "min_age_hours": 24}
 
-
-@pytest.fixture(autouse=True)
-def no_proc_scan(monkeypatch):
-    monkeypatch.setattr(cleanup, "_process_paths", lambda: [])
+def force(root: Path) -> dict:
+    """Thresholds relative to what the filesystem under ``root`` really shows, so a nearly empty tmpfs
+    still triggers a sweep (``high_water=1`` would assume at least 1% used)."""
+    usage = cleanup._usage(root)
+    if usage <= 0:
+        pytest.skip("the filesystem reports no usage at all")
+    return {"high_water": usage / 2, "low_water": 0.0, "min_age_hours": 24}
 
 
 def project(root: Path, name="project", age=48) -> Path:
     p = root / name
     p.mkdir(parents=True)
     subprocess.run(["git", "init", "-q", str(p)], check=True)
-    (p / "Cargo.toml").write_text('[package]\nname = "fixture"\nversion = "0.1.0"\n')
-    t = p / "target"
-    t.mkdir()
-    (t / ".rustc_info.json").write_text("{}")
-    (t / "artifact").write_bytes(b"x" * 4096)
+    (p / "Cargo.toml").write_text('[package]\nname = "fixture"\nversion = "0.1.0"\nedition = "2021"\n')
+    (p / "src").mkdir()
+    (p / "src/main.rs").write_text("fn main() {}\n")
+    t = build(p, p / "target")  # a real build: cargo writes the tag and the fingerprints
     stamp = time.time() - age * 3600
-    for path in [*t.iterdir(), t]:
+    for path in [*t.rglob("*"), t]:
         os.utime(path, (stamp, stamp))
     return t
 
 
 def sweep(root, state, **kw):
-    return cleanup.run_once([root], state, **{**FORCE, **kw})
+    return cleanup.run_once([root], state, **{**force(root), **kw})
 
 
 def reasons(res):
@@ -164,42 +165,77 @@ def test_no_registry_file_is_legacy_behavior(env):
     assert not (state / br.DB_NAME).exists()  # cleanup never creates the registry
 
 
-def test_lease_taken_between_scan_and_delete_is_rechecked(env, monkeypatch):
-    """The 2nd ``_process_paths`` call happens after the first lease check and before
-    rmtree (the existing revalidation step). Acquire a lease there, from the same
-    seam the legacy tests already patch, and expect the target to survive."""
+_RACING_CHILD = """
+import json, sys
+import herdr_engineering.build_cleanup as c
+root, state, high = sys.argv[1:4]
+print(json.dumps(c.run_once([root], state, high_water=float(high), low_water=0.0, min_age_hours=24)))
+"""
+
+def _busy_check_running(sweeper: subprocess.Popen) -> bool:
+    """True while the sweep's own child (the process scan of the busy check) exists: a real process that
+    runs between the sweep's first lease check and its re-read of the lease, before it removes anything."""
+    out = subprocess.run(["ps", "-ww", "-o", "pid=,ppid=,args=", "-A"], capture_output=True, text=True).stdout
+    return any(f" {sweeper.pid} " in f" {line.split(None, 2)[1]} " and "_busy_child" in line
+               for line in out.splitlines() if len(line.split(None, 2)) == 3)
+
+
+def sweep_while_racing(root, state, tmp_path, race):
+    """Run a real sweep in another process and run ``race()`` while that sweep is between its first
+    checks and its removal. The sync point is real: the sweep starts a child process to scan the host
+    for busy targets (after its lease check, before it removes anything), and we act once that child
+    exists. No fake on PATH, no fixed sleeps."""
+    import json
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
+    child = subprocess.Popen([sys.executable, "-c", _RACING_CHILD, str(root), str(state),
+                              str(force(root)["high_water"])], env=env, stdout=subprocess.PIPE, text=True)
+    try:
+        deadline = time.monotonic() + 300
+        while not _busy_check_running(child):
+            assert child.poll() is None and time.monotonic() < deadline, "sweep never reached its busy check"
+            time.sleep(0.002)
+        race()
+    except BaseException:
+        child.kill()
+        raise
+    out, _ = child.communicate(timeout=300)
+    return json.loads(out.splitlines()[-1])
+
+
+def test_lease_taken_between_scan_and_delete_is_rechecked(env, tmp_path):
+    """A real build registers its lease while a real sweep (another process) is between its first lease
+    check and the removal: the target must survive."""
     root, state = env
     t = project(root)
-    reg = br.Registry(state)
-    a = reg.register(repo_id="r", input_digest=None, cmd_kind="x")
-    reg.transition(a.attempt_id, "classified", "t")
-    reg.transition(a.attempt_id, "admitted", "t")
-    calls = []
 
-    def scan():
-        calls.append(1)
-        if len(calls) == 2:
-            reg.acquire_lease(root / "project", a.attempt_id, 300)
-        return []
+    def race():
+        reg = br.Registry(state)
+        a = reg.register(repo_id="r", input_digest=None, cmd_kind="x")
+        reg.transition(a.attempt_id, "classified", "t")
+        reg.transition(a.attempt_id, "admitted", "t")
+        reg.acquire_lease(root / "project", a.attempt_id, 300)
 
-    monkeypatch.setattr(cleanup, "_process_paths", scan)
-    res = sweep(root, state)
-    assert len(calls) == 2, "revalidation seam not reached"
+    res = sweep_while_racing(root, state, tmp_path, race)
     assert t.exists()
     assert reasons(res) == {"project": "active_lease"}
 
 
-def test_target_no_longer_recognized_is_never_removed(env, monkeypatch):
+def test_a_workspace_that_vanishes_during_the_scan_is_never_cleaned(env, tmp_path):
     root, state = env
     t = project(root)
-    calls = []
-
-    def scan():
-        calls.append(1)
-        if len(calls) == 2:  # between scan and delete the project is replaced
-            (root / "project" / "Cargo.toml").unlink()
-        return []
-
-    monkeypatch.setattr(cleanup, "_process_paths", scan)
-    res = sweep(root, state)
+    res = sweep_while_racing(root, state, tmp_path, lambda: (root / "project" / "Cargo.toml").unlink())
     assert t.exists() and res["removed"] == []
+
+
+def test_a_leased_target_is_skipped_without_a_scan_and_does_not_abort_the_sweep(env, monkeypatch):
+    root, state = env
+    t = project(root)
+    owner, _reg, _a, _lease = hold_lease(state, root / "project")
+    monkeypatch.setenv("HERDR_BUSY_CHECK_SECONDS", "0.001")  # any scan would time out and abort
+    try:
+        res = sweep(root, state)
+    finally:
+        owner.kill()
+        owner.wait()
+    assert t.exists() and reasons(res) == {"project": "active_lease"}, res
+    assert not res["aborted"] and res["process_scans"] == 0, res

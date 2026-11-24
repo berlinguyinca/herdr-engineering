@@ -47,17 +47,6 @@ def _fake_repo(tmp_path):
     return tmp_path
 
 
-def test_devfabric_list_unwraps_leases():
-    from herdr_engineering.herdr_adapter import NativeHerdrAdapter
-    ad = NativeHerdrAdapter()
-    ad._run_json = lambda *a, **k: {"leases": [{"target": {"machine_id": "beast"}}]}
-    assert ad.devfabric_list() == [{"target": {"machine_id": "beast"}}]
-    ad._run_json = lambda *a, **k: [{"id": "x"}]
-    assert ad.devfabric_list() == [{"id": "x"}]
-    ad._run_json = lambda *a, **k: {"leases": []}
-    assert ad.devfabric_list() == []
-
-
 @patch("herdr_engineering.fleet._run")
 def test_fleet_join_attaches_provisions_verifies(mock_run, tmp_path, monkeypatch):
     repo = _fake_repo(tmp_path)
@@ -71,10 +60,10 @@ def test_fleet_join_attaches_provisions_verifies(mock_run, tmp_path, monkeypatch
             pass
         def add_machine(self, **kw):
             self.called = kw
-        def devfabric_list(self):
-            return [{"machine_id": "newbox", "target": "newbox"}]
 
-    with patch("herdr_engineering.fleet.NativeHerdrAdapter", FakeAdapter):
+    with patch("herdr_engineering.fleet.NativeHerdrAdapter", FakeAdapter), \
+            patch("herdr_engineering.fleet.devfabric_leases",
+                  return_value=[{"machine_id": "newbox", "target": "newbox"}]):
         rep = fleet.fleet_join(ssh_target="newbox.tail.ts.net", label="newbox",
                                ansible_host="newbox.tail.ts.net", user="alice")
 
@@ -118,10 +107,9 @@ def test_fleet_join_idempotent_inventory(mock_run, tmp_path, monkeypatch):
             pass
         def add_machine(self, **kw):
             pass
-        def devfabric_list(self):
-            return []
 
-    with patch("herdr_engineering.fleet.NativeHerdrAdapter", FakeAdapter):
+    with patch("herdr_engineering.fleet.NativeHerdrAdapter", FakeAdapter), \
+            patch("herdr_engineering.fleet.devfabric_leases", return_value=[]):
         r1 = fleet.fleet_join(ssh_target="newbox", label="newbox")
         r2 = fleet.fleet_join(ssh_target="newbox", label="newbox")
     assert r1["steps"]["inventory"]["added"] is True
@@ -212,7 +200,10 @@ def test_update_refreshes_enabled_local_cleanup(tmp_path, monkeypatch):
     monkeypatch.setattr(fleet, 'fleet_status', lambda **kwargs: STATUS)
     result = fleet.fleet_update(pull_controller=False, reinstall_local=False)
     assert result['ok']
-    assert any(str(repo / 'scripts/build-cleanup.sh') in cmd for cmd in calls)
+    # build-hygiene alone writes the cleanup job (the old systemd script is no longer run)
+    assert not any('build-cleanup.sh' in str(part) for cmd in calls for part in cmd)
+    hygiene = next(cmd for cmd in calls if 'build-hygiene' in cmd)
+    assert '--skip-cleanup-job' not in hygiene
 
 
 def test_update_status_failure_is_not_success(tmp_path, monkeypatch):

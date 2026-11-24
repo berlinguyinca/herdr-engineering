@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -29,7 +30,8 @@ requires_lsof = pytest.mark.skipif(
 
 def test_managed_target_storage_is_an_explicit_valid_option():
     assert validate({"enabled": True, "local": {"manage_targets": True}}).local.manage_targets
-    assert not validate(None).local.manage_targets
+    assert validate(None).local.manage_targets  # on by default
+    assert not validate({"enabled": True, "local": {"manage_targets": False}}).local.manage_targets
 
 
 def test_unique_workspaces_and_ownership_are_preserved(tmp_path: Path):
@@ -299,7 +301,7 @@ def test_target_management_cli_enable_and_migration_safety(tmp_path: Path):
     # to the migrator and would hide the same-filesystem verdict this test asserts.
     ambient = {key: value for key, value in os.environ.items()
                if key not in ("CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR")}
-    env = {**ambient, "HOME": str(home), "CARGO_HOME": str(home / ".cargo"),
+    env = {**ambient, "HERDR_DISK_GUARD_OVERRIDE": "1", "HOME": str(home), "CARGO_HOME": str(home / ".cargo"),
            "RUSTUP_HOME": os.environ.get("RUSTUP_HOME", str(Path.home() / ".rustup")),
            "HERDR_ENGINEERING_CONFIG": str(config), "HERDR_ENGINEERING_STATE": str(state),
            "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
@@ -377,3 +379,148 @@ def test_migration_cli_uses_real_external_volume(tmp_path: Path):
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = value
+
+
+def _hold_open(path: Path, *, cwd: Path | None = None, name: str | None = None) -> subprocess.Popen[bytes]:
+    """A real process that keeps ``path`` open (or, named like a compiler, sits in ``cwd``)."""
+    sleep = shutil.which("sleep")
+    assert sleep
+    if name is not None:
+        program = path.parent / name
+        shutil.copy(sleep, program)
+        process = subprocess.Popen([str(program), "30"], cwd=cwd)
+    else:
+        process = subprocess.Popen(["tail", "-f", str(path)], stdout=subprocess.DEVNULL)
+    return process
+
+
+def _wait_until_listed(predicate) -> None:
+    import time
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        if predicate():
+            return
+        time.sleep(0.1)
+    raise AssertionError("process never appeared in the native open-file listing")
+
+
+@requires_lsof
+def test_idle_check_reports_open_files_and_active_compilers(tmp_path: Path):
+    from herdr_engineering.cargo_target_migration import assert_idle, process_paths
+    workspace = tmp_path / "ws"
+    target = workspace / "target"
+    target.mkdir(parents=True)
+    held = target / "held.log"
+    held.write_text("x")
+    assert_idle(target, workspace)
+    reader = _hold_open(held)
+    try:
+        _wait_until_listed(lambda: held.resolve() in process_paths()[0])
+        with pytest.raises(ValueError, match="open files"):
+            assert_idle(target, workspace)
+    finally:
+        reader.kill()
+        reader.wait()
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    compiler = _hold_open(tools / "x", cwd=workspace, name="rustc")
+    try:
+        _wait_until_listed(lambda: workspace.resolve() in process_paths()[1])
+        with pytest.raises(ValueError, match="active compiler"):
+            assert_idle(tmp_path / "elsewhere", workspace.resolve())
+    finally:
+        compiler.kill()
+        compiler.wait()
+
+
+@requires_lsof
+def test_migration_replaces_a_stale_marker_and_a_prepared_destination(tmp_path: Path):
+    from herdr_engineering.cargo_target_storage import TARGET_MARKER
+    workspace, cache, state = build_real_fixture(tmp_path)
+    target = workspace / "target"
+    # A stray marker inside the old output must not survive: the copy gets a fresh, correct one.
+    (target / TARGET_MARKER).write_text('{"stale": true}\n')
+    result = migrate_target(target, cache, workspace, state, quiescent=True)
+    assert result["status"] == "moved_verified"
+    marker = json.loads((Path(str(result["destination"])) / TARGET_MARKER).read_text())
+    assert marker["workspace"] == str(workspace.resolve()) and "stale" not in marker
+
+
+@requires_lsof
+def test_old_output_is_never_merged_into_a_newer_managed_target(tmp_path: Path):
+    workspace, cache, state = build_real_fixture(tmp_path)
+    target = workspace / "target"
+    first = prepare_target(cache, workspace.resolve())
+    (first / "newer-fingerprint").write_text("keep")
+    result = migrate_target(target, cache, workspace, state, quiescent=True)
+    destination = Path(str(result["destination"]))
+    assert destination != first and "-legacy-" in destination.name
+    assert (first / "newer-fingerprint").read_text() == "keep"
+
+
+def _migration_environment(tmp_path: Path, workspace: Path, cache: Path, state: Path,
+                           local: dict[str, object] | None = None) -> dict[str, str]:
+    from herdr_engineering.cargo_host import install
+    cargo = shutil.which("cargo")
+    assert cargo
+    home = tmp_path / "home"
+    install(home, Path(cargo), Path(sys.executable))
+    config = tmp_path / "migration.yaml"
+    section: dict[str, object] = {"enabled": True, "local": {
+        "min_free_disk_percent": 0, "storage_tiers": [{"name": "internal", "directory": str(cache)}],
+        **(local or {})}}
+    config.write_text(yaml.safe_dump({"fabric_build_cache": section}))
+    ambient = {key: value for key, value in os.environ.items()
+               if key not in ("CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR")}
+    return {**ambient, "HOME": str(home), "CARGO_HOME": str(home / ".cargo"),
+            "RUSTUP_HOME": os.environ.get("RUSTUP_HOME", str(Path.home() / ".rustup")),
+            "HERDR_ENGINEERING_CONFIG": str(config), "HERDR_ENGINEERING_STATE": str(state),
+            "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
+
+
+@requires_lsof
+def test_migration_dry_run_and_apply_across_two_filesystems(tmp_path: Path):
+    shm = Path("/dev/shm")
+    if not shm.is_dir() or not os.access(shm, os.W_OK):
+        pytest.skip("a second writable filesystem (/dev/shm) is required")
+    workspace, _cache, state = build_real_fixture(tmp_path)
+    if workspace.stat().st_dev == shm.stat().st_dev:
+        pytest.skip("/dev/shm shares the project's filesystem")
+    external = Path(tempfile.mkdtemp(prefix="herdr-migration-", dir=shm))
+    try:
+        env = _migration_environment(tmp_path, workspace, external, state)
+        run = lambda *arguments: subprocess.run(  # noqa: E731
+            [sys.executable, "-m", "herdr_engineering.cargo_host", "targets-migrate", "--root", str(workspace),
+             *arguments], env=env, text=True, capture_output=True, timeout=120)
+        plan = run()
+        assert plan.returncode == 0, plan.stderr
+        report = json.loads(plan.stdout)
+        assert report["dry_run"] is True and report["targets"][0]["status"] == "eligible"
+        assert not (workspace / "target").is_symlink()
+        applied = run("--apply", "--quiescent")
+        assert applied.returncode == 0, applied.stderr
+        item = json.loads(applied.stdout)["targets"][0]
+        assert item["status"] == "moved_verified" and (workspace / "target").is_symlink()
+    finally:
+        shutil.rmtree(external, ignore_errors=True)
+
+
+@requires_lsof
+def test_migration_run_rejects_unusable_storage_and_unconfigured_hosts(tmp_path: Path):
+    workspace, cache, state = build_real_fixture(tmp_path)
+    env = _migration_environment(tmp_path, workspace, cache, state, local={
+        "storage_tiers": [{"name": "gone", "directory": "herdr-build/compiler-cache",
+                           "volume_uuid": "11111111-2222-4333-8444-555555555555"}]})
+    base = [sys.executable, "-m", "herdr_engineering.cargo_host", "targets-migrate", "--root", str(workspace)]
+    result = subprocess.run(base, env=env, text=True, capture_output=True, timeout=60)
+    assert result.returncode == 1 and "No eligible storage tier" in result.stderr
+    disabled = tmp_path / "disabled.yaml"
+    disabled.write_text("fabric_build_cache:\n  enabled: false\n")
+    result = subprocess.run(base, env={**env, "HERDR_ENGINEERING_CONFIG": str(disabled)},
+                            text=True, capture_output=True, timeout=60)
+    assert result.returncode == 1 and "configuration is required" in result.stderr
+
+
+def test_planned_destination_is_the_managed_target_directory(tmp_path: Path):
+    from herdr_engineering.cargo_target_migration import planned_destination
+    assert planned_destination(tmp_path, tmp_path / "ws") == target_directory(tmp_path, tmp_path / "ws")

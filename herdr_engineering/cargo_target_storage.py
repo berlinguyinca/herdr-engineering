@@ -26,6 +26,28 @@ def _owned_json(path: Path) -> dict[str, object] | None:
         return None
 
 
+def owner_record(root: Path, name: str) -> Path:
+    """The ownership record of managed target ``name``, kept beside the targets, never inside one: a
+    ``cargo clean`` (or a kill in its middle) cannot take it away."""
+    return root / ".owners" / f"{name}.json"
+
+
+def read_owner(root: Path, name: str) -> dict[str, object] | None:
+    return _owned_json(owner_record(root, name))
+
+
+def _write_owner(root: Path, name: str, payload: dict[str, object]) -> None:
+    record = owner_record(root, name)
+    record.parent.mkdir(exist_ok=True, mode=0o700)
+    temporary = record.with_name(f".{name}.{os.getpid()}.tmp")
+    with open(temporary, "w") as output:
+        json.dump(payload, output, sort_keys=True)
+        output.write("\n")
+        output.flush()
+        os.fsync(output.fileno())
+    os.replace(temporary, record)
+
+
 def _alias_record(state: Path, workspace: Path) -> Path:
     key = hashlib.sha256(str(workspace.resolve()).encode()).hexdigest()
     return state / "target-aliases" / f"{key}.json"
@@ -114,22 +136,35 @@ def maintenance_lock(state: Path, *, exclusive: bool = False) -> Iterator[None]:
         os.close(fd)
 
 
-def _target_setting(path: Path) -> bool:
+def _target_setting(path: Path) -> Path | bool:
+    """The ``build.target-dir`` a Cargo config sets (relative to the config's project), True when it
+    overrides something unreadable or unresolvable, False when it sets nothing."""
     try:
         config = tomllib.loads(path.read_text())
     except FileNotFoundError:
         return False
     except (OSError, ValueError):
         return True  # Unknown configuration is never overridden.
-    return bool(config.get("include") or config.get("build", {}).get("target-dir"))
-
-
-def target_override(arguments: list[str], env: Mapping[str, str], cwd: Path) -> bool:
-    arguments = arguments[:arguments.index("--")] if "--" in arguments else arguments
-    if any(env.get(key) for key in ("CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR")):
+    if config.get("include"):
         return True
+    value = config.get("build", {}).get("target-dir")
+    if not value:
+        return False
+    return Path(value) if isinstance(value, str) and Path(value).is_absolute() else (
+        path.parent.parent / value if isinstance(value, str) and path.parent.name == ".cargo" else True)
+
+
+def target_override(arguments: list[str], env: Mapping[str, str], cwd: Path) -> Path | bool:
+    """Where the caller already directs Cargo's output: the directory when it can be resolved, True when
+    something overrides it but the directory is unknown (a ``--config`` file), False when nothing does."""
+    arguments = arguments[:arguments.index("--")] if "--" in arguments else arguments
+    config_value: Path | bool = False
     for index, arg in enumerate(arguments):
-        if arg == "--target-dir" or arg.startswith("--target-dir="):
+        if arg == "--target-dir" and index + 1 < len(arguments):
+            return cwd / arguments[index + 1]
+        if arg.startswith("--target-dir="):
+            return cwd / arg.split("=", 1)[1]
+        if arg == "--target-dir":
             return True
         if arg == "--config" and index + 1 < len(arguments):
             value = arguments[index + 1]
@@ -138,17 +173,32 @@ def target_override(arguments: list[str], env: Mapping[str, str], cwd: Path) -> 
         else:
             continue
         if "=" not in value:
-            return True  # A separately supplied config file remains authoritative.
+            config_value = True  # A separately supplied config file may set it, and the last one wins.
+            continue
         try:
-            if tomllib.loads(value).get("build", {}).get("target-dir"):
-                return True
+            directory = tomllib.loads(value).get("build", {}).get("target-dir")
         except ValueError:
-            return True
+            config_value = True
+            continue
+        if directory:
+            config_value = cwd / directory if isinstance(directory, str) else True  # repeated --config: the last wins
+    # Cargo's precedence: --target-dir, then --config, then the environment, then config files.
+    if config_value:
+        return config_value
+    for key in ("CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"):
+        if env.get(key):
+            return cwd / env[key]
     for directory in (cwd, *cwd.parents):
-        if any(_target_setting(directory / ".cargo" / name) for name in ("config", "config.toml")):
-            return True
+        for name in ("config", "config.toml"):
+            found = _target_setting(directory / ".cargo" / name)
+            if found:
+                return found
     home = Path(env.get("CARGO_HOME", str(Path.home() / ".cargo")))
-    return any(_target_setting(home / name) for name in ("config", "config.toml"))
+    for name in ("config", "config.toml"):
+        found = _target_setting(home / name)
+        if found:
+            return found
+    return False
 
 
 def workspace_root(real_cargo: Path, arguments: list[str], cwd: Path) -> Path:
@@ -185,7 +235,35 @@ def _write_marker(path: Path, payload: dict[str, object]) -> None:
         os.fsync(output.fileno())
 
 
+@contextmanager
+def _manager_lock(root: Path) -> Iterator[None]:
+    fd = os.open(root / ".target-manager.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+CACHEDIR_TAG = ("Signature: 8a477f597d28d172789f06886806bc55\n"
+                "# This file is a cache directory tag created by Herdr, as cargo does.\n"
+                "# For information about cache directory tags see https://bford.info/cachedir/\n")
+
+
+def write_cachedir_tag(target: Path) -> None:
+    """Give a managed target the ``CACHEDIR.TAG`` cargo checks before ``cargo clean`` (cargo writes it
+    only when it creates the directory itself, and the manager creates it first)."""
+    tag = target / "CACHEDIR.TAG"
+    if not os.path.lexists(tag):
+        tag.write_text(CACHEDIR_TAG)
+
+
 def prepare_target(cache: Path, workspace: Path) -> Path:
+    """The workspace's managed target, created and ownership-checked, under the manager lock.
+
+    The cleanup takes the same lock to delete an orphaned target and to run ``cargo clean`` on a managed
+    one, so a build that starts meanwhile waits here and then finds a whole, freshly prepared target.
+    """
     if not cache.is_dir():
         raise ValueError("Selected storage disappeared; refusing to create a mount directory")
     target = target_directory(cache, workspace)
@@ -193,12 +271,10 @@ def prepare_target(cache: Path, workspace: Path) -> Path:
     if root.is_symlink():
         raise ValueError("Managed target root cannot be a symlink")
     root.mkdir(exist_ok=True, mode=0o700)  # parent must already exist on selected storage
-    fd = os.open(root / ".target-manager.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+    with _manager_lock(root):
         root_marker = root / ".herdr-target-root.json"
         if not root_marker.exists():
-            if any(p.name != ".target-manager.lock" for p in root.iterdir()):
+            if any(not p.name.endswith(".lock") for p in root.iterdir()):
                 raise ValueError("Existing target root is not managed by Herdr")
             _write_marker(root_marker, {"version": 1, "owner_uid": os.getuid()})
         else:
@@ -206,6 +282,7 @@ def prepare_target(cache: Path, workspace: Path) -> Path:
             if (root_marker.is_symlink() or not isinstance(metadata, dict)
                     or metadata.get("version") != 1 or metadata.get("owner_uid") != os.getuid()):
                 raise ValueError("Target root ownership does not match")
+    with _manager_lock(root):
         if target.is_symlink():
             raise ValueError("Managed target directory cannot be a symlink")
         target.mkdir(exist_ok=True, mode=0o700)
@@ -215,10 +292,25 @@ def prepare_target(cache: Path, workspace: Path) -> Path:
             if marker.is_symlink() or json.loads(marker.read_text()) != expected:
                 raise ValueError("Target directory belongs to a different workspace")
         else:
-            if any(target.iterdir()):
+            # a directory a killed ``cargo clean`` left without its marker is still ours when the record says so
+            if any(target.iterdir()) and read_owner(root, target.name) != expected:
                 raise ValueError("Existing target directory has no ownership marker")
             _write_marker(marker, expected)
+        if read_owner(root, target.name) != expected:
+            _write_owner(root, target.name, expected)
+        write_cachedir_tag(target)  # new targets get one, and ones made before this existed are backfilled
         os.utime(marker, None, follow_symlinks=False)
-        return target
-    finally:
-        os.close(fd)
+    return target
+
+
+# --- Retired shared target pool ---------------------------------------------------------------
+# The pool (``shared-targets/<repo-id>/<slot>/target``) is gone: every worktree has one managed
+# target. Hosts that already filled a pool keep it swept by build-cleanup until it is idle.
+
+
+def shared_targets_root(state: Path | None = None) -> Path:
+    """Directory of a retired shared target pool (swept, never written)."""
+    if state is None:
+        from .build_coord import _default_state_dir
+        state = _default_state_dir()
+    return state / "shared-targets"
