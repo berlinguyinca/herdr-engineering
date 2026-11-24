@@ -11,6 +11,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - `invite_by_email` of an already-signed-in user respects `max_members_per_room`: a full room records a pending invite instead (same reply, no sign-in oracle).
 - Scheduler lease heartbeat clamps `ttl` to 1..600 s and rejects non-numeric or non-finite values (`ValueError`) instead of storing an expiry decades away or overflowing.
 - `retention.py` docstring now says `apply_retention` is not applied in production; no deletion behaviour changed.
+### Fix: fabric agent no longer drops every lease on a failed listener scan
+
+- `scan_once` ignored `ListenerInventory.complete`, so one timed-out or failed `ss`/`lsof` (an empty inventory) released every lease and stopped every forwarder, and the next cycle re-adopted them with new leases. A port is now treated as gone only on a complete scan.
+- At startup, a remembered forward port that cannot be rebound (or whose forwarder fails to start) now drops the store entry and closes its lease, so the next scan re-adopts the service with a working forwarder instead of advertising a dead URL.
 
 ### Fix: web packages bug-hunt (collaboration sign-in/out, room polling, composer, member routes, nav badge)
 
