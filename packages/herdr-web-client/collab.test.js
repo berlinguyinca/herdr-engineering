@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { pkcePair, authorizeUrl, parseRedirect, exchangeCode, TokenStore, tokenExpiry, CollabApi, AuthError } from './collab.js';
+import { createServer } from 'node:http';
+import { pkcePair, authorizeUrl, logoutUrl, parseRedirect, exchangeCode, TokenStore, tokenExpiry, CollabApi, AuthError } from './collab.js';
 
 const cfg = { client_id: 'web', hosted_ui_domain: 'https://auth.example/' };
 const jwt = (exp) => `h.${btoa(JSON.stringify({ exp })).replaceAll('+', '-').replaceAll('/', '_')}.s`;
@@ -122,4 +123,27 @@ test('delegation and proposal calls use the documented owner routes and never an
     ['POST', '/api/v1/collab/rooms/r1/tasks/grant_1/cancel'], ['GET', '/api/v1/collab/rooms/r1/proposals'],
     ['GET', '/api/v1/collab/rooms/r1/proposals/prp_1'], ['POST', '/api/v1/collab/rooms/r1/proposals/prp_1/decide']]);
   assert.ok(!Object.getOwnPropertyNames(CollabApi.prototype).some((n) => /apply|execute|run/i.test(n)));
+});
+
+test('logout URL ends the Hosted-UI session and returns to the registered sign-out address', () => {
+  const url = new URL(logoutUrl({ client_id: 'cid', hosted_ui_domain: 'https://auth.example.test/', public_url: 'https://collab.example.test/' }));
+  assert.equal(`${url.origin}${url.pathname}`, 'https://auth.example.test/logout');
+  assert.equal(url.searchParams.get('client_id'), 'cid');
+  assert.equal(url.searchParams.get('logout_uri'), 'https://collab.example.test/');
+  const own = new URL(logoutUrl({ client_id: 'cid', hosted_ui_domain: 'https://auth.example.test', public_url: 'https://collab.example.test/', logout_uri: 'https://collab.example.test/bye' }));
+  assert.equal(own.searchParams.get('logout_uri'), 'https://collab.example.test/bye');
+});
+
+test('a call to a server that accepts the connection but never answers times out instead of hanging', async () => {
+  const server = createServer(() => { /* never respond: a half-open connection */ });
+  await new Promise((r) => { server.listen(0, '127.0.0.1', r); });
+  try {
+    const api = new CollabApi(() => ({ access: 'T' }), undefined, `http://127.0.0.1:${server.address().port}`, { timeoutMs: 150 });
+    const started = Date.now();
+    await assert.rejects(api.rooms(), (e) => e.name === 'TimeoutError');
+    assert.ok(Date.now() - started < 3000);
+    const ctl = new AbortController();
+    setTimeout(() => ctl.abort(), 50);
+    await assert.rejects(api.state('r', -1, 0, 8, ctl.signal), (e) => e.name === 'AbortError');   // a caller abort stays an abort
+  } finally { server.closeAllConnections(); await new Promise((r) => { server.close(r); }); }
 });
