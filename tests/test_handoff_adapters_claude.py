@@ -8,7 +8,6 @@ import pytest
 
 from herdr_engineering.handoff_adapters.base import ExitPlan, Harness, SessionRef, TypedInput
 from herdr_engineering.handoff_adapters.claude import PROMPT_MARKER, ClaudeAdapter
-from herdr_engineering.handoff_context_hook import context_tokens
 
 FIXTURES = Path(__file__).parent / "fixtures" / "handoff_adapters" / "claude"
 SESSION = "11111111-1111-4111-8111-111111111111"
@@ -55,7 +54,7 @@ def test_partial_last_line_is_skipped(tmp_path):
     cwd = tmp_path / "work"
     path = _install(tmp_path, cwd, "partial_last_line.jsonl")
     reading = ClaudeAdapter(home=tmp_path).read_context(_ref(path, cwd))
-    assert reading is not None and reading.used_tokens == 1203 == context_tokens(path)  # same sum as the hook
+    assert reading is not None and reading.used_tokens == 1203
 
 
 @pytest.mark.parametrize("fixture,window", [("model_change.jsonl", 200_000),

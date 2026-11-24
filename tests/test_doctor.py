@@ -137,3 +137,23 @@ def test_doctor_reports_not_applicable_when_no_checkout(monkeypatch, tmp_path):
     for name in ("lock", "plugins"):
         assert checks[name]["status"] == "unknown"
         assert "not applicable" in checks[name]["detail"]
+
+
+def test_doctor_reports_a_missing_controller_as_warning_and_failure_under_strict(monkeypatch, tmp_path):
+    monkeypatch.delenv("HERDR_HANDOFF_AUTO", raising=False)
+    monkeypatch.setenv("HERDR_ENGINEERING_STATE", str(tmp_path / "state"))
+    absent = str(tmp_path / "no-such-herdr")
+    for strict, expected in ((False, "warn"), (True, "fail")):
+        report = run_doctor(config=dict(DEFAULTS), herdr_bin=absent, strict=strict).to_dict()
+        check = next(c for c in report["checks"] if c["name"] == "handoff_controller")
+        assert check["status"] == expected
+        assert "herdr-eng handoff controller link" in check["detail"]
+        side = next(c for c in report["checks"] if c["name"] == "handoff_side_pane")
+        assert side["status"] == "warn"  # optional: never a failure
+
+
+def test_doctor_controller_is_ok_when_switched_off_on_purpose(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERDR_HANDOFF_AUTO", "0")
+    monkeypatch.setenv("HERDR_ENGINEERING_STATE", str(tmp_path / "state"))
+    report = run_doctor(config=dict(DEFAULTS), herdr_bin=str(tmp_path / "none"), strict=True).to_dict()
+    assert next(c for c in report["checks"] if c["name"] == "handoff_controller")["status"] == "ok"

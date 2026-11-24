@@ -1,0 +1,61 @@
+---
+# Package provisioning precedes this include. Closing panes is OFF unless the host's own
+# ~/.config/herdr-engineering/config.yaml sets `handoff_reap: {enabled: true}`: fleet updates never opt a host in,
+# and a host that opted out has the timer stopped again. The job runs `herdr-handoff reap --apply` (never the
+# unrecorded-records flag) over the shared handoff store.
+- name: "Deploy the handoff pane-reap timer"
+  become: false
+  when: ansible_facts['system'] == 'Linux'
+  environment:
+    HOME: "{{ fleet_home }}"
+    XDG_RUNTIME_DIR: "/run/user/{{ ansible_facts['user_uid'] }}"
+  vars:
+    herdr_eng_bin: "{{ fleet_home }}/.venvs/herdr-engineering/bin/herdr-eng"
+  block:
+    - name: "Read the host's handoff_reap policy (YAML; fails closed to disabled)"
+      ansible.builtin.command:
+        argv:
+          - "{{ herdr_eng_bin }}"
+          - handoff-reap
+          - status
+      register: handoff_reap_status
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: "Derive the policy"
+      ansible.builtin.set_fact:
+        handoff_reap_policy: "{{ (handoff_reap_status.stdout | from_json).policy
+          if (handoff_reap_status.rc == 0 and handoff_reap_status.stdout | length > 0)
+          else {'enabled': false, 'interval_minutes': 15} }}"
+
+    - name: "Create the user unit directory"
+      ansible.builtin.file:
+        path: "{{ fleet_home }}/.config/systemd/user"
+        state: directory
+        mode: "0755"
+
+    - name: "Install the reap service with this host's executable"
+      ansible.builtin.copy:
+        content: >-
+          {{ lookup('file', herdr_engineering_repo_root ~ '/scripts/herdr-eng-handoff-reap.service')
+             | replace('__HERDR_ENG__', '"' ~ (herdr_eng_bin | replace('\\', '\\\\') | replace('"', '\\"')
+               | replace('%', '%%')) ~ '"') }}
+        dest: "{{ fleet_home }}/.config/systemd/user/herdr-eng-handoff-reap.service"
+        mode: "0644"
+
+    - name: "Install the reap timer with the YAML interval"
+      ansible.builtin.copy:
+        content: >-
+          {{ lookup('file', herdr_engineering_repo_root ~ '/scripts/herdr-eng-handoff-reap.timer')
+             | replace('__INTERVAL_MINUTES__', handoff_reap_policy.interval_minutes | string) }}
+        dest: "{{ fleet_home }}/.config/systemd/user/herdr-eng-handoff-reap.timer"
+        mode: "0644"
+
+    - name: "Enable the timer only where the host's YAML opts in"
+      ansible.builtin.systemd_service:
+        name: herdr-eng-handoff-reap.timer
+        scope: user
+        daemon_reload: true
+        enabled: "{{ handoff_reap_policy.enabled | bool }}"
+        state: "{{ 'started' if (handoff_reap_policy.enabled | bool) else 'stopped' }}"

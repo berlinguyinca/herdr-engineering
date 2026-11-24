@@ -11,6 +11,7 @@ import urllib.request
 import pytest
 
 from herdr_engineering.control_plane.api import ControlPlaneServer
+from herdr_engineering.control_plane.fleet_rollout import HOST_ORDER
 from herdr_engineering.control_plane.ingest import INGEST_ENTITY_TYPES, validate_fleet_rollout
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 from herdr_engineering.fleet_watch.plan import rollout_id as make_rollout_id
@@ -558,3 +559,19 @@ def test_corpus_strings_in_any_field_are_a_400_or_never_stored_through_http(serv
     vocabulary = json.dumps(EXAMPLES) + json.dumps(sorted(fr.EVENT_FIELDS))      # field names and values legitimately stored
     for text in CORPUS:
         assert text in vocabulary or text not in blob, text
+
+
+def test_mac_studio_is_a_fleet_host_and_orders_after_bender():
+    ok = validate_fleet_rollout(RID, "host.finished", host_finished(host="mac-studio"))
+    assert ok["host"] == "mac-studio"
+    assert validate_fleet_rollout(RID, "rollout.halted", ev(halted_at_host="mac-studio", reason="health_failed"))
+    assert HOST_ORDER.index("bender") < HOST_ORDER.index("mac-studio") < HOST_ORDER.index("macbook-pro")
+
+
+def test_mac_studio_rows_are_accepted_and_ordered(server):
+    post, get, *_ = server
+    seed_rollout(post)
+    assert post(envelope("host.finished", host_finished(RID, 5, "macbook-pro", "ok", after_sha=SHA_A)))[0] == 200
+    assert post(envelope("host.finished", host_finished(RID, 6, "mac-studio", "ok", after_sha=SHA_A)))[0] == 200
+    hosts = get(f"/api/v1/fleet-rollouts/{RID}")[1]["hosts"]
+    assert [h["host"] for h in hosts] == ["beast", "mac-studio", "macbook-pro"]

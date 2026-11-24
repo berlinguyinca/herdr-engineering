@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Closes the panes that confirmed handoffs replaced (herdr-handoff reap with the apply flag, never its unrecorded-records flag).
+  Rendered by scripts/install-handoff-reap.sh: __HERDR_ENG__ is the herdr-eng path, __HOME__ the home
+  directory, __INTERVAL_SECONDS__ handoff_reap.interval_minutes * 60. Policy is the handoff_reap section of
+  ~/.config/herdr-engineering/config.yaml; the agent is only loaded on a host whose YAML enables it.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.herdr-engineering.handoff-reap</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HERDR_ENG__</string>
+    <string>handoff-reap</string>
+    <string>run</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__HOME__</string>
+  <key>StartInterval</key>
+  <integer>__INTERVAL_SECONDS__</integer>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>Nice</key>
+  <integer>10</integer>
+  <key>Umask</key>
+  <integer>63</integer>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/.local/state/herdr-engineering/handoff-reap.log</string>
+  <key>StandardOutPath</key>
+  <string>__HOME__/.local/state/herdr-engineering/handoff-reap.log</string>
+</dict>
+</plist>

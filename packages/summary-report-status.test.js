@@ -32,3 +32,10 @@ test('unsaved reports say so and unknown codes stay generic', () => {
   assert.match(reportView({state: 'queued'}, null).status, /Waiting for the agent's host/);
   assert.match(reportView({state: 'running'}, null).status, /Running the summary skill/);
 });
+
+test('a done report carries its snapshot series only when there is a history to plot', () => {
+  const done = {state: 'done', report: '# r', source: 'terminal'};
+  assert.equal(reportView(done, null).snapshots, undefined);
+  assert.equal(reportView({...done, snapshots: [{prompts: 1}]}, null).snapshots, undefined);
+  assert.deepEqual(reportView({...done, snapshots: [{prompts: 1}, {prompts: 2}]}, null).snapshots, [{prompts: 1}, {prompts: 2}]);
+});

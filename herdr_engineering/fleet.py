@@ -13,12 +13,14 @@ Everything is idempotent and non-disruptive to running agents.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
+import unicodedata
 from pathlib import Path
 
 from .fleet_inventory import add_host, write_host_vars
@@ -597,6 +599,59 @@ def _summary_state(parts: list[str], root: Path) -> str:
     return "current" if sha == want else "differs"
 
 
+_STAGE_ERROR = re.compile(r"HERDR_STAGE_ERROR:([a-z_]+):([A-Za-z0-9_=-]*)")
+
+
+def parse_stage_error(*streams: str) -> dict | None:
+    """The typed error stage-release.py emits, found in its (possibly Ansible-wrapped) output.
+
+    The marker is quote-free, so it survives Ansible's JSON escaping of captured stderr.
+    """
+    for text in streams:
+        found = _STAGE_ERROR.search(text or "")
+        if not found:
+            continue
+        try:
+            detail = json.loads(base64.urlsafe_b64decode(found[2].encode()))
+        except (ValueError, TypeError):
+            continue
+        if isinstance(detail, dict) and found[1] in _STAGE_ERROR_CODES:
+            return _bounded_stage_error(found[1], detail)
+    return None
+
+
+_STAGE_ERROR_CODES = frozenset({"managed_release_dirty"})
+_ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-_]")
+
+
+def printable_text(value) -> str:
+    """Remote-derived text made safe to store and print.
+
+    ANSI escapes are removed and every other control or format character (newlines, NUL,
+    bidi overrides, ...) becomes a space, so remote output cannot forge lines or recolour
+    the operator's terminal.
+    """
+    text = _ANSI.sub("", str(value))
+    text = "".join(
+        " " if unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp") else c for c in text
+    )
+    return re.sub(r" {2,}", " ", text).strip()
+
+
+def _bounded_stage_error(code: str, detail: dict) -> dict:
+    """Only text fields, size-capped. Marker text comes from remote output, so it is untrusted:
+    it must never be able to supply ok/sourceRoot/revision/host."""
+    files = detail.get("files")
+    error = detail.get("error")
+    return {
+        "code": code,
+        "error": printable_text(error)[:500] if isinstance(error, str) else "",
+        "files": [printable_text(f)[:200] for f in files[:20] if isinstance(f, str)]
+        if isinstance(files, list)
+        else [],
+    }
+
+
 def stage_pi_runtime(revision: str, *, host: str, inventory: Path | None = None) -> dict:
     """Install/register a pinned Pi package; never reload or restart live sessions."""
     report: dict = {"ok": False, "revision": revision, "host": host}
@@ -615,6 +670,9 @@ def stage_pi_runtime(revision: str, *, host: str, inventory: Path | None = None)
            str(root / "ansible" / "playbooks" / "pi-runtime-stage.yml"), "-l", host,
            "-e", json.dumps({"pi_engineering_revision": revision})]
     rc, out, err = _run(cmd, timeout=1800)
+    typed = parse_stage_error(out, err) if rc != 0 else None
+    if typed is not None:
+        return {**typed, **report, "rc": rc, "stdout": out[-4000:], "stderr": err[-1000:]}
     status = fleet_status(inventory=inv, host=host)
     parity = _parity(status, expected, revision, revision, pi_only=True)
     ok = rc == 0 and parity["ok"]

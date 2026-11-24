@@ -29,7 +29,7 @@
   /* semantic status colors (Spec §9) */
   --status-ok: #08794f;        /* healthy / complete */
   --status-active: #2563eb;    /* active / running */
-  --status-waiting: #9ca3af;   /* waiting */
+  --status-waiting: #5b6270;   /* waiting (4.5:1 on white, so it is safe as text) */
   --status-attention: #b45309; /* needs attention */
   --status-blocked: #ea580c;   /* blocked */
   --status-failed: #b91c1c;    /* failed / critical */
@@ -76,6 +76,7 @@
   --hd-border: var(--border);
   --text-primary: var(--text);
   --text-sm: 0.8125rem;
+  --status-warn: var(--status-attention); /* warnings and stale data: amber, never the failure red */
   --status-danger: var(--status-failed);
   --status-error: var(--status-failed);
   --status-success: var(--status-ok);

@@ -85,11 +85,18 @@ class Wire:
         return [
             {
                 "agent": "pi",
+                "pane_id": "pane-1",
                 "terminal_id": "terminal-1",
+                "revision": 8,
+                "state_change_seq": 3,
                 "agent_session": {"value": target["host"] + "-conversation"},
                 "session": "main",
             }
         ]
+
+    def process_info(self, target, pane):
+        # By default a pane runs a bare shell: a dead registration for it is a husk.
+        return {"pane_id": pane, "foreground_processes": [{"pid": 77, "name": "zsh"}]}
 
     def sessions(self, target, root):
         if self.corrupt:
@@ -1458,6 +1465,36 @@ def test_ambiguous_identity_is_never_retired(tmp_path):
     assert after["status"] != "complete"
 
 
+def test_dead_registration_is_retirable_and_is_not_reported_as_a_disagreement(tmp_path):
+    """A registration with no live instance behind it is a husk, not a disagreement.
+
+    `no reachable row` and `two live rows` used to raise one untyped error, and the only
+    settlement refuses the untyped text -- so a session whose process is gone blocked its host
+    with no supported way past it, and every later plan reproduced the same block.
+    """
+    from herdr_engineering.fleet_rollout import retire_identityless
+
+    store, plan = setup_rollout(tmp_path)
+    wire = Wire()
+    wire.offline.clear()
+    # No row at all reports this conversation any more (an unreachable row would instead be
+    # classified as gone or transient, which is handled separately).
+    wire.rows["beast"]["descriptor"]["sessionId"] = "someone-else"
+
+    result = apply(store, plan, wire)
+    session = result["hosts"]["beast"]["sessions"]["beast-conversation"]
+    assert session["status"] == "blocked"
+    assert "no live instance to act on" in session["error"]
+    assert session["blockReason"] == "identity_missing"
+    # Nothing here may read as a disagreement between two live registrations.
+    assert "ambiguous" not in session["error"]
+
+    settled = retire_identityless(store, plan["id"])
+    assert [entry["sessionId"] for entry in settled["retired"]] == ["beast-conversation"]
+    assert settled["stillBlocked"] == []
+    assert store.read(plan["id"])["hosts"]["beast"]["status"] == "complete"
+
+
 def test_retired_registration_is_picked_back_up_when_its_identity_resolves(tmp_path):
     """Retiring was a guess about a dead pane; if it comes back, the rollout must use it."""
     from herdr_engineering.fleet_rollout import retire_identityless
@@ -2033,7 +2070,10 @@ class VanishingWire(Wire):
             rows.append(
                 {
                     "agent": "pi",
+                    "pane_id": "pane-2",
                     "terminal_id": "terminal-2",
+                    "revision": 5,
+                    "state_change_seq": 1,
                     "agent_session": {"value": "second-conversation"},
                     "session": "main",
                 }
@@ -2505,3 +2545,527 @@ def test_apply_and_run_refuse_abandoned_rollouts(tmp_path):
         with pytest.raises(ValueError, match="abandoned"):
             action(store, plan["id"])
     assert store.read(plan["id"])["status"] == "abandoned"  # untouched
+
+
+# ---- rollout correctness fixes ----------------------------------------------------------
+
+
+ANSIBLE_RECAP = (
+    "PLAY RECAP *****\nbender : ok=12 changed=1 unreachable=0 failed=1 skipped=0 rescued=0 ignored=0\n"
+)
+
+
+def test_ansible_recap_unreachable_zero_is_not_an_offline_failure(tmp_path):
+    from herdr_engineering.fleet_rollout import _automatic_blocker, _offline_failure
+
+    store, plan = setup_rollout(tmp_path)
+    wire = Wire()
+    wire.offline.clear()
+    wire.stage = lambda revision, *, host, inventory: {
+        "ok": False,
+        "rc": 2,
+        "stdout": ANSIBLE_RECAP,
+        "stderr": "",
+    }
+    result = apply(store, plan, wire)
+    state = result["hosts"]["bender"]
+    assert state["status"] == "pending" and state["error"] == "staging unavailable"
+    assert _offline_failure(state) is False
+    assert _automatic_blocker(result) is not None
+
+
+@pytest.mark.parametrize("rc", [4, 124, 255])
+def test_transport_return_codes_still_mean_offline(rc):
+    from herdr_engineering.fleet_rollout import _offline_failure
+
+    assert _offline_failure({"staging": {"rc": rc, "stdout": ANSIBLE_RECAP}}) is True
+
+
+def _stale_predecessor_wire():
+    """The pane's native reference still names a dead conversation; a live Pi runs in the pane."""
+    wire = Wire()
+    wire.offline.clear()
+    native = {
+        "agent": "pi",
+        "pane_id": "pane-1",
+        "terminal_id": "terminal-1",
+        "revision": 8,
+        "state_change_seq": 3,
+        "agent_session": {"value": "bender-dead"},
+    }
+    wire.native = lambda target: [copy.deepcopy(native)] if target["host"] == "bender" else []
+    live = wire.rows["bender"]
+    live["descriptor"]["sessionId"] = "bender-live"
+    live["reply"]["data"].update(pid=42, instanceId="bender-instance", sessionId="bender-live")
+    dead = copy.deepcopy(live)
+    dead["descriptor"].update(sessionId="bender-dead", pid=41, instanceId="bender-old")
+    dead.update(reachable=False, error="session_process_gone", reply={})
+    original = wire.sessions
+    wire.sessions = lambda target, root: original(target, root) + (
+        [copy.deepcopy(dead)] if target["host"] == "bender" else []
+    )
+    wire.process_info = lambda target, pane: {
+        "pane_id": pane,
+        "foreground_process_group_id": 42,
+        "foreground_processes": [{"pid": 42, "name": "pi"}],
+        "shell_pid": 40,
+    }
+    return wire
+
+
+def test_dead_predecessor_registration_falls_back_to_the_live_foreground_session(tmp_path):
+    store, plan = setup_rollout(tmp_path)
+    wire = _stale_predecessor_wire()
+    result = apply(store, plan, wire)
+    bender = result["hosts"]["bender"]
+    live = bender["sessions"]["bender-live"]
+    assert live["identityProof"]["source"] == "verified_foreground_pid"
+    assert live["status"] != "ended"
+    assert wire.mutations, "the live Pi session must be prepared and reloaded"
+    assert bender["status"] != "complete" or live["status"] == "complete"
+
+
+def test_host_with_no_pi_sessions_is_settled_complete_with_a_reason(tmp_path):
+    store, plan = setup_rollout(tmp_path)
+    wire = Wire()
+    wire.offline.clear()
+    wire.native = lambda target: []
+    wire.sessions = lambda target, root: []
+    result = apply(store, plan, wire)
+    for host in ("bender", "beast"):
+        state = result["hosts"][host]
+        assert state["status"] == "complete", state.get("error")
+        assert state["sessions"] == {}
+        assert "no Pi sessions" in state["statusReason"]
+        assert state["sourceRoot"].endswith(plan["revision"])
+        assert "error" not in state
+    assert result["status"] == "complete"
+
+
+def test_live_pi_row_outside_the_native_inventory_blocks_the_empty_host_settle(tmp_path):
+    """A Pi herdr never tagged (or running outside a pane) answers on its control socket."""
+    store, plan = setup_rollout(tmp_path)
+    wire = Wire()
+    wire.offline.clear()
+    wire.native = lambda target: []
+    result = apply(store, plan, wire)
+    for host in ("bender", "beast"):
+        state = result["hosts"][host]
+        assert state["status"] == "blocked"
+        assert "no native Pi sessions; expected coverage unverified" in state["error"]
+        assert "statusReason" not in state
+    assert result["status"] != "complete"
+    assert not wire.mutations
+
+
+def _only_row(wire, **changes):
+    base = wire.row("bender")
+    base.update(changes)
+    wire.sessions = lambda target, root: [copy.deepcopy(base)]
+
+
+def test_unresponsive_but_live_pi_row_also_blocks_the_empty_host_settle(tmp_path):
+    """A Pi that is alive but did not answer (not provably gone) is not 'nothing to reload'."""
+    store, plan = setup_rollout(tmp_path)
+    wire = Wire()
+    wire.offline.clear()
+    wire.native = lambda target: []
+    _only_row(wire, reachable=False, error="control socket timed out")
+    result = apply(store, plan, wire)
+    state = result["hosts"]["bender"]
+    assert state["status"] == "blocked"
+    assert "expected coverage unverified" in state["error"]
+    assert not wire.mutations
+
+
+def test_provably_dead_pi_row_does_not_block_the_empty_host_settle(tmp_path):
+    store, plan = setup_rollout(tmp_path)
+    wire = Wire()
+    wire.offline.clear()
+    wire.native = lambda target: []
+    _only_row(wire, reachable=False, error="session_process_gone")
+    result = apply(store, plan, wire)
+    assert result["hosts"]["bender"]["status"] == "complete"
+    assert "nothing to reload" in result["hosts"]["bender"]["statusReason"]
+
+
+def test_no_pi_sessions_does_not_hide_a_still_tracked_session(tmp_path):
+    store, plan = setup_rollout(tmp_path)
+    wire = Wire()
+    wire.offline.clear()
+    apply(store, plan, wire)
+    wire.native = lambda target: []
+    result = apply(store, plan, wire)
+    assert "statusReason" not in result["hosts"]["bender"]
+
+
+def test_delta_plan_covers_hosts_added_after_a_plan_settled(tmp_path):
+    from herdr_engineering.fleet_rollout import delta_targets
+
+    store, plan = setup_rollout(tmp_path)
+    wire = Wire()
+    wire.offline.clear()
+    wire.native = lambda target: []
+    wire.sessions = lambda target, root: []
+    apply(store, plan, wire)
+    assert store.read(plan["id"])["status"] == "complete"
+    current = [
+        {"host": h, "sshTarget": h, "port": 22, "local": False} for h in ("bender", "beast", "new")
+    ]
+    assert [t["host"] for t in delta_targets(store, SHA, current)] == ["new"]
+    assert delta_targets(store, "c" * 40, current) == current  # nothing settled for that pin
+    assert delta_targets(store, SHA, current[:2]) == []
+
+
+def test_delta_plan_ignores_abandoned_plans(tmp_path):
+    from herdr_engineering.fleet_rollout import abandon_rollout, delta_targets
+
+    store, plan = setup_rollout(tmp_path)
+    abandon_rollout(store, plan["id"])
+    current = [{"host": "bender", "sshTarget": "bender", "port": 22, "local": False}]
+    assert delta_targets(store, SHA, current) == current
+
+
+def _fake_ansible_inventory(tmp_path, monkeypatch, hosts):
+    resolved = {"herdr_fleet": {"hosts": list(hosts)}, "_meta": {"hostvars": {}}}
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    script = bin_dir / "ansible-inventory"
+    script.write_text("#!/bin/sh\ncat <<'JSON'\n" + json.dumps(resolved) + "\nJSON\n")
+    script.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+
+
+def test_plan_host_flag_is_repeatable_and_plans_every_host(tmp_path, monkeypatch):
+    from herdr_engineering.cli import _build_parser
+    from herdr_engineering.fleet_rollout import inventory_targets
+
+    args = _build_parser().parse_args(
+        ["fleet", "rollout", "plan", "--pi-revision", SHA, "--host", "a", "--host", "b"]
+    )
+    assert args.host == ["a", "b"]
+    _fake_ansible_inventory(tmp_path, monkeypatch, ["a", "b", "c"])
+    assert [t["host"] for t in inventory_targets(tmp_path / "hosts.yml", args.host)] == ["a", "b"]
+    assert [t["host"] for t in inventory_targets(tmp_path / "hosts.yml", "c")] == ["c"]
+
+
+def test_plan_host_flag_rejects_duplicates_and_unknown_hosts(tmp_path, monkeypatch):
+    from herdr_engineering.fleet_rollout import inventory_targets
+
+    _fake_ansible_inventory(tmp_path, monkeypatch, ["a", "b"])
+    with pytest.raises(ValueError, match="duplicate"):
+        inventory_targets(tmp_path / "hosts.yml", ["a", "a"])
+    with pytest.raises(ValueError, match="not in expected inventory"):
+        inventory_targets(tmp_path / "hosts.yml", ["a", "zzz"])
+
+
+@pytest.mark.parametrize("mode", [0o775, 0o777, 0o757])
+def test_writable_by_others_state_directory_is_refused_on_every_path(tmp_path, mode):
+    """Another user able to write the directory could plant a plan whose inventory is executed."""
+    root = tmp_path / "state"
+    root.mkdir()
+    root.chmod(mode)
+    from herdr_engineering.fleet_rollout import RolloutStore, latest_unfinished, list_rollouts
+
+    store = RolloutStore(root)
+    for call in (lambda: list_rollouts(store), lambda: latest_unfinished(store), lambda: store.lock().__enter__()):
+        with pytest.raises(ValueError, match="private, owned directory"):
+            call()
+    assert root.stat().st_mode & 0o777 == mode  # refused, not silently repaired
+
+
+def test_plan_file_owned_by_someone_else_is_not_trusted(tmp_path, monkeypatch):
+    store, plan = setup_rollout(tmp_path)
+    import os
+
+    real_uid = os.getuid()
+    monkeypatch.setattr(os, "getuid", lambda: real_uid + 1)
+    with pytest.raises(ValueError):
+        store.read(plan["id"])
+
+
+def test_existing_group_readable_state_directory_is_tightened_not_refused(tmp_path):
+    from herdr_engineering.fleet_rollout import RolloutStore
+
+    root = tmp_path / "state"
+    root.mkdir(mode=0o755)
+    root.chmod(0o755)
+    with RolloutStore(root).lock():
+        pass
+    assert root.stat().st_mode & 0o777 == 0o700
+
+
+def test_read_only_paths_never_change_state_directory_permissions(tmp_path):
+    from herdr_engineering.fleet_rollout import RolloutStore, latest_unfinished, list_rollouts
+
+    store = RolloutStore(tmp_path / "state")
+    plan = _make_plan(store, "1" * 40, status="pending", created_at="2026-11-01T00:00:00+00:00")
+    store.root.chmod(0o755)
+    assert [p["id"] for p in list_rollouts(store)] == [plan["id"]]
+    assert latest_unfinished(store)["id"] == plan["id"]
+    assert store.read(plan["id"])["id"] == plan["id"]
+    assert store.root.stat().st_mode & 0o777 == 0o755  # looked at, not touched
+    # The ownership and symlink refusals still hold on the read path.
+    link = tmp_path / "link"
+    link.symlink_to(store.root)
+    with pytest.raises(ValueError, match="private"):
+        list_rollouts(RolloutStore(link))
+
+
+def test_symlinked_state_directory_is_still_refused(tmp_path):
+    from herdr_engineering.fleet_rollout import RolloutStore
+
+    real = tmp_path / "real"
+    real.mkdir(mode=0o700)
+    link = tmp_path / "state"
+    link.symlink_to(real)
+    with pytest.raises(ValueError, match="private"):
+        RolloutStore(link)._directory()
+
+
+def test_dirty_managed_release_is_a_blocked_host_with_a_next_step(tmp_path):
+    store, plan = setup_rollout(tmp_path)
+    wire = Wire()
+    wire.offline.clear()
+    wire.stage = lambda revision, *, host, inventory: {
+        "ok": False,
+        "rc": 3,
+        "code": "managed_release_dirty",
+        "files": ["package.json", "notes.txt"],
+        "error": "managed release is dirty: package.json, notes.txt; local work preserved",
+    }
+    result = apply(store, plan, wire)
+    state = result["hosts"]["bender"]
+    assert state["status"] == "blocked"
+    assert "managed release is dirty: package.json, notes.txt; local work preserved" in state["error"]
+    assert "nextStep" in state and "releases/" + SHA in state["nextStep"]
+    from herdr_engineering.fleet_rollout import _automatic_blocker
+
+    assert "dirty" in _automatic_blocker(result)
+
+
+def test_missing_result_in_a_receipt_does_not_crash_the_session(tmp_path):
+    store, plan = setup_rollout(tmp_path)
+    wire = Wire()
+    wire.offline.clear()
+    original = wire.maintenance
+
+    def maintenance(target, root, instance, request):
+        reply = original(target, root, instance, request)
+        for receipt in wire.receipts.values():
+            receipt["maintenance"]["result"] = None
+        return reply
+
+    wire.maintenance = maintenance
+    result = apply(store, plan, wire)
+    assert result["hosts"]["bender"]["status"] in ("blocked", "pending")
+
+
+def _predecessor(wire_mutator=None, *, dead_error="session_process_gone", **native_changes):
+    wire = _stale_predecessor_wire()
+    original_native = wire.native
+    if native_changes:
+        wire.native = lambda target: [
+            {**row, **native_changes} for row in original_native(target)
+        ]
+    sessions = wire.sessions
+
+    def with_error(target, root):
+        rows = sessions(target, root)
+        for row in rows:
+            if row["descriptor"]["sessionId"] == "bender-dead":
+                row["error"] = dead_error
+        return rows
+
+    wire.sessions = with_error
+    if wire_mutator:
+        wire_mutator(wire)
+    return wire
+
+
+def _unproven(wire, tmp_path):
+    store, plan = setup_rollout(tmp_path)
+    result = apply(store, plan, wire)
+    bender = result["hosts"]["bender"]
+    dead = bender["sessions"]["bender-dead"]
+    assert dead["status"] != "ended", dead
+    assert "endedAt" not in dead
+    assert bender["status"] not in ("complete", "blocked"), bender
+    assert not bender.get("coverageErrors")
+    assert "hostLevelError" not in bender
+    assert not [m for m in wire.mutations if m[0] == "bender"]
+    return result
+
+
+def test_stale_registration_without_a_revision_token_is_unproven_not_ended(tmp_path):
+    def drop_tokens(wire):
+        native = wire.native
+        wire.native = lambda target: [
+            {k: v for k, v in row.items() if k not in ("revision", "state_change_seq")}
+            for row in native(target)
+        ]
+
+    _unproven(_predecessor(drop_tokens), tmp_path)
+
+
+def test_stale_registration_with_invalid_pane_id_is_unproven_not_ended(tmp_path):
+    _unproven(_predecessor(pane_id="bad pane!"), tmp_path)
+
+
+def test_stale_registration_with_a_failing_process_query_is_unproven_not_blocking(tmp_path):
+    def broken(wire):
+        def process_info(target, pane):
+            raise ConnectionError("ssh dropped")
+
+        wire.process_info = process_info
+
+    _unproven(_predecessor(broken), tmp_path)
+
+
+def test_stale_registration_whose_pane_runs_an_unreachable_live_pi_is_unproven(tmp_path):
+    def live_but_silent(wire):
+        sessions = wire.sessions
+
+        def unreachable(target, root):
+            rows = sessions(target, root)
+            for row in rows:
+                if row["descriptor"]["sessionId"] == "bender-live":
+                    row.update(reachable=False, error="session_unresponsive")
+                    row.pop("reply", None)
+            return rows
+
+        wire.sessions = unreachable
+
+    _unproven(_predecessor(live_but_silent), tmp_path)
+
+
+@pytest.mark.parametrize(
+    "processes", [[], [{"pid": 77, "name": "zsh"}]], ids=["empty_pane", "shell_only"]
+)
+def test_stale_registration_with_no_pi_process_in_the_pane_is_a_husk_and_ends(
+    tmp_path, processes
+):
+    def husk(wire):
+        wire.process_info = lambda target, pane: {
+            "pane_id": pane,
+            "foreground_processes": processes,
+        }
+        sessions = wire.sessions
+        wire.sessions = lambda target, root: [
+            r for r in sessions(target, root) if r["descriptor"]["sessionId"] != "bender-live"
+        ]
+
+    store, plan = setup_rollout(tmp_path)
+    result = apply(store, plan, _predecessor(husk))
+    assert result["hosts"]["bender"]["sessions"]["bender-dead"]["status"] == "ended"
+
+
+def test_transiently_unreachable_native_session_never_queries_the_pane(tmp_path):
+    def forbidden(wire):
+        def process_info(target, pane):
+            raise AssertionError("foreground proof must not run for a transient miss")
+
+        wire.process_info = process_info
+
+    store, plan = setup_rollout(tmp_path)
+    wire = _predecessor(forbidden, dead_error="session_unresponsive")
+    first = apply(store, plan, wire)
+    dead = first["hosts"]["bender"]["sessions"]["bender-dead"]
+    assert dead["status"] == "pending"
+    assert dead["lastUnreachableAt"]
+    assert not first["hosts"]["bender"].get("coverageErrors")
+    assert first["hosts"]["bender"]["status"] != "complete"
+
+
+def test_dirty_release_error_is_sanitised_before_it_is_stored(tmp_path):
+    store, plan = setup_rollout(tmp_path)
+    wire = Wire()
+    wire.offline.clear()
+    wire.stage = lambda revision, *, host, inventory: {
+        "ok": False,
+        "rc": 3,
+        "code": "managed_release_dirty",
+        "files": ["a"],
+        "error": "managed release is dirty: \x1b[31mevil\x1b[0m\nINJECTED\x07; local work preserved",
+    }
+    state = apply(store, plan, wire)["hosts"]["bender"]
+    assert state["status"] == "blocked"
+    assert not any(ord(c) < 32 or ord(c) == 127 for c in state["error"])
+    assert "\x1b" not in state["error"] and "[31m" not in state["error"]
+    assert "evil" in state["error"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "ssh: connect to host bender port 22: Network is unreachable",
+        "ssh: connect to host bender port 22: Host is unreachable",
+        "ssh: connect to host bender port 22: No route to host",
+        "ssh: connect to host bender port 22: Connection timed out",
+    ],
+)
+@pytest.mark.parametrize("field", ["state", "staging"])
+def test_ssh_transport_text_means_offline_without_a_return_code(text, field):
+    from herdr_engineering.fleet_rollout import _offline_failure
+
+    state = {"error": text} if field == "state" else {"staging": {"rc": 2, "error": text}}
+    assert _offline_failure(state) is True
+
+
+def test_ansible_recap_and_its_unreachable_counter_stay_online():
+    from herdr_engineering.fleet_rollout import _offline_failure
+
+    state = {"error": "staging unavailable", "staging": {"rc": 2, "stdout": ANSIBLE_RECAP}}
+    assert _offline_failure(state) is False
+    assert _offline_failure({"error": "unreachable=0 failed=1"}) is False
+
+
+def test_dirty_release_filenames_never_read_as_an_offline_marker(tmp_path):
+    from herdr_engineering.fleet_rollout import _automatic_blocker, _offline_failure
+
+    store, plan = setup_rollout(tmp_path)
+    wire = Wire()
+    wire.offline.clear()
+    wire.stage = lambda revision, *, host, inventory: {
+        "ok": False,
+        "rc": 3,
+        "code": "managed_release_dirty",
+        "files": ["offline", "timed out.txt", "No route to host"],
+        "error": "managed release is dirty: offline, timed out.txt, No route to host; "
+        "local work preserved",
+    }
+    result = apply(store, plan, wire)
+    state = result["hosts"]["bender"]
+    assert state["status"] == "blocked" and state["blockCode"] == "managed_release_dirty"
+    assert _offline_failure(state) is False
+    assert "dirty" in _automatic_blocker(result)
+    # Clearing the block on a later successful pass drops the flag with the error.
+    wire.stage = Wire().stage
+    again = apply(store, plan, wire)
+    assert "blockCode" not in again["hosts"]["bender"]
+
+
+def test_prune_keeps_the_settled_plans_that_cover_the_pinned_revision(tmp_path):
+    """Pruning the old full plan would make a small later delta plan look like the whole fleet."""
+    from datetime import UTC, datetime
+
+    from herdr_engineering.fleet_rollout import RolloutStore, delta_targets, prune_settled
+
+    store = RolloutStore(tmp_path / "state")
+    full = _make_plan(store, SHA, status="complete", created_at="2026-08-01T00:00:00+00:00",
+                      hosts=("a", "b"))
+    redundant = _make_plan(store, SHA, status="complete", created_at="2026-08-02T00:00:00+00:00",
+                           hosts=("a",))
+    _make_plan(store, SHA, status="complete", created_at="2026-11-20T00:00:00+00:00",
+               hosts=("c",))
+    other = _make_plan(store, "d" * 40, status="complete", created_at="2026-08-01T00:00:00+00:00")
+    pruned = prune_settled(store, older_than_days=30, now=datetime(2026, 11, 24, tzinfo=UTC),
+                           keep_revisions={SHA})
+    assert {p["id"] for p in pruned} == {redundant["id"], other["id"]}
+    assert (store.root / (full["id"] + ".json")).exists()
+    current = [{"host": h, "sshTarget": h, "port": 22, "local": False} for h in "abc"]
+    assert delta_targets(store, SHA, current) == []
+    # Without the pin's protection the old behaviour is still available.
+    again = prune_settled(store, older_than_days=30, now=datetime(2026, 11, 24, tzinfo=UTC))
+    assert {p["id"] for p in again} == {full["id"]}
+    assert [t["host"] for t in delta_targets(store, SHA, current)] == ["a", "b"]

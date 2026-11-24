@@ -16,7 +16,7 @@ missing. The fallback errs towards handing off early only for a model whose real
 | Item | Measured |
 | --- | --- |
 | Record location | `~/.claude/projects/<cwd with every non-alphanumeric as "-">/<session id>.jsonl` |
-| Context size | latest main-chain assistant entry (`isSidechain` false, model not `<synthetic>`): `message.usage.input_tokens + cache_read_input_tokens + cache_creation_input_tokens`; output tokens are not included (same sum as `handoff_context_hook`) |
+| Context size | latest main-chain assistant entry (`isSidechain` false, model not `<synthetic>`): `message.usage.input_tokens + cache_read_input_tokens + cache_creation_input_tokens`; output tokens are not included |
 | Window source | Transcripts record none. Claude Code's own model catalogue, `~/.claude/cache/model-catalog/<org>-<hash>-cc.json`, field `catalog.config.models[].runtime.max_input_tokens` (one file per account; the newest `fetchedAt` that lists the model wins). `window_source='recorded'`; a dated and an undated spelling of an id match each other (the catalogue lists `claude-haiku-4-5-20251001` dated and everything else undated). A model the catalogue does not list falls to `MODEL_WINDOWS`, then 128,000. When both list the model and disagree, see "Catalogue against table" below |
 | Corroboration (not used) | The statusline input JSON carries `context_window.context_window_size`; a cached copy written by the oh-my-claudecode HUD (`~/.claude/hud/cache/stdin.<session>.json`) shows 1,000,000 for `claude-sonnet-5-5`, which agrees with the catalogue. No `statusLine` is configured in `~/.claude/settings.json`, and the cache belongs to a third-party plugin and goes stale, so it is not read |
 | Checked, no window | `~/.claude.json` has no per-model window (`tengu_hawthorn_window`, 200000, is a feature flag with no model attached). No `[1m]` suffix appears in transcript model ids or in `requestedModel`; it is a model-setting suffix (the binary says to "append [1m] to the model name for 1M" and to set `CLAUDE_CODE_MAX_CONTEXT_TOKENS` for a custom id), and the transcript records the bare id |
@@ -257,3 +257,29 @@ models seen in recent sessions (window and window_source as the adapter resolves
 sessions above 100% of their window:
   none
 ```
+
+## Headless fallback briefing writer
+
+When a drained session writes no briefing, `handoff_controller/briefing.py` asks the same harness for one in a headless
+call: stdin prompt, a fresh empty working directory under `<store>/fallback-work/`, every `HERDR_*` variable and the
+harness's session-identity variables removed. A harness is enabled only if its own `--help` shows how to turn every tool
+off, or (Codex) a sandbox that stops writes in an empty directory. Only `--help` was run; no real model call was made, so the last column is what is still unverified.
+
+| Harness | Enabled | Flags | Unverified without a real call |
+| --- | --- | --- | --- |
+| claude | yes | `-p --output-format text --no-session-persistence --setting-sources "" --strict-mcp-config --disable-slash-commands --tools ""`, plus `--safe-mode` when `claude --help` lists it | empty values for `--setting-sources` and `--tools` accepted, and user/project hooks dropped; prompt read from stdin |
+| pi | yes | `-p --no-session --no-tools --no-extensions --no-mcp --no-skills --no-prompt-templates --no-context-files` | prompt read from stdin with no message argument; provider login still usable with `--no-extensions` |
+| codex | yes | `exec --sandbox read-only --skip-git-repo-check --ephemeral -`, plus `--ignore-user-config --ignore-rules` when `codex exec --help` lists them (`codex exec --help`: prompt read from stdin when absent or `-`; `--ephemeral` writes no session files; `--ignore-user-config`: "Do not load `$CODEX_HOME/config.toml`; auth still uses `CODEX_HOME`"; `--ignore-rules`: "Do not load user or project execpolicy `.rules` files") | tools stay on but the read-only sandbox stops writes and the work directory is empty; prompt read from stdin; login still usable with `--ephemeral`; no network restriction was seen in `--help` |
+| opencode | no | `opencode run` offers `--agent` and `--auto` but no command-line way to deny tools | not enabled |
+
+Stripped from the environment: `HERDR_*`, `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_SESSION_ID`,
+`CLAUDE_SESSION_ID`, `CODEX_THREAD_ID`, `CODEX_SANDBOX`, `CODEX_SANDBOX_NETWORK_DISABLED`, `CODEX_MANAGED_BY_NPM`,
+`PI_CODING_AGENT`, `PI_SESSION_ID`, `OPENCODE`, `OPENCODE_PID`, `OPENCODE_SESSION_ID` (the first four groups are the
+variables `handoff_harness.py` reads to detect an ancestor harness). Kept: auth and config such as `ANTHROPIC_*`,
+`OPENAI_*`, `HOME`, `PATH`.
+
+The optional flags are read from `<harness> --help` (`codex exec --help`) at run time, once per PATH; only `--help` is run. Read from the installed CLIs on 2026-11-18:
+
+- `claude --bare` is **not** used. Its help says it skips hooks, plugin sync, auto-memory, keychain reads and CLAUDE.md discovery, and that "Anthropic auth is strictly ANTHROPIC_API_KEY or apiKeyHelper via --settings (OAuth and keychain are never read)". A user logged in with a subscription would get no answer.
+- `claude --safe-mode` is used when listed. Its help says it starts "with all customizations (CLAUDE.md, skills, installed plugins, hooks, MCP servers, custom commands and agents, ...) disabled" and that "Auth, model selection, built-in tools and plugins, and permissions work normally"; admin-managed policy settings still apply.
+- Codex: both flags are listed, and `--ignore-user-config` keeps auth ("auth still uses `CODEX_HOME`").

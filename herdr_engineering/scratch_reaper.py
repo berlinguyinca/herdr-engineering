@@ -343,13 +343,36 @@ def _swift_declared(path: Path) -> bool:
     return False
 
 
+def _cargo_fingerprint_dir(profile: Path) -> bool:
+    """Cargo keeps fingerprints in `.fingerprint` (<= 1.99) or, with the new build-dir
+    layout (1.100+), in `build/<package>/<hash>/fingerprint`."""
+    if (profile / ".fingerprint").is_dir():
+        return True
+    try:
+        with os.scandir(profile / "build") as packages:
+            for package in packages:
+                if not package.is_dir(follow_symlinks=False):
+                    continue
+                with os.scandir(package.path) as units:
+                    if any(
+                        (Path(unit.path) / "fingerprint").is_dir()
+                        for unit in units
+                        if unit.is_dir(follow_symlinks=False)
+                    ):
+                        return True
+    except OSError:
+        return False
+    return False
+
+
 def _cargo_markers(path: Path) -> bool:
-    """Cargo wrote this target dir: old layout (.rustc_info.json, <mode>/.fingerprint)
-    or the cargo >= 1.99 build-dir layout, which keeps only <mode>/.cargo-lock."""
+    """Cargo wrote this target dir: old layout (.rustc_info.json, <mode>/.fingerprint),
+    the cargo >= 1.99 build-dir layout (<mode>/.cargo-lock), or the 1.100 layout
+    (<mode>/build/<package>/<hash>/fingerprint)."""
     if (path / ".rustc_info.json").is_file():
         return True
     return any(
-        (path / mode / ".fingerprint").is_dir() or (path / mode / ".cargo-lock").is_file()
+        (path / mode / ".cargo-lock").is_file() or _cargo_fingerprint_dir(path / mode)
         for mode in ("debug", "release")
     )
 

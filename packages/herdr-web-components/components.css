@@ -122,7 +122,8 @@
 .hd-ins__badge { font-size: 0.75rem; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border-subtle); color: var(--text-secondary); background: var(--surface); }
 .hd-ins__badge--live { color: var(--status-ok, #1a7f37); }
 .hd-ins__badge--run { color: var(--status-active, #0969da); }
-.hd-ins__badge--fail, .hd-ins__badge--warn, .hd-ins__badge--stale { color: var(--status-failed, #b42318); }
+.hd-ins__badge--fail { color: var(--status-failed, #b42318); }
+.hd-ins__badge--warn, .hd-ins__badge--stale { color: var(--status-warn, #b45309); }
 .hd-ins__tools { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 .hd-ins__tab { border: 1px solid var(--border-subtle); background: var(--surface); color: var(--text-secondary); padding: 6px 10px; border-radius: var(--radius-sm); cursor: pointer; font-size: 0.8125rem; min-height: 32px; }
 .hd-ins__tab.is-active { background: var(--accent-weak); color: var(--accent); font-weight: 500; }

@@ -1,0 +1,1 @@
+{"id":"cli:agent:list","result":{"agents":[{"agent":"claude","agent_status":"unknown","cwd":"/work","focused":true,"foreground_cwd":"/work","pane_id":"w1:p1","revision":0,"state_change_seq":0,"tab_id":"w1:t1","terminal_id":"term_6609a0601322d1","workspace_id":"w1"}],"type":"agent_list"}}

@@ -14,9 +14,10 @@ export function selectComponents(matrix, { driftedOnly = false } = {}) {
 
 function cell(entry, host) {
   const state = entry?.state ?? 'missing';
+  const label = STATE_LABEL[state] ?? String(state);
   const text = entry?.version ? esc(entry.version) : '—';
   // Text carries the state too (never colour alone).
-  return `<td class="hd-fleet__cell hd-fleet__cell--${state}" data-host-id="${esc(host)}" title="${STATE_LABEL[state]}">${text}${state === 'drifted' ? ' <span aria-label="differs from fleet">≠</span>' : ''}</td>`;
+  return `<td class="hd-fleet__cell hd-fleet__cell--${esc(state)}" data-host-id="${esc(host)}" title="${esc(label)}">${text}${state === 'drifted' ? ' <span aria-label="differs from fleet">≠</span>' : ''}</td>`;
 }
 
 export function renderFleetMatrix(matrix, opts = {}, now = Date.now()) {

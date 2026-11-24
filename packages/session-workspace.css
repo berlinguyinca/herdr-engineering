@@ -38,3 +38,12 @@
 .sw--fullscreen .sw-activity-collapse{display:inline}
 .sw--fullscreen .sw-panes--solo{grid-template-columns:minmax(0,1fr) 0 0}
 .sw--fullscreen .sw-panes--solo .sw-activity,.sw--fullscreen .sw-panes--solo .sw-splitter{display:none}
+
+.sw-plot{margin:10px 0}
+.sw-plot h4{margin:0 0 6px}
+.sw-plot-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.sw-plot-label{flex:0 0 7.5em;font-size:.85em;opacity:.8}
+.sw-plot-row svg{flex:0 1 240px;max-width:100%;height:22px;color:var(--accent,#4a7bd0)}
+.sw-plot-drift{fill:none;stroke:var(--warn,#d08a1a);stroke-width:1.5}
+.sw-plot-value{font-variant-numeric:tabular-nums;font-size:.85em}
+.sw-plot-note{font-size:.8em;opacity:.7;margin:4px 0 0}

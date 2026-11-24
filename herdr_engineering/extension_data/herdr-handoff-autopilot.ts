@@ -245,7 +245,7 @@ export default function (pi: ExtensionAPI) {
 			// to do until the next refresh — and the CLI said so, not us.
 			idleUntilRefresh =
 				verdict.trigger !== true &&
-				["disabled", "harness_unsupported", "already_triggered", "handoff_underway"].includes(code);
+				["disabled", "harness_unsupported", "already_triggered", "handoff_underway", "herdr_controller_managed"].includes(code);
 			if (verdict.trigger !== true) return;
 
 			const prompt = typeof verdict.prompt === "string" ? verdict.prompt : "";
