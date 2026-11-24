@@ -16,13 +16,13 @@
 * **staging**: ``MemberService.sweep_staging``.
 * **blobs**: blob files with no ``artifact_blobs`` row and no manifest reference, older than ``blob_grace``, are
   deleted under the per-sha advisory lock publish holds (try-lock: a sha being published is skipped).
-* **versions**: a version that no longer backs anything is marked ``purged`` and the blobs only it used are deleted
-  (the ``artifact_blobs`` row and the file), so the quota (current versions of live artifacts) matches what is stored.
-  Purgeable: a superseded version once a newer one is ``version_grace`` seconds old, and every version of a retracted or
-  tombstoned artifact once it was last touched ``version_grace`` seconds ago.  Never purged: the current version of a
-  live artifact, anything under ``legal_hold``, a version a pending or live share points at, and any blob a kept
-  version's manifest still names.  A version whose blob is mid-publish (per-sha lock held) waits for the next pass.
-* **usage**: ``member_usage.bytes_used`` is recomputed from the artifacts under the member_usage row lock.
+* **versions**: only a *tombstoned* artifact whose ``purge_after`` hold has passed is collected: its versions are marked
+  ``purged`` and the blobs only they used are deleted (the ``artifact_blobs`` row and the file).  A tombstone with no
+  ``purge_after`` (an imported one) is given the standard 30-day hold counted from the first pass that sees it and is
+  not purged on that pass.  Every version of a live (or retracted, archived) artifact is kept, so old versions count
+  toward the quota.  Never purged: ``legal_hold`` artifacts, a version a pending or live share points at, and any blob a
+  kept version's manifest still names.  A version whose blob is mid-publish (per-sha lock held) waits for the next pass.
+* **usage**: ``member_usage.bytes_used`` (current plus kept old versions of live artifacts) is recomputed under the member_usage row lock.
 
 Pending-intake needs no sweep: the cap is enforced when an item is claimed and the original never expired pending items.
 Each duty is isolated: one that raises is named in ``SweepReport.failed`` (logged by exception type only).
@@ -43,6 +43,7 @@ import asyncpg
 from .blobs import BlobStore
 from .cognito import DirectorySnapshot
 from .db import LOCK_NS_BLOB, LOCK_NS_HOUSEKEEPING
+from .library import retained_bytes_sql
 from .member_api import MemberService
 
 if TYPE_CHECKING:
@@ -56,7 +57,7 @@ REMOVED_GRACE: Final = 3600.0
 STAGING_MAX_AGE: Final = 24 * 3600.0
 BLOB_GRACE: Final = 3600.0
 BLOB_GC_EVERY: Final = 900.0
-VERSION_GRACE: Final = 3600.0
+TOMBSTONE_HOLD: Final = timedelta(days=30)
 EXPIRY_FLOOR: Final = timedelta(days=7)
 _BLOB_BATCH: Final = 500
 _PURGE_BATCH: Final = 200
@@ -84,7 +85,6 @@ class HousekeepingConfig:
     removed_grace: float = REMOVED_GRACE
     staging_max_age: float = STAGING_MAX_AGE
     blob_grace: float = BLOB_GRACE
-    version_grace: float = VERSION_GRACE
     blob_gc_every: float = (
         BLOB_GC_EVERY  # the blob walk is the costly duty: it runs on this slower cadence
     )
@@ -361,26 +361,29 @@ class Housekeeper:
     # -- versions
 
     async def _purge_versions(self, now: datetime) -> int:
-        cutoff = now - timedelta(seconds=self.config.version_grace)
+        # a tombstone with no purge date (imported) starts its hold now; it is never purged on the pass that finds it
+        await self.pool.execute(
+            "UPDATE artifacts SET purge_after = $1 WHERE lifecycle='tombstoned' AND purge_after IS NULL "
+            "AND NOT legal_hold",
+            now + TOMBSTONE_HOLD,
+        )
         due = await self.pool.fetch(
             "SELECT v.version_id FROM artifact_versions v JOIN artifacts a ON a.artifact_id = v.artifact_id "
             "WHERE v.state <> 'purged' AND NOT a.legal_hold "
-            "AND ((a.lifecycle IN ('retracted','tombstoned') AND a.updated_at < $1) "
-            "  OR (a.lifecycle NOT IN ('retracted','tombstoned') AND v.version_id IS DISTINCT FROM a.current_version_id "
-            "      AND EXISTS (SELECT 1 FROM artifact_versions n WHERE n.artifact_id = v.artifact_id "
-            "                  AND n.version_number > v.version_number AND n.created_at < $1))) "
+            "AND a.lifecycle = 'tombstoned' AND a.purge_after IS NOT NULL AND a.purge_after < $1 "
             "AND NOT EXISTS (SELECT 1 FROM shares s WHERE s.version_id = v.version_id "
             "                AND s.state IN ('pending','live')) "
             "ORDER BY v.created_at LIMIT $2",
-            cutoff,
+            now,
             _PURGE_BATCH,
         )
-        return sum([1 for r in due if await self._purge_one(r["version_id"], cutoff)])
+        return sum([1 for r in due if await self._purge_one(r["version_id"], now)])
 
-    async def _purge_one(self, version_id: str, cutoff: datetime) -> bool:
+    async def _purge_one(self, version_id: str, now: datetime) -> bool:
         """Mark one version purged and delete the blobs only it used, under publish's per-sha locks (try-lock: a sha
-        somebody holds defers the whole version to the next pass).  The due-conditions are re-checked under the locks'
-        protection by the UPDATE itself, so a share or publish that landed since the listing is respected."""
+        somebody holds defers the whole version to the next pass).  The artifact row is locked (as ``share_create``
+        does) and the due-conditions are re-checked by the UPDATE inside that transaction, so a share or restore that
+        landed since the listing is respected."""
         async with self.pool.acquire() as conn:
             manifest = await conn.fetchval(
                 "SELECT output_manifest::text FROM artifact_versions WHERE version_id=$1 AND state <> 'purged'",
@@ -399,18 +402,22 @@ class Housekeeper:
                     ):
                         return False
                     held.append(sha)
-                done = await conn.execute(
-                    "UPDATE artifact_versions v SET state='purged', purged_at=now() FROM artifacts a "
-                    "WHERE v.version_id=$1 AND v.state <> 'purged' AND a.artifact_id = v.artifact_id "
-                    "AND NOT a.legal_hold "
-                    "AND ((a.lifecycle IN ('retracted','tombstoned') AND a.updated_at < $2) "
-                    "  OR (a.lifecycle NOT IN ('retracted','tombstoned') "
-                    "      AND v.version_id IS DISTINCT FROM a.current_version_id)) "
-                    "AND NOT EXISTS (SELECT 1 FROM shares s WHERE s.version_id = v.version_id "
-                    "                AND s.state IN ('pending','live'))",
-                    version_id,
-                    cutoff,
-                )
+                async with conn.transaction():
+                    await conn.execute(
+                        "SELECT 1 FROM artifacts a JOIN artifact_versions v ON v.artifact_id = a.artifact_id "
+                        "WHERE v.version_id=$1 FOR UPDATE OF a",
+                        version_id,
+                    )
+                    done = await conn.execute(
+                        "UPDATE artifact_versions v SET state='purged', purged_at=now() FROM artifacts a "
+                        "WHERE v.version_id=$1 AND v.state <> 'purged' AND a.artifact_id = v.artifact_id "
+                        "AND NOT a.legal_hold AND a.lifecycle = 'tombstoned' "
+                        "AND a.purge_after IS NOT NULL AND a.purge_after < $2 "
+                        "AND NOT EXISTS (SELECT 1 FROM shares s WHERE s.version_id = v.version_id "
+                        "                AND s.state IN ('pending','live'))",
+                        version_id,
+                        now,
+                    )
                 if done.rsplit(" ", 1)[-1] != "1":
                     return False
                 for sha in shas:
@@ -437,7 +444,9 @@ class Housekeeper:
 
     async def _reconcile_usage(self) -> int:
         drifted = await self.pool.fetch(
-            "SELECT u.member_id FROM member_usage u LEFT JOIN (SELECT owner, sum(size_bytes) AS s FROM artifacts "
+            "SELECT u.member_id FROM member_usage u LEFT JOIN (SELECT owner, sum(size_bytes + "
+            + retained_bytes_sql("artifacts")
+            + ") AS s FROM artifacts "
             f"WHERE {_LIVE_QUOTA} GROUP BY owner) a ON a.owner = u.member_id "
             "WHERE u.bytes_used <> coalesce(a.s, 0)"
         )
@@ -450,7 +459,9 @@ class Housekeeper:
                     "SELECT 1 FROM member_usage WHERE member_id=$1 FOR UPDATE", member
                 )
                 actual = await conn.fetchval(
-                    f"SELECT coalesce(sum(size_bytes), 0) FROM artifacts WHERE owner=$1 AND {_LIVE_QUOTA}",
+                    "SELECT coalesce(sum(size_bytes + "
+                    + retained_bytes_sql("artifacts")
+                    + f"), 0) FROM artifacts WHERE owner=$1 AND {_LIVE_QUOTA}",
                     member,
                 )
                 done = await conn.execute(
