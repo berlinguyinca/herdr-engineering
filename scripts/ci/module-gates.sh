@@ -5,7 +5,8 @@
 # Each gate runs its module's tests under that module's own .coveragerc-* and then holds every file to 80% statements, branches and
 # functions with scripts/ci/check-cargo-coverage.py. Thresholds are unchanged from the workflows. Linux only: the macOS legs (APFS
 # volume, tests/test_scratch_swift_macos.py) are dropped, there is no macOS runner.
-# Gates that need a real Rust toolchain are skipped LOUDLY when the host has none; the rest always run.
+# Gates that need a real Rust toolchain are skipped LOUDLY on a local host with none, and FAIL in CI unless HERDR_ALLOW_NO_CARGO=1
+# (scripts/ci/require-cargo.sh); the rest always run.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
@@ -79,7 +80,9 @@ python3 -m coverage json -o .superpowers/build-metrics-coverage.json
 python3 scripts/ci/check-cargo-coverage.py .superpowers/build-metrics-coverage.json
 unset COVERAGE_RCFILE
 
-if command -v cargo >/dev/null 2>&1 && command -v rustc >/dev/null 2>&1; then
+cargo_rc=0; bash scripts/ci/require-cargo.sh || cargo_rc=$?
+[ "$cargo_rc" != 1 ] || exit 1   # CI without a toolchain fails; it does not skip
+if [ "$cargo_rc" = 0 ]; then
   # scratch-retention: `-m ''` clears the default marker deselection, so the real-cargo integration test and the e2e run.
   cov scratch .coveragerc-scratch-reaper -m '' tests/test_scratch_reaper.py
   # cargo-host needs a real sccache for the run_rustc cache path; CI has none, so fetch a pinned official release.
@@ -105,6 +108,4 @@ if command -v cargo >/dev/null 2>&1 && command -v rustc >/dev/null 2>&1; then
     tests/test_cargo_host.py tests/test_cargo_host_real.py tests/test_build_cache_volume.py tests/test_cargo_target_storage.py \
     tests/test_cargo_managed_targets_real.py tests/test_cargo_target_retention.py
   PATH="$cargo_host_path" python3 -m pytest -m e2e -q tests/test_cargo_target_retention.py
-else
-  echo "module gate: NOTICE no cargo/rustc on this host: scratch-retention and cargo-host gates SKIPPED" >&2
 fi
