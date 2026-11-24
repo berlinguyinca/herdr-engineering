@@ -21,6 +21,12 @@ CREATE TABLE fabric_events (
   source text, source_sequence bigint);"""
 
 
+V2_COLUMNS_SQL = ("ALTER TABLE fabric_events ADD COLUMN causation_id text, ADD COLUMN correlation_id text, ADD COLUMN actor jsonb,"
+                  " ADD COLUMN visibility_scope text, ADD COLUMN evidence_refs jsonb, ADD COLUMN org_id text,"
+                  " ADD COLUMN project_id text, ADD COLUMN room_id text, ADD COLUMN workspace_id text,"
+                  " ADD COLUMN task_id text, ADD COLUMN agent_id text, ADD COLUMN trace_id text, ADD COLUMN projection_position bigint;")
+
+
 def test_migration_is_idempotent_and_down_drops_only_its_table():
     text = MIGRATION.read_text()
     assert text.count("CREATE TABLE IF NOT EXISTS") == 1 and "DROP TABLE IF EXISTS inspector_snapshots;" in text
@@ -80,9 +86,10 @@ def test_the_real_source_skips_covered_rows_and_boots_to_the_same_state(tmp_path
     from herdr_engineering.control_plane import inspector as insp
     from herdr_engineering.control_plane.bridge import PostgresSource, load_into
     from herdr_engineering.control_plane.repo import ControlPlaneRepo
-    fabric = tmp_path / "fabric.sql"
+    fabric, v2 = tmp_path / "fabric.sql", tmp_path / "v2.sql"
     fabric.write_text(FABRIC)
-    with private_postgres(fabric, MIGRATION) as dsn:
+    v2.write_text(V2_COLUMNS_SQL)               # PostgresSource selects the v2 envelope columns
+    with private_postgres(fabric, v2, MIGRATION) as dsn:
         if dsn is None:
             pytest.skip("no postgres binaries")
         rows = stream(500, seed=41)
@@ -118,12 +125,6 @@ def test_the_real_source_skips_covered_rows_and_boots_to_the_same_state(tmp_path
         assert events_loaded == loaded_less                      # the rows were skipped at load, then fetched back
         a, b = json.loads(refused), json.loads(full)
         assert a["sessions"] == b["sessions"] and a["watermark"] == b["watermark"] and a["count"] == b["count"]
-
-
-V2_COLUMNS_SQL = ("ALTER TABLE fabric_events ADD COLUMN causation_id text, ADD COLUMN correlation_id text, ADD COLUMN actor jsonb,"
-                  " ADD COLUMN visibility_scope text, ADD COLUMN evidence_refs jsonb, ADD COLUMN org_id text,"
-                  " ADD COLUMN project_id text, ADD COLUMN room_id text, ADD COLUMN workspace_id text,"
-                  " ADD COLUMN task_id text, ADD COLUMN agent_id text, ADD COLUMN trace_id text, ADD COLUMN projection_position bigint;")
 
 
 @pytest.mark.integration
