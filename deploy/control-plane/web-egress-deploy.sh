@@ -22,6 +22,7 @@ web_egress_preflight() {
       && [ ! -e "$STATE_DIR/web-egress/pending.json" ] && [ ! -L "$STATE_DIR/web-egress/pending.json" ]; then
     MEMORY_PRIVATE_EGRESS=0; return 0
   fi
+  local requested="$MEMORY_PRIVATE_EGRESS"
   if [ "$MEMORY_PRIVATE_EGRESS" = auto ]; then
     local approved="$ENV_DIR/web-egress-approved.json" values
     web_egress_cmd approved --current "$WEB_EGRESS_CURRENT" >"$approved" || return 1
@@ -35,7 +36,8 @@ PYAPPROVED
   fi
   # An explicit enable on a host that already has an approved network keeps that network's subnet unless
   # --memory-private-egress-cidr names another (the built-in default only seeds hosts with no approved network).
-  if [ "$MEMORY_PRIVATE_EGRESS" = 1 ] && [ "$MEMORY_PRIVATE_EGRESS_CIDR_SET" != 1 ] && [ -e "$WEB_EGRESS_CURRENT" ]; then
+  # Auto mode already took the approved cidr above, so only an explicit enable needs this.
+  if [ "$requested" = 1 ] && [ "${MEMORY_PRIVATE_EGRESS_CIDR_SET:-0}" != 1 ] && [ -e "$WEB_EGRESS_CURRENT" ]; then
     local kept
     kept="$(web_egress_cmd approved --current "$WEB_EGRESS_CURRENT" 2>/dev/null | python3 -c '
 import json,sys
