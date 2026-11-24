@@ -23,28 +23,24 @@ set -euo pipefail
 gate="${1:-unit}"
 case "$gate" in
   unit)
-    # Anything that can change what the suite proves. Deliberately a prefix match on directories, so a new module under
-    # herdr_engineering/ or a new test file is covered without editing this list.
-    COVERED_PREFIXES='herdr_engineering/
-tests/
-packages/
-scripts/ci/
-deploy/
-lock/
-.coveragerc-'
-    COVERED_FILES='pyproject.toml
-.woodpecker/unit-gates.yml
-.woodpecker/unit-gates-shard-1.yml
-.woodpecker/unit-gates-shard-2.yml
-.woodpecker/unit-gates-shard-3.yml
-.woodpecker/main-cron.yml
-.woodpecker/unit-gates-main.yml
-.woodpecker/structural-gates.yml
-.woodpecker/artifact-handoff.yml
-scripts/ci-pipeline-freshness.sh
-scripts/ci/integrate-main.sh'
+    # Default = RUN. The unit gate is the broad one, so the list below is what may be skipped, not what must run: a new top-level
+    # path (a new package, ansible/, skills/, a root script, package.json ...) is covered from its first commit with no edit here,
+    # which an allow-list of covered paths cannot promise (herdr_artifact_host/, ansible/, skills/, scripts/*.sh, package*.json
+    # all silently skipped the required check before). Add to this list only paths no test reads, and keep it short.
+    GATE_MODE=exempt
+    EXEMPT_PREFIXES='docs/
+.github/
+.autospec/'
+    EXEMPT_FILES='.gitignore
+.gitattributes
+.gitguardian.yaml
+.dockerignore
+LICENSE
+BUNDLE_MANIFEST.txt
+.woodpecker/ui-gates.yml'
     ;;
   ui)
+    GATE_MODE=covered
     # Anything that can change the browser gates' result: the old `when: path: include` list of ui-gates.yml, plus the routing
     # config and this script, which decide whether the gate runs at all.
     COVERED_PREFIXES='packages/
@@ -76,13 +72,23 @@ label="${gate}-gates"
 herdr_covered_path() {
   local path="$path"
   while [ "${path#./}" != "$path" ]; do path="${path#./}"; done
-  local prefix
-  while IFS= read -r prefix; do
-    [ -n "$prefix" ] && [ "${path#"$prefix"}" != "$path" ] && return 0
+  local entry
+  if [ "$GATE_MODE" = exempt ]; then
+    # Covered unless explicitly exempt.
+    while IFS= read -r entry; do
+      [ -n "$entry" ] && [ "${path#"$entry"}" != "$path" ] && return 1
+    done <<< "$EXEMPT_PREFIXES"
+    while IFS= read -r entry; do
+      [ "$path" = "$entry" ] && return 1
+    done <<< "$EXEMPT_FILES"
+    case "$path" in */*) ;; *.md) return 1 ;; esac   # root-level markdown only: a skill's SKILL.md is read by tests
+    return 0
+  fi
+  while IFS= read -r entry; do
+    [ -n "$entry" ] && [ "${path#"$entry"}" != "$path" ] && return 0
   done <<< "$COVERED_PREFIXES"
-  local file
-  while IFS= read -r file; do
-    [ "$path" = "$file" ] && return 0
+  while IFS= read -r entry; do
+    [ "$path" = "$entry" ] && return 0
   done <<< "$COVERED_FILES"
   return 1
 }
