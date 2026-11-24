@@ -135,11 +135,22 @@ so it covers the fast pass, the xdist rerun and the slow tail) and prints, as th
 * cadence: every `HERDR_PYTEST_PROGRESS_EVERY_SECONDS` (60) or `HERDR_PYTEST_PROGRESS_EVERY_TESTS` (200), whichever comes first, plus a
   final record. A wall-clock tick is used, not only report arrivals, because a wedged pass produces no reports - the run worth reading is
   the one that has gone quiet;
-* `running=` names the test each worker is inside and for how long. xdist forwards a report when a test *finishes* and forwards no
-  "started" event, so each worker writes the test it started to `$HERDR_PYTEST_PROGRESS_DIR/<pass-id>/worker-<id>.json` and the
-  controller reads those files (default `.tmp/ci-progress`, gitignored). `workers=` counts what has reported, over what `-n` asked for,
-  because a worker that has started nothing yet is invisible and a killed pass must not read as an idle one;
-* `<pass-id>` is the xdist test-run id (`--testrunuid` if one was pinned), or `local-<pid>` for a pass without workers. It is needed
+* a stall is reported **once**, then the plugin writes nothing at all (no line, no state-file read, no fsync) until a test finishes again.
+  This is a safety property, not tidiness: `scripts/ci/run-watched.py` decides a pass is wedged from two signals only - no byte on the
+  pipe and no CPU rise in the tree (`run-watched.py:266-292`) - and both are reset by anything the plugin does. A line every interval
+  would keep a deadlocked pass alive forever and re-create pipeline 1362's 8 h 20 m run. The one line (`quiet=true`) names what each worker
+  was inside when the pass went quiet, and the silence after it belongs to the watchdog. `tests/test_ci_pytest_progress.py` runs a hung
+  pass under `run-watched.py` and requires exit 124;
+* `running=` names the test each worker is inside and for how long. A finished test's report reaches the controller only at the end, and
+  xdist's forwarded `pytest_runtest_logstart` (`xdist/dsession.py:308-315`) carries no worker identity, so the controller cannot tell from
+  it who is inside what: each worker writes the test it started to `$HERDR_PYTEST_PROGRESS_DIR/<pass-id>/worker-<id>.json` and the
+  controller reads those files (default `.tmp/ci-progress`, gitignored). `workers=` counts what has reported, over what xdist will
+  actually start - the transport list, so `-n auto --maxprocesses=8` says 8 and not the uncapped auto count - because a worker that has
+  started nothing yet is invisible and a killed pass must not read as an idle one;
+* `<pass-id>` is the xdist test-run id, taken from the worker's own `workerinput` or the controller's session plugin (or `--testrunuid`
+  when pinned), or `local-<pid>` for a pass without workers. Never from `PYTEST_XDIST_TESTRUNUID`: a pytest that a test starts in a
+  subprocess inherits that variable from the worker which started it, and a nested controller reading it would clean and read its parent's
+  directory while filing its own records under the parent's id, so the parent's live workers would read as vanished. The id is needed
   because `herdr_pytest_run_gate` in `scripts/ci/pytest-rerun.sh` can have the slow tail running beside the fast pass in one progress
   directory: filed together, the serial pass's `main` reads as a fifth xdist worker and either pass's cleanup erases the other's evidence
   mid-run. Only the pass that owns the run writes records - a worker inherits `HERDR_PYTEST_PROGRESS_DIR`, and if it appended its own

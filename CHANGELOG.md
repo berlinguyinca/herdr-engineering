@@ -19,19 +19,32 @@ YYYY-MM-DD. The format follows Keep a Changelog.
   (`scripts/ci/unit-gates.sh` keeps "a slow but live run is never killed"; `scripts/ci/run-watched.py` still owns wedged passes).
   `herdr_pytest_progress_defaults` in `scripts/ci/pytest-parallel.sh` sets it; a non-numeric override fails the gate instead of running
   without evidence.
-- Workers publish the test they started to `$HERDR_PYTEST_PROGRESS_DIR/<pass-id>/worker-<id>.json` (xdist forwards no "started" event) and
-  only the pass that owns the run writes records. `<pass-id>` is the xdist test-run id, or `local-<pid>` without workers: the gate can run
-  its slow tail beside its fast pass in one progress directory, and filed together the serial pass's `main` reads as a fifth xdist worker,
-  either pass's startup cleanup erases the other's evidence mid-run, and a worker appending its own records counts every test twice.
-  A role is decided from `config.workerinput`, never from an inherited `PYTEST_XDIST_WORKER`: a pytest that a test starts in a subprocess
-  inherits that variable, and a controller that believed itself a worker would emit nothing in exactly the shape CI runs in.
+- Workers publish the test they started to `$HERDR_PYTEST_PROGRESS_DIR/<pass-id>/worker-<id>.json` (a finished test's report arrives only at
+  the end, and xdist's forwarded `pytest_runtest_logstart` carries no worker identity - `xdist/dsession.py:308-315`) and only the pass that
+  owns the run writes records. `<pass-id>` comes from the worker's own `workerinput` or the controller's session plugin, never from
+  `PYTEST_XDIST_TESTRUNUID`, or `local-<pid>` without workers: a pytest that a test starts in a subprocess inherits that variable from the
+  worker that started it, so a nested controller reading it would clean and read its parent's directory and file its records under the
+  parent's id. The id is needed because the gate can run its slow tail beside its fast pass in one progress directory, and filed together
+  the serial pass's `main` reads as a fifth xdist worker, either pass's startup cleanup erases the other's evidence mid-run, and a worker
+  appending its own records counts every test twice. A role is decided from `config.workerinput`, never from an inherited
+  `PYTEST_XDIST_WORKER`: a controller that believed itself a worker would emit nothing in exactly the shape CI runs in.
+- A stall is reported once and then the plugin goes completely silent (no line, no state-file read, no fsync) until a test finishes again,
+  marked `quiet=true`. `scripts/ci/run-watched.py` decides a pass is wedged from two signals only - no byte on the pipe and no CPU rise in
+  the tree (`run-watched.py:266-292`) - and both are reset by anything the plugin does, so a ticker repeating on an interval would keep a
+  deadlocked pass alive forever and re-create pipeline 1362's 8 h 20 m run. The one line names what each worker was inside; the silence
+  after it is what the watchdog measures, and `tests/test_ci_pytest_progress.py` proves a hung pass under `run-watched.py` still exits 124.
+- `workers=N/M` divides by the workers xdist will really start (the transport list), not the raw `-n`: `-n auto --maxprocesses=8`, which is
+  what `scripts/ci/pytest-parallel.sh` passes, resolved `auto` to the visible-CPU count and capped only the transports
+  (`xdist/plugin.py:318-324`), so printing the option read "8 workers out of 64" - a "workers vanished" alarm on a healthy pass.
 - Docs (`docs/operations/ci-gates.md`): how to read the lines, the measured numbers behind both budgets, and the disposition of #907 -
   closed unmerged because `scripts/ci/cpu-quota.py` sizes workers from the cgroup quota and the load average now only shaves `auto` to a
   floor of half the visible CPUs, never below 4, so the `-n 1` squeeze of pipeline 1804 cannot recur.
-- Tests: `tests/test_ci_pytest_progress.py` (13) runs real pytest passes with real xdist workers over a subprocess - no mocks - and
+- Tests: `tests/test_ci_pytest_progress.py` (16) runs real pytest passes with real xdist workers over a subprocess - no mocks - and
   asserts progress names a test still running, that an exceedance dumps the in-flight view without changing the verdict, shard labelling,
-  the serial `main` worker, two concurrent passes sharing one directory staying separate, that results are identical with and without the
-  plugin, and the gate wiring/budget/override rules.
+  the serial `main` worker, two concurrent passes sharing one directory staying separate, that a nested pass neither borrows its parent's
+  test-run id nor touches its state directory, that `workers=` divides by what `--maxprocesses` allows, that the gate's exported cadence is
+  the cadence the plugin runs at, that results are identical with and without the plugin, the gate wiring/budget/override rules, and - on
+  Linux - that a hung pass under `run-watched.py` still dies at the hard timeout (exit 124) with the stall named in the log.
 
 ### Fix: Codex second-reviewer follow-ups from #820 (always-on-review.py)
 

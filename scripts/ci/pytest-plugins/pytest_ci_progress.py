@@ -76,8 +76,9 @@ _cleaned = False
 
 # --- worker side: publish what this worker is inside, so the controller can read it while it runs ------------------------------
 #
-# xdist forwards a report to the controller when a test *finishes*; there is no forwarded "started" event. So a worker writes the id of
-# the test it started, and the controller reads those files. Workers live on the same host as the controller, so this is a local file
+# xdist forwards a test's reports when it *finishes*, and its forwarded `pytest_runtest_logstart` (`xdist/dsession.py:308-315`) carries no
+# worker identity, so the controller cannot tell from it which worker is inside what. So a worker writes the id of the test it started, and
+# the controller reads those files. Workers live on the same host as the controller, so this is a local file
 # under the pass's own directory; one small write per test start, and a test that never finishes is the case whose file never changes -
 # which is the one that matters.
 
@@ -113,17 +114,24 @@ def _dsession_uid() -> str | None:
     return None
 
 
+_worker_pass_id: str | None = None
+
+
 def _resolve_pass_id() -> str | None:
     """This pass's id, or None when it is an xdist pass whose id is not knowable yet.
 
-    A worker is told the id (`PYTEST_XDIST_TESTRUNUID`, set from `workerinput`). The controller only learns it once xdist has created its
-    session plugin, which can be after this plugin's `pytest_configure` - xdist starts workers early. Guessing a process-local id in the
-    meantime would split the pass in two: the controller cleaning and reading one directory while its workers write another, which is how
-    `workers=0` gets reported for a pass that plainly has workers.
+    Never from `PYTEST_XDIST_TESTRUNUID`. A pytest that a test starts in a subprocess inherits that variable from the xdist worker that
+    started it, so a nested controller reading it would resolve its *parent's* pass: it would clean the parent's worker state files and
+    file its own records under the parent's id, which reads as workers vanishing mid-run. A worker is told the id in `workerinput` (the
+    same value xdist puts in that variable, but this process's own), and a controller takes it from its own session plugin. The
+    `--testrunuid` option is per-config, so it is safe to honour.
+
+    The controller only learns its id once xdist has created its session plugin, which can be after this plugin's `pytest_configure` -
+    xdist starts workers early. Guessing a process-local id in the meantime would split the pass in two: the controller cleaning and
+    reading one directory while its workers write another, which is how `workers=0` gets reported for a pass that plainly has workers.
     """
-    uid = os.environ.get("PYTEST_XDIST_TESTRUNUID")
-    if uid:
-        return uid
+    if _worker_pass_id:
+        return _worker_pass_id
     uid = _dsession_uid()
     if uid:
         return uid
@@ -238,8 +246,10 @@ def _write_worker_state(current: str | None, started: float | None) -> None:
 def pytest_runtest_logstart(nodeid: str, location: Any) -> None:
     """Record what this process started, so a quiet worker is still visible.
 
-    `pytest_runtest_logreport` only arrives when a test finishes and xdist forwards no start events, so without this the moment a budget
-    overrun is about - the test that has been running for four minutes - is invisible.
+    A finished test's report reaches the controller only when the test ends, and although `DSession` forwards a worker's logstart to the
+    controller (`xdist/dsession.py:308-315`) the forwarded call carries no worker identity, so the controller cannot tell from it which
+    worker is inside what. Without this hook the moment a budget overrun is about - the test that has been running for four minutes - is
+    invisible.
 
     A controller driving workers is excluded: `DSession` calls `pytest_runtest_logstart` in the controller as it forwards a worker's
     report, so recording it would add a `main` entry beside the worker that actually ran the test and report more workers than were asked
@@ -258,6 +268,7 @@ def pytest_sessionfinish(session: Any, exitstatus: Any) -> None:
     A controller driving workers never had a marker to clear (see `pytest_runtest_logstart`), so it writes nothing: a `worker-main.json`
     left in the pass's directory reads as an extra worker.
     """
+    global _serial_current
     if _ROLE != "worker" and not _is_serial_pass():
         return
     _serial_current = (None, None)
@@ -277,9 +288,11 @@ _slowest: list[tuple[float, str]] = []
 _serial_current: tuple[str | None, float | None] = (None, None)
 _tests_since_emit = 0
 _last_emit_mono = 0.0
+_last_emit_done = -1
 _last_budget_mono = 0.0
+_quiet_emitted = False
+_dumped_done = -1
 _total_collected: int | None = None
-_workers_requested: int | str | None = None
 
 
 def _elapsed() -> float:
@@ -289,8 +302,8 @@ def _elapsed() -> float:
 def _worker_states() -> list[dict[str, Any]]:
     """What each worker said it was inside, read from the files the workers write.
 
-    Files from another session (a previous pass in the same directory, or a rerun) are ignored by session tag, so a stale "still running"
-    line cannot be read as evidence about a pass that is not running.
+    Files are read only from this pass's own directory and, inside it, only when tagged with this pass's id, so a state left by a previous
+    pass or by a pass sharing the directory cannot be read as a "still running" line about a pass that is running.
     """
     states: dict[str, dict[str, Any]] = {}
     directory = state_dir() if _progress_dir else None
@@ -349,15 +362,22 @@ def _record(kind: str, *, final: bool = False) -> dict[str, Any]:
         "error": _counts["error"],
         "workers": len(workers),
         "worker_states": workers,
+        # True on the one line that opens a stall - no test has finished between this line and the previous one. It is the line that says
+        # "the pass is quiet and here is what it was inside", and the last line a wedged pass will write.
+        "quiet": _quiet_emitted,
         "slowest": [[node, round(seconds, 1)] for seconds, node in _slowest[:SLOWEST_TOP]],
         "final": final,
     }
     if _total_collected is not None:
+        # Only a serial pass reaches `pytest_report_collectionfinish`: an xdist controller delegates collection, so `collected` is absent
+        # there rather than wrong.
         record["collected"] = _total_collected
-    if _workers_requested is not None:
+    requested = _requested_workers(_CONFIG) if _CONFIG is not None else None
+    if requested is not None:
         # At the start of a pass no worker has finished a test or written a state file, so `workers` reads 0; saying what was asked for
-        # keeps the first line from looking like an idle pass.
-        record["workers_requested"] = _workers_requested
+        # keeps the first line from looking like an idle pass. Resolved here rather than at configure because xdist fills in the transport
+        # list in its own `pytest_configure`, which can run after this plugin's.
+        record["workers_requested"] = requested
     if BUDGET_SECONDS:
         record["budget_s"] = round(BUDGET_SECONDS, 1)
     return record
@@ -402,35 +422,62 @@ def _emit(record: dict[str, Any]) -> None:
         )
 
 
+def _changed() -> bool:
+    """Whether any test has finished since the last line was written."""
+    return _counts["done"] != _last_emit_done
+
+
 def emit_progress(*, force: bool = False) -> None:
-    """Print one progress line if its interval has come (or if `force`)."""
-    global _tests_since_emit, _last_emit_mono
+    """Print one progress line if its interval has come (or if `force`).
+
+    Once a pass stops producing reports the emitter says so **once** and then writes nothing at all, not even a state-file read. That is a
+    safety property, not tidiness: `scripts/ci/run-watched.py` stops a pass after HARD seconds with no output byte and no CPU rise
+    (`run-watched.py:266-292`), and both are reset by anything this plugin does. A line every interval would therefore keep a deadlocked
+    pass alive forever and bring back the run this plugin exists to diagnose - the 8-hour pipeline 1362 shape. One line at the start of a
+    stall is the whole value: it names what each worker was inside when the pass went quiet, and then the watchdog is free to do its job.
+    A pass that resumes is a changed pass, and the interval rule applies to it again.
+    """
+    global _tests_since_emit, _last_emit_mono, _quiet_emitted, _last_emit_done
     _clean_state_dir()
     with _LOCK:
         elapsed = _elapsed()
-        due = (
-            force
-            or (EVERY_SECONDS and (elapsed - _last_emit_mono) >= EVERY_SECONDS)
-            or (EVERY_TESTS and _tests_since_emit >= EVERY_TESTS)
-        )
-        if not due:
+        by_time = bool(EVERY_SECONDS) and (elapsed - _last_emit_mono) >= EVERY_SECONDS
+        by_tests = bool(EVERY_TESTS) and _tests_since_emit >= EVERY_TESTS
+        if not (force or by_time or by_tests):
             return
-        _last_emit_mono = elapsed
-        _tests_since_emit = 0
-        _emit(_record("progress"))
+        changed = _changed()
+        if changed:
+            _quiet_emitted = False
+        if force or changed or not _quiet_emitted:
+            _quiet_emitted = not (force or changed)
+            _last_emit_mono = elapsed
+            _last_emit_done = _counts["done"]
+            _tests_since_emit = 0
+            _emit(_record("progress"))
+        # Reached on a tick whose progress line was suppressed too: crossing the budget is evidence in its own right, and the dump that
+        # names what the pass was inside when it went over is the one a stopped step is read for. `maybe_budget_dump` allows it once per
+        # stall and does no file I/O after that, so the silence after it is still the watchdog's to measure.
         maybe_budget_dump()
 
 
 def maybe_budget_dump() -> None:
-    """Once past the budget, dump what is in flight once per interval, and keep running."""
-    global _last_budget_mono
+    """Once past the budget, dump what is in flight, and keep running.
+
+    A dump is printed when it would say something new: the first time over the budget, and afterwards only once the `done` count has moved.
+    Repeating an unchanged dump is pure output, and output is what keeps `scripts/ci/run-watched.py` from ever stopping a wedged pass (see
+    `emit_progress`). One dump at the crossing is the evidence a stopped step is read for.
+    """
+    global _last_budget_mono, _dumped_done
     if not BUDGET_SECONDS:
         return
     elapsed = _elapsed()
     if elapsed < BUDGET_SECONDS:
         return
+    if _dumped_done == _counts["done"]:
+        return  # nothing has finished since the last dump: say it once, then leave the pipe to the watchdog
     if _last_budget_mono and (elapsed - _last_budget_mono) < max(EVERY_SECONDS, 0.0):
         return
+    _dumped_done = _counts["done"]
     _last_budget_mono = elapsed
     record = _record("budget")
     _line(
@@ -471,9 +518,29 @@ def _ticker() -> None:
             _line(f"[ci-progress] emitter error: {exc!r}")
 
 
+def _requested_workers(config: Any) -> int | None:
+    """How many workers this pass actually asked xdist for, not the uncapped `-n` figure.
+
+    `-n auto --maxprocesses=8` is what the gate passes, and xdist caps only the transport list (`xdist/plugin.py:318-324`), leaving
+    `numprocesses` at the auto count. Printing that count would make a healthy 8-worker pass read as 8 workers out of 64 - the exact
+    "workers vanished" signal this field exists to give, raised on a pass that is fine.
+    """
+    try:
+        transports = getattr(config.option, "tx", None)
+    except (ValueError, AttributeError):
+        transports = None
+    if isinstance(transports, (list, tuple)) and transports:
+        return len(transports)
+    try:
+        requested = config.getoption("numprocesses")
+    except (ValueError, AttributeError):
+        return None
+    return int(requested) if requested else None
+
+
 def pytest_configure(config: Any) -> None:
     """Decide the role from `config.workerinput`, then start the controller's emitter."""
-    global _ROLE, _WORKER_ID, _CONFIG
+    global _ROLE, _WORKER_ID, _CONFIG, _worker_pass_id
     # Before anything else, and for both roles: `_is_serial_pass()` and the pass id are asked from the first hook onwards, and a worker
     # that could not answer them writes its state file under the wrong pass and labels itself `main`.
     _CONFIG = config
@@ -483,19 +550,11 @@ def pytest_configure(config: Any) -> None:
         _WORKER_ID = str(
             workerinput.get("workerid") or os.environ.get("PYTEST_XDIST_WORKER") or "worker"
         )
-    else:
-        _ROLE = "main"
-        _WORKER_ID = "main"
-    # Workers inherit the controller's environment after this point, so the session tag reaches their state files too.
-    os.environ["HERDR_PYTEST_PROGRESS_SESSION"] = _SESSION
-    if _ROLE != "main":
+        uid = workerinput.get("testrunuid")
+        _worker_pass_id = str(uid) if uid else None
         return
-    global _workers_requested
-    try:
-        requested = config.getoption("numprocesses")
-    except (ValueError, AttributeError):
-        requested = None
-    _workers_requested = requested
+    _ROLE = "main"
+    _WORKER_ID = "main"
     _clean_state_dir()  # may be unresolvable this early for an xdist pass; it is retried at every emit
     _stop.clear()
     thread = threading.Thread(target=_ticker, name="ci-progress", daemon=True)
@@ -504,11 +563,13 @@ def pytest_configure(config: Any) -> None:
     emit_progress(force=True)
 
 
-def pytest_report_collectionfinish(config: Any, start_path: Any, items: list[Any]) -> str:
-    """Record the collected total (pytest renamed `startdir` to `start_path` in 8.x; the hookspec's name is what must match)."""
+def pytest_report_collectionfinish(config: Any, start_path: Any, items: list[Any]) -> None:
+    """Record the collected total (pytest renamed `startdir` to `start_path` in 8.x; the hookspec's name is what must match).
+
+    Returns nothing rather than `""`: an empty string is a report, and pytest prints it, so the pass would gain a blank line for it.
+    """
     global _total_collected
     _total_collected = len(items)
-    return ""
 
 
 def _worker_of(report: Any) -> str:

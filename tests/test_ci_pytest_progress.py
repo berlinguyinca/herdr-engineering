@@ -18,6 +18,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 REPO = Path(__file__).resolve().parents[1]
 PLUGINS = REPO / "scripts" / "ci" / "pytest-plugins"
 PLUGIN = "pytest_ci_progress"
@@ -95,6 +97,12 @@ SLEEPY = "import time\n\n\ndef test_sleepy():\n    time.sleep(1.5)\n"
 # above - which is why the two tests that must catch a test *in flight* use this one: the window stays open while the workers come up.
 SLEEPY_LONG = "import time\n\n\ndef test_sleepy():\n    time.sleep(6.0)\n"
 FAST = "def test_a():\n    assert True\n\n\ndef test_b():\n    assert True\n"
+# A pass that never finishes, for the watchdog test. It sleeps rather than spins so the process tree shows no CPU rise - which is the
+# signal `scripts/ci/run-watched.py` needs to stay flat in order to stop a wedged pass.
+HANG = "import time\n\n\ndef test_hangs():\n    time.sleep(3600)\n"
+# Longer than the plugin's fallback interval (5 s) and shorter than the gate's default (60 s), so a pass of this length distinguishes the
+# cadence the gate exported from the cadence the plugin fell back to.
+MEDIUM = "import time\n\n\ndef test_medium():\n    time.sleep(7.0)\n"
 
 
 def test_progress_records_are_written_while_the_run_is_still_running(tmp_path: Path) -> None:
@@ -345,18 +353,182 @@ def test_a_bad_progress_override_fails_the_gate_instead_of_running_silently(tmp_
         assert name in done.stderr, done.stderr
 
 
-def test_the_gate_calls_the_progress_defaults_before_the_passes_run() -> None:
+def test_the_gate_exports_the_cadence_names_the_plugin_actually_reads(tmp_path: Path) -> None:
+    """The cadence the gate exports is the cadence the plugin runs at, proved by a pass long enough to tell them apart.
+
+    `herdr_pytest_progress_defaults` exports `HERDR_PYTEST_PROGRESS_EVERY_SECONDS` (60) and `HERDR_PYTEST_PROGRESS_EVERY_TESTS` (200) with
+    `:-` defaults, and the plugin reads those names. A renamed export, or an empty one, is invisible to every other test here: the plugin
+    would fall back to its own 5 s default while the gate believed it had asked for 60 s. So run a 7 s pass - over the fallback, well under
+    the gate's interval - under the environment the gate itself exports, and require the interval lines to be absent. The difference between
+    one line and forty per 40 minutes is read on the step whose log the platform truncates.
+    """
+    dumped = sh(
+        "herdr_pytest_progress_defaults > /dev/null; "
+        'env | grep -E \'^HERDR_PYTEST_PROGRESS_(EVERY_SECONDS|EVERY_TESTS)=\'',
+        tmp_path,
+    )
+    assert dumped.returncode == 0, dumped.stderr
+    exported = dict(line.split("=", 1) for line in dumped.stdout.split("\n") if line.strip())
+    assert exported.get("HERDR_PYTEST_PROGRESS_EVERY_SECONDS") == "60", exported
+    assert exported.get("HERDR_PYTEST_PROGRESS_EVERY_TESTS") == "200", exported
+
+    root = _project(tmp_path, {"test_medium.py": MEDIUM})
+    progress = tmp_path / "progress"
+    done = _run(
+        root,
+        env={
+            "HERDR_PYTEST_PROGRESS_DIR": str(progress),
+            "HERDR_PYTEST_PROGRESS_EVERY_SECONDS": exported["HERDR_PYTEST_PROGRESS_EVERY_SECONDS"],
+            "HERDR_PYTEST_PROGRESS_EVERY_TESTS": exported["HERDR_PYTEST_PROGRESS_EVERY_TESTS"],
+        },
+        args=["-p", PLUGIN],
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    records = _records(progress)
+    # Only the configure line (t measured from plugin import, so ~0) may be non-final. A 7 s pass under the 5 s fallback would also have
+    # written an interval line at t~5, which is what this distinguishes.
+    interval = [record for record in records if not record.get("final") and record["t"] >= 3.0]
+    assert not interval, (
+        f"a 7 s pass must not emit an interval line at the gate's 60 s cadence; the exported value did not reach the plugin: {records}"
+    )
+    assert any(record.get("final") for record in records), records
+
+
+def test_the_worker_count_reports_the_workers_xdist_will_start(tmp_path: Path) -> None:
+    """`-n auto --maxprocesses=8` has 8 workers, and the line must say 8.
+
+    The gate passes exactly that (`scripts/ci/pytest-parallel.sh`). xdist resolves `auto` to the visible-CPU count and then caps only the
+    transport list, leaving `numprocesses` uncapped (xdist/plugin.py:318-324), so reporting the option prints "8 workers out of 64" - the
+    "workers vanished" alarm raised on a pass that is healthy, on the line CI is read from.
+    """
+    root = _project(tmp_path, {"test_fast.py": FAST})
+    progress = tmp_path / "progress"
+    done = _run(
+        root,
+        env={"HERDR_PYTEST_PROGRESS_DIR": str(progress)},
+        args=["-p", PLUGIN, "-n", "auto", "--maxprocesses", "2"],
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    records = _records(progress)
+    assert records, "the pass wrote no progress records"
+    requested = {record.get("workers_requested") for record in records if "workers_requested" in record}
+    assert requested == {2}, (
+        f"`-n auto --maxprocesses 2` starts 2 workers; the records said {requested}"
+    )
+    final = [record for record in records if record.get("final")]
+    assert final and final[-1]["workers"] <= 2, f"more workers than asked for: {final}"
+
+
+def _hang_pass(tmp_path: Path, seconds: float) -> tuple[list[str], list[dict[str, Any]]]:
+    """Run a pass that hangs forever, with an aggressive emitter, for `seconds`, and return its progress lines and records.
+
+    A 1 s interval is the adversarial setting: it is the one where a repeating ticker most reliably keeps a watchdog alive.
+    """
+    root = _project(tmp_path, {"test_hang.py": HANG})
+    progress = tmp_path / "progress"
+    process = subprocess.Popen(
+        _command(["-p", PLUGIN, "tests/test_hang.py"]),
+        cwd=root,
+        env=_environ(
+            {
+                "HERDR_PYTEST_PROGRESS_DIR": str(progress),
+                "HERDR_PYTEST_PROGRESS_EVERY_SECONDS": "1",
+                "HERDR_PYTEST_PROGRESS_BUDGET_SECONDS": "2",
+            }
+        ),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        process.wait(timeout=seconds)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=60)
+    stdout = process.stdout.read() if process.stdout else ""
+    return [line for line in stdout.splitlines() if "[ci-" in line], _records(progress)
+
+
+def test_a_stall_is_reported_once_and_then_the_pipe_goes_silent(tmp_path: Path) -> None:
+    """The mechanism the watchdog depends on: one line per stall, then no output at all.
+
+    `scripts/ci/run-watched.py` decides a pass is wedged from two signals only - no byte on the pipe, and no CPU rise in the tree
+    (run-watched.py:266-292) - and both are reset by anything this plugin does. A ticker printing on its interval would therefore keep a
+    deadlocked pass alive forever and re-create the run this change exists to diagnose (pipeline 1362: 8 h 20 m). So the emitter writes one
+    line at the start of a stall and nothing more.
+    """
+    lines, records = _hang_pass(tmp_path, 12.0)
+    assert lines, "a hung pass produced no progress line at all"
+    assert any("test_hang.py::test_hangs" in line for line in lines), (
+        f"the stall line must name the test the pass is stuck inside, got {lines}"
+    )
+    # 12 s at a 1 s interval would be ~12 progress lines plus a budget dump every second; one stall gets one of each.
+    assert len([line for line in lines if "[ci-progress]" in line]) <= 2, (
+        f"the emitter repeated during a stall and would reset run-watched.py's idle clock every interval: {lines}"
+    )
+    assert len([line for line in lines if "[ci-budget]" in line]) <= 2, (
+        f"the budget dump repeated during a stall, which is the same watchdog defect: {lines}"
+    )
+    assert any(record.get("quiet") for record in records), (
+        f"the stall must be marked `quiet`, so a reader knows the pass went quiet rather than merely slow: {records}"
+    )
+    late = [record for record in records if record["t"] >= 5.0]
+    assert not late, f"records were written long into a stall, so the pipe never went idle: {late}"
+
+
+def test_a_hung_pass_under_run_watched_still_dies_at_the_hard_timeout(tmp_path: Path) -> None:
+    """End to end, on Linux: the plugin must not defeat `run-watched.py`'s hard timeout.
+
+    This is the property the whole feature trades against. `run-watched.py` needs /proc to see the process tree, so off Linux this is
+    skipped and `test_a_stall_is_reported_once_and_then_the_pipe_goes_silent` covers the mechanism; CI is Linux, and CI is where the
+    8-hour run happened.
+    """
+    if not Path("/proc").exists():
+        pytest.skip("run-watched.py needs /proc to see the process tree")
+    root = _project(tmp_path, {"test_hang.py": HANG})
+    progress = tmp_path / "progress"
+    done = subprocess.run(
+        [
+            sys.executable,
+            str(REPO / "scripts" / "ci" / "run-watched.py"),
+            "2",  # SOFT: announce the suspicion
+            "6",  # HARD: stop the pass - the timeout the plugin must never defeat
+            "--",
+            *_command(["-p", PLUGIN, "tests/test_hang.py"]),
+        ],
+        cwd=root,
+        env=_environ(
+            {
+                "HERDR_PYTEST_PROGRESS_DIR": str(progress),
+                "HERDR_PYTEST_PROGRESS_EVERY_SECONDS": "1",
+                "HERDR_PYTEST_PROGRESS_BUDGET_SECONDS": "2",
+            }
+        ),
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert done.returncode == 124, (
+        f"a hung pass under the watchdog must die at the hard timeout with the plugin loaded; got {done.returncode}\n"
+        f"{done.stdout[-3000:]}\n{done.stderr[-2000:]}"
+    )
+    lines = [line for line in done.stdout.splitlines() if "[ci-" in line]
+    assert any("test_hang.py::test_hangs" in line for line in lines), (
+        f"the watchdog killed the pass without ever saying what it was inside:\n{done.stdout[-2000:]}"
+    )
     """`unit-gates.sh` has to load the defaults, or the plugin runs on its own built-in defaults and the budgets are fiction."""
     assert "herdr_pytest_progress_defaults" in GATE
     assert GATE.index("herdr_pytest_progress_defaults") < GATE.index("herdr_pytest_run_gate")
 
 
 def test_a_nested_pass_is_still_the_controller_however_it_was_started(tmp_path: Path) -> None:
-    """Inheriting `PYTEST_XDIST_WORKER` must not make a pass believe it is a worker.
+    """Inheriting xdist's environment must not make a pass believe it is a worker, nor borrow its parent's pass id.
 
-    The unit gate runs pytest under xdist, and a pytest that a test starts in a subprocess inherits that variable. If the plugin decided
-    its role from the environment, the nested controller would think it was a worker and emit nothing - a CI-progress plugin that goes
-    silent exactly in the shape CI runs in.
+    The unit gate runs pytest under xdist, and a pytest that a test starts in a subprocess inherits `PYTEST_XDIST_WORKER` and
+    `PYTEST_XDIST_TESTRUNUID` from the worker that started it (xdist sets both in the worker's environment, `xdist/remote.py:409-416`). If
+    the plugin decided its role from the environment, the nested controller would think it was a worker and emit nothing - a CI-progress
+    plugin that goes silent exactly in the shape CI runs in. If it took its pass id from that environment, it would clean and read its
+    *parent's* state directory and file its own records under the parent's id, so the parent's live workers would read as vanished.
     """
     root = _project(tmp_path, {"test_fast.py": FAST})
     progress = tmp_path / "progress"
@@ -375,6 +547,12 @@ def test_a_nested_pass_is_still_the_controller_however_it_was_started(tmp_path: 
     assert records and records[-1]["done"] == 2, records
     assert not any("gw7" in str(record) for record in records), (
         f"a pass that is a controller must report itself as `main`, not as the inherited worker: {records}"
+    )
+    assert all(record["pass"] != "not-a-real-run" for record in records), (
+        f"a nested pass must not file its records under the test-run id it inherited: {records}"
+    )
+    assert not (progress / "not-a-real-run").exists(), (
+        "the nested pass must not create, clean, or read a directory named for its parent's run"
     )
 
 
@@ -421,9 +599,10 @@ def test_two_passes_sharing_a_progress_directory_stay_separate(tmp_path: Path) -
 
     records = _records(progress)
     # A parallel pass's first line is written in `pytest_configure`, before xdist has created its session and therefore before the run id
-    # exists. That one line may be unresolved; anything later must say who wrote it.
+    # exists. That one line may be unresolved; anything later must say who wrote it. What makes it the first line is that no test had
+    # finished and no worker had written state - not its timestamp, which depends on how long collection took.
     for record in [record for record in records if not record.get("pass")]:
-        assert record["t"] == 0.0 and not record["worker_states"], (
+        assert record["done"] == 0 and not record["worker_states"], (
             f"only the first line of a pass may predate the run id: {record}"
         )
     by_pass: dict[str, list[dict[str, Any]]] = {}
