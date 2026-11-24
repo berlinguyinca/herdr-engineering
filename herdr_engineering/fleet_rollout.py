@@ -672,7 +672,11 @@ def _foreground_identity(transport, target, agent, rows):
         row for row in rows if row.get("reachable") is True and row["descriptor"].get("pid") in pids
     ]
     if not candidates:
-        raise NoForegroundProof("foreground PID does not identify a live Pi control instance")
+        if any(row["descriptor"].get("pid") in pids for row in rows):
+            # A Pi control row owns the foreground process but did not answer: a live Pi we
+            # could not attribute, which is not the same as nothing running there.
+            raise NoForegroundProof("foreground Pi control instance did not answer the list")
+        raise NoProcessInPane("no Pi process runs in the pane")
     if len(candidates) != 1:
         raise ValueError("foreground PID does not identify exactly one live Pi control instance")
     descriptor = candidates[0]["descriptor"]
@@ -715,7 +719,11 @@ def _foreground_identity(transport, target, agent, rows):
 
 
 class NoForegroundProof(ValueError):
-    """The pane has no live Pi control instance to attribute the foreground process to."""
+    """The foreground process could not be attributed: unproven, so never grounds for "ended"."""
+
+
+class NoProcessInPane(ValueError):
+    """The pane runs no Pi process at all (empty, or only a shell): a registration for it is a husk."""
 
 
 class TransientlyUnreachable(ValueError):
@@ -1095,6 +1103,15 @@ def _session(plan, state, transport, target, root, save):
         )
 
 
+_UNPRINTABLE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-_]|[^\x20-\x7e\u00a0-\U0010ffff]|[\x7f-\x9f]")
+
+
+def _printable(text) -> str:
+    """Remote-derived text made safe to store and print: ANSI escapes and control characters
+    (newlines included) become spaces."""
+    return re.sub(r" +", " ", _UNPRINTABLE.sub(" ", str(text))).strip()
+
+
 def _note_unreachable(state, note):
     state["lastUnreachableAt"] = datetime.now(UTC).isoformat()
     state["note"] = note[:500]
@@ -1176,6 +1193,7 @@ def apply_rollout(store, rollout_id, *, transport=None, stage=None):
                 rows = _rows(transport, target, root)
                 identified = []
                 coverage_errors = []
+                unproven = {}
                 for agent in agents:
                     try:
                         try:
@@ -1183,15 +1201,32 @@ def apply_rollout(store, rollout_id, *, transport=None, stage=None):
                         except ValueError:
                             session_id, proof = _foreground_identity(transport, target, agent, rows)
                         else:
-                            if not _has_reachable_row(rows, session_id):
+                            if (
+                                not _has_reachable_row(rows, session_id)
+                                and _unreachable_kind(rows, session_id) != "transient"
+                            ):
                                 # The native reference may name a dead predecessor while a live
                                 # Pi runs in this pane; settling it as ended would skip the reload.
+                                # A transient miss keeps its previous status instead, so the
+                                # remote proof is not even attempted for it. The proof is best
+                                # effort here: only "no Pi process in the pane" lets the
+                                # registration be treated as a husk; anything else leaves it
+                                # unproven, so it is retried and never settles as ended.
                                 try:
                                     session_id, proof = _foreground_identity(
                                         transport, target, agent, rows
                                     )
-                                except NoForegroundProof:
-                                    pass  # nothing live in the pane: the registration is a husk
+                                except NoProcessInPane:
+                                    pass
+                                except (
+                                    ValueError,
+                                    KeyError,
+                                    TypeError,
+                                    ConnectionError,
+                                    OSError,
+                                    subprocess.SubprocessError,
+                                ) as exc:
+                                    unproven[session_id] = _printable(str(exc))[:500]
                         identified.append((agent, session_id, proof))
                     except (
                         ValueError,
@@ -1245,6 +1280,18 @@ def apply_rollout(store, rollout_id, *, transport=None, stage=None):
                         session_id,
                         {"sessionId": session_id, "native": agent, "status": "discovered"},
                     )
+                    if session_id in unproven:
+                        # A dead registration whose pane we could not inspect: keep the status,
+                        # note why, and retry next pass. Never end it, never complete the host.
+                        _note_unreachable(
+                            state,
+                            "native registration has no live row and the pane's foreground "
+                            "could not be proved: " + unproven[session_id],
+                        )
+                        if state.get("status") == "discovered":
+                            state["status"] = "pending"
+                        save()
+                        continue
                     previous_error = state.get("error")
                     if state.get("status") != "retired":
                         # A retired session keeps the refusal that justified retiring it.

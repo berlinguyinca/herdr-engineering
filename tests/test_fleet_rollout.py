@@ -85,11 +85,18 @@ class Wire:
         return [
             {
                 "agent": "pi",
+                "pane_id": "pane-1",
                 "terminal_id": "terminal-1",
+                "revision": 8,
+                "state_change_seq": 3,
                 "agent_session": {"value": target["host"] + "-conversation"},
                 "session": "main",
             }
         ]
+
+    def process_info(self, target, pane):
+        # By default a pane runs a bare shell: a dead registration for it is a husk.
+        return {"pane_id": pane, "foreground_processes": [{"pid": 77, "name": "zsh"}]}
 
     def sessions(self, target, root):
         if self.corrupt:
@@ -2063,7 +2070,10 @@ class VanishingWire(Wire):
             rows.append(
                 {
                     "agent": "pi",
+                    "pane_id": "pane-2",
                     "terminal_id": "terminal-2",
+                    "revision": 5,
+                    "state_change_seq": 1,
                     "agent_session": {"value": "second-conversation"},
                     "session": "main",
                 }
@@ -2775,3 +2785,119 @@ def test_missing_result_in_a_receipt_does_not_crash_the_session(tmp_path):
     wire.maintenance = maintenance
     result = apply(store, plan, wire)
     assert result["hosts"]["bender"]["status"] in ("blocked", "pending")
+
+
+def _predecessor(wire_mutator=None, *, dead_error="session_process_gone", **native_changes):
+    wire = _stale_predecessor_wire()
+    original_native = wire.native
+    if native_changes:
+        wire.native = lambda target: [
+            {**row, **native_changes} for row in original_native(target)
+        ]
+    sessions = wire.sessions
+
+    def with_error(target, root):
+        rows = sessions(target, root)
+        for row in rows:
+            if row["descriptor"]["sessionId"] == "bender-dead":
+                row["error"] = dead_error
+        return rows
+
+    wire.sessions = with_error
+    if wire_mutator:
+        wire_mutator(wire)
+    return wire
+
+
+def _unproven(wire, tmp_path):
+    store, plan = setup_rollout(tmp_path)
+    result = apply(store, plan, wire)
+    bender = result["hosts"]["bender"]
+    dead = bender["sessions"]["bender-dead"]
+    assert dead["status"] != "ended", dead
+    assert "endedAt" not in dead
+    assert bender["status"] not in ("complete", "blocked"), bender
+    assert not bender.get("coverageErrors")
+    assert "hostLevelError" not in bender
+    assert not [m for m in wire.mutations if m[0] == "bender"]
+    return result
+
+
+def test_stale_registration_without_a_revision_token_is_unproven_not_ended(tmp_path):
+    def drop_tokens(wire):
+        native = wire.native
+        wire.native = lambda target: [
+            {k: v for k, v in row.items() if k not in ("revision", "state_change_seq")}
+            for row in native(target)
+        ]
+
+    _unproven(_predecessor(drop_tokens), tmp_path)
+
+
+def test_stale_registration_with_invalid_pane_id_is_unproven_not_ended(tmp_path):
+    _unproven(_predecessor(pane_id="bad pane!"), tmp_path)
+
+
+def test_stale_registration_with_a_failing_process_query_is_unproven_not_blocking(tmp_path):
+    def broken(wire):
+        def process_info(target, pane):
+            raise ConnectionError("ssh dropped")
+
+        wire.process_info = process_info
+
+    _unproven(_predecessor(broken), tmp_path)
+
+
+def test_stale_registration_whose_pane_runs_an_unreachable_live_pi_is_unproven(tmp_path):
+    def live_but_silent(wire):
+        sessions = wire.sessions
+
+        def unreachable(target, root):
+            rows = sessions(target, root)
+            for row in rows:
+                if row["descriptor"]["sessionId"] == "bender-live":
+                    row.update(reachable=False, error="session_unresponsive")
+                    row.pop("reply", None)
+            return rows
+
+        wire.sessions = unreachable
+
+    _unproven(_predecessor(live_but_silent), tmp_path)
+
+
+@pytest.mark.parametrize(
+    "processes", [[], [{"pid": 77, "name": "zsh"}]], ids=["empty_pane", "shell_only"]
+)
+def test_stale_registration_with_no_pi_process_in_the_pane_is_a_husk_and_ends(
+    tmp_path, processes
+):
+    def husk(wire):
+        wire.process_info = lambda target, pane: {
+            "pane_id": pane,
+            "foreground_processes": processes,
+        }
+        sessions = wire.sessions
+        wire.sessions = lambda target, root: [
+            r for r in sessions(target, root) if r["descriptor"]["sessionId"] != "bender-live"
+        ]
+
+    store, plan = setup_rollout(tmp_path)
+    result = apply(store, plan, _predecessor(husk))
+    assert result["hosts"]["bender"]["sessions"]["bender-dead"]["status"] == "ended"
+
+
+def test_transiently_unreachable_native_session_never_queries_the_pane(tmp_path):
+    def forbidden(wire):
+        def process_info(target, pane):
+            raise AssertionError("foreground proof must not run for a transient miss")
+
+        wire.process_info = process_info
+
+    store, plan = setup_rollout(tmp_path)
+    wire = _predecessor(forbidden, dead_error="session_unresponsive")
+    first = apply(store, plan, wire)
+    dead = first["hosts"]["bender"]["sessions"]["bender-dead"]
+    assert dead["status"] == "pending"
+    assert dead["lastUnreachableAt"]
+    assert not first["hosts"]["bender"].get("coverageErrors")
+    assert first["hosts"]["bender"]["status"] != "complete"
