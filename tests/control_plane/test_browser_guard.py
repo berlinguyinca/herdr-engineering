@@ -199,6 +199,25 @@ def test_a_host_token_route_answers_to_an_unlisted_name_but_only_with_the_token(
         svr.shutdown()
 
 
+def test_clearing_a_deployment_request_is_a_host_token_route_too(tmp_path):
+    # DELETE /api/v1/deployments/requests/<id> is how a fleet host clears a force request it picked up; when the
+    # clear fails the host must not redeploy, so the Host allowlist must not stand in its way either.
+    from herdr_engineering.fleet_config import FleetConfigStore
+    path = tmp_path / "fleet.yaml"
+    _fleet_file(path)
+    svr = ControlPlaneServer(ControlPlaneRepo(), fleet_config=FleetConfigStore(path))
+    threading.Thread(target=svr.serve, daemon=True).start()
+    svr.wait_until_ready()
+    try:
+        headers = {"Host": "cp.tail1234.ts.net", "X-Host-Token": "placeholder-host-bender"}
+        status, body = call(svr, "DELETE", "/api/v1/deployments/requests/req-1", headers)
+        assert "host not allowed" not in json.dumps(body), (status, body)
+        status, body = call(svr, "DELETE", "/api/v1/deployments/requests/req-1", {"Host": "cp.tail1234.ts.net"})
+        assert status == 403 and "host not allowed" in json.dumps(body), (status, body)
+    finally:
+        svr.shutdown()
+
+
 def test_a_name_added_to_dashboard_hosts_works_without_a_restart(tmp_path):
     from herdr_engineering.fleet_config import FleetConfigStore
     path = tmp_path / "fleet.yaml"

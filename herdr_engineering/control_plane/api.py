@@ -2240,6 +2240,7 @@ def _make_handler(server, public=False, operator=False, fabric=False):
         def _host_token_route(self, path):
             return (path == _FLEET_CONFIG_PATH or path in (_FLEET_CONFIG_PATH + "/applied", _FLEET_CONFIG_PATH + "/telemetry")
                     or path in _DEPLOYMENT_HOST_GET_PATHS or path in _DEPLOYMENT_EVENTS_PATHS
+                    or _DEPLOYMENT_REQUEST_PATH.match(path) is not None   # DELETE: the host clears a picked-up request
                     or path.startswith("/api/v1/host/terminal/"))
 
         def _valid_host_token(self):
