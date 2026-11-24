@@ -5,6 +5,13 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Feature: control-plane database and object-store backup, pre-migration dump, migrator lock
+
+- `memory-backup.sh --target control-plane` dumps `herdr-cp-postgres` (`pg_dump -Fc`, verified, atomic rename, newest 14 kept) and copies the `herdr-cp-rustfs` object store into a verified tar; `herdr-controlplane-backup.{service,timer}` run it daily and every real `deploy.sh` installs them. Dumps stay on the host.
+- `deploy.sh` takes a verified `predeploy-controlplane-*.dump` before the checkpoint prewarm applies migrations and stops if it fails; a failed prewarm no longer says nothing changed, because the schema may have moved.
+- The migrator holds a Postgres advisory lock and a 60 s `lock_timeout` for a run, so two starters cannot migrate at once and a migration cannot hang behind a long transaction.
+- `herdr-eng doctor` gains `control_plane_backup` (age of the newest dump; "not applicable" on hosts without the control plane). Restore runbook: `docs/operations/control-plane-backup-restore.md`.
+
 ### Fix: assistant store snapshot loading, ordering and locking
 
 - `PostgresStoreBackend.load()` no longer turns a failed read into "no snapshot": it raises `StoreLoadError`, so a control plane that boots while Postgres is unreachable fails startup instead of running with an empty store whose first mutation overwrote the stored snapshot.
