@@ -908,7 +908,7 @@ class FabricAgent:
         # is due at once, the same one again only every host_slow_interval.
         self._slow_handled: dict[str, Any] | None = None
         # Restore forwarders for loopback-only services survived a restart.
-        for port_s, entry in self._store.items():
+        for port_s, entry in list(self._store.items()):
             if entry.get("fwd_port"):
                 fwd = AgentForwarder(config.tailnet_ip, int(port_s),
                                      fabric_names=config.fabric_names(), fabric_domains=config.domains())
@@ -920,11 +920,15 @@ class FabricAgent:
                         fwd.stop()
                         fwd = self._rebind(fwd, entry["fwd_port"], int(port_s))
                         if fwd is None:
+                            self._release(port_s)
                             continue
                     self._forwards[int(port_s)] = fwd
                 except OSError as exc:
                     log.warning("could not restore forwarder for port %s: %s",
                                 port_s, exc)
+                    # No forwarder means the advertised URL would refuse
+                    # connections: drop the entry so the next scan re-adopts it.
+                    self._release(port_s)
         # Report every currently-tracked service to the control plane so the
         # fleet Services page is fully populated across agent restarts (a
         # restart re-heartbeats these leases; it does not re-adopt them, so
@@ -1001,6 +1005,9 @@ class FabricAgent:
         """One detect/register/close cycle. Returns a summary."""
         listeners = scan_listening_ports()
         live_ports = set(listeners)
+        # A failed or partial scan (ss/lsof timeout, error, unparsable line)
+        # proves nothing about absence: never release on it.
+        scan_complete = getattr(listeners, "complete", True)
         self._probe_cache = {
             port: cached for port, cached in self._probe_cache.items()
             if port in live_ports
@@ -1045,7 +1052,7 @@ class FabricAgent:
                 port = int(port_s)
                 entry = self._store[port_s]
                 process = entry.get("process") or ""
-                if (port not in live_ports
+                if ((scan_complete and port not in live_ports)
                         or port in gateway_front
                         or process in _IGNORED_PROCESSES
                         or process_denied(process, self.cfg.deny_processes)
