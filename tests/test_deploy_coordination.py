@@ -527,6 +527,11 @@ exec '{original}' "$@"
         result = subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
     log = env["log"].read_text()
     assert "prewarm-before-host-changes" in log
+    # the database is dumped (and verified) BEFORE the migration the prewarm applies, into the private backup directory
+    dump = next(env["home"].glob(".local/share/herdr-engineering/backups/control-plane/predeploy-controlplane-*.dump"))
+    assert dump.read_bytes() == b"PGDMP-synthetic" and stat.S_IMODE(dump.stat().st_mode) == 0o600
+    assert log.index("pg_dump -U cpadmin -d herdr") < log.index("docker run ")
+    assert "herdr-cp-rustfs" not in log           # a migration does not touch the object store
     assert "PREWARM-SECRET" not in result.stdout + result.stderr
     metadata_path = next(state(env).glob("attempt-*/metadata.json"))
     metadata = json.loads(metadata_path.read_text())
@@ -536,6 +541,9 @@ exec '{original}' "$@"
     if fail:
         assert "PREWARM-SECRET-MUST-NOT-LEAK" in prewarm_log.read_text()
         assert result.returncode == 1, result.stdout + result.stderr
+        # the migration may have moved the schema: the message says so and names the dump instead of claiming nothing changed
+        assert "no host files or services changed" not in result.stderr
+        assert "schema may have changed" in result.stderr and str(dump) in result.stderr
         assert metadata["outcome"] == "prewarm_failed"
         assert " up " not in log
         assert not (env["home"] / ".config").exists()
@@ -554,6 +562,28 @@ exec '{original}' "$@"
         assert f"src={metadata_path.parent}/candidate,dst=/etc/herdr/fleet,readonly" in run
         assert log.index("docker run ") < log.index(" up ")
     assert not (state(env) / "rollout-owner.json").exists()
+
+
+def test_a_failed_pre_migration_dump_stops_the_deploy_before_the_migration(env):
+    _seed_previous(env, _layout_commit())
+    env["env"]["STUB_FAIL_CP_DUMP"] = "1"
+    result = deploy(env)
+    log = env["log"].read_text()
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "before the migration failed; nothing was migrated" in result.stderr
+    assert "docker run " not in log and " up " not in log
+    assert list(env["home"].glob(".local/share/herdr-engineering/backups/control-plane/.partial-*")) == []
+    metadata = json.loads(next(state(env).glob("attempt-*/metadata.json")).read_text())
+    assert metadata["outcome"] == "prewarm_failed"
+
+
+def test_a_real_deploy_installs_the_control_plane_backup_timer_and_a_first_deploy_dumps_nothing(env):
+    result = deploy(env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    log = env["log"].read_text()
+    assert "pg_dump" not in log                    # nothing to dump before the first database exists
+    assert "systemctl --user enable --now herdr-controlplane-backup.timer" in log
+    assert (env["home"] / ".config/systemd/user/herdr-controlplane-backup.timer").is_file()
 
 
 def test_initially_absent_web_skips_prewarm_network_and_is_recreated(env):
