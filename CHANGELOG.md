@@ -16,6 +16,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - Report routes that answer before reading a POST body (build status, build, unknown path, report creation) close the connection; `too_large` is answered only for an artifact with a stored file (a report with no current file stays 404); a 10+ digit Content-Length is 413, not 400.
 - S3 client: 5 s connect timeout, botocore's own 60 s read timeout and default retries (a 30 s read timeout cut large uploads short).
 
+### Fix: required `unit-gates` no longer skips PRs that touch untested-by-list paths; Rust module gates fail in CI without cargo
+
+- `scripts/ci/unit-gates-applicable.sh unit` is now default-run with a short exempt list instead of an allow-list, so `herdr_artifact_host/`, `ansible/`, `skills/`, `scripts/*.sh`, `package.json`, `package-lock.json` and any new top-level path run the suite (they previously passed the required check with no tests; `main-moved-check.sh` shared the gap). A test checks every tracked file against the matcher.
+- `scripts/ci/module-gates.sh` no longer silently skips the scratch-retention and cargo-host gates when cargo is absent in CI: new `scripts/ci/require-cargo.sh` fails there unless `HERDR_ALLOW_NO_CARGO=1` is set explicitly.
 ### Fix: assistant store snapshot loading, ordering and locking
 
 - `PostgresStoreBackend.load()` no longer turns a failed read into "no snapshot": it raises `StoreLoadError`, so a control plane that boots while Postgres is unreachable fails startup instead of running with an empty store whose first mutation overwrote the stored snapshot.

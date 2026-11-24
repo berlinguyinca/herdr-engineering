@@ -43,8 +43,7 @@ path-filtered check made *required* parks every unrelated pull request on *Expec
 `unit-gates` (#719) and `ui-gates` no longer have a path filter. Both trigger on every `pull_request` (and `manual`) and an
 `applicability` step runs `scripts/ci/unit-gates-applicable.sh [unit|ui]`, which diffs the PR against its merge base and exits
 0 (run the gate), 3 (no covered path changed: drop `.ci-<gate>-not-applicable`; the gate step exits 0 in seconds saying why) or
-fails the pipeline. It fails open: a diff it cannot work out runs the gate. The covered paths live in that one script (the `unit` and
-`ui` cases); a manual run (read from `CI_PIPELINE_EVENT`, falling back to legacy `CI_EVENT`) always runs the gate. The `ui` list is locked by `tests/test_ci_gate_routing.py`: every tracked UI source tree (web client, member/share static pages, schemas, browser-test configs) and every script the gate runs must be matched by it, so a new UI directory fails that test until it is listed. **All four pipelines now report on every pull request, so all four are safe to
+fails the pipeline. It fails open: a diff it cannot work out runs the gate. The `unit` gate is **default-run**: the script holds a short exempt list (`docs/`, `.github/`, `.autospec/`, root-level `*.md`, a few inert root files) and every other path runs the suite, so a new top-level directory can never silently skip the required check (`tests/test_ci_gate_routing.py` checks every tracked file against it). `main-moved-check.sh` reuses the same decision. The `ui` gate keeps an explicit covered list. Both live in that one script; a manual run (read from `CI_PIPELINE_EVENT`, falling back to legacy `CI_EVENT`) always runs the gate. The `ui` list is locked by `tests/test_ci_gate_routing.py`: every tracked UI source tree (web client, member/share static pages, schemas, browser-test configs) and every script the gate runs must be matched by it, so a new UI directory fails that test until it is listed. **All four pipelines now report on every pull request, so all four are safe to
 require.** Do not reintroduce a `path:` filter in a pipeline whose context is required.
 
 ## Why `main` is gated by `structural-gates` and not by `unit-gates`
@@ -125,3 +124,7 @@ The plugin is `scripts/ci/herdr_flaky_plugin.py`.
 one test (issue #703). A single red `unit-gates` on a pull request whose diff cannot reach that file should be re-checked rather
 than assumed to be caused by the diff - and note that `structural-gates` failing is never in that category, because it reads only
 tracked data files.
+
+## Rust-toolchain module gates
+
+`scripts/ci/module-gates.sh` (shard 1) runs the scratch-retention and cargo-host coverage gates only with a real `cargo` and `rustc`. `scripts/ci/require-cargo.sh` decides: toolchain present runs them; absent on a local run skips with a NOTICE; absent in CI (`CI` or `CI_PIPELINE_EVENT` set) **fails** the gate, unless the runner is known to have no Rust and sets `HERDR_ALLOW_NO_CARGO=1`, which skips with a logged NOTICE. Tested by `tests/test_ci_require_cargo.py`.
