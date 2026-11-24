@@ -7,9 +7,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ### Fix: bug-hunt wave 2 (handoff checkpoint, scratch reaper, cleanup target, architecture runner)
 
-- Auto-handoff checkpoint: a refused push (non-fast-forward, protected upstream, failing hook) now records `handoff.wip_committed` with reason `push_failed` and the chain continues, instead of ending red as `git_state_unknown`.
-- Scratch reaper and `cleanup --scope tmp`: session records older than the live window no longer count toward the 50,000-file inspection limit, and a record deleted mid-scan is skipped. The limit still fails closed for recent records.
-- `cleanup --scope target` refuses when `git ls-files` fails for any reason other than "not a git repository".
+- Auto-handoff checkpoint: a refused push (non-fast-forward, protected upstream, failing hook) now records `handoff.wip_committed` with reason `push_failed` (and git's error text in `error`) and the chain continues, taking over with the dirty source allowed so the old session still closes; if git cannot list the unpushed commits after the refusal, the chain ends red as `git_state_unknown`.
+- Scratch reaper and `cleanup --scope tmp`: session records older than the live window no longer count toward the 50,000-file inspection limit, and a record that vanishes mid-scan (it may have been renamed) makes the scan fail closed, like a directory removed mid-walk or a recent-record count over the limit.
+- `cleanup --scope target` (and `--scope tmp`) refuse when `git` fails for any reason other than "not a git repository (or any of the parent directories)", so a worktree whose repository moved is no longer treated as untracked; the tracked-files check now asks about the target's own name, so managed `targets/<label>-<id>` directories are covered.
 - Architecture worker output over 64 MiB is reported as a size error at once, not after the 300 s wall-clock limit.
 
 ### Fix: assistant store snapshot loading, ordering and locking
@@ -17,6 +17,7 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - `PostgresStoreBackend.load()` no longer turns a failed read into "no snapshot": it raises `StoreLoadError`, so a control plane that boots while Postgres is unreachable fails startup instead of running with an empty store whose first mutation overwrote the stored snapshot.
 - Backend snapshot writes are numbered under the store lock and written one at a time; a slow older write can no longer land after a newer snapshot.
 - The store's list/search methods, `request_tool_action`'s idempotency scan and `list_approvals` read the shared dicts under the store lock (no more `dictionary changed size during iteration`), and `decide_approval` is atomic, so two concurrent decisions on one approval cannot both pass the pending check.
+
 ### Fix: Slack approval of unseen text, calendar block-list alias, Rakazo first-bot cache
 
 - Slack ask: the Approve buttons are only offered when the command is shown in full; a long (truncated) command gets Deny only and a "cannot be approved from Slack" note, and an approve tap on such an ask is refused (`not_fully_shown`).

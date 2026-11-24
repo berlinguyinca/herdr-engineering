@@ -287,3 +287,14 @@ def test_failed_config_lookup_never_pushes(tmp_path: Path) -> None:
     reason, error = _push(work, "feat/x", 10.0)
     assert reason is WipReason.GIT_ERROR and error
     assert "feat/x" not in remote_heads(tmp_path)
+
+
+def test_a_failed_push_whose_unpushed_list_cannot_be_read_is_a_git_error(tmp_path: Path) -> None:
+    work = make_repo(tmp_path)
+    (work / "a.txt").write_text("two\n")
+    hook = work / ".git" / "hooks" / "pre-push"  # refuses the push and leaves a repository rev-list cannot read
+    hook.write_text("#!/bin/sh\necho refused >&2\nprintf 'garbage' > \"$(git rev-parse --git-dir)/packed-refs\"\nrm -f \"$(git rev-parse --git-dir)/HEAD\"\nexit 1\n")
+    hook.chmod(0o755)
+    result = wip_commit(work, push_allowed=True)
+    assert result.reason is not WipReason.PUSH_FAILED and result.reason is WipReason.GIT_ERROR
+    assert result.error and "refused" in result.error

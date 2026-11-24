@@ -402,3 +402,28 @@ def test_target_scope_refuses_when_git_cannot_say_what_is_tracked(env: Env) -> N
     with pytest.raises(Refusal):
         cleanup("target", env.repo / "target", roots=env.roots)
     assert (env.repo / "target" / "tracked.txt").read_text() == "t"
+
+
+def test_managed_target_with_tracked_files_is_refused(env: Env) -> None:
+    targets = env.repo / "targets"
+    managed = targets / "lbl-1"
+    (managed / "debug" / ".fingerprint").mkdir(parents=True)
+    (targets / ".herdr-target-root.json").write_text(json.dumps({"owner_uid": os.getuid()}))
+    (managed / ".herdr-cargo-target.json").write_text(json.dumps({"owner_uid": os.getuid(), "workspace": str(env.repo)}))
+    (managed / "tracked.txt").write_text("t")
+    git(env.repo, "add", "-f", "targets/lbl-1/tracked.txt")
+    with pytest.raises(Refusal, match="tracked"):
+        cleanup("target", managed, roots=env.roots)
+    assert (managed / "tracked.txt").read_text() == "t"
+
+
+def test_target_of_a_worktree_whose_repository_moved_is_refused(env: Env) -> None:
+    wt = env.worktree("feat1")
+    (wt / "Cargo.toml").write_text("[package]\n")
+    (wt / "target" / "debug" / ".fingerprint").mkdir(parents=True)
+    (wt / "target" / "tracked.txt").write_text("t")
+    git(wt, "add", "-f", "Cargo.toml", "target/tracked.txt")
+    env.repo.rename(env.roots[0] / "moved")  # git now says "not a git repository: <gitdir>", not the plain form
+    with pytest.raises(Refusal):
+        cleanup("target", wt / "target", roots=env.roots)
+    assert (wt / "target" / "tracked.txt").read_text() == "t"

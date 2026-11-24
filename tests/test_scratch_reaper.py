@@ -1517,13 +1517,25 @@ def test_claude_config_dirs_includes_configured_dir(
 
 def test_old_session_records_do_not_count_toward_the_inspection_limit(tmp_path: Path) -> None:
     from herdr_engineering.scratch_reaper import _live_ids
+
     root = tmp_path / "sessions"
     root.mkdir()
     old = time.time() - 10 * 86400
     uuid = "12345678-1234-1234-1234-123456789abc"
-    for i in range(50_001):
+    for i in range(6):
         path = root / f"old-{i}.jsonl"
         path.write_text("")
         os.utime(path, (old, old))
     (root / f"{uuid}.jsonl").write_text("")
-    assert _live_ids([root], time.time() - 3600) == {uuid}
+    assert _live_ids([root], time.time() - 3600, limit=3) == {uuid}
+
+
+def test_recent_session_records_over_the_inspection_limit_fail_closed(tmp_path: Path) -> None:
+    from herdr_engineering.scratch_reaper import _live_ids
+
+    root = tmp_path / "sessions"
+    root.mkdir()
+    for i in range(4):
+        (root / f"new-{i}.jsonl").write_text("")
+    with pytest.raises(OSError, match="inspection limit"):
+        _live_ids([root], time.time() - 3600, limit=3)

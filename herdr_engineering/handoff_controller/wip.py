@@ -176,8 +176,9 @@ def wip_commit(worktree: Path, *, push_allowed: bool, timeout_s: float = 120.0) 
     reason, push_error = _push(worktree, branch, timeout_s)
     if reason is not None:
         remaining, err = _unpushed(worktree, timeout_s)
-        return WipResult(committed, sha, False, remaining if not err else unpushed, untracked, reason,
-                         push_error if not err else f"{push_error}; {err}")
+        if err:  # the state after the refused push is unknown: not a good local commit
+            return WipResult(committed, sha, False, unpushed, untracked, WipReason.GIT_ERROR, f"{push_error}; {err}")
+        return WipResult(committed, sha, False, remaining, untracked, reason, push_error)
     after_push, err = _unpushed(worktree, timeout_s)
     if err:
         return WipResult(committed, sha, True, (), untracked, WipReason.GIT_ERROR, err)

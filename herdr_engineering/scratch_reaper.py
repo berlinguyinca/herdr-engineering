@@ -735,7 +735,7 @@ def _walk_error(error: OSError) -> NoReturn:
     raise error
 
 
-def _live_ids(roots: list[Path], cutoff: float) -> set[str]:
+def _live_ids(roots: list[Path], cutoff: float, limit: int = 50_000) -> set[str]:
     live: set[str] = set()
     inspected = 0
     for root in roots:
@@ -752,16 +752,18 @@ def _live_ids(roots: list[Path], cutoff: float) -> set[str]:
                 try:
                     if path.is_symlink() or path.stat().st_mtime < cutoff:
                         continue  # old files are never read, so they do not count toward the limit
-                except FileNotFoundError:
-                    continue  # removed between the walk and the stat: not live
-                inspected += 1
-                if inspected > 50_000:
-                    raise OSError("session activity inspection limit reached")
-                if _UUID.fullmatch(path.stem):
-                    live.add(path.stem)
-                with path.open("rb") as stream:
-                    stream.seek(max(0, path.stat().st_size - 65536))
-                    live.update(_UUID.findall(stream.read().decode(errors="replace")))
+                    inspected += 1
+                    if inspected > limit:
+                        raise OSError("session activity inspection limit reached")
+                    if _UUID.fullmatch(path.stem):
+                        live.add(path.stem)
+                    with path.open("rb") as stream:
+                        stream.seek(max(0, path.stat().st_size - 65536))
+                        live.update(_UUID.findall(stream.read().decode(errors="replace")))
+                except (
+                    FileNotFoundError
+                ) as error:  # a rename (tmp -> final, rotation) looks the same: its ids may be live
+                    raise OSError(f"session record vanished during the scan: {path}") from error
     return live
 
 

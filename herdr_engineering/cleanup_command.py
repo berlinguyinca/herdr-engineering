@@ -566,14 +566,19 @@ def remove_worktree(path: Path, *, dry_run: bool, merged_ok: bool,
     return {"branch": facts["branch"]}
 
 
+def _outside_repository(proc: subprocess.CompletedProcess[str]) -> bool:
+    """git's "no repository here" answer; `not a git repository: <gitdir>` (a worktree whose repository moved) is not it."""
+    return proc.returncode == 128 and "not a git repository (or any of the parent directories)" in proc.stderr
+
+
 def _remove_target(path: Path, *, dry_run: bool, state_dir: Path | None) -> dict[str, Any]:
     from .build_cleanup import _lease_block, _recognized
     if not _recognized(path):
         raise Refusal("not_cargo_target", f"{path} is not a cargo target directory")
-    tracked = _git(path.parent, "ls-files", "--", "target")
+    tracked = _git(path.parent, "ls-files", "--", f":(literal){path.name}")  # managed targets are `targets/<label>-<id>`
     if tracked.returncode == 0 and tracked.stdout.strip():
         raise Refusal("tracked_files", f"{path} contains tracked files")
-    if tracked.returncode != 0 and not (tracked.returncode == 128 and "not a git repository" in tracked.stderr):
+    if tracked.returncode != 0 and not _outside_repository(tracked):
         raise Refusal("git_repository", f"{path}: cannot verify it has no tracked files")  # fail closed, as _refuse_git
     if state_dir is not None and (reason := _lease_block(state_dir, path)):
         raise Refusal(reason, f"{path} is protected by the build registry")
@@ -605,7 +610,7 @@ def _refuse_git(path: Path) -> None:
     probe = safe_git(path if is_dir else path.parent, "rev-parse", "--git-dir")
     if probe.returncode == 0:
         raise Refusal("git_repository", f"{path} is or is inside a git repository; use --scope worktree")
-    if probe.returncode != 128 or "not a git repository" not in probe.stderr:
+    if not _outside_repository(probe):
         raise Refusal("git_repository", f"{path}: cannot verify it is outside a git repository")
     if not is_dir:
         return
