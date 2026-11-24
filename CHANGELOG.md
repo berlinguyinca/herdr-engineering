@@ -12,6 +12,11 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - The token is re-read per request: a rotated file is followed without a restart, the previous token is accepted for 5 minutes, and a token seen once is never forgotten (a deleted file does not reopen the API).
 - `/healthz` needs no token: unauthenticated callers (the container healthcheck) get `{"ok": ...}` only; authenticated callers get the full payload.
 - `deploy/control-plane/compose.yaml` mounts `~/.config/herdr-engineering/fabric-gateway` at `/run/fabric` and keeps `--allow-open` for the rollout; see the PR for the order.
+### Fix: Slack approval of unseen text, calendar block-list alias, Rakazo first-bot cache
+
+- Slack ask: the Approve buttons are only offered when the command is shown in full; a long (truncated) command gets Deny only and a "cannot be approved from Slack" note, and an approve tap on such an ask is refused (`not_fully_shown`).
+- `CalendarPolicy`: blocking both `primary` and the primary's real id no longer blocks every other calendar.
+- Rakazo bridge: the first-bot cache is keyed by `(tenant, user)`, so two spaces of one account no longer share a cached bot id.
 
 ### Feature: periodic `herdr-handoff reap --apply` timer (opt-in, off by default)
 

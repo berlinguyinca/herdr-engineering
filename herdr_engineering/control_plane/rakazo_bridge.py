@@ -812,7 +812,7 @@ class RakazoBridge:
         self.push = PushNotifier(PushRegistry(push_persistence), sender, self._push_target,
                                  enabled=bool(push_cfg.get("enabled")), quiet_hours=push_cfg.get("quiet_hours"))
         self.push.start()
-        self._first_bots: dict[str, tuple[float, str]] = {}
+        self._first_bots: dict[tuple[str, str], tuple[float, str]] = {}
         self._procs: dict[str, Callable[[_Ctx, dict[str, Any]], Any]] = {
             "me": self._me, "spaces/list": self._spaces_list, "bots/list": self._bots_list, "bots/get": self._bots_get,
             "bots/create": self._bots_create, "threads/head": self._threads_head, "threads/get": self._threads_get,
@@ -1382,13 +1382,13 @@ class RakazoBridge:
     def _first_bot(self, ctx: _Ctx) -> str | None:
         """The account's oldest bot (bots are never deleted here, so the answer is cached for a few seconds)."""
         now = self._monotonic()
-        hit = self._first_bots.get(ctx.user)
+        hit = self._first_bots.get((ctx.tenant, ctx.user))
         if hit is not None and now - hit[0] < 5.0:
             return hit[1]
         bots = self.svc.list_assistants(tenant_id=ctx.tenant, user_id=ctx.user)
         first = min(bots, key=lambda a: (a.created_at, a.assistant_id)).assistant_id if bots else None
         if first is not None:
-            self._first_bots[ctx.user] = (now, first)
+            self._first_bots[(ctx.tenant, ctx.user)] = (now, first)
         return first
 
     def _bot(self, ctx: _Ctx, assistant) -> dict[str, Any]:
