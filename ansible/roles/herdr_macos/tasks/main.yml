@@ -63,7 +63,7 @@
 - name: "Report Herdr drift"
   ansible.builtin.debug:
     msg: "{{ herdr_check.stderr }}"   # an ok task's stderr is hidden by default, so the drift line is printed here
-  when: "'DRIFT' in herdr_check.stderr"
+  when: "'DRIFT' in (herdr_check.stderr | default(''))"
 
 - name: "Verify Pi is present"
   ansible.builtin.shell: |
@@ -78,7 +78,7 @@
 - name: "Report Pi drift"
   ansible.builtin.debug:
     msg: "{{ pi_check.stderr }}"   # an ok task's stderr is hidden by default, so the drift line is printed here
-  when: "'DRIFT' in pi_check.stderr"
+  when: "'DRIFT' in (pi_check.stderr | default(''))"
 
 - name: "Clone berlinguyinca/pi-engineering"
   ansible.builtin.git:

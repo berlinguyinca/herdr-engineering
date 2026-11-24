@@ -477,6 +477,27 @@ def test_a_failed_once_leaves_no_temp_dir_in_the_sync_dir(tmp_path):
 
 
 @pytest.mark.parametrize("role", ["herdr_linux", "herdr_macos"])
+def test_the_drift_report_tasks_survive_a_check_mode_dry_run(tmp_path, role):
+    """`site.yml --check` skips the Verify shell tasks, so their registers carry no stderr."""
+    ansible = shutil.which("ansible-playbook")
+    if ansible is None:
+        pytest.skip("ansible-playbook is not installed")
+    tasks = yaml.safe_load((ROOT / "ansible" / "roles" / role / "tasks" / "main.yml").read_text())
+    wanted = [t for t in tasks if t["name"].startswith(("Verify Herdr", "Report Herdr", "Verify Pi", "Report Pi"))]
+    assert len(wanted) == 4
+    play = [{"hosts": "localhost", "connection": "local", "gather_facts": False,
+             "vars": {"herdr_pinned_version": "0.9.1"}, "tasks": wanted}]
+    book = tmp_path / "play.yml"
+    book.write_text(yaml.safe_dump(play))
+    # HOME stays: a user-site ansible install is found through it; ansible's own state goes to the temp dir
+    env = {**os.environ, "ANSIBLE_HOME": str(tmp_path / "ahome"), "ANSIBLE_LOCAL_TEMP": str(tmp_path / "atmp")}
+    r = subprocess.run([ansible, "-i", "localhost,", str(book), "--check"],
+                       capture_output=True, text=True, env=env, timeout=120)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "failed=0" in r.stdout
+
+
+@pytest.mark.parametrize("role", ["herdr_linux", "herdr_macos"])
 @pytest.mark.parametrize("task_name,binary", [("Verify Herdr", "herdr"), ("Verify Pi", "pi")])
 def test_a_missing_runtime_is_reported_as_drift_and_never_fails_the_host(
     tmp_path, role, task_name, binary
