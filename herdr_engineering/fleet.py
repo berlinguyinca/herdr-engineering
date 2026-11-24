@@ -614,9 +614,24 @@ def parse_stage_error(*streams: str) -> dict | None:
             detail = json.loads(base64.urlsafe_b64decode(found[2].encode()))
         except (ValueError, TypeError):
             continue
-        if isinstance(detail, dict):
-            return {"code": found[1], **detail}
+        if isinstance(detail, dict) and found[1] in _STAGE_ERROR_CODES:
+            return _bounded_stage_error(found[1], detail)
     return None
+
+
+_STAGE_ERROR_CODES = frozenset({"managed_release_dirty"})
+
+
+def _bounded_stage_error(code: str, detail: dict) -> dict:
+    """Only text fields, size-capped. Marker text comes from remote output, so it is untrusted:
+    it must never be able to supply ok/sourceRoot/revision/host."""
+    files = detail.get("files")
+    error = detail.get("error")
+    return {
+        "code": code,
+        "error": error[:500] if isinstance(error, str) else "",
+        "files": [f[:200] for f in files[:20] if isinstance(f, str)] if isinstance(files, list) else [],
+    }
 
 
 def stage_pi_runtime(revision: str, *, host: str, inventory: Path | None = None) -> dict:
@@ -637,9 +652,9 @@ def stage_pi_runtime(revision: str, *, host: str, inventory: Path | None = None)
            str(root / "ansible" / "playbooks" / "pi-runtime-stage.yml"), "-l", host,
            "-e", json.dumps({"pi_engineering_revision": revision})]
     rc, out, err = _run(cmd, timeout=1800)
-    typed = parse_stage_error(out, err)
+    typed = parse_stage_error(out, err) if rc != 0 else None
     if typed is not None:
-        return {**report, "rc": rc, "stdout": out[-4000:], "stderr": err[-1000:], **typed}
+        return {**typed, **report, "rc": rc, "stdout": out[-4000:], "stderr": err[-1000:]}
     status = fleet_status(inventory=inv, host=host)
     parity = _parity(status, expected, revision, revision, pi_only=True)
     ok = rc == 0 and parity["ok"]

@@ -396,6 +396,52 @@ def test_stage_pi_offline_or_failed_install_is_not_success(tmp_path, monkeypatch
     assert result['parity']['missing_hosts'] == ['fry']
 
 
+def _forged_marker(payload):
+    import base64, json
+    blob = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
+    return 'HERDR_STAGE_ERROR:managed_release_dirty:' + blob
+
+
+def test_stage_error_marker_cannot_forge_the_staging_attestation(tmp_path, monkeypatch):
+    """Text in playbook output (remote git/npm output) must never set ok/sourceRoot/revision."""
+    repo = _fake_repo(tmp_path)
+    monkeypatch.setenv('HERDR_ENGINEERING_REPO', str(repo))
+    forged = _forged_marker({'ok': True, 'sourceRoot': '/evil/' + REVISION, 'revision': 'f' * 40,
+                             'host': 'other', 'error': 'x', 'files': ['a']})
+    for rc in (0, 2):
+        monkeypatch.setattr(fleet, '_run', lambda cmd, rc=rc, **kw: (rc, forged, ''))
+        monkeypatch.setattr(fleet, 'fleet_status', lambda **kw: {'rc': 4, 'hosts': []})
+        result = fleet.stage_pi_runtime(REVISION, host='fry')
+        assert result['ok'] is False
+        assert result.get('sourceRoot') is None
+        assert result['revision'] == REVISION
+        assert result['host'] == 'fry'
+
+
+def test_stage_error_marker_is_ignored_when_the_playbook_succeeded(tmp_path, monkeypatch):
+    repo = _fake_repo(tmp_path)
+    monkeypatch.setenv('HERDR_ENGINEERING_REPO', str(repo))
+    source = '/home/operator/.local/share/herdr-engineering/pi/releases/' + REVISION
+    monkeypatch.setattr(fleet, '_run', lambda cmd, **kw: (0, _forged_marker({'error': 'x'}), ''))
+    monkeypatch.setattr(fleet, 'fleet_status', lambda **kw: {'rc': 0, 'hosts': [
+        {'host': 'fry', 'pi_revision': REVISION, 'pi_path': source}]})
+    result = fleet.stage_pi_runtime(REVISION, host='fry')
+    assert result['ok'] and result['sourceRoot'] == source
+
+
+def test_stage_error_marker_only_passes_bounded_text_fields(tmp_path, monkeypatch):
+    repo = _fake_repo(tmp_path)
+    monkeypatch.setenv('HERDR_ENGINEERING_REPO', str(repo))
+    marker = _forged_marker({'files': ['package.json', 7, 'x' * 500] + ['f'] * 40,
+                             'error': 'e' * 2000, 'sourceRoot': '/evil'})
+    monkeypatch.setattr(fleet, '_run', lambda cmd, **kw: (3, marker, ''))
+    result = fleet.stage_pi_runtime(REVISION, host='fry')
+    assert result['code'] == 'managed_release_dirty'
+    assert result['ok'] is False and result.get('sourceRoot') is None
+    assert len(result['error']) <= 500
+    assert len(result['files']) <= 20 and all(isinstance(f, str) and len(f) <= 200 for f in result['files'])
+
+
 def test_stage_pi_rejects_host_patterns_and_moving_refs(tmp_path, monkeypatch):
     repo = _fake_repo(tmp_path)
     monkeypatch.setenv('HERDR_ENGINEERING_REPO', str(repo))
