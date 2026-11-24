@@ -2906,6 +2906,27 @@ def _renew_local(reg, lease_id: str):
     return renewed
 
 
+def _renew_serving_origin(reg, lease_id: str, bound_port: int, forwarder, bind: str):
+    """One renewal cycle of ``enroll --serve``. Returns (bound_port, forwarder).
+
+    The port is tracked by the caller, not read off a lease object captured at
+    enroll time: the registry reloads fresh lease objects, so a stale copy would
+    keep reporting the old port and restart the forwarder every cycle.
+    """
+    from .devfabric import forwarder_for
+    renewed = _renew_local(reg, lease_id)
+    if renewed is None or renewed.external_port == bound_port:
+        return bound_port, forwarder
+    logging.getLogger("herdr.cli").warning(
+        "lease %s moved from port %s to %s on renewal",
+        lease_id, bound_port, renewed.external_port)
+    forwarder.stop()
+    forwarder = forwarder_for(renewed, bind_host=bind).start()
+    _print_json({"ok": True, "serving": f"http://{bind}:{renewed.external_port}",
+                 "note": "lease moved to a new port"})
+    return renewed.external_port, forwarder
+
+
 def heartbeat_local_leases(reg, state: dict, fwd: dict | None = None,
                            bind: str = "127.0.0.1") -> None:
     """Renew every locally-held lease (the --serve renewal loop, #89).
@@ -3352,22 +3373,15 @@ def _cmd_dev_enroll(args) -> int:
     stop = {"flag": False}
     signal.signal(signal.SIGINT, lambda *_: stop.__setitem__("flag", True))
     next_hb = time.monotonic()
+    bound_port = lease.external_port
     while not stop["flag"]:
         time.sleep(0.2)
         # Keep the lease active (default TTL ~90s) so the origin stays a live
         # fabric member (visible in `devfabric list`, kept by a central gateway).
         if time.monotonic() >= next_hb:
             try:
-                bound_port = lease.external_port
-                renewed = _renew_local(reg, lease.id)
-                if renewed is not None and renewed.external_port != bound_port:
-                    logging.getLogger("herdr.cli").warning(
-                        "lease %s moved from port %s to %s on renewal",
-                        lease.id, bound_port, renewed.external_port)
-                    forwarder.stop()
-                    forwarder = forwarder_for(renewed, bind_host=args.bind).start()
-                    _print_json({"ok": True, "serving": f"http://{args.bind}:{renewed.external_port}",
-                                 "note": "lease moved to a new port"})
+                bound_port, forwarder = _renew_serving_origin(
+                    reg, lease.id, bound_port, forwarder, args.bind)
             except Exception:
                 pass
             next_hb = time.monotonic() + 30

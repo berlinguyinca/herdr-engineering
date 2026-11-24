@@ -15,6 +15,7 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - `rewriting_pipe` waits up to `HERDR_GATEWAY_RESPONSE_TIMEOUT` seconds (default 300) for the origin's response head and answers 504 on expiry; local (gateway-less) lease renewal re-registers a lease whose port was re-allocated.
 - A backend that accepts bytes but sends nothing back for the inactivity timeout ends a `proxy_pair` / `prefixed_pipe` even while the client keeps sending; a response that is still flowing is never cut. The head deadline always answers 504 (never an empty reply), and a dead origin (keepalive ETIMEDOUT) answers 502.
 - Gateway-less renewal: a lease moved to a new port restarts its forwarder (`enroll --serve`, `enroll-dir --serve`), `devfabric heartbeat` re-registers like the serve loops, and `heartbeat`/re-register reload the store first so a port another CLI process took is seen. `HERDR_GATEWAY_RESPONSE_TIMEOUT` must be finite and positive, else the 300 s default applies.
+- `enroll --serve` tracks the bound port itself (`_renew_serving_origin`) instead of comparing against the enroll-time lease object, so a lease that moved port restarts its forwarder once, not every 30 s cycle.
 
 ### Fix: assistant store snapshot loading, ordering and locking
 

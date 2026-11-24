@@ -445,6 +445,32 @@ def test_local_heartbeat_moves_the_forwarder_with_a_lease_that_changed_port(tmp_
                 f.stop()
 
 
+def test_enroll_serve_loop_restarts_the_forwarder_once_for_a_moved_lease(tmp_path):
+    from herdr_engineering.cli import _renew_serving_origin
+    from herdr_engineering.devfabric import forwarder_for
+    reg_a = _reg(tmp_path)
+    port = next(p for p in range(26900, 26999) if _can_bind(p))
+    a = reg_a.register(target_machine_id="x", target_host="127.0.0.1", target_port=9001, preferred_port=port)
+    bound = a.external_port
+    forwarder = None
+    try:
+        reg_a.close(a.id)
+        reg_b = _reg(tmp_path)  # a second process on the same store file
+        b = reg_b.register(target_machine_id="y", target_host="127.0.0.1", target_port=9002, preferred_port=port)
+        assert b.external_port == port
+        forwarder = forwarder_for(a, bind_host="127.0.0.1").start()  # still listening on its old port
+        seen = [forwarder]
+        for _ in range(4):
+            bound, forwarder = _renew_serving_origin(reg_a, a.id, bound, forwarder, "127.0.0.1")
+            if forwarder is not seen[-1]:
+                seen.append(forwarder)
+        assert bound != port
+        assert len(seen) == 2  # exactly one restart, none on later cycles
+    finally:
+        if forwarder is not None:
+            forwarder.stop()
+
+
 # -- re-review: head deadline answers 504, never an empty reply ----------------------------------
 
 def test_rewriting_pipe_answers_504_not_an_empty_reply_when_the_origin_closes_on_half_close():
