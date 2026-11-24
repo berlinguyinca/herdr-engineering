@@ -28,7 +28,7 @@
 
     - name: "Record the fleet user's home"
       ansible.builtin.set_fact:
-        fleet_home: "{{ ansible_env.HOME }}"
+        fleet_home: "{{ ansible_facts['env']['HOME'] }}"
 
     - name: "Mine this host's transcripts into a redacted JSON summary"
       # become: false — must read the FLEET user's transcript stores, not root's.

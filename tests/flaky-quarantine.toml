@@ -1,0 +1,12 @@
+# Known-flaky tests. A quarantined test STILL RUNS and is reported (QUARANTINED section of the pytest summary and the unit-gate log); a failure
+# of it does not fail the gate. Use this only with a tracked issue: every entry needs all four fields (nodeid, reason, issue, expires);
+# tests/test_ci_flaky_quarantine.py fails the structural gate for an entry without a reason / issue / expiry, and an entry past its expiry stops quarantining (the test
+# fails the gate again; `expires` is at most 90 days away). Prefer fixing the test. The same declaration can sit on the test itself:
+#   @pytest.mark.quarantine_flaky(reason="what is flaky and what was measured", issue="#873", expires="2026-12-31")
+# (on the test FUNCTION only; a module-level pytestmark or class decorator is rejected)
+#
+# [[quarantine]]
+# nodeid  = "tests/test_example.py::test_name"      # all parametrisations match
+# reason  = "fails ~1 run in 20 under load: waits on wall clock (measured in pipelines 1776, 1781)"
+# issue   = "#873"
+# expires = "2026-12-31"

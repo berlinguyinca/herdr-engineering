@@ -22,7 +22,9 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 APPLICABLE = ROOT / "scripts" / "ci" / "unit-gates-applicable.sh"
 CRON = ROOT / "scripts" / "ci" / "main-cron-gates.sh"
-UNIT_GATES_YML = (ROOT / ".woodpecker" / "unit-gates.yml").read_text()
+UI_GATES_YML = (ROOT / ".woodpecker" / "ui-gates.yml").read_text()
+UNIT_GATES_YML = (ROOT / ".woodpecker" / "unit-gates-shard-1.yml").read_text()   # the aggregate unit-gates.yml has no steps of its own
+UNIT_GATES_AGGREGATE_YML = (ROOT / ".woodpecker" / "unit-gates.yml").read_text()
 CRON_YML = (ROOT / ".woodpecker" / "main-cron.yml").read_text()
 
 GIT_ENV = {
@@ -68,10 +70,13 @@ def change(repo: Path, path: str, branch: str = "feature") -> str:
     return git(repo, "rev-parse", "HEAD")
 
 
-def applicability(repo: Path, sha: str, event: str = "pull_request", base: str = "main") -> subprocess.CompletedProcess[str]:
-    env = {**os.environ, "CI_EVENT": event, "CI_COMMIT_SHA": sha, "CI_TARGET_BRANCH": "main",
+def applicability(repo: Path, sha: str, event: str = "pull_request", base: str = "main",
+                  gate: str | None = None, event_var: str = "CI_PIPELINE_EVENT") -> subprocess.CompletedProcess[str]:
+    base_env = {k: v for k, v in os.environ.items() if not k.startswith("CI_")}  # a runner's CI_* must not leak in
+    env = {**base_env, event_var: event, "CI_COMMIT_SHA": sha, "CI_TARGET_BRANCH": "main",
            "HERDR_APPLICABILITY_BASE": base}
-    return subprocess.run(["bash", str(APPLICABLE)], cwd=repo, env=env, capture_output=True, text=True)
+    args = ["bash", str(APPLICABLE), *([gate] if gate else [])]
+    return subprocess.run(args, cwd=repo, env=env, capture_output=True, text=True)
 
 
 # ------------------------------------------------------------------ applicability: what must run ------------------------------------
@@ -86,6 +91,14 @@ def applicability(repo: Path, sha: str, event: str = "pull_request", base: str =
     "deploy/control-plane/deploy.sh",        # the deploy scripts the suite exercises
     "pyproject.toml",                        # dependency and pytest config
     ".woodpecker/unit-gates.yml",            # the routing config
+    ".woodpecker/unit-gates-shard-2.yml",    # a shard workflow
+    "scripts/ci/unit-shard.py",              # the shard split
+    "scripts/ci/main-moved-check.sh",
+    ".woodpecker/unit-gates-main.yml",
+    ".woodpecker/structural-gates.yml",
+    ".woodpecker/artifact-handoff.yml",
+    "scripts/ci-pipeline-freshness.sh",      # not under scripts/ci/
+    "scripts/ci/integrate-main.sh",
 ])
 def test_a_change_that_can_affect_the_suite_runs_it(repo, path):
     result = applicability(repo, change(repo, path))
@@ -239,10 +252,11 @@ def test_a_state_dir_that_cannot_be_written_still_runs_the_gate(tree, tmp_path):
 
 def test_unit_gates_is_no_longer_path_filtered():
     """The trap this whole change exists to spring: a filtered pipeline never reports, so it can never be required."""
-    triggers = yaml.safe_load(UNIT_GATES_YML)["when"]
-    assert [t for t in triggers if t.get("event") == "pull_request"], "unit-gates must still trigger on PRs"
-    offenders = [t for t in triggers if "path" in t or "include" in t]
-    assert not offenders, f"a path filter here re-creates the never-reports problem: {offenders}"
+    for text in (UNIT_GATES_YML, UNIT_GATES_AGGREGATE_YML):
+        triggers = yaml.safe_load(text)["when"]
+        assert [t for t in triggers if t.get("event") == "pull_request"], "unit-gates must still trigger on PRs"
+        offenders = [t for t in triggers if "path" in t or "include" in t]
+        assert not offenders, f"a path filter here re-creates the never-reports problem: {offenders}"
 
 
 def test_the_skip_is_reported_rather_than_silently_absent():
@@ -261,7 +275,190 @@ def test_the_cron_pipeline_triggers_on_cron_only():
     assert "main-cron-gates.sh" in CRON_YML
 
 
+def test_the_cron_pipeline_runs_on_the_heavy_pool_and_never_overlaps_itself():
+    cron, unit = yaml.safe_load(CRON_YML), yaml.safe_load(UNIT_GATES_YML)
+    assert cron["labels"] == unit["labels"] == {"cluster": "hive-heavy"}, "cron runs landed on 4-CPU nodes without the label"
+    assert cron["concurrency"]["limit"] == 1 and cron["concurrency"]["group"]
+
+
 def test_both_scripts_are_valid_bash():
     for script in (APPLICABLE, CRON):
         out = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True)
         assert out.returncode == 0, f"{script.name}: {out.stderr}"
+
+
+def test_cron_without_a_state_dir_fails_loudly_instead_of_guessing(tree, tmp_path):
+    env = {k: v for k, v in os.environ.items() if k not in ("HERDR_CI_STATE", "XDG_STATE_HOME")}
+    env.update(RUN_LOG=str(tmp_path / "ran"), HOME=str(tmp_path / "home"))
+    result = subprocess.run(["bash", str(tree / "scripts" / "ci" / "main-cron-gates.sh")],
+                            cwd=tree, env=env, capture_output=True, text=True)
+    assert result.returncode == 2 and "HERDR_CI_STATE is not set" in result.stderr
+    assert not (tmp_path / "ran").exists() and not (tmp_path / "home").exists()
+
+
+def test_the_cron_pipeline_takes_its_state_dir_from_the_runner_with_runtime_escaping():
+    commands = yaml.safe_load(CRON_YML)["steps"][1]["commands"]
+    export = next(c for c in commands if "HERDR_CI_STATE" in c)
+    assert "$${WPCI_CI_DIR" in export, "Woodpecker substitutes single-$ vars at parse time; the runtime var needs $$"
+    assert "/home/" not in CRON_YML
+
+
+# ------------------------------------------------------------------ ui-gates: the same decision, a different path list -----------
+
+@pytest.mark.parametrize("path", [
+    "packages/herdr-web-client/app.js",
+    "tests/playwright/ui-gates-lib.mjs",
+    "tests/visual/baseline.png",
+    "docs/assets/screenshots/home.png",
+    "scripts/ci/ui-gates.sh",
+    "scripts/ci-pipeline-freshness.sh",
+    "package.json",
+    "package-lock.json",
+    "herdr_engineering/control_plane/server.py",
+    ".woodpecker/ui-gates.yml",              # the routing config
+    "scripts/ci/unit-gates-applicable.sh",   # the decision itself
+])
+def test_a_change_that_can_affect_the_ui_gates_runs_them(repo, path):
+    result = applicability(repo, change(repo, path), gate="ui")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "ui-gates applicability" in result.stdout and "running the" in result.stdout
+
+
+@pytest.mark.parametrize("path", [
+    "docs/operations/ci-gates.md",
+    "CHANGELOG.md",
+    "herdr_engineering/cli.py",                  # python outside control_plane: unit-gates' business, not the browser's
+    "tests/test_cli.py",
+    "scripts/ci/unit-gates.sh",
+    "docs/packages/notes.md",                    # contains a covered prefix; must not match on substring
+])
+def test_a_change_that_cannot_affect_the_ui_gates_is_skipped(repo, path):
+    result = applicability(repo, change(repo, path), gate="ui")
+    assert result.returncode == 3, (result.stdout, result.stderr)
+    assert "ui-gates applicability" in result.stdout and "skipping" in result.stdout
+
+
+def test_the_two_gates_decide_independently(repo):
+    sha = change(repo, "herdr_engineering/cli.py")
+    assert applicability(repo, sha).returncode == 0
+    assert applicability(repo, sha, gate="ui").returncode == 3
+
+
+def test_ui_gates_manual_and_push_events_always_run(repo):
+    sha = change(repo, "docs/whatever.md")
+    for event in ("manual", "push"):
+        assert applicability(repo, sha, event=event, gate="ui").returncode == 0
+
+
+@pytest.mark.parametrize("gate", ["unit", "ui"])
+@pytest.mark.parametrize("event", ["manual", "push"])
+def test_woodpecker_event_variable_manual_and_push_always_run(repo, gate, event):
+    """Woodpecker exports CI_PIPELINE_EVENT and no CI_EVENT; reading only CI_EVENT turned a manual run green without running."""
+    sha = change(repo, "docs/whatever.md")
+    result = applicability(repo, sha, event=event, gate=gate)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "always runs the suite" in result.stdout
+
+
+@pytest.mark.parametrize("gate", ["unit", "ui"])
+def test_woodpecker_event_variable_pull_request_can_still_skip(repo, gate):
+    result = applicability(repo, change(repo, "docs/whatever.md"), event="pull_request", gate=gate)
+    assert result.returncode == 3, (result.stdout, result.stderr)
+
+
+def test_legacy_ci_event_variable_is_still_honoured(repo):
+    sha = change(repo, "docs/whatever.md")
+    assert applicability(repo, sha, event="manual", gate="ui", event_var="CI_EVENT").returncode == 0
+
+
+@pytest.mark.parametrize("path", ["pyproject.toml", "scripts/ci/journal.sh", "scripts/ci/cache-trust.sh"])
+def test_ui_gates_dependencies_route_to_run(repo, path):
+    result = applicability(repo, change(repo, path), gate="ui")
+    assert result.returncode == 0, (result.stdout, result.stderr)
+
+
+def test_ui_gates_unresolvable_base_fails_open(repo):
+    result = applicability(repo, git(repo, "rev-parse", "HEAD"), base="origin/no-such-branch", gate="ui")
+    assert result.returncode == 0 and "fail open" in result.stderr
+
+
+def test_an_unknown_gate_is_an_error_not_a_skip(repo):
+    result = applicability(repo, git(repo, "rev-parse", "HEAD"), gate="nope")
+    assert result.returncode not in (0, 3)
+
+
+def test_ui_gates_is_no_longer_path_filtered():
+    """A filtered pipeline never reports, so ci/woodpecker/pr/ui-gates could never be required."""
+    triggers = yaml.safe_load(UI_GATES_YML)["when"]
+    assert [t for t in triggers if t.get("event") == "pull_request"]
+    assert [t for t in triggers if t.get("event") == "manual"], "a manual run must still run the gate"
+    offenders = [t for t in triggers if "path" in t or "include" in t]
+    assert not offenders, f"a path filter here re-creates the never-reports problem: {offenders}"
+
+
+def test_ui_gates_skip_is_reported_rather_than_silently_absent():
+    steps = {s["name"]: s for s in yaml.safe_load(UI_GATES_YML)["steps"]}
+    assert list(steps) == ["checkout", "freshness", "integrate-main", "applicability", "ui-gates"]
+    applicability_cmds = steps["applicability"]["commands"]
+    assert "rc=0; bash scripts/ci/unit-gates-applicable.sh ui || rc=$?" in applicability_cmds
+    # the marker is touched only on rc 3; any other non-zero rc fails the step instead of skipping
+    decision = next(c for c in applicability_cmds if c.startswith("if ["))
+    assert 'if [ "$rc" = 3 ]; then touch .ci-ui-gates-not-applicable;' in decision
+    assert 'elif [ "$rc" != 0 ]; then exit "$rc"; fi' in decision
+    assert [c for c in applicability_cmds if "touch" in c] == [decision]
+    gate_cmds = steps["ui-gates"]["commands"]
+    guard = next(c for c in gate_cmds if c.startswith("if ["))
+    assert gate_cmds.index(guard) < gate_cmds.index("bash scripts/ci/ui-gates.sh")
+    assert "[ -f .ci-ui-gates-not-applicable ]" in guard
+    assert "nothing to run" in guard and guard.rstrip().endswith("exit 0; fi")
+
+
+# ------------------------------------------------------------------ ui-gates: the covered list cannot drift from what the gate uses ----
+
+import re  # noqa: E402  (kept next to the tests that use it)
+
+
+def _ui_covered(path: str) -> bool:
+    """Ask the real script's own matcher, not a copy of its list."""
+    script = (
+        f'path="$1"; set -- ui; src="$(sed -n "/^gate=/,/^label=/p" {APPLICABLE})"; eval "$src"; path="$path"; '
+        f'eval "$(sed -n "/^herdr_covered_path()/,/^}}/p" {APPLICABLE})"; herdr_covered_path'
+    )
+    return subprocess.run(["bash", "-c", script, "x", path], capture_output=True).returncode == 0
+
+
+def _tracked(*patterns: str) -> list[str]:
+    out = subprocess.run(["git", "ls-files", "--", *patterns], cwd=ROOT, capture_output=True, text=True, check=True)
+    return [p for p in out.stdout.splitlines() if p]
+
+
+def test_ui_gate_covered_helper_agrees_with_the_script():
+    assert _ui_covered("packages/app.js") and not _ui_covered("CHANGELOG.md")
+
+
+def test_every_ui_source_tree_and_root_ui_config_is_covered():
+    """New UI sources (web client, static member/share pages, browser-test configs) must trigger the gate."""
+    must_cover = _tracked(
+        "packages", "tests/playwright", "tests/visual", "docs/assets/screenshots",
+        "herdr_artifact_host/member_static", "herdr_artifact_host/share_static", "schemas",
+        "playwright*.config.*", "eslint*.config.*", "tsconfig*.json", "package.json", "package-lock.json",
+    )
+    assert must_cover, "the tracked-file query found nothing; the test would pass vacuously"
+    missed = [p for p in must_cover if not _ui_covered(p)]
+    assert not missed, f"UI paths the gate ignores (add them to the `ui` list in unit-gates-applicable.sh): {missed[:10]}"
+
+
+def test_every_file_ui_gates_sh_runs_or_sources_is_covered():
+    script = (ROOT / "scripts" / "ci" / "ui-gates.sh").read_text()
+    sourced = [f"scripts/ci/{m}" for m in re.findall(r'\. "\$\(dirname "\$0"\)/([\w.-]+\.sh)"', script)]
+    assert sourced, "expected ui-gates.sh to source helper scripts"
+    pkg = (ROOT / "package.json").read_text()
+    referenced = re.findall(r"(?:tests|packages)/[\w./*!()-]+", pkg.split('"test:ui-gates"')[1].split("\n")[0])
+    referenced += re.findall(r"node (tests/[\w./-]+)", pkg)
+    missed = [p for p in sourced + referenced + ["scripts/ci/ui-gates.sh"] if not _ui_covered(p.split("*")[0].split("!")[0] or p)]
+    assert not missed, f"the gate runs these but a change to them would skip it: {missed}"
+
+
+def test_ui_gates_workflow_files_are_covered():
+    for path in (".woodpecker/ui-gates.yml", "scripts/ci/unit-gates-applicable.sh", "scripts/ci/ui-gates.sh"):
+        assert _ui_covered(path), path

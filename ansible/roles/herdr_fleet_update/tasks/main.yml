@@ -247,7 +247,7 @@
         scope: user
       become: false
       environment:
-        XDG_RUNTIME_DIR: "/run/user/{{ ansible_user_uid }}"
+        XDG_RUNTIME_DIR: "/run/user/{{ ansible_facts['user_uid'] }}"
       when:
         - fleet_update_restart_needed | bool
         - fleet_update_reason != 'agent restart deferred'
@@ -264,7 +264,7 @@
     # never installed) must not turn a successful update into "failed".
     - name: "Fleet update: Restart the fabric agent (macOS launchd)"
       ansible.builtin.command:
-        argv: [launchctl, kickstart, -k, "gui/{{ ansible_user_uid }}/com.herdr-engineering.fabric-agent"]
+        argv: [launchctl, kickstart, -k, "gui/{{ ansible_facts['user_uid'] }}/com.herdr-engineering.fabric-agent"]
       become: false
       register: fleet_update_kickstart
       changed_when: fleet_update_kickstart.rc == 0

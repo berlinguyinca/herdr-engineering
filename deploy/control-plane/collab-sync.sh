@@ -16,6 +16,7 @@
 # --share-host HOST (shares enabled): the edge presents this one certificate for the share host too, so a
 # certificate whose subjectAltName lacks HOST is refused (never copied to the edge; `once` and the timer exit
 # non-zero) and `cert-host` checks the staged copy. deploy.sh passes it and install writes it into the unit.
+# --member-host HOST (artifact host with member_host set): the same refusal for the member UI's own name.
 # Usage: collab-sync.sh once|install|renew-check|cert-host [--config SLICE] [--dir SYNC_DIR] [--data-dir DIR]
 #          [--cert-dir DIR] [--cert-src LIVE_DIR] [--acme-dir DIR] [--certbot BIN] [--cert-name NAME]
 # Unless --certbot is explicit, Certbot is read from the ACME directory's sibling DIR-venv.
@@ -23,7 +24,7 @@
 # which is what keeps the minute timer's run out of a deploy; without the flag this run would
 # see that lock and skip its own refresh. Never written into a unit.
 set -euo pipefail
-USAGE="usage: $0 once|install|renew-check|cert-host [--config SLICE] [--dir SYNC_DIR] [--data-dir DIR] [--cert-dir DIR] [--cert-src LIVE_DIR] [--acme-dir DIR] [--certbot BIN] [--cert-name NAME] [--share-host HOST] [--lock-held]"
+USAGE="usage: $0 once|install|renew-check|cert-host [--config SLICE] [--dir SYNC_DIR] [--data-dir DIR] [--cert-dir DIR] [--cert-src LIVE_DIR] [--acme-dir DIR] [--certbot BIN] [--cert-name NAME] [--share-host HOST] [--member-host HOST] [--lock-held]"
 ACTION="${1:-once}"; [ $# -gt 0 ] && shift
 CONFIG="$HOME/.config/herdr-engineering/collab/collab-config.json"
 FLEET="$HOME/.config/herdr-engineering/fleet/fleet-config.yaml"
@@ -36,6 +37,7 @@ CERT_SRC=""
 CERTBOT=""
 LOCK_HELD=0
 SHARE_HOST=""
+MEMBER_HOST=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --config) CONFIG="${2:?--config needs a value}"; shift 2 ;;
@@ -48,6 +50,7 @@ while [ $# -gt 0 ]; do
     --certbot) CERTBOT="${2:?--certbot needs a value}"; shift 2 ;;
     --cert-name) CERT_NAME="${2:?--cert-name needs a value}"; shift 2 ;;
     --share-host) SHARE_HOST="${2:?--share-host needs a value}"; shift 2 ;;
+    --member-host) MEMBER_HOST="${2:?--member-host needs a value}"; shift 2 ;;
     --lock-held) LOCK_HELD=1; shift ;;
     *) echo "$USAGE" >&2; exit 2 ;;
   esac
@@ -131,12 +134,17 @@ PY
 }
 
 check_cert_host() {   # <pem> <where>: the loud refusal
-  [ -z "$SHARE_HOST" ] && return 0
-  cert_covers_host "$1" "$SHARE_HOST" && return 0
-  echo "ERROR: the $2 certificate ($1) does not name the share host $SHARE_HOST in its subjectAltName;" \
-       "browsers would fail the TLS handshake. Run certbot --expand to add it (or fix the DNS-01 plugin for its zone)" \
-       "before deploying; the previous certificate stays in place." >&2
-  return 1
+  local kind host
+  for kind in share member; do
+    if [ "$kind" = share ]; then host="$SHARE_HOST"; else host="$MEMBER_HOST"; fi
+    [ -z "$host" ] && continue
+    cert_covers_host "$1" "$host" && continue
+    echo "ERROR: the $2 certificate ($1) does not name the $kind host $host in its subjectAltName;" \
+         "browsers would fail the TLS handshake. Run certbot --expand to add it (or fix the DNS-01 plugin for its zone)" \
+         "before deploying; the previous certificate stays in place." >&2
+    return 1
+  done
+  return 0
 }
 
 # Hand the edge ONLY its own certificate. Mounting certbot's whole config dir would give the
@@ -236,7 +244,7 @@ install_timer() {
 Description=Refresh collab Cognito membership and keys
 [Service]
 Type=oneshot
-ExecStart="$bin" once --config "$CONFIG" --dir "$DIR" --data-dir "$DATA_DIR" --cert-dir "$CERT_DIR" --cert-src "$CERT_SRC"${SHARE_HOST:+ --share-host "$SHARE_HOST"}
+ExecStart="$bin" once --config "$CONFIG" --dir "$DIR" --data-dir "$DATA_DIR" --cert-dir "$CERT_DIR" --cert-src "$CERT_SRC"${SHARE_HOST:+ --share-host "$SHARE_HOST"}${MEMBER_HOST:+ --member-host "$MEMBER_HOST"}
 UNIT
   cat > "$u/herdr-collab-sync.timer" <<UNIT
 [Unit]

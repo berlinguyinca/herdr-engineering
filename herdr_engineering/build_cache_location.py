@@ -5,13 +5,14 @@ import json
 import os
 import plistlib
 import re
-import shutil
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID
 
+from .disk_guard import measure
 from .errors import InvalidError
 
 
@@ -64,31 +65,45 @@ def parse_storage_tiers(value: object) -> tuple[StorageTier, ...]:
     return tuple(result)
 
 
-def mounted_volume(identity: str) -> Path | None:
+def volume_mount_from_plist(raw: bytes, identity: str) -> Path | None:
+    """The mount point named by a `diskutil info -plist` document, when it is this identity and writable."""
+    try:
+        info = plistlib.loads(raw)
+    except (ValueError, plistlib.InvalidFileException):
+        return None
+    if not isinstance(info, dict):
+        return None
+    mount = info.get("MountPoint")
+    if (str(info.get("VolumeUUID", "")).lower() != identity.lower()
+            or info.get("WritableVolume") is not True or not isinstance(mount, str)):
+        return None
+    return writable_mount(Path(mount))
+
+
+def writable_mount(path: Path) -> Path | None:
+    """``path`` when it is a mount point the user can write to."""
+    return path if path.is_mount() and os.access(path, os.W_OK) else None
+
+
+def mounted_volume(identity: str) -> Path | None:  # pragma: darwin-only
     """Resolve a mounted, writable macOS volume by identity, including renamed drives."""
     if sys.platform != "darwin":
         return None
     try:
         result = subprocess.run(["/usr/sbin/diskutil", "info", "-plist", identity],
                                 capture_output=True, timeout=3, check=False)
-        if result.returncode:
-            return None
-        info = plistlib.loads(result.stdout)
-        if not isinstance(info, dict):
-            return None
-        mount = info.get("MountPoint")
-        if (str(info.get("VolumeUUID", "")).lower() != identity.lower()
-                or info.get("WritableVolume") is not True or not isinstance(mount, str)):
-            return None
-        path = Path(mount)
-        return path if path.is_mount() and os.access(path, os.W_OK) else None
-    except (OSError, ValueError, plistlib.InvalidFileException, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError):
         return None
+    return None if result.returncode else volume_mount_from_plist(result.stdout, identity)
 
 
-def _candidate(tier: StorageTier, min_free_percent: float) -> StorageCandidate:
+VolumeResolver = Callable[[str], "Path | None"]
+
+
+def _candidate(tier: StorageTier, min_free_percent: float,
+               resolve_volume: VolumeResolver = mounted_volume) -> StorageCandidate:
     if tier.volume_uuid:
-        mount = mounted_volume(tier.volume_uuid)
+        mount = resolve_volume(tier.volume_uuid)
         if mount is None:
             return StorageCandidate(tier.name, None, "volume_unavailable")
         path = mount / tier.directory
@@ -110,8 +125,9 @@ def _candidate(tier: StorageTier, min_free_percent: float) -> StorageCandidate:
     try:
         if not os.access(probe, os.W_OK):
             return StorageCandidate(tier.name, None, "not_writable")
-        usage = shutil.disk_usage(probe)
-        if usage.total and 100 * usage.free / usage.total < min_free_percent:
+        # The one disk figure (df: reserved blocks are neither used nor available), shared with the guard and
+        # the cleanup, so "full" means the same thing in all three.
+        if 100 - measure(probe)[0] < min_free_percent:
             return StorageCandidate(tier.name, None, "low_free_disk")
     except OSError:
         return StorageCandidate(tier.name, None, "storage_unavailable")
@@ -129,13 +145,13 @@ def choose_storage(candidates: tuple[StorageCandidate, ...]) -> StorageSelection
 
 
 def select_storage(tiers: tuple[StorageTier, ...], default: Path,
-                   min_free_percent: float) -> StorageSelection:
+                   min_free_percent: float, *, resolve_volume: VolumeResolver = mounted_volume) -> StorageSelection:
     if not tiers:
         return StorageSelection("default", default)
     # Probe lazily: an available primary does not wait for absent lower tiers.
     skipped: list[str] = []
     for tier in tiers:
-        selected = choose_storage((_candidate(tier, min_free_percent),))
+        selected = choose_storage((_candidate(tier, min_free_percent, resolve_volume),))
         if selected.directory is not None:
             return StorageSelection(selected.name, selected.directory, tuple(skipped))
         skipped.extend(selected.skipped)

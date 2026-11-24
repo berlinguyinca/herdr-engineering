@@ -68,7 +68,7 @@ needs `herdr-memory` on PATH and a project config, and depends on the P01 contra
 
 ## Pin
 
-`lock/upstreams.yaml` pins `herdr-memory` at `d48b334b6236065aa188a696dc6e9095b04ca761` (client `0.1.8`, contract v1, private
+`lock/upstreams.yaml` pins `herdr-memory` at `eb1338a4067d4e17910a9f651fc7c08551f5b8a9` (client `0.1.10`, contract v1, private
 repo); the same value is `memory_install.PINNED_REVISION` and a test keeps them equal.
 `memory_install.PINNED_CLIENT_VERSION` is the release `herdr-memory --version` is expected to
 report. The installed manifest records the pin used. `scripts/install.sh --with-memory`

@@ -21,6 +21,7 @@ import queue
 import re
 import secrets
 import socket
+import sys
 import threading
 import time
 import traceback
@@ -211,6 +212,14 @@ class _DaemonThreadingServer(ThreadingHTTPServer):
             super().process_request_thread(request, client_address)
         finally:
             self._request_slots.release()
+
+    def handle_error(self, request, client_address):
+        # A client that resets or abandons its connection is routine (agents restart, proxies time out); the
+        # stdlib would print a full traceback to stderr each time. Real handler bugs keep their traceback.
+        if isinstance(sys.exc_info()[1], (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)):
+            log.debug("client %s went away: %s", client_address[0], type(sys.exc_info()[1]).__name__)
+            return
+        super().handle_error(request, client_address)
 
 
 class _DaemonThreadingServerV6(_DaemonThreadingServer):
@@ -2766,6 +2775,8 @@ def _make_handler(server, public=False, operator=False, fabric=False):
             except ValueError:
                 return self._deny(400, "bad length")
             headers = {k.lower(): v for k, v in self.headers.items()}
+            if len(self.headers.get_all("X-Forwarded-For") or []) > 1:
+                return self._deny(400, "ambiguous forwarded-for chain")   # never guess a client: a loopback proxy would win
             if length < 0 or length > server.rakazo.body_limit(self.path, headers):
                 self.close_connection = True              # the unread body would otherwise be parsed as the next request
                 return self._deny(413, "body too large")

@@ -147,7 +147,7 @@ def entries_from_rows(rows: list[dict]) -> list[dict]:
             "ts": stamp.isoformat() if isinstance(stamp, datetime) else stamp,
             "sensitive": bool(p.get("sensitive")), "redacted": bool(p.get("redacted")),
             "truncated": bool(p.get("truncated")), "size": 0,
-            "data": {k: v for k, v in p.items() if k not in _META},
+            "data": {k: v for k, v in p.items() if k not in _META and not k.startswith("_")},
             "history_id": r["event_id"],
         })
     return out

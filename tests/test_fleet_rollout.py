@@ -153,6 +153,9 @@ def apply(store, plan, wire):
                 assert remote[-2:] == ["api", "snapshot"]
                 reply = {"result": {"snapshot": {"agents": wire.native({"host": host})}}}
             return subprocess.CompletedProcess(argv, 0, json.dumps(reply), "")
+        if remote[0] == "env":
+            # The Host-equivalence probe is real git against a real release directory.
+            return subprocess.run(remote, capture_output=True, text=True, timeout=30)
         assert remote[0] == "node"
         root = remote[1].removesuffix("/scripts/pi-engineering.ts")
         if remote[3] == "list":
@@ -1467,7 +1470,9 @@ def test_dead_registration_is_retirable_and_is_not_reported_as_a_disagreement(tm
     store, plan = setup_rollout(tmp_path)
     wire = Wire()
     wire.offline.clear()
-    wire.rows["beast"]["reachable"] = False
+    # No row at all reports this conversation any more (an unreachable row would instead be
+    # classified as gone or transient, which is handled separately).
+    wire.rows["beast"]["descriptor"]["sessionId"] = "someone-else"
 
     result = apply(store, plan, wire)
     session = result["hosts"]["beast"]["sessions"]["beast-conversation"]
@@ -1746,3 +1751,787 @@ def test_retire_identityless_is_a_supported_command():
     assert args.rollout_command == "retire-identityless"
     assert args.id == "2a94fdcfa602409989400171a2cd46df"
     assert args.settled_by == "operator"
+
+
+# --- Host code equivalence -------------------------------------------------
+
+
+def _git(cwd, *args):
+    import subprocess
+
+    env = {
+        "PATH": __import__("os").environ["PATH"],
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_SYSTEM": "/dev/null",
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@example.com",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@example.com",
+    }
+    out = subprocess.run(
+        ["git", "-C", str(cwd), *args], capture_output=True, text=True, check=True, env=env
+    )
+    return out.stdout.strip()
+
+
+def _commit(repo, files, message):
+    for name, text in files.items():
+        path = repo / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", message)
+    return _git(repo, "rev-parse", "HEAD")
+
+
+PKG = {
+    "name": "p",
+    "scripts": {"test": "a"},
+    "devDependencies": {"x": "1"},
+    "dependencies": {"y": "1"},
+    "pi": {"extensions": ["./src/runtime/host/entry.ts"]},
+}
+
+
+class HostWorld:
+    """Real source repo plus the staged-release layout the Pi stager produces."""
+
+    def __init__(self, tmp_path, changes):
+        self.home = tmp_path / "home"
+        self.releases = self.home / ".local/share/herdr-engineering/pi/releases"
+        self.releases.mkdir(parents=True)
+        self.source = tmp_path / "source"
+        self.source.mkdir()
+        _git(self.source, "init", "-q")
+        base = {
+            "package.json": json.dumps(PKG),
+            "src/runtime/host/entry.ts": "export const a = 1;\n",
+            "src/runtime/other.ts": "export const b = 1;\n",
+        }
+        self.old = _commit(self.source, base, "old")
+        self.new = _commit(self.source, changes, "new")
+
+    def stage_release(self, commit, *, shallow):
+        """Mirror ansible/files/stage-release.py: a depth-1 clone of one commit."""
+        release = self.releases / commit
+        _git(release.parent, "init", "-q", str(release))
+        _git(release, "remote", "add", "origin", self.source.as_uri())
+        _git(release, "fetch", "-q", *(["--depth", "1"] if shallow else []), "origin", commit)
+        _git(release, "checkout", "-q", "--detach", "FETCH_HEAD")
+        return release
+
+
+def _host_result(tmp_path, changes, host_commit, *, stage_old=False, shallow=True):
+    from herdr_engineering.fleet_rollout import RolloutStore, create_rollout
+
+    world = HostWorld(tmp_path, changes)
+    release = world.stage_release(world.new, shallow=shallow)
+    if stage_old:
+        world.stage_release(world.old, shallow=shallow)
+    wire = Wire()
+    wire.offline = set()
+    revision = world.new
+    wire.stage = lambda rev, *, host, inventory: {
+        "ok": True,
+        "revision": rev,
+        "host": host,
+        "sourceRoot": str(release),
+    }
+    runtime = wire.rows["bender"]["reply"]["data"]["runtime"]
+    runtime["commit"] = revision
+    runtime["hostCommit"] = {"old": world.old, "new": world.new}.get(host_commit, host_commit)
+    wire.rows["bender"]["reply"]["data"]["missions"] = []
+    store = RolloutStore(tmp_path / "state")
+    plan = create_rollout(
+        store,
+        revision,
+        [{"host": "bender", "sshTarget": "bender", "port": 22, "local": False}],
+        inventory=tmp_path / "inventory.yml",
+    )
+    result = apply(store, plan, wire)
+    return world, result["hosts"]["bender"]["sessions"]["bender-conversation"]
+
+
+def test_host_commit_equal_to_release_is_current(tmp_path):
+    _, state = _host_result(tmp_path, {"src/runtime/other.ts": "x"}, "new")
+    assert state["status"] != "bootstrap_required"
+    assert "hostAcceptance" not in state
+
+
+def test_unchanged_host_files_are_accepted_by_code_equivalence(tmp_path):
+    world, state = _host_result(
+        tmp_path, {"src/runtime/other.ts": "export const b = 2;\n"}, "old", stage_old=True
+    )
+    assert state["status"] != "bootstrap_required"
+    assert state["hostAcceptance"]["mode"] == "code-equivalence"
+    assert state["hostAcceptance"]["hostCommit"] == world.old
+    assert state["hostAcceptance"]["revision"] == world.new
+
+
+def test_unchanged_host_files_accepted_when_both_commits_are_present(tmp_path):
+    world, state = _host_result(
+        tmp_path, {"src/runtime/other.ts": "export const b = 2;\n"}, "old", shallow=False
+    )
+    assert state["hostAcceptance"]["hostCommit"] == world.old
+
+
+@pytest.mark.parametrize("path", ["src/runtime/host/entry.ts", "package.json"])
+def test_changed_host_file_still_needs_bootstrap(tmp_path, path):
+    _, state = _host_result(tmp_path, {path: "{changed"}, "old", stage_old=True)
+    assert state["status"] == "bootstrap_required"
+    assert "hostAcceptance" not in state
+
+
+def test_unknown_host_commit_still_needs_bootstrap(tmp_path):
+    _, state = _host_result(tmp_path, {"src/runtime/other.ts": "x"}, "c" * 40)
+    assert state["status"] == "bootstrap_required"
+
+
+def test_unreachable_old_commit_in_shallow_release_still_needs_bootstrap(tmp_path):
+    _, state = _host_result(tmp_path, {"src/runtime/other.ts": "x"}, "old")
+    assert state["status"] == "bootstrap_required"
+
+
+def test_release_without_git_still_needs_bootstrap(tmp_path):
+    import shutil
+
+    from herdr_engineering.fleet_rollout import PiTransport
+
+    world = HostWorld(tmp_path, {"src/runtime/other.ts": "x"})
+    release = world.stage_release(world.new, shallow=False)
+    shutil.rmtree(release / ".git")
+    target = {"host": "bender", "sshTarget": "bender", "port": 22, "local": True}
+    assert PiTransport().host_code_unchanged(target, str(release), world.old, world.new) is None
+
+
+def test_ambient_git_dir_cannot_redirect_the_probe(tmp_path, monkeypatch):
+    from herdr_engineering.fleet_rollout import PiTransport
+
+    world = HostWorld(tmp_path, {"src/runtime/host/entry.ts": "changed"})
+    release = world.stage_release(world.new, shallow=False)
+    monkeypatch.setenv("GIT_DIR", str(world.source / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(tmp_path))
+    target = {"host": "bender", "sshTarget": "bender", "port": 22, "local": True}
+    assert PiTransport().host_code_unchanged(target, str(release), world.old, world.new) is False
+
+
+def _pkg(**changes):
+    return {"package.json": json.dumps({**PKG, **changes})}
+
+
+@pytest.mark.parametrize(
+    "changes", [{"scripts": {"test": "b", "test:coverage": "c"}}, {"devDependencies": {"x": "2"}}]
+)
+def test_package_json_ignored_keys_are_accepted(tmp_path, changes):
+    world, state = _host_result(tmp_path, _pkg(**changes), "old", stage_old=True)
+    assert state["status"] != "bootstrap_required"
+    assert state["hostAcceptance"]["hostCommit"] == world.old
+    assert state["hostAcceptance"]["packageJsonIgnoredKeys"] == ["devDependencies", "scripts"]
+
+
+@pytest.mark.parametrize(
+    "changes", [{"pi": {"extensions": ["./other.ts"]}}, {"dependencies": {"y": "2"}}]
+)
+def test_package_json_other_keys_need_bootstrap(tmp_path, changes):
+    _, state = _host_result(tmp_path, _pkg(**changes), "old", stage_old=True)
+    assert state["status"] == "bootstrap_required"
+
+
+def test_invalid_package_json_on_one_side_needs_bootstrap(tmp_path):
+    _, state = _host_result(tmp_path, {"package.json": "{not json"}, "old", stage_old=True)
+    assert state["status"] == "bootstrap_required"
+
+
+class LoadedHostWire(Wire):
+    """bender's list misses replies like a loaded host: the first `misses` lists are unreachable."""
+
+    def __init__(self, *, misses=0, error="session_unresponsive"):
+        super().__init__()
+        self.offline.clear()
+        self.misses = misses
+        self.error = error
+        self.lists = 0
+        self.duplicate = False
+
+    def sessions(self, target, root):
+        rows = super().sessions(target, root)
+        if target["host"] != "bender":
+            return rows
+        self.lists += 1
+        if self.lists <= self.misses:
+            return [
+                {
+                    "descriptor": copy.deepcopy(rows[0]["descriptor"]),
+                    "reachable": False,
+                    "error": self.error,
+                }
+            ]
+        if self.duplicate:
+            rows.append(copy.deepcopy(rows[0]))
+        return rows
+
+
+@pytest.fixture
+def no_backoff(monkeypatch):
+    monkeypatch.setattr("herdr_engineering.fleet_rollout._UNREACHABLE_BACKOFF_SECONDS", (0, 0))
+
+
+def _bender(report):
+    return report["hosts"]["bender"]["sessions"]["bender-conversation"]
+
+
+def test_transient_unresponsive_row_keeps_a_complete_session_complete(tmp_path, no_backoff):
+    store, plan = setup_rollout(tmp_path)
+    wire = LoadedHostWire()
+    mission = wire.rows["bender"]["reply"]["data"]["missions"][0]
+    mission.update(status="COMPLETE", resumeEligible=False)
+    done = apply(store, plan, wire)
+    assert _bender(done)["status"] == "complete"
+    wire.misses = wire.lists + 100
+    after = apply(store, plan, wire)
+    session = _bender(after)
+    assert session["status"] == "complete"
+    assert session["lastUnreachableAt"]
+    assert "session_unresponsive" in session["note"]
+    assert "error" not in session
+    assert after["hosts"]["bender"]["status"] == "complete"
+
+
+def test_transiently_unreachable_pending_session_is_not_blocked(tmp_path, no_backoff):
+    store, plan = setup_rollout(tmp_path)
+    wire = LoadedHostWire(misses=100, error="timeout")
+    report = apply(store, plan, wire)
+    session = _bender(report)
+    assert session["status"] == "pending"
+    assert session["lastUnreachableAt"]
+    assert report["hosts"]["bender"]["status"] == "pending"
+    assert "error" not in report["hosts"]["bender"]
+    wire.misses = 0
+    recovered = apply(store, plan, wire)
+    assert _bender(recovered)["status"] == "awaiting_progress"
+
+
+def test_two_reachable_rows_for_one_session_stay_blocked(tmp_path, no_backoff):
+    store, plan = setup_rollout(tmp_path)
+    wire = LoadedHostWire()
+    wire.duplicate = True
+    report = apply(store, plan, wire)
+    assert _bender(report)["status"] == "blocked"
+    assert "ambiguous" in _bender(report)["error"]
+    assert report["hosts"]["bender"]["status"] == "blocked"
+
+
+def test_in_pass_retry_recovers_when_the_second_list_succeeds(tmp_path):
+    store, plan = setup_rollout(tmp_path)
+    wire = LoadedHostWire(misses=1)
+    report = apply(store, plan, wire)
+    session = _bender(report)
+    assert session["status"] == "awaiting_progress"
+    assert "lastUnreachableAt" not in session
+    assert wire.lists >= 2
+
+
+def test_all_process_gone_rows_end_the_session_without_counting_a_success(tmp_path, no_backoff):
+    store, plan = setup_rollout(tmp_path)
+    wire = LoadedHostWire(misses=100, error="session_process_gone")
+    report = apply(store, plan, wire)
+    session = _bender(report)
+    assert session["status"] == "ended"
+    assert session["endedAt"]
+    assert "error" not in session
+    assert report["hosts"]["bender"]["endedSessions"] == ["bender-conversation"]
+    assert report["hosts"]["bender"]["status"] != "blocked"
+    assert not [m for m in wire.mutations if m[0] == "bender"]
+    # The same conversation answering again is picked back up.
+    wire.misses = 0
+    back = apply(store, plan, wire)
+    assert _bender(back)["status"] == "awaiting_progress"
+
+
+class VanishingWire(Wire):
+    """beast's second session leaves the native inventory; its rows may report an error."""
+
+    def __init__(self, error=None):
+        super().__init__()
+        self.offline.clear()
+        self.error = error
+        self.present = True
+
+    def native(self, target):
+        rows = super().native(target)
+        if target["host"] == "beast" and self.present:
+            rows.append(
+                {
+                    "agent": "pi",
+                    "terminal_id": "terminal-2",
+                    "agent_session": {"value": "second-conversation"},
+                    "session": "main",
+                }
+            )
+        return rows
+
+    def sessions(self, target, root):
+        rows = super().sessions(target, root)
+        if target["host"] == "beast":
+            second = copy.deepcopy(rows[0])
+            second["descriptor"].update(sessionId="second-conversation", pid=43)
+            if self.present:
+                rows.append(second)
+            elif self.error:
+                second.update(reachable=False, error=self.error)
+                second.pop("reply")
+                rows.append(second)
+        return rows
+
+
+@pytest.mark.parametrize("error", ["session_process_gone", None])
+def test_session_that_left_the_native_inventory_has_ended(tmp_path, no_backoff, error):
+    store, plan = setup_rollout(tmp_path)
+    wire = VanishingWire(error)
+    first = apply(store, plan, wire)
+    assert first["hosts"]["beast"]["sessions"]["second-conversation"]["status"] != "ended"
+    wire.present = False
+    after = apply(store, plan, wire)
+    beast = after["hosts"]["beast"]
+    assert beast["sessions"]["second-conversation"]["status"] == "ended"
+    assert beast["endedSessions"] == ["second-conversation"]
+    assert not any("missing from native" in e["error"] for e in beast["coverageErrors"])
+    assert "hostLevelError" not in beast
+
+
+class ExitedButListedWire(VanishingWire):
+    """The process exits but its terminal stays in the native inventory."""
+
+    def native(self, target):
+        present, self.present = self.present, True
+        try:
+            return super().native(target)
+        finally:
+            self.present = present
+
+
+@pytest.mark.parametrize("wire_type", [VanishingWire, ExitedButListedWire])
+def test_later_passes_keep_an_ended_sessions_history(tmp_path, no_backoff, wire_type):
+    store, plan = setup_rollout(tmp_path)
+    wire = wire_type("session_process_gone")
+    before = apply(store, plan, wire)["hosts"]["beast"]["sessions"]["second-conversation"]
+    wire.present = False
+    ended = apply(store, plan, wire)["hosts"]["beast"]["sessions"]["second-conversation"]
+    again = apply(store, plan, wire)["hosts"]["beast"]["sessions"]["second-conversation"]
+    assert again["status"] == "ended"
+    assert again["lastStatus"] == before["status"] != "ended"
+    assert again["endedAt"] == ended["endedAt"]
+
+
+def test_unresponsive_session_missing_from_native_is_not_an_error(tmp_path, no_backoff):
+    store, plan = setup_rollout(tmp_path)
+    wire = VanishingWire("session_unresponsive")
+    before = apply(store, plan, wire)["hosts"]["beast"]["sessions"]["second-conversation"]
+    wire.present = False
+    beast = apply(store, plan, wire)["hosts"]["beast"]
+    session = beast["sessions"]["second-conversation"]
+    assert session["status"] == before["status"]
+    assert session["lastUnreachableAt"]
+    assert "hostLevelError" not in beast
+
+
+@pytest.mark.parametrize("new_pid", [43, 42])
+def test_revived_session_restarts_maintenance_instead_of_reusing_old_receipts(
+    tmp_path, no_backoff, new_pid
+):
+    store, plan = setup_rollout(tmp_path)
+    wire = LoadedHostWire()
+    first = apply(store, plan, wire)
+    old = _bender(first)
+    assert old["prepared"] is True and old["loaded"]["commit"] == SHA
+    old_operations = copy.deepcopy(old["operations"])
+    assert wire.rows["bender"]["descriptor"]["instanceId"] == "bender-instance-new"
+
+    wire.misses, wire.error = wire.lists + 100, "session_process_gone"
+    ended = _bender(apply(store, plan, wire))
+    assert ended["status"] == "ended"
+
+    # The same conversation resumes in a new process still on the old runtime commit.
+    wire.misses = 0
+    wire.rows["bender"] = wire.row("bender")
+    wire.rows["bender"]["descriptor"].update(pid=new_pid, instanceId="bender-instance-b")
+    calls_before = len(wire.calls)
+    revived = _bender(apply(store, plan, wire))
+
+    new_calls = wire.calls[calls_before:]
+    assert [c["action"] for c in new_calls if c["action"] in ("prepare", "reload")] == [
+        "prepare",
+        "reload",
+    ]
+    old_ids = {op["request"]["operationId"] for op in old_operations.values()}
+    assert not {c["operationId"] for c in new_calls} & old_ids
+    assert {op["request"]["operationId"] for op in revived["operations"].values()}.isdisjoint(
+        old_ids
+    )
+    assert revived["pid"] == new_pid
+    assert revived["loaded"]["commit"] == SHA
+    assert wire.rows["bender"]["reply"]["data"]["runtime"]["commit"] == SHA
+    assert revived["previousIncarnations"] == [
+        {
+            "pid": 42,
+            "instanceId": "bender-instance-new",
+            "endedAt": ended["endedAt"],
+            "lastStatus": old["status"],
+        }
+    ]
+
+
+# --- #844: convergence -------------------------------------------------------
+
+
+def test_interactive_busy_resume_skip_retries_next_pass(tmp_path):
+    """A busy interactive session is a not-yet, not an operator blocker: the next pass
+    re-issues the resume with a fresh operation instead of parking the rollout blocked."""
+    store, plan = setup_rollout(tmp_path)
+    wire = Wire()
+    original = wire.maintenance
+    attempts = []
+
+    def interactive_busy_once(target, root, instance, request):
+        if request["action"] == "resume":
+            attempts.append(request["operationId"])
+            if len(attempts) == 1:
+                return {
+                    "maintenance": {
+                        "operationId": request["operationId"],
+                        "action": "resume",
+                        "status": "skipped",
+                        "result": {
+                            "status": "skipped",
+                            "code": "INTERACTIVE_BUSY",
+                            "reason": "interactive session is busy or idle state is unknown",
+                            "missionId": "M1",
+                        },
+                    }
+                }
+        return original(target, root, instance, request)
+
+    wire.maintenance = interactive_busy_once
+    first = apply(store, plan, wire)
+    state = first["hosts"]["bender"]["sessions"]["bender-conversation"]
+    assert state["status"] in ("pending", "awaiting_progress")
+    assert state["status"] != "blocked"
+    second = apply(store, plan, wire)
+    assert len(attempts) == 2 and attempts[0] != attempts[1]
+    assert (
+        second["hosts"]["bender"]["sessions"]["bender-conversation"]["status"]
+        == "awaiting_progress"
+    )
+
+
+def test_bootstrap_required_records_operator_next_step(tmp_path):
+    store, plan = setup_rollout(tmp_path)
+    wire = Wire()
+    wire.rows["bender"]["reply"]["data"]["runtime"]["hostCommit"] = "b" * 40
+    result = apply(store, plan, wire)
+    state = result["hosts"]["bender"]["sessions"]["bender-conversation"]
+    assert state["status"] == "bootstrap_required"
+    next_step = state.get("nextStep", "")
+    assert "bender" in next_step
+    assert SHA in next_step
+    # The next step survives in durable state, not just in the report.
+    reread = store.read(plan["id"])
+    assert (
+        reread["hosts"]["bender"]["sessions"]["bender-conversation"]["nextStep"] == next_step
+    )
+
+
+def _make_plan(store, revision, *, status, created_at, hosts=("bender",)):
+    from herdr_engineering.fleet_rollout import create_rollout
+
+    plan = create_rollout(
+        store,
+        revision,
+        [{"host": h, "sshTarget": h, "port": 22, "local": False} for h in hosts],
+        inventory=store.root.parent / "inventory.yml",
+    )
+    if status != "planned" or created_at:
+        plan = store.read(plan["id"])
+        plan["status"] = status
+        if created_at:
+            plan["createdAt"] = created_at
+        store.write(plan)
+    return plan
+
+
+def test_latest_unfinished_prefers_newest_and_skips_settled(tmp_path):
+    from herdr_engineering.fleet_rollout import RolloutStore, latest_unfinished, list_rollouts
+
+    store = RolloutStore(tmp_path / "state")
+    assert latest_unfinished(store) is None  # no state directory at all
+    rev_a = "1" * 40
+    rev_b = "2" * 40
+    old_complete = _make_plan(store, rev_a, status="complete", created_at="2026-11-01T00:00:00+00:00")
+    old_abandoned = _make_plan(store, rev_a, status="abandoned", created_at="2026-11-05T00:00:00+00:00")
+    newer = _make_plan(store, rev_b, status="pending", created_at="2026-11-10T00:00:00+00:00")
+    assert latest_unfinished(store)["id"] == newer["id"]
+    other = _make_plan(store, store.read(newer["id"])["revision"], status="abandoned",
+                       created_at="2026-11-11T00:00:00+00:00")
+    assert latest_unfinished(store)["id"] == newer["id"]
+    plan = store.read(newer["id"])
+    plan["status"] = "complete"
+    store.write(plan)
+    assert latest_unfinished(store) is None
+    assert {old_complete["id"], old_abandoned["id"], newer["id"], other["id"]} == {
+        p["id"] for p in list_rollouts(store)
+    }
+
+
+def test_latest_unfinished_tie_breaks_deterministically_and_fails_closed(tmp_path):
+    from herdr_engineering.fleet_rollout import RolloutStore, latest_unfinished
+
+    store = RolloutStore(tmp_path / "state")
+    a = _make_plan(store, "3" * 40, status="planned", created_at="2026-11-10T00:00:00+00:00")
+    b = _make_plan(store, "4" * 40, status="planned", created_at="2026-11-10T00:00:00+00:00")
+    first = latest_unfinished(store)
+    second = latest_unfinished(store)
+    assert first["id"] == second["id"]
+    assert first["id"] == max(a["id"], b["id"])
+    (store.root / ("f" * 32 + ".json")).write_text("not json")
+    try:
+        with pytest.raises(ValueError):
+            latest_unfinished(store)
+    finally:
+        (store.root / ("f" * 32 + ".json")).unlink()
+
+
+def test_pin_roundtrip_env_override_and_rejects_bad_values(tmp_path, monkeypatch):
+    from herdr_engineering.fleet_rollout import read_pin, write_pin
+
+    monkeypatch.delenv("HERDR_PI_ROLLOUT_REVISION", raising=False)
+    pin = tmp_path / "pin"
+    assert read_pin(pin) is None
+    write_pin(SHA, pin)
+    assert read_pin(pin) == SHA
+    assert (pin).stat().st_mode & 0o777 == 0o600
+    for bad in ("abc", "B" * 40, SHA + "0"):
+        with pytest.raises(ValueError):
+            write_pin(bad, pin)
+        assert read_pin(pin) == SHA  # a rejected write never clobbers the pin
+        pin.write_text(bad + "\n")
+        with pytest.raises(ValueError):
+            read_pin(pin)  # an invalid on-disk pin fails closed too
+        write_pin(SHA, pin)
+    other = "5" * 40
+    write_pin(other, pin)
+    monkeypatch.setenv("HERDR_PI_ROLLOUT_REVISION", SHA)
+    assert read_pin(pin) == SHA  # the env pin outranks the file
+    monkeypatch.setenv("HERDR_PI_ROLLOUT_REVISION", "not-a-sha")
+    try:
+        with pytest.raises(ValueError):
+            read_pin(pin)
+    finally:
+        monkeypatch.delenv("HERDR_PI_ROLLOUT_REVISION")
+    assert read_pin(pin) == other
+
+
+def test_resolve_plan_revision_prefers_explicit_then_pin(tmp_path, monkeypatch):
+    from herdr_engineering.fleet_rollout import resolve_plan_revision
+
+    monkeypatch.delenv("HERDR_PI_ROLLOUT_REVISION", raising=False)
+    pin = tmp_path / "pin"
+    with pytest.raises(ValueError, match="pi-rollout-revision"):
+        resolve_plan_revision(None, pin)
+    other = "6" * 40
+    write = __import__("herdr_engineering.fleet_rollout", fromlist=["write_pin"]).write_pin
+    write(other, pin)
+    assert resolve_plan_revision(None, pin) == other
+    assert resolve_plan_revision(SHA, pin) == SHA
+    monkeypatch.setenv("HERDR_PI_ROLLOUT_REVISION", "7" * 40)
+    assert resolve_plan_revision(None, pin) == "7" * 40
+    with pytest.raises(ValueError, match="40-character commit SHA"):
+        resolve_plan_revision("bad", pin)
+
+
+def test_abandon_settles_and_complete_cannot_be_abandoned(tmp_path):
+    from herdr_engineering.fleet_rollout import RolloutStore, abandon_rollout, latest_unfinished
+
+    store = RolloutStore(tmp_path / "state")
+    plan = _make_plan(store, "8" * 40, status="pending", created_at="2026-11-01T00:00:00+00:00")
+    abandoned = abandon_rollout(store, plan["id"], reason="superseded by pinned revision")
+    assert abandoned["status"] == "abandoned"
+    assert abandoned["abandonReason"] == "superseded by pinned revision"
+    assert "abandonedAt" in abandoned
+    assert latest_unfinished(store) is None
+    with pytest.raises(ValueError):
+        abandon_rollout(store, plan["id"])
+    done = _make_plan(store, "9" * 40, status="complete", created_at="2026-11-02T00:00:00+00:00")
+    with pytest.raises(ValueError):
+        abandon_rollout(store, done["id"])
+
+
+def test_apply_and_run_refuse_an_abandoned_plan(tmp_path):
+    """An abandoned plan is settled; reconciling it would silently un-abandon it."""
+    from herdr_engineering.fleet_rollout import (
+        RolloutStore,
+        abandon_rollout,
+        apply_rollout,
+        run_rollout,
+    )
+
+    store = RolloutStore(tmp_path / "state")
+    plan = _make_plan(store, "8" * 40, status="pending", created_at="2026-11-01T00:00:00+00:00")
+    abandon_rollout(store, plan["id"], reason="superseded")
+    with pytest.raises(ValueError, match="abandoned"):
+        apply_rollout(store, plan["id"])
+    with pytest.raises(ValueError, match="abandoned"):
+        run_rollout(store, plan["id"], max_passes=1)
+    assert store.read(plan["id"])["status"] == "abandoned"  # still settled, never reopened
+
+
+def test_prune_judges_abandoned_plans_by_abandoned_time(tmp_path):
+    """A freshly abandoned but old plan keeps its audit window; abandonedAt wins (#844)."""
+    from datetime import UTC, datetime
+
+    from herdr_engineering.fleet_rollout import (
+        RolloutStore,
+        abandon_rollout,
+        list_rollouts,
+        prune_settled,
+    )
+
+    store = RolloutStore(tmp_path / "state")
+    plan = _make_plan(store, "8" * 40, status="pending", created_at="2026-09-01T00:00:00+00:00")
+    # Abandoned today, even though created two months ago.
+    abandon_rollout(store, plan["id"], reason="superseded")
+    settled = store.read(plan["id"])
+    settled["abandonedAt"] = "2026-11-16T00:00:00+00:00"
+    store.write(settled)
+    pruned = prune_settled(store, older_than_days=30, now=datetime(2026, 11, 17, tzinfo=UTC))
+    assert pruned == []  # abandonedAt is within the horizon, so the record stays
+    assert {p["id"] for p in list_rollouts(store)} == {plan["id"]}
+    # Past the horizon measured from abandonedAt, it is finally pruned.
+    pruned = prune_settled(store, older_than_days=30, now=datetime(2026, 12, 20, tzinfo=UTC))
+    assert [p["id"] for p in pruned] == [plan["id"]]
+    assert list_rollouts(store) == []
+
+
+def test_prune_settled_deletes_only_old_settled_records(tmp_path):
+    from herdr_engineering.fleet_rollout import RolloutStore, list_rollouts, prune_settled
+
+    store = RolloutStore(tmp_path / "state")
+    old_complete = _make_plan(store, "a" * 39 + "b", status="complete",
+                              created_at="2026-10-01T00:00:00+00:00")
+    recent_complete = _make_plan(store, "a" * 39 + "c", status="complete",
+                                 created_at="2026-11-15T00:00:00+00:00")
+    old_pending = _make_plan(store, "a" * 39 + "d", status="pending",
+                             created_at="2026-10-01T00:00:00+00:00")
+    # A recently passed runner keeps an old plan alive.
+    old_runner = _make_plan(store, "a" * 39 + "e", status="complete",
+                            created_at="2026-10-01T00:00:00+00:00")
+    plan = store.read(old_runner["id"])
+    plan["runner"] = {"status": "complete", "lastPassAt": "2026-11-16T00:00:00+00:00"}
+    store.write(plan)
+    from datetime import UTC, datetime
+
+    pruned = prune_settled(store, older_than_days=30, now=datetime(2026, 11, 17, tzinfo=UTC))
+    assert [p["id"] for p in pruned] == [old_complete["id"]]
+    remaining = {p["id"] for p in list_rollouts(store)}
+    assert remaining == {recent_complete["id"], old_pending["id"], old_runner["id"]}
+    assert not (store.root / (old_complete["id"] + ".json")).exists()
+
+
+def test_rollout_convergence_commands_are_registered():
+    from herdr_engineering.cli import _build_parser
+
+    parser = _build_parser()
+    assert parser.parse_args(["fleet", "rollout", "latest"]).rollout_command == "latest"
+    assert parser.parse_args(["fleet", "rollout", "abandon", "--id", "1" * 32]).rollout_command == "abandon"
+    assert parser.parse_args(["fleet", "rollout", "prune", "--older-than-days", "7"]).older_than_days == 7
+    # --pi-revision is optional: the pin is the fallback target.
+    assert parser.parse_args(["fleet", "rollout", "plan"]).pi_revision is None
+
+
+def test_rollout_convergence_handlers_are_wired(tmp_path, monkeypatch, capsys):
+    """The new subcommands must reach their functions, not fall through to store.read (#844).
+
+    Parsing alone proved nothing: the handler dispatched only plan/apply/run and sent
+    latest/abandon/prune to `store.read(args.id)`, which crashed or no-op'd.
+    """
+    import json as _json
+
+    from herdr_engineering.cli import _build_parser, _cmd_fleet_rollout
+    from herdr_engineering.fleet_rollout import RolloutStore
+
+    monkeypatch.delenv("HERDR_PI_ROLLOUT_REVISION", raising=False)
+    # Point HOME at a pin-less temp dir: read_pin() otherwise falls back to the real
+    # ~/.config/herdr-engineering/pi-rollout-revision, making the fail-closed plan
+    # assertion host-dependent (a pinned controller would plan and exit 0).
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    state = str(tmp_path / "state")
+    store = RolloutStore(tmp_path / "state")
+
+    def run(*argv):
+        code = _cmd_fleet_rollout(_build_parser().parse_args(["fleet", "rollout", *argv]))
+        return code, _json.loads(capsys.readouterr().out)
+
+    # latest: no unfinished rollout -> a clean "none" outcome, not an AttributeError.
+    code, out = run("latest", "--state", state)
+    assert code == 0 and out["status"] == "none"
+
+    # plan without --pi-revision and no pin -> fails closed with the pin hint, no traceback.
+    code, out = run("plan", "--state", state)
+    assert code == 1 and "pi-rollout-revision" in out["error"]
+
+    # A real unfinished plan is then found by latest, abandoned, and pruned.
+    plan = _make_plan(store, "3" * 40, status="pending",
+                      created_at="2026-10-01T00:00:00+00:00")
+    code, out = run("latest", "--state", state)
+    assert code == 0 and out["id"] == plan["id"]
+
+    code, out = run("abandon", "--id", plan["id"], "--reason", "superseded", "--state", state)
+    assert code == 0 and out["status"] == "abandoned" and out["abandonReason"] == "superseded"
+
+    code, out = run("latest", "--state", state)
+    assert code == 0 and out["status"] == "none"  # abandoned no longer counts as unfinished
+
+    # The horizon protects a freshly-abandoned record...
+    code, out = run("prune", "--older-than-days", "30", "--state", state)
+    assert code == 0 and out["pruned"] == []
+    # ...and the prune handler really deletes once past it (older-than-days 0).
+    code, out = run("prune", "--older-than-days", "0", "--state", state)
+    assert code == 0 and out["pruned"][0]["id"] == plan["id"]
+
+
+def test_prune_horizon_is_bounded(tmp_path):
+    """A negative horizon would delete every settled record; a huge one would overflow."""
+    from herdr_engineering.fleet_rollout import RolloutStore, prune_settled
+
+    store = RolloutStore(tmp_path / "state")
+    for bad in (-1, 3651, 10**9):
+        with pytest.raises(ValueError):
+            prune_settled(store, older_than_days=bad)
+
+
+def test_retire_identityless_refuses_abandoned_rollout(tmp_path):
+    """An abandoned rollout is settled; retiring identities must not reopen it."""
+    from herdr_engineering.fleet_rollout import RolloutStore, abandon_rollout, retire_identityless
+
+    store = RolloutStore(tmp_path / "state")
+    plan = _make_plan(store, "1" * 40, status="pending", created_at="2026-11-01T00:00:00+00:00")
+    abandon_rollout(store, plan["id"], reason="superseded")
+    with pytest.raises(ValueError, match="abandoned"):
+        retire_identityless(store, plan["id"])
+
+
+def test_apply_and_run_refuse_abandoned_rollouts(tmp_path):
+    """Abandoned means settled: no action entry point may silently reopen the rollout."""
+    from herdr_engineering.fleet_rollout import (
+        RolloutStore,
+        abandon_rollout,
+        apply_rollout,
+        run_rollout,
+    )
+
+    store = RolloutStore(tmp_path / "state")
+    plan = _make_plan(store, "1" * 40, status="pending", created_at="2026-11-01T00:00:00+00:00")
+    abandon_rollout(store, plan["id"], reason="superseded")
+    for action in (apply_rollout, run_rollout):
+        with pytest.raises(ValueError, match="abandoned"):
+            action(store, plan["id"])
+    assert store.read(plan["id"])["status"] == "abandoned"  # untouched

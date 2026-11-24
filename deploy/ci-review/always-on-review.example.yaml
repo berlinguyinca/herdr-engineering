@@ -5,11 +5,26 @@
 # DRY-RUN IS THE DEFAULT. Nothing is posted (no status, no comment) unless `post: true` below AND the command line
 # passes --post. A dry run still runs the reviewers and writes state_dir/reviews.jsonl.
 
-repos:                                   # example: what `poll` watches when no --repo is given
+repos:                                   # what `poll` watches when no --repo is given (enroll a repo = add a line)
   - berlinguyinca/herdr-engineering
+
+# Poll scope. Enrolling a repo NEVER backfills: the first poll of a repo records its enrollment time in state.json and
+# only PRs opened or updated AFTER it are reviewed; `backfill: true` restores the old "review every open PR" behavior.
+skip_archived: true                      # skip archived repos (default true)
+skip_forks: false                        # true: skip repos that are forks (default false)
+skip_drafts: true                        # skip draft PRs (default true)
+only_prs_updated_after: ""               # ISO date or time, e.g. "2026-11-17": PRs last updated before it are never polled
+backfill: false                          # true: ignore the enrollment time (only_prs_updated_after still applies)
+# max_comments_per_hour: 6               # optional rate cap on PR comments this tool posts (rolling hour, all repos).
+                                         # A capped comment is skipped with a log line; statuses are still posted.
 state_dir: ~/.local/state/herdr-review   # locks, state.json (cooldowns), reviews.jsonl (one line per review), worktrees/
 post: false                              # key 1 of 2 for posting; key 2 is the --post flag
-clone: ~/IdeaProjects/herdr-engineering  # a clone with `origin` = GitHub; claude/pi get a detached worktree of the PR head
+clone: ~/IdeaProjects/herdr-engineering  # a clone with `origin` = GitHub; claude/pi get a detached worktree of the PR head.
+                                         # Used only for the repo its origin names; any other repo reviewed by this config
+                                         # (per-PR Woodpecker runs, `poll` of several repos) gets its own clone:
+# clones:                                # optional explicit per-repo clones: [{repo: OWNER/NAME, path: DIR}]
+#   - {repo: berlinguyinca/other, path: ~/clones/other.git}
+# clone_url: https://github.com/{repo}.git   # otherwise a bare clone is made here under state_dir/clones/ on first use
 
 # By default tier 2 reviews a head without waiting for its checks. Set wait_for_green: true to restore the
 # green-only gate: tier 2 then runs only on a head whose gates are green on that exact SHA (commit status context
@@ -44,6 +59,27 @@ tiers:
     time_cap_s: 900
     comment: false                       # true: one marked PR comment when it blocks; with pi it is REFUSED unless
                                          # backends.pi.wrapper is set (pi has no file sandbox; see README)
+    # ENSEMBLE: a non-empty `reviewers` list replaces backend/model above. Every reviewer runs in parallel on each PR
+    # head (read-only: findings only, no status, no comment; `comment: true` is refused with reviewers). Their findings
+    # are deduped (same file, nearby line, similar title) and handed to tier 2, where Opus CONFIRMS or REJECTS each one
+    # with a one-line reason and may add its own. The one comment per head is posted by tier 2 (tier2.comment: true):
+    # confirmed findings, rejected ones collapsed in <details>, and which models found each. A reviewer that is down is
+    # recorded in that comment and skipped; it never fails the PR. If tier 1 finds nothing, Opus reviews as usual.
+    #   backend gateway: the gateway of backends.gateway (api key from models_file), model id as the gateway names it.
+    #   backend openai:  any OpenAI-compatible server (llama.cpp). base_url must be https, or http to loopback/tailnet.
+    #                    api_key_file: path to a file holding the key (never inline, never an env var); "" = no key.
+    #                    Requests to one base_url are serialized (flock), so a one-slot llama.cpp is safe.
+    # reviewers:
+    #   - {name: qwen, backend: gateway, model: qwen3.8-27b}
+    #   - name: muse
+    #     backend: openai
+    #     base_url: http://127.0.0.1:28931/v1   # deploy/ci-review/herdr-muse-serve.service
+    #     model: muse-glimmer-30b
+    #     api_key_file: ""                      # e.g. ~/.config/herdr-engineering/muse.key
+    #     max_tokens: 32000
+    #     temperature: 0.2
+    #     silence_timeout_s: 300                # no stream bytes for this long = reviewer down
+    #     time_cap_s: 900                       # whole review incl. waiting for the slot (0 = tier time_cap_s)
   tier2:                                 # the required check, only for mergeable heads
     enabled: true
     context: Opus agent review

@@ -1,0 +1,2 @@
+{"timestamp":"2026-11-13T21:45:34.285Z","ordinal":9,"type":"turn_context","payload":{"turn_id":"turn-1","root_turn_id":"turn-0","disabled_plugin_ids":[],"cwd":"redacted","approval_policy":"never","model":"gpt-6.1-sol","realtime_active":false,"cyber_access_program":"standard","effort":"low","summary":"none"}}
+{"timestamp":"2026-11-13T21:45:38.824Z","ordinal":17,"type":"event_msg","payload":{"type":"token_count","info":null}}

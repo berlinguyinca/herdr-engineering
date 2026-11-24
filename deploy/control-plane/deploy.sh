@@ -26,9 +26,14 @@
 #   3. renders the variables docker compose itself needs (images' passwords, ports,
 #      bind address) from the central file into a transient 0600 env file inside a
 #      0700 directory (`herdr-eng fleet config render-compose`), removed on exit
-#   4. recreates control-plane-web, control-plane-worker and llm-proxy on that one
-#      image tag (postgres, rustfs, coredns, gateway, herdr-web untouched) using the
-#      compose files from that same commit; the central file's DIRECTORY is
+#   4. recreates control-plane-web, control-plane-worker, llm-proxy, fabric-gateway and herdr-web
+#      on that one image tag (postgres, rustfs, coredns untouched) using the
+#      compose files from that same commit. Recreating fabric-gateway drops its in-memory
+#      port leases for the restart window; the fabric agents re-register them on their next
+#      keepalive (herdr_engineering/fabric_agent.py, _keepalive: a heartbeat for an unknown
+#      lease, or a failed one, re-registers the same target and lease id), so dev:<port> URLs
+#      return without operator action, but expect a short gap in every forwarded service.
+#      The central file's DIRECTORY is
 #      mounted read-only at /etc/herdr/fleet/ (a single-file mount would keep the old
 #      inode after a rename-replace, so edits would never reach the server).
 #      With the collaboration marker it also renders control_plane.collab (and only
@@ -549,9 +554,12 @@ if [ "$ARTIFACT_HOST" = 1 ] && [ "$COLLAB" = 0 ]; then
 fi
 if [ "$DRY" = 1 ]; then AH_DIR="$NEW_AH"; else AH_DIR="$HOME/.config/herdr-engineering/artifact-host"; fi
 AH_FILES=(public.json internal.json migrate.json db-admin-password roles.sql)
-AH_PUBLIC_HOST=""
+AH_PUBLIC_HOST=""; AH_MEMBER_HOST=""; SHARE_MEMBER_HOST=""
 [ "$ARTIFACT_HOST" = 1 ] && { AH_PUBLIC_HOST="$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["public_host"])' "$NEW_AH/public.json")" \
   && [ -n "$AH_PUBLIC_HOST" ] || { echo "cannot read the artifact host's public name from its rendered slice" >&2; exit 1; }; }
+# Optional own origin for the member web UI (control_plane.artifact_host.member_host): empty when unset.
+[ "$ARTIFACT_HOST" = 1 ] && { AH_MEMBER_HOST="$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1])).get("member_host", ""))' "$NEW_AH/public.json")" \
+  || { echo "cannot read the artifact host's member name from its rendered slice" >&2; exit 1; }; }
 # What the PREVIOUS deploy left running: the marker it wrote on success, else (older deploys) whether the project has
 # containers. A rollback restores THIS, not whatever the new configuration says.
 AH_STATE="$HOME/.config/herdr-engineering/artifact-host.state"
@@ -682,7 +690,7 @@ export HERDR_CP_WEB_EGRESS_CIDR="$MEMORY_PRIVATE_EGRESS_CIDR"
 export HERDR_CP_WEB_EGRESS_GENERATION="$WEB_EGRESS_GENERATION"
 # Every service of ours that runs the herdr-engineering image and reads the fleet
 # config: rolled forward (and back) together on one tag.
-APP_SERVICES=(control-plane-web control-plane-worker llm-proxy)
+APP_SERVICES=(control-plane-web control-plane-worker llm-proxy fabric-gateway herdr-web)
 
 if [ "$DRY" = 1 ]; then
   echo "[dry-run] rendered the compose variables to a 0600 file in a 0700 temp dir (removed on exit)"
@@ -1075,7 +1083,7 @@ healthy_commit() {
 container_of() {
   case "$1" in
     control-plane-web) echo herdr-cp-web ;; control-plane-worker) echo herdr-cp-worker ;;
-    llm-proxy) echo herdr-llm-proxy ;; collab-public) echo herdr-collab-public ;;
+    llm-proxy) echo herdr-llm-proxy ;; fabric-gateway) echo herdr-fabric-gateway ;; collab-public) echo herdr-collab-public ;;
     collab-edge) echo herdr-collab-edge ;; fabric-whois) echo herdr-collab-fabric-whois ;; share-public) echo herdr-share-public ;; *) echo "$1" ;;
   esac
 }
@@ -1209,7 +1217,7 @@ forward() {
   if [ "$COLLAB" = 1 ]; then
     install_private "$NEW_COLLAB" "$COLLAB_CONFIG" || return 1
     mkdir -p "$HERDR_COLLAB_DATA_DIR" && chmod 700 "$HERDR_COLLAB_DATA_DIR" || return 1
-    if [ "$FABRIC" = 1 ]; then   # the sidecar's socket directory: created before either container mounts it
+    if [ "$FABRIC" = 1 ]; then   # the sidecar's socket directory: created before any container mounts it (collab-public, control-plane-web)
       mkdir -p "$HERDR_COLLAB_FABRIC_WHOIS_DIR" && chmod 700 "$HERDR_COLLAB_FABRIC_WHOIS_DIR" || return 1
     fi
     # keys + membership files, the edge certificate, the 1-minute timer and the cert renew
@@ -1226,10 +1234,15 @@ forward() {
     local share_host=()
     if [ "$ARTIFACT_HOST" = 1 ]; then   # the artifact host's name is served with this same certificate: the same check
       share_host=(--share-host "$AH_PUBLIC_HOST")
+      [ -z "${AH_MEMBER_HOST:-}" ] || share_host+=(--member-host "$AH_MEMBER_HOST")   # the member UI's own name too
     elif [ "$SHARE" = 1 ]; then
       SHARE_HOST_NAME="$("$PY" -c 'import json,sys; from urllib.parse import urlsplit; print(urlsplit(json.load(open(sys.argv[1]))["sections"]["control_plane"]["values"]["share"]["public_url"]).hostname or "")' "$SHARE_CONFIG")" \
         && [ -n "$SHARE_HOST_NAME" ] || { echo "cannot read the share host from $SHARE_CONFIG" >&2; return 1; }
       share_host=(--share-host "$SHARE_HOST_NAME")
+      # Optional own origin for the member web UI on the share path (control_plane.share.member_host): the same cert check.
+      SHARE_MEMBER_HOST="$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["sections"]["control_plane"]["values"]["share"].get("member_host") or "")' "$SHARE_CONFIG")" \
+        || { echo "cannot read the share member host from $SHARE_CONFIG" >&2; return 1; }
+      [ -z "${SHARE_MEMBER_HOST:-}" ] || share_host+=(--member-host "$SHARE_MEMBER_HOST")
     fi
     "$WORK/deploy/control-plane/collab-sync.sh" install --config "$COLLAB_CONFIG" \
       --dir "$HERDR_COLLAB_SYNC_DIR" --data-dir "$HERDR_COLLAB_DATA_DIR" --cert-dir "$CERT_DIR_VALUE" \
@@ -1447,6 +1460,14 @@ if forward; then
     probe="$(curl -sS -m 10 -o /dev/null -w '%{http_code}' "https://$PROBE_HOST/s/probe/" 2>/dev/null || true)"
     [ "$probe" = 404 ] || echo "WARNING: probe of https://$PROBE_HOST/s/probe/ answered '${probe:-no response}', expected 404:" \
       "check DNS, the SNI route to the edge and the certificate for the host" >&2
+  fi
+  MPROBE_HOST="${AH_MEMBER_HOST:-}"
+  [ -n "$MPROBE_HOST" ] || MPROBE_HOST="${SHARE_MEMBER_HOST:-}"
+  if [ -n "$MPROBE_HOST" ]; then
+    # The member host serves no /s/: a bare 404 here proves DNS, the SNI route, the certificate and the server line up.
+    mprobe="$(curl -sS -m 10 -o /dev/null -w '%{http_code}' "https://$MPROBE_HOST/s/probe/" 2>/dev/null || true)"
+    [ "$mprobe" = 404 ] || echo "WARNING: probe of https://$MPROBE_HOST/s/probe/ answered '${mprobe:-no response}', expected 404:" \
+      "check DNS, the SNI route to the edge and the certificate for the member host" >&2
   fi
   if [ "$MEMORY" = 1 ]; then memory_phase || exit 4; fi
   exit 0

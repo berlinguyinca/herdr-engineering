@@ -1,0 +1,58 @@
+# Woodpecker CI (ci.metabolomics.us) -- the full unit gates on every push to `main`.
+#
+# Branch protection `strict` ("branch must be up to date") is turned off so PRs can merge back to back with `gh pr merge --auto
+# --squash`. In exchange: a PR pipeline proves "PR + current main" (scripts/ci/integrate-main.sh), and `main` gets its own full
+# suite run per push, here, so two PRs that were each green alone but break together are caught on main within one pipeline.
+#
+# Same steps, script and runner pool as unit-gates.yml (scripts/ci/unit-gates.sh, cluster hive-heavy) with three differences:
+#   - no integrate-main and no applicability step: main is tested exactly as pushed and is never "not applicable";
+#   - concurrency group `unit-gates-main` with limit 1: pushes queue instead of running side by side;
+#   - the freshness step (scripts/ci-pipeline-freshness.sh) compares CI_COMMIT_SHA with `git ls-remote origin refs/heads/main`. A
+#     run whose commit is no longer main's head prints "superseded by newer push", writes .ci-main-superseded and exits 0 (a red
+#     pipeline would raise a false "CI failed - main"); the unit-gates step then skips and never records green. The newer push's
+#     pipeline carries the verdict (see docs/ci-and-reviews.md).
+# A green run records its commit for the 4-hourly cron (main-cron.yml) so the cron does not prove the same commit twice.
+#
+# This context is deliberately NOT a required check; making it one is a separate admin step.
+when:
+  - event: push
+    branch: main
+
+concurrency:
+  limit: 1
+  group: unit-gates-main
+
+# The whole suite starts real HTTP services and PostgreSQL clusters: the dedicated 16-CPU/64-GiB Hive pool (see unit-gates.yml).
+labels:
+  cluster: hive-heavy
+
+skip_clone: true
+
+steps:
+  - name: checkout
+    image: bash
+    commands:
+      - 'set -eu'
+      - 'test -r /etc/woodpecker-git-credentials || { echo "the job staged no forge credential" >&2; exit 1; }'
+      - 'git init -q -b "${CI_COMMIT_BRANCH:-main}" .'
+      - 'git remote add origin "https://github.com/${CI_REPO}.git"'
+      - 'git fetch --no-tags origin "$CI_COMMIT_SHA"'      # full history: tests/test_deploy_scripts.py resolves older commits
+      - 'git checkout -q FETCH_HEAD'
+      - 'git --no-pager log --oneline -1'
+
+  # A superseded push is marked here (exit 0); unit-gates then skips.
+  - name: freshness
+    image: bash
+    commands:
+      - 'set -eu'
+      - 'bash scripts/ci-pipeline-freshness.sh'
+
+  - name: unit-gates
+    image: bash
+    commands:
+      - 'set -eu'
+      - 'if [ -f .ci-main-superseded ]; then echo "unit-gates: superseded by a newer push to main; nothing to run, nothing recorded"; exit 0; fi'
+      - 'bash scripts/ci/unit-gates.sh'
+      # Persistent shared CI store, mounted and named by the runner (as in main-cron.yml). $$ escapes Woodpecker substitution.
+      - 'export HERDR_CI_STATE="$${WPCI_CI_DIR:?the runner must export WPCI_CI_DIR}/state/herdr"'
+      - 'bash scripts/ci/main-cron-gates.sh --record-green'

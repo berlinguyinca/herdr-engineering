@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -106,25 +107,73 @@ def _run(ctx: Context, argv: list[str], *, cwd: str | Path | None = None, timeou
            "HERDR_FLEET_BEFORE_SHA": ctx.before_sha or "", "GIT_TERMINAL_PROMPT": "0", **(extra_env or {})}
     timeout = COMMAND_TIMEOUT_S if timeout is None else timeout
     ctx.note("$ " + shlex.join(argv))
+    proc: subprocess.Popen | None = None
     try:
-        proc = subprocess.Popen(argv, cwd=str(cwd) if cwd else tempfile.gettempdir(), env=env, text=True,
-                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                start_new_session=True)
+        _SIGNALS.spawning = True                   # a SIGTERM in the next lines is held until `proc` is bound
+        try:
+            proc = subprocess.Popen(argv, cwd=str(cwd) if cwd else tempfile.gettempdir(), env=env, text=True,
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    start_new_session=True)
+        finally:
+            _SIGNALS.spawning = False
+        if _SIGNALS.term_pending:                  # raised here, inside the try, with `proc` known: its group is killed
+            _exit_on_sigterm()
+        out, _ = proc.communicate(timeout=timeout)
     except OSError as exc:
+        if proc is not None:                       # the command runs but could not be read: never leave it behind
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            raise
+        if _SIGNALS.term_pending:                  # a SIGTERM held during the spawn must not be lost with the failure
+            _exit_on_sigterm()
         ctx.note(f"cannot start: {exc}")
         return 127, ""
-    try:
-        out, _ = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         with contextlib.suppress(ProcessLookupError):
             os.killpg(proc.pid, signal.SIGKILL)
-        out, _ = proc.communicate()
+        out, _ = proc.communicate()                # the group is dead; a SIGTERM here just leaves (143)
         ctx.note(f"timed out after {timeout}s")
         ctx.note(out or "")
         return 124, out or ""
+    except BaseException:                          # SIGTERM (see `terminate_on_sigterm`): the command is in ITS OWN session
+        if proc is not None:                       # (None: the signal came before the command existed)
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGKILL)
+        raise
     ctx.note(out or "")
     ctx.note(f"exit {proc.returncode}")
     return proc.returncode, out or ""
+
+
+class _Signals:
+    """SIGTERM bookkeeping for `terminate_on_sigterm`: whether a command is being spawned right now, and a SIGTERM
+    that arrived meanwhile. Raising between `Popen` returning and `proc` being bound would orphan the command."""
+
+    def __init__(self) -> None:
+        self.spawning = False
+        self.term_pending = False
+
+
+_SIGNALS = _Signals()
+
+
+def _exit_on_sigterm() -> None:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    sys.exit(143)
+
+
+def terminate_on_sigterm() -> None:
+    """Turn SIGTERM into SystemExit so `_run` kills the in-flight command's group (it runs in its own session, so a
+    signal to host-apply's group would never reach it). The watcher sends SIGTERM first, SIGKILL after a grace.
+    One-shot (a second SIGTERM is ignored while the group is being killed); during the spawn of a command the
+    SIGTERM is only recorded and `_run` raises it as soon as the command's handle exists."""
+    def stop(*_) -> None:
+        if _SIGNALS.spawning:
+            _SIGNALS.term_pending = True
+            return
+        _exit_on_sigterm()
+
+    signal.signal(signal.SIGTERM, stop)
 
 
 def _git(ctx: Context, root: Path, *args: str, timeout: float = GIT_TIMEOUT_S) -> tuple[int, str]:
@@ -135,6 +184,22 @@ def _git(ctx: Context, root: Path, *args: str, timeout: float = GIT_TIMEOUT_S) -
 def _override(ctx: Context, name: str) -> list[str] | None:
     value = ctx.env.get(f"HERDR_FLEET_{name}_CMD")
     return shlex.split(value) if value is not None else None
+
+
+def _resolve_binary(ctx: Context, name: str, stable_rel: tuple[str, ...]) -> str:
+    """The host's launcher for `name`: PATH (the ctx env), then the stable install location, then the bare name.
+
+    Service units and non-interactive ssh shells do not put the launcher's directory on PATH (the autospec
+    runtime keeps it in ~/.autospec/bin, pi in ~/.local/bin), so a bare name is not found there; the stable
+    path keeps the check working without a PATH entry. The bare name is the last resort so a truly missing
+    launcher still fails closed with a useful log line instead of a silent pass."""
+    found = shutil.which(name, path=ctx.env.get("PATH"))
+    if found:
+        return found
+    stable = ctx.home.joinpath(*stable_rel)
+    if stable.is_file() and os.access(stable, os.X_OK):
+        return str(stable)
+    return name
 
 
 # --------------------------------------------------------------------------- D6 gate
@@ -419,7 +484,9 @@ class Autospec:
                                   "--repo-dir", str(root)], cwd=root)
 
     def checks(self, ctx: Context) -> list[dict]:
-        smoke = _override(ctx, "AUTOSPEC_SMOKE") or ["autospec", "--version"]
+        # `doctor`, not `--version`: the autospec CLI has no --version flag (it exits 2), so the smoke could
+        # never pass; `doctor` is read-only, fast, and exits 0 on a working installation.
+        smoke = _override(ctx, "AUTOSPEC_SMOKE") or [_resolve_binary(ctx, "autospec", (".autospec", "bin", "autospec")), "doctor"]
         return [_check("generation_receipt", self.installed(ctx) == ctx.sha
                        or (self.past_target(ctx) and self.installed_past_target(ctx))),
                 _timed("version_smoke", lambda: _run(ctx, smoke, timeout=60)[0] == 0)]
@@ -432,6 +499,48 @@ class Autospec:
 
 
 # --------------------------------------------------------------------------- pi-engineering (D7)
+
+# #881: a release receipt must prove the content it names, not merely exist. The
+# digest contract matches ansible/files/stage-release.py (a standalone, stdlib-only
+# script pushed to hosts); it is duplicated here rather than imported because the two
+# live in different deployment units. sha256 over sorted relpath + NUL + bytes for
+# every git-tracked file -- the artifact a release name denotes is its tracked tree,
+# so install/build output (node_modules, setuptools build/ + *.egg-info, __pycache__)
+# is untracked and never enters the digest, keeping it deterministic across stagings.
+
+
+def _artifact_digest(release: Path) -> str:
+    listing = subprocess.run(["git", "-C", str(release), "ls-files", "-z"],
+                             check=True, capture_output=True, timeout=120).stdout
+    digest = hashlib.sha256()
+    for raw in sorted(part for part in listing.split(b"\x00") if part):
+        digest.update(raw)
+        digest.update(b"\x00")
+        digest.update((release / os.fsdecode(raw)).read_bytes())
+    return "sha256:" + digest.hexdigest()
+
+
+def receipt_status(release: Path, receipt: dict) -> str:
+    """Classify a staged release by content against its receipt: ``verified`` (digest
+    matches, or a recorded patch chain explains the difference), ``drift`` (content
+    changed with no ledger entry -- the 599c06d0 shape), or ``unknown`` (a pre-#881
+    receipt carries no digest, so it is neither trusted nor condemned)."""
+    recorded = receipt.get("artifactDigest")
+    if not recorded:
+        return "unknown"
+    current = _artifact_digest(release)
+    if current == recorded:
+        return "verified"
+    expected = recorded
+    patches = receipt.get("patches") or []
+    for patch in patches:
+        if patch.get("beforeDigest") != expected:
+            return "drift"
+        expected = patch.get("afterDigest")
+    if patches and expected == current:
+        return "verified"
+    return "drift"
+
 
 class Pi:
     def root(self, ctx: Context) -> Path:
@@ -448,8 +557,28 @@ class Pi:
     def complete(self, ctx: Context, sha: str) -> bool:
         root = self.root(ctx)
         release = root / "releases" / sha
-        return ((release / "package.json").is_file() and (release / "node_modules").is_dir()
-                and (root / "receipts" / f"{sha}.json").is_file())
+        receipt = root / "receipts" / f"{sha}.json"
+        if not ((release / "package.json").is_file() and (release / "node_modules").is_dir()
+                and receipt.is_file()):
+            return False
+        # Existence is not integrity (#881): a receipt that records a digest is checked
+        # against the on-disk content, so an in-place edit reads as incomplete, not clean.
+        # A pre-#881 receipt has no digest (unknown) and stays reusable. Any failure to
+        # read the receipt or hash the tree (unreadable JSON, a non-dict receipt, a file
+        # that vanished mid-walk, git missing) is a release we cannot attest: incomplete,
+        # never an exception out of converged()/apply()/checks().
+        try:
+            data = json.loads(receipt.read_text())
+            if not isinstance(data, dict):
+                raise ValueError("receipt is not an object")
+            status = receipt_status(release, data)
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            ctx.note(f"release {sha} receipt could not be verified: {type(exc).__name__}")
+            return False
+        if status == "drift":
+            ctx.note(f"release {sha} content does not match its receipt digest")
+            return False
+        return True
 
     def converged(self, ctx: Context) -> bool:
         return self.installed(ctx) == ctx.sha and self.complete(ctx, ctx.sha)
@@ -504,7 +633,7 @@ class Pi:
         self.prune(ctx, {before} if before else set())
 
     def checks(self, ctx: Context) -> list[dict]:
-        smoke = _override(ctx, "PI_SMOKE") or ["pi", "--version"]
+        smoke = _override(ctx, "PI_SMOKE") or [_resolve_binary(ctx, "pi", (".local", "bin", "pi")), "--version"]
         return [_check("release_complete", self.complete(ctx, ctx.sha)),
                 _check("current_symlink", self.installed(ctx) == ctx.sha),
                 _timed("version_smoke", lambda: _run(ctx, smoke, timeout=60)[0] == 0)]

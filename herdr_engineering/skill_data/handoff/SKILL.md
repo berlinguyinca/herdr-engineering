@@ -47,18 +47,34 @@ Rules: never fabricate paths, hashes, URLs, counts or results; mark doubt in `un
 2. Create, passing the JSON on stdin through a quoted heredoc:
    `herdr-handoff create --goal "<goal>" --source-harness <source> --target-harness <target> --from-json - <<'HANDOFF_EOF'` ... `HANDOFF_EOF`
    Add `--model <id>` only if the user asked for a model. The command prints the queued envelope; take `handoff_id` from it. A validation error means fix the briefing and retry.
-3. Make the source worktree durable, then hand over: commit and push what matters, from the worktree `git -C <worktree>` resolves to (for a linked worktree that is its own path, not the upstream checkout), and only then run `herdr-handoff takeover <handoff_id> --cwd <worktree>`.
+3. Check for running work first. Closing this pane ends this session and every subagent or background task it started, and `takeover` cannot see them. Before running `herdr-handoff takeover`, wait for subagents and background tasks to finish and record their results in the briefing, or list what is still running under `remaining`. If something is still running and cannot be waited for, hand over with `--keep-source` so it is not killed, and tell the user the old pane is still open.
+4. Make the source worktree durable, then hand over: commit and push what matters, from the worktree `git -C <worktree>` resolves to (for a linked worktree that is its own path, not the upstream checkout), and only then run `herdr-handoff takeover <handoff_id> --cwd <worktree>`.
    - `status: interactive_started`: the target is running in this tab (a split of this pane, else a new tab or workspace) with a prompt to read the handoff document first, and this pane is closing. Report only what the result actually reports; never claim the old session was closed when it was not.
    - `status: launch_unconfirmed` / `launch_failed`: the close was refused, so BOTH panes stay up - nothing was destroyed. Report it; re-running does not make an unobserved successor live, and forcing it is not the fix.
    - `status: source_dirty`: this pane's worktree holds work that is not durable, so the close was refused — the reason names which: `worktree_dirty` (tracked changes uncommitted), `worktree_unpushed` (commits no remote branch has) or `worktree_unknown` (git could not be consulted, which refuses too). The successor is live and the handoff succeeded; only the close did not. Make the work durable (commit, push), then run `herdr-handoff takeover <handoff_id>` again with the **same id**: it reuses the successor already recorded for that handoff rather than starting a second pane, and closes this one now that git is clean.
+   - Takeover gave up waiting for the successor (`--confirm-timeout`) and left this pane open: the successor's later `herdr-handoff confirm` closes it through the same gate (herdr-handoff 0.5.1). It reports `close` as `source_closed`, `already_closed`, `refused` (with a `reason`, e.g. `source_dirty`) or `not_attempted` (after `--keep-source`, no recorded source pane, or a record written by 0.5.0). Confirm is not an optional acknowledgement; if it is `refused`, make the work durable and re-run `confirm` or `takeover` with the same id.
    - `status: source_close_failed`: the handoff went ahead and herdr refused the close - report it, do not force it.
    - `status: manual_launch_required`: herdr is not usable here. Show the user the printed `command` verbatim, run from `cwd`; `resume_command` prints the full resume prompt.
    - Keep the source pane up (the pre-0.4.0 behaviour) with `--keep-source`.
+   - Panes left open by earlier handoffs: `herdr-handoff reap` lists them (dry run, changes nothing); `herdr-handoff reap --apply` closes them through the same gate as `confirm` (live pane checks: `source_working`, `source_is_caller`, `source_pane_reused`, `successor_gone`). Review the dry run first. Never add `--include-unrecorded` unless the user says to: records from before close options existed cannot detect pane-id reuse.
    - `--allow-dirty-source` closes a pane with uncommitted or unpushed work and loses it. Use it only when the user says to; `git -C <worktree> status --short` and `git -C <worktree> log @{u}..HEAD --oneline` show what would be lost. It cannot bypass the live-successor or same-tab checks, and it is never a retry of a refusal.
    - Never close a pane by hand to make a refusal go away: a refusal is the guard working, and the pane you delete by hand is the one holding the work.
-4. Reply with the target, the handoff id, the document path and the placement or command. No recap of the briefing.
+5. Reply with the target, the handoff id, the document path and the placement or command. No recap of the briefing.
+
+## Automatic triggers
+
+A handoff is not something the operator has to ask for. `scripts/install.sh` arms automatic
+handoffs (step 7e): a Pi extension on `turn_end` and Claude Code `Stop`/`PreCompact` hooks
+watch the context window, and when a session reaches the threshold they inject this skill's
+instruction mid-session. Treat that instruction as the operator's standing authorization - do
+not ask "would you like me to hand off?", do not finish the current task first, and record the
+trigger (percent, boundary) in the briefing's constraints so the successor knows the handoff was
+unprompted. Everything above still holds: durable before the close, and a refusal is the guard
+working - report it, never `--allow-dirty-source` it away. Policy and opt-out:
+`docs/automatic-handoffs.md`.
 
 ## Notes
 
 - Models: pass only what the user requested; opencode wants `provider/model`, and `herdr-handoff` drops a bare model for opencode with a note.
-- Automatic triggers (PreCompact and similar) are intentionally not installed; see `docs/operations/handoff.md`.
+- Automatic handoffs are installed by default (`scripts/install.sh` step 7e, after the workflow hooks in 7c): the Pi extension fires at `turn_end`, the Claude Code hooks at `Stop` and `PreCompact`, and all of them ask `herdr-eng handoff autopilot` what to do. Policy and opt-out: `docs/automatic-handoffs.md`; the check is `handoff-autopilot` in `herdr-eng doctor`.
+- `herdr-eng handoff context-hook claude` is the older, opt-in Claude `UserPromptSubmit` trigger. It is not installed by default; opt in as described in `docs/operations/handoff.md`.

@@ -24,7 +24,7 @@
   gather_facts: false
   become: "{{ herdr_engineering_become | default((ansible_user | default(lookup('env', 'USER'), true)) != 'root') }}"
   environment:
-    PATH: "/opt/homebrew/bin:/usr/local/bin:{{ ansible_env.HOME | default('~', true) }}/.local/bin:{{ ansible_env.PATH | default('/usr/bin:/bin:/usr/sbin:/sbin') }}"
+    PATH: "/opt/homebrew/bin:/usr/local/bin:{{ ansible_facts['env']['HOME'] | default('~', true) }}/.local/bin:{{ ansible_facts['env']['PATH'] | default('/usr/bin:/bin:/usr/sbin:/sbin') }}"
   vars:
     herdr_engineering_repo_root: "{{ playbook_dir }}/../.."
     fabric_agent_gateway_url: "http://dev.lan:29999"
@@ -37,8 +37,8 @@
 
     - name: "Record the fleet user's home + uid for paths/ownership"
       ansible.builtin.set_fact:
-        fleet_home: "{{ ansible_env.HOME }}"
-        fleet_user: "{{ ansible_user_id }}"
+        fleet_home: "{{ ansible_facts['env']['HOME'] }}"
+        fleet_user: "{{ ansible_facts['user_id'] }}"
 
     - name: "Converge herdr-eng + fabric auto-registration agent"
       ansible.builtin.include_tasks: ../tasks/fabric-agent.yml
@@ -50,6 +50,9 @@
       ansible.builtin.include_tasks: ../tasks/ai-sync-feed.yml
     - name: "Converge ai-sync enforcement (opt-in per host, never on the publisher)"
       ansible.builtin.include_tasks: ../tasks/ai-sync-enforce.yml
+    - name: "Keep the herdr-engineering deployment checkout + pointer file for the rollout rows"
+      ansible.builtin.include_tasks: ../tasks/fleet-deployment-checkout.yml
+
     - name: "Install the fleet rollout watcher unit (enabled only with fleet_watch_enabled on beast)"
       ansible.builtin.include_tasks: ../tasks/fleet-watch.yml
 

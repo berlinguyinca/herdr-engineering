@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from herdr_engineering.handoff_dependency import CLI_COMMANDS
+from herdr_engineering.handoff_dependency import CLI_COMMANDS, REAP
 
 ROOT = Path(__file__).resolve().parents[1]
 SKILL = ROOT / "herdr_engineering" / "skill_data" / "handoff" / "SKILL.md"
@@ -41,6 +41,10 @@ def test_the_lock_pin_names_the_revision_that_hands_off_by_default():
     assert re.fullmatch(r"[0-9a-f]{40}", entry["revision"]), "the pin must be a full commit sha"
     note = entry["note"]
     assert "v0.4.0" in note and "herdr-handoff#7" in note, note
+    assert "v0.5.0" in note and "herdr-handoff#12" in note, note
+    assert "v0.5.1" in note and "herdr-handoff#13" in note, note
+    assert "v0.6.0" in note and "herdr-handoff#16" in note and "reap" in note, note
+    assert entry["revision"] == "c16c2dfdd86d6c0f22d8523f894718420e23d3a1", "the 0.6.0 merge (#16)"
     # The guard is part of what the pin buys: a host told only "takeover exists" cannot know a pane may
     # now refuse to close because of the work it holds.
     assert "source_dirty" in note and "--keep-source" in note, note
@@ -84,7 +88,7 @@ def test_every_cli_command_the_skill_invokes_is_covered_by_the_dependency_probe(
     agent runs, while every subcommand in the skill is one an agent will type.
     """
     invoked = {m for m in re.findall(r"`herdr-handoff ([a-z][a-z-]+)", _skill())}
-    unprobed = sorted(command for command in invoked if command not in CLI_COMMANDS)
+    unprobed = sorted(command for command in invoked if command not in (*CLI_COMMANDS, REAP))
     assert not unprobed, f"the skill calls commands the probe never checks: {unprobed}"
     assert "takeover" in invoked, "the skill no longer instructs a takeover at all"
 
@@ -135,3 +139,13 @@ def test_flags_the_skill_types_for_takeover_exist_in_the_installed_cli():
             assert not unknown, (
                 f"the {surface} types {unknown}; takeover offers {sorted(advertised)}"
             )
+
+
+def test_the_skill_finishes_or_hands_over_running_subagents_before_the_close():
+    """Closing the pane kills this session's subagents; the skill must not close under running work."""
+    text = _skill().lower()
+    assert "subagent" in text, "the skill must address subagents that are still running"
+    assert "before the close" in text or "before running `herdr-handoff takeover`" in text
+    assert "--keep-source" in text and "still running" in text, (
+        "the skill must say to keep the source when work is still running"
+    )

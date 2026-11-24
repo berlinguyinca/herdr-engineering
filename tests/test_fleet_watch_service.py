@@ -7,6 +7,7 @@ stand-in, throwaway HOMEs) drives real subprocesses. Nothing here starts or enab
 from __future__ import annotations
 
 import json
+import os
 import re
 import shlex
 import signal
@@ -337,10 +338,354 @@ def test_loop_stops_cleanly_on_sigterm_between_passes(fleet):
         while time.monotonic() < deadline and "head" not in json.dumps(fleet.saved()["repos"]):
             time.sleep(0.2)
         proc.send_signal(signal.SIGTERM)
-        assert proc.wait(timeout=20) in (0, -signal.SIGTERM)
+        assert proc.wait(timeout=20) == 0                                          # a clean stop, not death by signal
     finally:
         proc.kill()
         proc.communicate()
+
+
+# --------------------------------------------------------------------------- orphaned children
+
+def local_loop_argv(fleet, remote_bin, *extra: str) -> list[str]:
+    """A loop that applies the local host (beast) without ssh through `remote_bin`."""
+    fleet.identify("beast")
+    return [sys.executable, "-I", "-c", BOOT, "fleet-watch", "loop", "--lock", str(fleet.lock), "--repo", HE,
+            "--interval", "1", "--enable-rollouts", "--local-host", "beast", "--remote-bin", str(remote_bin), *extra]
+
+
+def hung_remote_bin(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """A host-apply stand-in that hangs, leaving a parent shell and a sleeping child, both recorded by pid."""
+    parent, child = tmp_path / "hung.parent.pid", tmp_path / "hung.child.pid"
+    bin_ = tmp_path / "hung-herdr-eng"
+    bin_.write_text(f"#!/bin/sh\nsleep 300 &\necho $! > {child}\necho $$ > {parent}\nwait\n")
+    bin_.chmod(0o755)
+    return bin_, parent, child
+
+
+def alive(pid: int) -> bool:
+    """Running (a zombie counts as dead). Never raises: the process may vanish between any two of these steps."""
+    try:
+        os.kill(pid, 0)
+        state_field = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+    except OSError:                                # ProcessLookupError, FileNotFoundError: it is gone
+        return False
+    return state_field != "Z"
+
+
+def wait_for(path: Path, seconds: float = 30) -> int:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if path.exists() and path.read_text().strip():
+            return int(path.read_text())
+        time.sleep(0.1)
+    raise AssertionError(f"{path} never appeared")
+
+
+def assert_dead_soon(*pids: int) -> None:
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and any(alive(p) for p in pids):
+        time.sleep(0.1)
+    assert not [p for p in pids if alive(p)], "a host-apply child outlived the watcher"
+
+
+def test_sigterm_during_a_local_host_apply_kills_the_child_process_group(fleet, tmp_path):
+    bin_, parent, child = hung_remote_bin(tmp_path)
+    proc = subprocess.Popen(local_loop_argv(fleet, bin_), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            env=fleet.env())
+    pids: list[int] = []
+    try:
+        pids = [wait_for(parent), wait_for(child)]
+        assert all(alive(p) for p in pids)
+        proc.send_signal(signal.SIGTERM)
+        assert proc.wait(timeout=30) == 0
+        assert_dead_soon(*pids)
+    finally:
+        proc.kill()
+        proc.communicate()
+        for pid in pids:
+            if alive(pid):
+                os.kill(pid, signal.SIGKILL)
+
+
+def test_the_hard_limit_exit_kills_the_child_process_group(fleet, tmp_path):
+    bin_, parent, child = hung_remote_bin(tmp_path)
+    argv = local_loop_argv(fleet, bin_, "--soft-limit", "1", "--hard-limit", "3")
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=fleet.env())
+    pids: list[int] = []
+    try:
+        pids = [wait_for(parent), wait_for(child)]
+        assert proc.wait(timeout=60) == 70
+        assert_dead_soon(*pids)
+    finally:
+        proc.kill()
+        proc.communicate()
+        for pid in pids:
+            if alive(pid):
+                os.kill(pid, signal.SIGKILL)
+
+
+def grandchild_remote_bin(fleet, tmp_path: Path) -> tuple[Path, Path]:
+    """The real beast `herdr-eng` shim, but its install command hangs with a child of its own. host_apply runs that
+    command with start_new_session=True, so it and its child are in a different session and process group than
+    host-apply: killing host-apply's group alone would miss both."""
+    pidfile = tmp_path / "grandchild.pid"
+    hang = tmp_path / "hang-install.sh"
+    hang.write_text(f"#!/bin/sh\nsleep 300 &\necho $! > {pidfile}\nwait\n")
+    hang.chmod(0o755)
+    shim = fleet.shims["beast"].read_text()
+    install = fleet.home("beast") / "install.sh"
+    assert str(install) in shim
+    wrapper = tmp_path / "beast-hung-herdr-eng"
+    wrapper.write_text(shim.replace(str(install), str(hang), 1).replace(
+        "#!/bin/sh\n", f"#!/bin/sh\nexport HOME={fleet.home('beast')}\n", 1))
+    wrapper.chmod(0o755)
+    return wrapper, pidfile
+
+
+@pytest.mark.parametrize("how", ["sigterm", "hard_limit"])
+def test_a_grandchild_in_its_own_session_dies_with_the_watcher(fleet, tmp_path, how):
+    wrapper, pidfile = grandchild_remote_bin(fleet, tmp_path)
+    extra = ("--soft-limit", "1", "--hard-limit", "4") if how == "hard_limit" else ()
+    proc = subprocess.Popen(local_loop_argv(fleet, wrapper, *extra), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, env=fleet.env())
+    pids: list[int] = []
+    try:
+        pids = [wait_for(pidfile)]
+        assert alive(pids[0]) and os.getsid(pids[0]) != os.getsid(proc.pid)   # not in the watcher's session
+        if how == "sigterm":
+            proc.send_signal(signal.SIGTERM)
+            assert proc.wait(timeout=40) == 0
+        else:
+            assert proc.wait(timeout=60) == 70
+        assert_dead_soon(*pids)
+    finally:
+        proc.kill()
+        out, err = proc.communicate()
+        print(f"watcher stdout:\n{out}\nwatcher stderr:\n{err}")           # shown by pytest on failure
+        for pid in pids:
+            if alive(pid):
+                os.kill(pid, signal.SIGKILL)
+
+
+def term_ignoring_remote_bin(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """A host-apply stand-in that ignores SIGTERM (so only the watcher's SIGKILL stops it); records parent and child."""
+    parent, child = tmp_path / "deaf.parent.pid", tmp_path / "deaf.child.pid"
+    bin_ = tmp_path / "deaf-herdr-eng"
+    bin_.write_text(f"#!/bin/sh\ntrap '' TERM\nsleep 300 &\necho $! > {child}\necho $$ > {parent}\nwait\n")
+    bin_.chmod(0o755)
+    return bin_, parent, child
+
+
+def test_a_second_sigterm_does_not_cut_the_child_kill_short(fleet, tmp_path):
+    """The loop's SIGTERM handler is one-shot: a second SIGTERM during the 5 s grace must not raise out of the child
+    cleanup before the final SIGKILL (the child here ignores SIGTERM, so only that SIGKILL can stop it)."""
+    bin_, parent, child = term_ignoring_remote_bin(tmp_path)
+    proc = subprocess.Popen(local_loop_argv(fleet, bin_), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            env=fleet.env())
+    pids: list[int] = []
+    try:
+        pids = [wait_for(parent), wait_for(child)]
+        proc.send_signal(signal.SIGTERM)
+        time.sleep(1)                                                              # inside the grace period
+        proc.send_signal(signal.SIGTERM)
+        assert proc.wait(timeout=40) == 0
+        assert_dead_soon(*pids)
+    finally:
+        proc.kill()
+        out, err = proc.communicate()
+        print(f"watcher stdout:\n{out}\nwatcher stderr:\n{err}")
+        for pid in pids:
+            if alive(pid):
+                os.kill(pid, signal.SIGKILL)
+
+
+DRIVER = ("import os, signal, subprocess, sys, time; sys.path.insert(0, {root!r}); "
+          "from herdr_engineering.fleet_watch import host_apply as h; "
+          "ctx = h.Context('0' * 16, 'berlinguyinca/herdr-engineering', 'a' * 40, None, None, "
+          "{{'PATH': os.environ['PATH']}}, 0, 0); h.terminate_on_sigterm()\n{prelude}\n"
+          "print('ready', flush=True); rc = h._run(ctx, ['sh', '-c', {cmd!r}], timeout={timeout}); print('returned', rc)")
+
+
+def start_driver(tmp_path: Path, cmd: str, timeout: float, prelude: str = "") -> subprocess.Popen:
+    """A real process running host_apply._run on `cmd` with host-apply's own SIGTERM handling installed. `prelude` is
+    extra Python run first: it wraps real calls (Popen, os.killpg) to land a signal at an exact point, nothing is faked."""
+    code = DRIVER.format(root=str(ROOT), cmd=cmd, timeout=timeout, prelude=prelude)
+    return subprocess.Popen([sys.executable, "-I", "-c", code], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, cwd=tmp_path)
+
+
+def finish_driver(proc: subprocess.Popen, pids: list[int]) -> None:
+    proc.kill()
+    out, err = proc.communicate()
+    print(f"driver stdout:\n{out}\ndriver stderr:\n{err}")
+    for pid in pids:
+        if alive(pid):
+            os.kill(pid, signal.SIGKILL)
+
+
+def wait_pidfile_in_hook(pidfile: Path) -> str:
+    """Prelude text: block (inside the hooked call) until the command has written its pid."""
+    return (f"def _wait_pid():\n    end = time.monotonic() + 20\n"
+            f"    while time.monotonic() < end and not (os.path.exists({str(pidfile)!r}) "
+            f"and open({str(pidfile)!r}).read().strip()):\n        time.sleep(0.02)\n")
+
+
+def test_a_sigterm_landing_inside_the_spawn_is_held_and_still_kills_the_command(tmp_path):
+    """SIGTERM arrives after the process exists but before `proc` is bound (a Popen hook raises it there). The hold
+    makes it wait until the handle exists, so the command's group is killed instead of orphaned; exit 143."""
+    pidfile = tmp_path / "cmd.pid"
+    prelude = wait_pidfile_in_hook(pidfile) + (
+        "class P(subprocess.Popen):\n"
+        "    def __init__(self, *a, **k):\n"
+        "        super().__init__(*a, **k)\n"
+        "        _wait_pid()\n"
+        "        os.kill(os.getpid(), signal.SIGTERM)\n"
+        "h.subprocess.Popen = P\n")
+    proc = start_driver(tmp_path, f"sleep 300 & echo $! > {pidfile}; wait", 60, prelude)
+    pids: list[int] = []
+    try:
+        assert proc.wait(timeout=60) == 143
+        pids = [wait_for(pidfile)]
+        assert_dead_soon(*pids)
+    finally:
+        finish_driver(proc, pids)
+
+
+def test_a_sigterm_held_during_a_spawn_that_fails_still_exits_143_not_127(tmp_path):
+    prelude = ("class P(subprocess.Popen):\n"
+               "    def __init__(self, *a, **k):\n"
+               "        os.kill(os.getpid(), signal.SIGTERM)\n"
+               "        raise OSError('cannot spawn')\n"
+               "h.subprocess.Popen = P\n")
+    proc = start_driver(tmp_path, "true", 60, prelude)
+    try:
+        assert proc.wait(timeout=30) == 143, "the held SIGTERM was swallowed by the spawn failure"
+    finally:
+        finish_driver(proc, [])
+
+
+def test_an_oserror_while_reading_a_started_command_kills_its_group(tmp_path):
+    pidfile = tmp_path / "cmd.pid"
+    prelude = wait_pidfile_in_hook(pidfile) + (
+        "class P(subprocess.Popen):\n"
+        "    def communicate(self, *a, **k):\n"
+        "        _wait_pid()\n"
+        "        raise OSError('pipe broke')\n"
+        "h.subprocess.Popen = P\n")
+    proc = start_driver(tmp_path, f"sleep 300 & echo $! > {pidfile}; wait", 60, prelude)
+    pids: list[int] = []
+    try:
+        assert proc.wait(timeout=60) != 0                                          # the OSError propagates
+        pids = [wait_for(pidfile)]
+        assert_dead_soon(*pids)
+    finally:
+        finish_driver(proc, pids)
+
+
+def test_a_second_sigterm_landing_inside_the_command_kill_does_not_skip_it(tmp_path):
+    """A second SIGTERM arrives exactly while `_run` is killing the group (os.killpg is wrapped to send it first).
+    A handler that raised again would abort the kill and orphan the command."""
+    pidfile = tmp_path / "cmd.pid"
+    prelude = ("real_killpg = os.killpg\n"
+               "def killpg(pid, sig):\n"
+               "    os.kill(os.getpid(), signal.SIGTERM)\n"
+               "    return real_killpg(pid, sig)\n"
+               "os.killpg = killpg\n")
+    proc = start_driver(tmp_path, f"sleep 300 & echo $! > {pidfile}; wait", 60, prelude)
+    pids: list[int] = []
+    try:
+        pids = [wait_for(pidfile)]
+        proc.send_signal(signal.SIGTERM)
+        assert proc.wait(timeout=30) == 143
+        assert_dead_soon(*pids)
+    finally:
+        finish_driver(proc, pids)
+
+
+def test_sigterm_while_draining_a_timed_out_command_exits_promptly_with_its_group_dead(tmp_path):
+    """After the timeout kill, a process that left the session keeps the pipe open and the drain blocks; SIGTERM must
+    still end host-apply (the leaked process is the documented limit, reaped by the unit's cgroup), and everything
+    that stayed in the command's group is dead by then."""
+    leaked, ingroup = tmp_path / "leaked.pid", tmp_path / "ingroup.pid"
+    cmd = f"setsid sleep 300 & echo $! > {leaked}; sleep 300 & echo $! > {ingroup}; wait"
+    proc = start_driver(tmp_path, cmd, 1)
+    pids: list[int] = []
+    try:
+        pids = [wait_for(leaked), wait_for(ingroup)]
+        time.sleep(3)                                                              # past the timeout kill: now draining
+        assert proc.poll() is None                                                 # blocked on the leaked pipe holder
+        assert not alive(pids[1])                                                  # the in-group process was killed
+        proc.send_signal(signal.SIGTERM)
+        assert proc.wait(timeout=15) == 143
+    finally:
+        finish_driver(proc, pids)
+
+
+def test_stop_group_still_sigkills_when_the_grace_wait_is_interrupted(tmp_path):
+    """An exception inside the grace wait (here: poll() raising) must not skip the final SIGKILL: the child ignores
+    SIGTERM, so only that SIGKILL can stop it."""
+    from herdr_engineering.fleet_watch import run as runner
+    pidfile = tmp_path / "deaf.pid"
+
+    class Interrupted(subprocess.Popen):
+        def poll(self):
+            raise RuntimeError("interrupted during the grace wait")
+
+    child = Interrupted(["sh", "-c", f"trap '' TERM; echo $$ > {pidfile}; sleep 300 & wait"], start_new_session=True,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    pids: list[int] = []
+    try:
+        pids = [wait_for(pidfile), child.pid]
+        with pytest.raises(RuntimeError):
+            runner._stop_group(child)
+        assert_dead_soon(*pids)
+    finally:
+        for pid in pids:
+            if alive(pid):
+                os.kill(pid, signal.SIGKILL)
+        subprocess.Popen.wait(child)
+
+
+def test_stop_group_sends_no_sigkill_when_the_group_is_already_gone(tmp_path, monkeypatch):
+    """The only observable of a signal that was not sent is a recording wrapper around the real os.killpg."""
+    from herdr_engineering.fleet_watch import run as runner
+    child = subprocess.Popen(["true"], start_new_session=True)
+    child.wait()                                                                   # exited and reaped: group is gone
+    sent: list[int] = []
+    real = os.killpg
+
+    def recording(pid, sig):
+        sent.append(sig)
+        return real(pid, sig)
+
+    monkeypatch.setattr(runner.os, "killpg", recording)
+    runner._stop_group(child)
+    assert signal.SIGKILL not in sent and sent[0] == signal.SIGTERM
+
+
+def test_ssh_transport_kills_the_group_when_reading_a_started_command_fails(tmp_path, monkeypatch):
+    from herdr_engineering.fleet_watch import run as runner
+    pidfile = tmp_path / "ssh.pid"
+
+    class Broken(subprocess.Popen):
+        def communicate(self, *a, **k):
+            wait_for(pidfile)
+            raise OSError("pipe broke")
+
+    monkeypatch.setattr(runner.subprocess, "Popen", Broken)
+    bin_ = tmp_path / "herdr-eng"
+    bin_.write_text(f"#!/bin/sh\nsleep 300 &\necho $! > {pidfile}\nwait\n")
+    bin_.chmod(0o755)
+    pids: list[int] = []
+    try:
+        with pytest.raises(OSError):
+            runner.SshTransport(local_host="beast", remote_bin=str(bin_)).run("beast", ["--sha", "a" * 40], 60)
+        pids = [wait_for(pidfile)]
+        assert_dead_soon(*pids)
+    finally:
+        for pid in pids:
+            if alive(pid):
+                os.kill(pid, signal.SIGKILL)
 
 
 # --------------------------------------------------------------------------- systemd unit and ansible task
@@ -377,7 +722,7 @@ def block():
 def test_tasks_install_the_unit_but_enable_only_when_fleet_watch_enabled_on_beast():
     b = block()
     assert b["when"] == "ansible_facts['system'] == 'Linux'" and b["become"] is False
-    assert b["environment"]["XDG_RUNTIME_DIR"] == "/run/user/{{ ansible_user_uid }}"
+    assert b["environment"]["XDG_RUNTIME_DIR"] == "/run/user/{{ ansible_facts['user_uid'] }}"
     wanted = b["vars"]["watch_wanted"]
     assert "fleet_watch_enabled | default(false) | bool" in wanted and "inventory_hostname == 'beast'" in wanted
     service = [t["ansible.builtin.systemd_service"] for t in b["block"] if "ansible.builtin.systemd_service" in t][0]

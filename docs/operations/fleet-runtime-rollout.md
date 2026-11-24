@@ -93,11 +93,20 @@ Per-host work is serial so one rollout does not create a fleet build storm.
 Transport calls have timeouts; a stopped controller resumes from durable state.
 Requests are saved before sending and receipts are saved atomically with fsync.
 Typed failed receipts emitted with CLI exit code 1 are recorded as failures. A
-skipped `busy` outcome or `STALE_MISSION_FENCE` code proves no mutation occurred:
-its receipt is archived and the next pass can create one fresh request using the
-latest mission fences. Other skipped outcomes remain explicitly blocked until
+skipped `busy` outcome, `STALE_MISSION_FENCE` code, or `INTERACTIVE_BUSY` code
+proves no mutation occurred: the receipt is archived and the next pass can create
+one fresh request using the latest mission fences. The Pi runtime reports its
+not-yet conditions as `busy` (runtime not ready, mission planning or recovering,
+custody changed, no local resumable controller) and a busy interactive session as
+`INTERACTIVE_BUSY`; both are time, not operator attention, so they retry instead
+of blocking the rollout. Other skipped outcomes remain explicitly blocked until
 refreshed state proves operator intent or a terminal mission; they do not generate
 unbounded fresh recovery operations.
+
+A session whose runtime activated but whose stable Host still runs an older
+release records `bootstrap_required` with a durable `nextStep`: restart the stable
+Pi Host on that host so it loads the selected release, then resume the rollout.
+A hot reload never changes `hostCommit`, so no pass can fix this by itself.
 Uncertain deliveries reuse the original operation ID and payload. A replacement
 runtime instance in the same process polls the same durable receipt.
 
@@ -106,6 +115,47 @@ The default state directory is `~/.local/state/herdr-engineering/rollouts`, mode
 Do not edit it to change a revision, destination, process, or operation ID. Create
 a separate rollout for another release. There is no automatic downgrade or
 cross-rollout rollback: a rollback is a separately reviewed pinned release plan.
+
+## Unattended convergence: pin, resume, prune
+
+Plans are only as good as the revision they target and the driver that drains
+them. Three mechanisms keep the fleet on one target (#844):
+
+**Pin the target.** Write the full 40-character commit SHA you want the fleet's
+Pi runtimes on, one line, to `~/.config/herdr-engineering/pi-rollout-revision`
+(the `HERDR_PI_ROLLOUT_REVISION` environment variable overrides the file). With a
+pin, `fleet rollout plan` no longer requires `--pi-revision`; an explicit flag
+still wins. Without a pin, planning without `--pi-revision` fails closed, and the
+unattended driver does not touch rollouts at all. An invalid pin (not a full
+lowercase 40-hex SHA) is a failure, never a silent fallback.
+
+**Resume, don't re-mint.** `fleet rollout latest` prints the newest plan that has
+not settled (`complete` or `abandoned`), or `{"id": null}`. The daily controller
+(`herdr-eng-fleet-update.timer` -> `herdr_engineering.fleet_autoupdate`) runs this
+selector after each successful controller update: with a pin it resumes the newest
+unfinished rollout with a bounded pass window (`--max-passes 3`, 30-second
+interval), and mints a new plan only when nothing unfinished exists **and** the
+pinned revision has never been rolled out - once a plan for the pin settles, later
+nights report a skip instead of re-staging the converged fleet, and an abandoned
+plan for the pin is respected as the operator's decision to retire it. A plan
+whose revision does not match the pin is skipped and reported in the run record -
+the operator settles it with `fleet rollout abandon --id ROLLOUT_ID --reason ...`
+(settling a `complete` rollout is refused) or finishes it. The result of the pi
+step is recorded in the unattended run state next to the controller update, so a
+permanently skipped or blocked drain is visible without reading the journal. The
+step's own failures - a malformed pin file, an unreadable store, a rollout lock
+held by an operator command - are recorded as `pi_rollout.status: error` (or
+`prunedError` beside a completed drain) and never undo a successful controller
+update: the run's pass/fail verdict belongs to the controller update.
+
+**Bound the state.** `fleet rollout prune [--older-than-days N]` (default 30,
+bounded to 0-3650: a negative horizon would delete every settled record) deletes
+settled records - `complete` or `abandoned`, judged by their last pass or creation
+time - so the state directory reflects current intent. Unsettled records are never
+touched: a blocked rollout may still be the operator's next action, and only a
+deliberate `abandon` marks it done - and like `apply` and `run`, `retire-identityless`
+refuses an abandoned rollout rather than silently reopening it. The daily driver
+prunes after each drain.
 
 ## What completion proves
 
@@ -150,10 +200,28 @@ Pi agents remains coverage-unverified rather than silently succeeding.
 - `activation_unverified`: Pi acknowledged reload but still reports old or pending
   code. Inspect the saved activation receipt and Pi host diagnostics.
 - `bootstrap_required`: a session lacks maintenance capabilities, or its stable Host
-  commit differs from the target. Runtime hot reload cannot replace that stable
+  code differs from the target. Runtime hot reload cannot replace that stable
   Host. Preserve its conversation and work, then perform a controlled extension or
   process bootstrap before a new reconciliation plan. This command intentionally
   provides no forced kill/restart fallback.
+
+  A hot reload never changes the session's reported `hostCommit`, so a differing
+  commit alone does not prove stale Host code. When `hostCommit` differs from the
+  target, the coordinator runs `git diff --quiet <hostCommit> <revision> -- <Host paths>`
+  in the staged release on the target host (same transport as `sessions list`, with
+  `GIT_DIR`, `GIT_WORK_TREE` and `GIT_COMMON_DIR` unset). No change means the Host is
+  accepted by code equivalence and the session continues; its state records
+  `hostAcceptance` with `mode: "code-equivalence"`, both commits and the paths
+  compared. Any change, or any inability to compare (release without `.git`, either
+  commit unavailable, git or transport error), keeps `bootstrap_required`. The Host
+  paths are the fixed list `HOST_CODE_PATHS` in `herdr_engineering/fleet_rollout.py`
+  (`src/runtime/host/` and the rest of the stable Host's import closure). `package.json`
+  is compared parsed through `git show`, ignoring only `scripts` and `devDependencies`
+  (the Host never reads them); `hostAcceptance.packageJsonIgnoredKeys` records that.
+  An unreadable or unparsable `package.json` keeps `bootstrap_required`. Staged releases are depth-1 clones, so a missing old `hostCommit` is
+  fetched without network access from the sibling release
+  `pi/releases/<hostCommit>` when that directory still exists; otherwise the
+  session stays `bootstrap_required`.
 - `blocked`: identity, protocol, revision, or coverage evidence was rejected.
   Inspect the per-host error and per-session receipt. An uncertain request is never
   replaced with a fresh resume against a different mission revision.
@@ -188,6 +256,27 @@ blocked with that reason in `error`/`coverageErrors` and keeps the plan from com
 session is terminal for the runner and keeps its refusal in `error`; it vanishing from the native
 inventory is not a blocker. The command exits 2 while `stillBlocked` sessions or `blockedHosts` remain. Run `apply` first on plans written before this change, so sessions carry the typed `blockReason` and hosts carry `hostLevelError`.
 
+## Unresponsive and exited sessions
+
+`sessions list` waits a bounded time per session. On a loaded controller every live session can
+miss its reply in the same pass (rows come back `reachable:false`, `error:"session_unresponsive"`),
+which says nothing about the sessions. A session with no reachable row is classified by its rows:
+
+| Rows for the session | Outcome |
+| --- | --- |
+| 2 or more `reachable:true` | `blocked` (`session identity missing or ambiguous`), unchanged |
+| 0 reachable, at least one unreachable with a non-terminal error (`session_unresponsive`, a timeout, no error) | transient: re-list up to twice in the pass (0.5 s, then 1 s backoff); if still unreachable the session **keeps its previous status and error** and is retried next pass. A `complete` session stays `complete`; a new one becomes `pending`. `lastUnreachableAt` and `note` record the miss. Never blocks. |
+| every row `session_process_gone`, or no rows and the session left the native inventory | `ended`: the process exited and there is nothing to update. |
+
+`ended` is terminal and non-failing, like `retired`: it does not block the host, does not hold
+the rollout open, and does not consume the online stall budget. It is never a success. The host
+lists such sessions in `endedSessions`, and the session keeps `endedAt` and `note`, so a report
+can tell "updated" from "exited". If the same conversation answers again (possibly in a new process on an old runtime), the
+next pass restarts it as a fresh `discovered` session: prepare, reload and resume receipts,
+`prepared`, `loaded`, `missions` and `hostAcceptance` from the old process are discarded and
+only `previousIncarnations` (pid, instanceId, endedAt, last status) is kept for the report. A discovered session that is unreachable (not exited) and
+absent from the native inventory is treated as transient, not as a missing-session blocker.
+
 ## Validation coverage
 
 `tests/test_fleet_rollout.py` exercises real durable state and the production JSON
@@ -197,7 +286,8 @@ operator pause, busy preparation, duplicate/stale identities, missing native
 coverage, corrupt receipts, progress regression and expired waits. Identity-less
 registrations are covered for the refusal, operator retirement, the evidence kept in the
 report, ambiguous identity refusing to be retired, and a retired session rejoining when its
-identity resolves. Runner tests
+identity resolves. Transient unresponsive rows, ambiguous rows, exited sessions and the in-pass
+retry are covered with a subprocess runner that returns different lists on successive calls. Runner tests
 cover reconnect, durable restart/backoff, interruption, duplicate controllers and
 explicit operator-attention stops. These tests do
 not constitute a live multi-workstation rollout; validate a canary before fleet

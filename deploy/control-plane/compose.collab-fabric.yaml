@@ -71,6 +71,17 @@ services:
       - "${HERDR_COLLAB_FABRIC_BIND:?run deploy.sh}:${HERDR_COLLAB_FABRIC_PORT:?run deploy.sh}:${HERDR_COLLAB_FABRIC_PORT:?run deploy.sh}"
     networks: [collab, fabric]
 
+  # The phone bridge (control_plane.rakazo_bridge.tailnet_open_owner) identifies tailnet callers through the same
+  # whois sidecar: control-plane-web gets the socket directory READ-ONLY, nothing else (no tailscaled socket, no
+  # network, no capability change). A read-only directory mount is enough to connect() to a socket inside it.
+  # Permission note: the socket is 0660 owned by HERDR_COLLAB_CERT_UID, and the directory is 0700. control-plane-web
+  # runs as root with the default capability set (no user:, no cap_drop), so CAP_DAC_OVERRIDE lets it traverse the
+  # directory and connect. If web is ever made non-root or drops capabilities, it must join the sidecar's uid/gid.
+  # Set rakazo_bridge.whois_socket: /run/fabric-whois/whois.sock (docs/operations/shepherd-discovery.md).
+  control-plane-web:
+    volumes:   # appended to the base list
+      - ${HERDR_COLLAB_FABRIC_WHOIS_DIR:?run deploy.sh}:/run/fabric-whois:ro
+
 networks:
   fabric:
     ipam:

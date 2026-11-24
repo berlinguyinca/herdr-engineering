@@ -19,6 +19,11 @@
 #      key via $TS_AUTH_KEY or ~/.config/herdr-engineering/tailscale-auth.key;
 #      otherwise it prints the command and continues)
 #   7. puts `herdr-eng` and `herdr-handoff` on PATH (~/.local/bin) when writable
+#   7e. arms AUTOMATIC handoffs (default on): installs the Pi extension and the Claude
+#       Code Stop/PreCompact hooks, so a session that reaches the context threshold hands
+#       itself off to a fresh pane instead of waiting to be asked or losing detail to a
+#       summarizer. `--no-handoff-autopilot` (or HERDR_HANDOFF_AUTOPILOT=off at runtime)
+#       keeps handoffs on-request-only; `herdr-eng handoff autopilot uninstall` removes it.
 #   8. runs `herdr-eng doctor` and prints a summary
 #   2b. build-cache toolchain: checksum-pinned sccache 0.19.0 into ~/.local/bin
 #      (per-user, no root; non-fatal). --no-build-cache-tools skips it;
@@ -28,6 +33,26 @@
 #      installs the managed herdr-memory harness adapters (pi, claude, codex,
 #      opencode) via `herdr-eng memory install`; harnesses that are not
 #      installed are skipped and foreign config is reported, never overwritten.
+#   (default on) step 7c registers the managed Claude Code workflow hooks
+#      (SessionStart reminder, PreCompact /handoff prompt) via
+#      `herdr-eng workflow install`; opt out with --no-workflow-hooks or
+#      HERDR_INSTALL_WORKFLOW_HOOKS=0. Skipped when Claude Code is absent.
+#   (default on) step 7c2 registers the managed SubagentStart/SubagentStop hooks
+#      (the registry of running background agents per pane) via
+#      `herdr-eng handoff auto install --subagents-only`; opt out with
+#      --no-subagent-hooks or HERDR_INSTALL_SUBAGENT_HOOKS=0.
+#   (default on) step 7d installs/updates berlinguyinca/screenwright, tracking
+#      origin/main (not pinned), and links its screenwright-review skill via
+#      scripts/install-screenwright.sh; opt out with --no-screenwright or
+#      HERDR_INSTALL_SCREENWRIGHT=0. Non-fatal; dirty/non-main checkouts are skipped.
+#   (default on) step 7e installs the disk-hygiene jobs (worktree reaper every 6 h, docker sweep
+#      nightly; systemd user timers on Linux, LaunchAgents on macOS) via
+#      scripts/install-disk-hygiene.sh; opt out with --no-disk-hygiene or
+#      HERDR_INSTALL_DISK_HYGIENE=0. Non-fatal. See docs/disk-hygiene.md.
+#   (default on) step 7g installs the build-cleanup timer (systemd user unit on Linux,
+#      launchd agent on macOS) and the managed cargo launcher via
+#      `herdr-eng build-hygiene install`; opt out with --no-build-hygiene or
+#      HERDR_INSTALL_BUILD_HYGIENE=0 (or build_cleanup.enabled: false in config). Non-fatal.
 #
 # Re-running produces no unexpected changes. No secrets are written anywhere.
 #
@@ -37,12 +62,27 @@ set -euo pipefail
 WITH_MEMORY="${HERDR_INSTALL_MEMORY:-0}"
 BUILD_CACHE_TOOLS=1
 BUILD_CACHE_TOOLS_ONLY=0
+WITH_WORKFLOW_HOOKS="${HERDR_INSTALL_WORKFLOW_HOOKS:-1}"
+WITH_SUBAGENT_HOOKS="${HERDR_INSTALL_SUBAGENT_HOOKS:-1}"
+WITH_SCREENWRIGHT="${HERDR_INSTALL_SCREENWRIGHT:-1}"
+# Automatic handoffs are installed by default: the operator's rule is that a handoff is
+# never something they have to ask for, so arming the triggers is the expected state of an
+# installed machine. Opt out with --no-handoff-autopilot (or the runtime env var).
+HANDOFF_AUTOPILOT="${HERDR_INSTALL_HANDOFF_AUTOPILOT:-1}"
+WITH_DISK_HYGIENE="${HERDR_INSTALL_DISK_HYGIENE:-1}"
+WITH_BUILD_HYGIENE="${HERDR_INSTALL_BUILD_HYGIENE:-1}"
 for arg in "$@"; do
   case "$arg" in
+    --no-workflow-hooks) WITH_WORKFLOW_HOOKS=0 ;;
+    --no-subagent-hooks) WITH_SUBAGENT_HOOKS=0 ;;
+    --no-screenwright) WITH_SCREENWRIGHT=0 ;;
+    --no-build-hygiene) WITH_BUILD_HYGIENE=0 ;;
+    --no-disk-hygiene) WITH_DISK_HYGIENE=0 ;;
     --with-memory) WITH_MEMORY=1 ;;
     --no-build-cache-tools) BUILD_CACHE_TOOLS=0 ;;
     --build-cache-tools-only) BUILD_CACHE_TOOLS_ONLY=1 ;;
-    -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+    --no-handoff-autopilot) HANDOFF_AUTOPILOT=0 ;;
+    -h|--help) sed -n '2,/^set -euo/p' "$0" | sed '$d'; exit 0 ;;
     *) printf 'unknown option: %s\n' "$arg" >&2; exit 2 ;;
   esac
 done
@@ -328,6 +368,59 @@ if [ "$WITH_MEMORY" = "1" ]; then
   "$PY" -m herdr_engineering.cli memory install --all || warn "memory install reported conflicts (see above); foreign config was left untouched"
 else
   printf '\n  (herdr-memory adapters not installed; opt in with --with-memory)\n'
+fi
+
+# --- 7c. managed Claude Code workflow hooks (default on) --------------------
+if [ "$WITH_WORKFLOW_HOOKS" = "1" ]; then
+  step "7c/8 Claude Code workflow hooks (managed; foreign hooks untouched)"
+  "$PY" -m herdr_engineering.cli workflow install || warn "workflow hooks not installed (see above); settings.json was left untouched"
+else
+  printf '\n  (workflow hooks not installed; HERDR_INSTALL_WORKFLOW_HOOKS=0 or --no-workflow-hooks)\n'
+fi
+
+# --- 7c2. managed Claude Code subagent registry hooks (default on) ----------
+# Skips (writes nothing) when Claude Code is absent: `claude` not on PATH and no ~/.claude, the same gate as 7c.
+if [ "$WITH_SUBAGENT_HOOKS" = "1" ]; then
+  step "7c2/8 Claude Code subagent registry hooks (managed; foreign hooks untouched)"
+  "$PY" -m herdr_engineering.cli handoff auto install --subagents-only || warn "subagent hooks not installed (see above); settings.json was left untouched"
+else
+  printf '\n  (subagent hooks not installed; HERDR_INSTALL_SUBAGENT_HOOKS=0 or --no-subagent-hooks)\n'
+fi
+
+# --- 7d. screenwright (default on; tracks origin/main, never pinned) --------
+if [ "$WITH_SCREENWRIGHT" = "1" ]; then
+  step "7d/8 screenwright (latest origin/main; skill linked into the harnesses)"
+  bash "$REPO_ROOT/scripts/install-screenwright.sh" || warn "screenwright not installed/updated (see above); the rest of the install is unaffected"
+else
+  printf '\n  (screenwright not installed; HERDR_INSTALL_SCREENWRIGHT=0 or --no-screenwright)\n'
+fi
+
+# --- 7e. automatic handoff triggers (default on) ----------------------------
+if [ "$HANDOFF_AUTOPILOT" = "1" ]; then
+  step "7e/8 arming automatic handoffs (Pi extension + Claude Code hooks)"
+  # Idempotent and content-checked: a second run reports every item unchanged. It only ever
+  # rewrites the hook group it wrote itself, so the workflow hooks in 7c - and any foreign
+  # ~/.claude/settings.json entries - stay exactly where the previous steps put them.
+  "$PY" -m herdr_engineering.cli handoff autopilot install \
+    || warn "automatic handoff triggers are not fully installed (see above); handoffs will still work when asked for"
+else
+  printf '\n  (automatic handoffs not armed; handoffs will have to be asked for. Re-run without --no-handoff-autopilot)\n'
+fi
+
+# --- 7f. disk hygiene jobs (default on) --------------------------------------
+if [ "$WITH_DISK_HYGIENE" = "1" ]; then
+  step "7f/8 disk hygiene (worktree reaper + docker sweep timers)"
+  HERDR_ENG="$VENV/bin/herdr-eng" bash "$REPO_ROOT/scripts/install-disk-hygiene.sh" install || warn "disk-hygiene timers not installed (see above); the rest of the install is unaffected"
+else
+  printf '\n  (disk-hygiene timers not installed; HERDR_INSTALL_DISK_HYGIENE=0 or --no-disk-hygiene)\n'
+fi
+
+# --- 7g. build hygiene (default on): build-cleanup timer + managed cargo launcher -------
+if [ "$WITH_BUILD_HYGIENE" = "1" ]; then
+  step "7g/8 build hygiene (build-cleanup timer, managed cargo launcher; non-fatal)"
+  "$PY" -m herdr_engineering.cli build-hygiene install || warn "build hygiene not installed (see above); opt out with build_cleanup.enabled: false"
+else
+  printf '\n  (build hygiene not installed; HERDR_INSTALL_BUILD_HYGIENE=0 or --no-build-hygiene)\n'
 fi
 
 # --- 8. doctor ------------------------------------------------------------

@@ -644,6 +644,62 @@ def test_pi_incomplete_stage_is_failed(world):
     assert not (world.home / ".local/share/herdr-engineering/pi/current").exists()
 
 
+def _git_release(release: Path) -> None:
+    # A staged release is a detached git checkout; the #881 digest is over its
+    # tracked tree (`git ls-files`), so the test release must be a real repo.
+    subprocess.run(["git", "init", "-q", "-b", "main", str(release)], check=True)
+    for key, value in (("user.name", "Test"), ("user.email", "t@test.test")):
+        subprocess.run(["git", "-C", str(release), "config", key, value], check=True)
+    (release / ".gitignore").write_text("node_modules/\n")
+    subprocess.run(["git", "-C", str(release), "add", "package.json", ".gitignore"], check=True)
+    subprocess.run(["git", "-C", str(release), "commit", "-qm", "release"], check=True,
+                   env={**os.environ, "GIT_AUTHOR_DATE": "2020-01-01T00:00:00", "GIT_COMMITTER_DATE": "2020-01-01T00:00:00"})
+
+
+def test_pi_complete_consults_the_artifact_digest(world):
+    # A receipt that records a digest must be checked against the content: an
+    # in-place edit to a tracked file (the 599c06d0 shape) makes the release
+    # incomplete, not clean. node_modules is untracked, so the digest ignores it.
+    release = make_release(world, PI_SHAS[0])
+    (release / "package.json").write_text('{"name":"pi-engineering-runtime"}')
+    _git_release(release)
+    root = world.home / ".local/share/herdr-engineering/pi"
+    receipt = root / "receipts" / f"{PI_SHAS[0]}.json"
+    receipt.write_text(json.dumps({"revision": PI_SHAS[0], "sourceRoot": str(release),
+                                   "artifactDigest": host_apply._artifact_digest(release), "patches": []}))
+    ctx = host_apply.Context(RID, "pi-engineering", PI_SHAS[0], "bender", env={"HOME": str(world.home)})
+    pi = host_apply.Pi()
+    assert pi.complete(ctx, PI_SHAS[0]) is True
+    (release / "node_modules" / "dep.js").write_text("untracked install output")
+    assert pi.complete(ctx, PI_SHAS[0]) is True            # install output is not the artifact
+    (release / "package.json").write_text('{"name":"pi-engineering-runtime","hotpatch":true}')
+    assert pi.complete(ctx, PI_SHAS[0]) is False           # a tracked edit is drift
+
+
+def test_pi_complete_tolerates_pre_digest_receipt(world):
+    # A pre-#881 receipt has no digest (unknown): still reusable, not condemned.
+    release = make_release(world, PI_SHAS[0])
+    ctx = host_apply.Context(RID, "pi-engineering", PI_SHAS[0], "bender", env={"HOME": str(world.home)})
+    assert host_apply.Pi().complete(ctx, PI_SHAS[0]) is True
+    (release / "package.json").write_text('{"name":"pi-engineering-runtime","edited":true}')
+    assert host_apply.Pi().complete(ctx, PI_SHAS[0]) is True
+
+
+def test_pi_complete_is_incomplete_when_a_digest_receipt_cannot_be_verified(world):
+    # An unreadable/non-dict receipt, or a release that is not a checkout, is a
+    # release we cannot attest: incomplete, never an exception out of complete().
+    release = make_release(world, PI_SHAS[0])
+    root = world.home / ".local/share/herdr-engineering/pi"
+    ctx = host_apply.Context(RID, "pi-engineering", PI_SHAS[0], "bender", env={"HOME": str(world.home)})
+    (root / "receipts" / f"{PI_SHAS[0]}.json").write_text("[not an object]")
+    assert host_apply.Pi().complete(ctx, PI_SHAS[0]) is False
+    # A digest-bearing receipt over a non-git release cannot be hashed -> incomplete.
+    (root / "receipts" / f"{PI_SHAS[0]}.json").write_text(json.dumps(
+        {"revision": PI_SHAS[0], "sourceRoot": str(release),
+         "artifactDigest": "sha256:" + "0" * 64, "patches": []}))
+    assert host_apply.Pi().complete(ctx, PI_SHAS[0]) is False
+
+
 def test_pi_refuses_to_replace_a_real_current_directory(world):
     root = world.home / ".local/share/herdr-engineering/pi"
     (root / "current").mkdir(parents=True)
@@ -688,6 +744,79 @@ def test_autospec_dirty_checkout_blocks_and_failed_refresh_leaves_previous_gener
     third = world.publish("four")
     (world.checkout / "dirty").write_text("d")
     assert world.run("precheck", repo="autospec", sha=third, env=env)["reason"] == "dirty_checkout"
+
+
+# --------------------------------------------------------------------------- default smoke: launcher resolution
+#
+# The default smoke commands run in the service/ssh environment: the unit's PATH has no ~/.autospec/bin and a
+# non-interactive ssh shell's PATH has no ~/.local/bin, so a bare `autospec`/`pi` is not found there (and
+# `autospec --version` is not a command at all - it exits 2). The adapter resolves the launcher (PATH, then the
+# stable install location, then the bare name so a truly missing launcher still fails closed) and smokes
+# `autospec doctor` instead.
+
+MINIMAL_PATH = "/usr/bin:/bin"        # has `sh`, no autospec/pi on the test hosts or CI runners
+
+
+def recording_binary(path: Path, argv_log: Path, rc: int = 0) -> Path:
+    """A real launcher stand-in: records its argv one per line, then exits rc."""
+    return script(path, f'printf "%s\\n" "$@" >> "{argv_log}"; exit {rc}')
+
+
+def test_autospec_smoke_defaults_to_doctor_and_resolves_the_launcher_from_path(world):
+    world, env = autospec_world(world)
+    target = world.publish("two")
+    assert world.run("apply", repo="autospec", sha=target, env=env)["status"] == "ok"
+    bin_dir = world.root / "bin"
+    bin_dir.mkdir()
+    argv_log = world.root / "autospec.argv"
+    recording_binary(bin_dir / "autospec", argv_log)
+    env = {**env, "PATH": f"{bin_dir}{os.pathsep}{env['PATH']}"}
+    env.pop("HERDR_FLEET_AUTOSPEC_SMOKE_CMD")
+    health = world.run("health", repo="autospec", sha=target, env=env)
+    assert health["status"] == "ok"
+    assert {c["name"]: c["status"] for c in health["checks"]} == {"generation_receipt": "ok", "version_smoke": "ok"}
+    assert argv_log.read_text().splitlines() == ["doctor"]
+    assert_closed(health)
+
+
+def test_autospec_smoke_falls_back_to_the_runtime_bin_when_not_on_path(world):
+    world, env = autospec_world(world)
+    target = world.publish("two")
+    assert world.run("apply", repo="autospec", sha=target, env=env)["status"] == "ok"
+    bin_dir = world.home / ".autospec" / "bin"
+    bin_dir.mkdir(parents=True)
+    argv_log = world.root / "autospec.argv"
+    recording_binary(bin_dir / "autospec", argv_log)
+    env = {**env, "PATH": MINIMAL_PATH}
+    env.pop("HERDR_FLEET_AUTOSPEC_SMOKE_CMD")
+    health = world.run("health", repo="autospec", sha=target, env=env)
+    assert health["status"] == "ok"
+    assert {c["name"]: c["status"] for c in health["checks"]}["version_smoke"] == "ok"
+    assert argv_log.read_text().splitlines() == ["doctor"]
+
+
+def test_autospec_smoke_fails_closed_when_the_launcher_is_nowhere(world):
+    world, env = autospec_world(world)
+    target = world.publish("two")
+    assert world.run("apply", repo="autospec", sha=target, env=env)["status"] == "ok"
+    env = {**env, "PATH": MINIMAL_PATH}
+    env.pop("HERDR_FLEET_AUTOSPEC_SMOKE_CMD")
+    health = world.run("health", repo="autospec", sha=target, env=env)
+    assert (health["status"], health["reason"]) == ("failed", "health_failed")
+    assert {c["name"]: c["status"] for c in health["checks"]} == {"generation_receipt": "ok", "version_smoke": "failed"}
+
+
+def test_pi_smoke_falls_back_to_local_bin_when_not_on_path(world):
+    (world.home / ".local" / "bin").mkdir(parents=True)
+    argv_log = world.root / "pi.argv"
+    recording_binary(world.home / ".local" / "bin" / "pi", argv_log)
+    env = {**world.env, "HERDR_FLEET_PI_STAGE_CMD": str(pi_stage_script(world)), "PATH": MINIMAL_PATH}
+    assert "HERDR_FLEET_PI_SMOKE_CMD" not in env
+    out = world.run("all", repo="pi-engineering", sha=PI_SHAS[0], env=env)
+    assert out["status"] == "ok" and out["after_sha"] == PI_SHAS[0]
+    assert {c["name"]: c["status"] for c in out["checks"]}["version_smoke"] == "ok"
+    assert argv_log.read_text().splitlines() == ["--version"]
+    assert_closed(out)
 
 
 # --------------------------------------------------------------------------- the real CLI

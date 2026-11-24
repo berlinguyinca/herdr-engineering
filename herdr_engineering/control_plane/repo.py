@@ -269,8 +269,9 @@ class ControlPlaneRepo:
         self.agent_identities = AgentIdentityRegistry(persist=self._persist_agent_projection,
             verify_noop=bool(getattr(self._sink, "verify_agent_identity_noop", False)))
         # Agent inspector (spec 0200): bounded per-session detail projection.
+        # The repo's clock, not the wall clock: the inspector clamps event times to its retention ceiling around `now`.
         self.inspector = InspectorStore.from_config(inspector_limits, persist=self._persist_inspector,
-                                                    journal_suppression=self._journal_policy)
+                                                    journal_suppression=self._journal_policy, clock=lambda: self._now())
         self.mission_activity_mirror = mission_activity_mirror is True
         self.mission_activity = self._new_mission_activity()
         self._mission_activity_pruned_at = 0.0
@@ -2948,6 +2949,9 @@ class ControlPlaneRepo:
                     if entity_type in _CI_EVENT_KINDS and not stream:
                         self._events.pop(key, None)
                     raise
+                acknowledged = True
+            else:
+                acknowledged = False
             if self._pending_scheduler_events is not None:
                 if self._sink is not None and not require_durable:
                     try:
@@ -2955,7 +2959,7 @@ class ControlPlaneRepo:
                     except Exception:
                         pass
                 self._pending_scheduler_events.append((ev, feed, publish))
-                return _copy(ev)
+                return {**_copy(ev), "durably_acknowledged": acknowledged} if env is not None else _copy(ev)
             if entity_type in _CI_EVENT_KINDS:
                 self._ci_sequence = seq + 1
             stream.append(ev)
@@ -2983,7 +2987,7 @@ class ControlPlaneRepo:
                         listener(_copy(ev))
                     except Exception:
                         pass  # a listener must never break event recording
-            return _copy(ev)
+            return {**_copy(ev), "durably_acknowledged": acknowledged} if env is not None else _copy(ev)
 
     def mission_timeline(self, mission_key):
         """Build a per-mission timeline from mission events, CI runs, reviews

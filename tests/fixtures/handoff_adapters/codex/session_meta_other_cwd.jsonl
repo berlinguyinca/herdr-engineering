@@ -1,0 +1,1 @@
+{"timestamp": "2026-11-19T00:12:48.100Z", "ordinal": 0, "type": "session_meta", "payload": {"id": "redacted", "timestamp": "2026-11-19T00:12:48.100Z", "cwd": "/elsewhere", "originator": "codex-tui", "cli_version": "0.170.0", "source": "vscode"}}
