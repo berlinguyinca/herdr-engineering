@@ -33,6 +33,10 @@ sections:
       #   upstream: "http://control-plane-web:8080"
       #   # operator_post_allowlist: ["POST /api/v1/attention/ack"]   # "METHOD /path"; * = one segment, trailing ** = rest
       #   #   default = the dashboard's own write actions (see control_plane/dashboard_proxy.py)
+      #   # public_hosts: ["dash.example.ts.net"]   # names the browser uses, "host[:port]" (no port = any port). Needed to
+      #   #   reach the dashboard by DNS name (Origin-guarded writes are 403 otherwise). Set: other Host values are 403
+      #   #   (DNS rebinding); behind a Host-rewriting front also list its upstream name, e.g. "dashboard-proxy".
+      #   # public_scheme: https                    # Origin scheme required for a listed name (TLS ends before the proxy)
       rustfs_endpoint: "http://rustfs:9000"
       minio_user: "REDACTED"        # the object store's access key (what the web reads)
       minio_password: "REDACTED"
