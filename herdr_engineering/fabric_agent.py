@@ -1086,10 +1086,14 @@ class FabricAgent:
                 fwd.stop()
                 fwd = self._rebind(fwd, entry["fwd_port"], int(port_s))
                 if fwd is None:
+                    # No forwarder means the advertised URL would refuse connections:
+                    # drop the entry so the adoption pass re-adopts the port (#959).
+                    self._release(port_s)
                     return
             self._forwards[int(port_s)] = fwd
         except OSError as exc:
             log.warning("could not restore forwarder for port %s: %s", port_s, exc)
+            self._release(port_s)
 
     def _rebind(self, fwd: AgentForwarder, port: int,
                 target_port: int) -> AgentForwarder | None:
@@ -1133,6 +1137,9 @@ class FabricAgent:
         """One detect/register/close cycle. Returns a summary."""
         listeners = scan_listening_ports()
         live_ports = set(listeners)
+        # A failed or partial scan (ss/lsof timeout, error, unparsable line)
+        # proves nothing about absence: never release on it.
+        scan_complete = getattr(listeners, "complete", True)
         self._probe_cache = {
             port: cached for port, cached in self._probe_cache.items()
             if port in live_ports
@@ -1182,7 +1189,7 @@ class FabricAgent:
                 port = int(port_s)
                 entry = self._store[port_s]
                 process = entry.get("process") or ""
-                if (port not in live_ports
+                if ((scan_complete and port not in live_ports)
                         or port in gateway_front
                         or process in _IGNORED_PROCESSES
                         or self._process_denied(process)
@@ -1196,7 +1203,11 @@ class FabricAgent:
                 # probe is cached per listener identity (addrs, process, pid)
                 # for 30 s, so a replaced listener is asked again at once. Only
                 # a conclusive answer releases; an inconclusive one keeps the
-                # lease (and, after a restart, leaves the forwarder down).
+                # lease (and, after a restart, leaves the forwarder down). A
+                # scan that did not list the port (incomplete inventory) is no
+                # evidence either way: leave the lease as it is.
+                if port not in listeners:
+                    continue
                 try:
                     reason = self._debug_surface_cached(port, listeners[port])
                 except ProbeInconclusive:

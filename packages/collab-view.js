@@ -23,10 +23,19 @@ import { ensureConversationStyles, mountComposer } from './conversation-composer
 import { providers, ROOM_COMMANDS, unresolvedMentions, ambiguousMentions, mentionChips, resolveToken } from './collab-mention.js';
 import { renderMarkdown } from './conversation-markdown.js';
 import {
-  AuthError, CollabApi, TokenStore, authorizeUrl, exchangeCode, parseRedirect, pkcePair, randomString,
+  AuthError, CollabApi, TokenStore, authorizeUrl, logoutUrl, exchangeCode, parseRedirect, pkcePair, randomString,
 } from './herdr-web-client/collab.js';
 
-const store = new TokenStore(window.sessionStorage);
+// A browser that blocks site data makes the window.sessionStorage getter throw; that must not stop this module (and, through
+// app.js, the whole dashboard) from loading. Fall back to memory: sign-in cannot survive its redirect then, and says so.
+function resolveStorage() {
+  try { const s = window.sessionStorage; s.getItem('hcn.probe'); return s; } catch {
+    const m = new Map();
+    return { getItem: (k) => (m.has(k) ? m.get(k) : null), setItem: (k, v) => { m.set(k, String(v)); }, removeItem: (k) => { m.delete(k); } };
+  }
+}
+const storage = resolveStorage();
+const store = new TokenStore(storage);
 let operator = false;   // the local owner on the dashboard: no sign-in, the server knows who they are
 const api = new CollabApi(() => (operator ? { access: 'operator', id: 'operator' } : store.get()));
 const ROLES = [['contributor', 'Can chat'], ['viewer', 'Read only'], ['guest', 'Guest (read only, expires)']];
@@ -50,10 +59,10 @@ export async function completeSignInIfRedirected() {
   const found = parseRedirect(window.location.search);
   if (!found) return false;
   const done = (hash) => window.history.replaceState(null, '', `${window.location.pathname}#${hash}`);
-  const saved = JSON.parse(window.sessionStorage.getItem('hcn.pkce') || 'null');
-  window.sessionStorage.removeItem('hcn.pkce');
+  const saved = JSON.parse(storage.getItem('hcn.pkce') || 'null');
+  storage.removeItem('hcn.pkce');
   if (found.error || !saved || saved.state !== found.state) {
-    window.sessionStorage.setItem('hcn.error', found.error || 'sign-in could not be verified; try again');
+    storage.setItem('hcn.error', found.error || 'sign-in could not be verified; try again');
     done('/collab');
     return true;
   }
@@ -61,7 +70,7 @@ export async function completeSignInIfRedirected() {
     const cfg = await loadConfig();
     store.set(await exchangeCode(cfg, found.code, saved.verifier, cfg.public_url));
   } catch (e) {
-    window.sessionStorage.setItem('hcn.error', e.message);
+    storage.setItem('hcn.error', e.message);
   }
   done('/collab');
   return true;
@@ -146,8 +155,16 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
   async function signIn(cfg) {
     const { verifier, challenge } = await pkcePair();
     const state = randomString(16);
-    window.sessionStorage.setItem('hcn.pkce', JSON.stringify({ verifier, state }));
+    storage.setItem('hcn.pkce', JSON.stringify({ verifier, state }));
     window.location.assign(authorizeUrl(cfg, cfg.public_url, state, challenge));
+  }
+
+  // Local tokens go, and so does the Hosted-UI session: its cookie would otherwise sign the next person on this machine straight in.
+  function signOut() {
+    store.clear();
+    if (lastCfg && !operator) { window.location.assign(logoutUrl(lastCfg)); return; }
+    window.location.hash = '';
+    start();
   }
 
   const copy = async (text, btn) => {
@@ -172,7 +189,7 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
       </aside>
       <main class="hd-shell__main"><div class="hd-shell__content">${strip}${content}</div></main></div>`;
     wire();
-    if ($('hcn-out')) $('hcn-out').onclick = () => { store.clear(); window.location.hash = ''; start(); };
+    if ($('hcn-out')) $('hcn-out').onclick = () => signOut();
   }
 
   function centered(inner) {
@@ -197,8 +214,8 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
         <a class="hd-btn" href="${esc(cfg.public_url)}">Open it here</a>`);
       return;
     }
-    const err = window.sessionStorage.getItem('hcn.error');
-    window.sessionStorage.removeItem('hcn.error');
+    const err = storage.getItem('hcn.error');
+    storage.removeItem('hcn.error');
     if (!store.get()) {
       centered(`<h1>HerdR Collaboration</h1>
         <p>Shared rooms for people and their AI agents. Sign in with your BinView account. New accounts wait for approval before anything is shared.</p>
@@ -216,7 +233,7 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
       centered(`<h1>Collaboration</h1><p class="cx-msg" role="alert">${esc(e.message)}</p>
         <p>If you were just added to the group, sign out and sign in again.</p>
         <button id="hcn-out2" class="hd-btn hd-btn--ghost" type="button">Sign out</button>`);
-      $('hcn-out2').onclick = () => { store.clear(); start(); };
+      $('hcn-out2').onclick = () => signOut();
     }
   }
 
@@ -228,7 +245,7 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
       <p>You're signed in as <strong>${esc(me.email || me.user_id)}</strong>. The person who runs this network, or a lab admin, has to approve your account before you can use rooms or connect agents. Nothing is shared with you until then.</p>
       <p class="cx-sub">This page checks every few seconds and opens as soon as you're approved.</p>
       <button id="hcn-out3" class="hd-btn hd-btn--ghost" type="button">Sign out</button>`);
-    $('hcn-out3').onclick = () => { clearTimeout(waitTimer); store.clear(); start(); };
+    $('hcn-out3').onclick = () => { clearTimeout(waitTimer); signOut(); };
     waitTimer = setTimeout(async () => {
       try {
         const now = await api.me();
@@ -733,7 +750,8 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
     const onVisible = () => { if (!document.hidden) { since = -1; if (wake) { wake(); wake = null; } } };
     document.addEventListener('visibilitychange', onVisible);
     let teamRoom = null;
-    teardown = () => { alive = false; composer?.dispose(); unbindHelpers(); teamRoom?.dispose(); ctl?.abort(); document.removeEventListener('visibilitychange', onVisible); if (wake) wake(); };
+    const onFocusOut = () => setTimeout(() => { if (stale.size && alive) paint(); }, 0);
+    teardown = () => { alive = false; root.removeEventListener('focusout', onFocusOut); composer?.dispose(); unbindHelpers(); teamRoom?.dispose(); ctl?.abort(); document.removeEventListener('visibilitychange', onVisible); if (wake) wake(); };
     const kick = () => { since = -1; ctl?.abort(); };       // an action just happened: refetch now
 
     // Replace a container's markup only when it changed and you are not typing in it.
@@ -756,7 +774,7 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
       });
       return true;
     };
-    root.addEventListener('focusout', () => setTimeout(() => { if (stale.size && alive) paint(); }, 0));
+    root.addEventListener('focusout', onFocusOut);
     // Team rooms (slices 1-3): three collapsed sections that ask the server nothing until someone opens them, so a server with the
     // flags off never sees a request from a room nobody opened this in.
     teamRoom = mountTeamRoom({ root, api, roomId, put, sections: {
