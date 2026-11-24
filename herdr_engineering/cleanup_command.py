@@ -566,9 +566,15 @@ def remove_worktree(path: Path, *, dry_run: bool, merged_ok: bool,
     return {"branch": facts["branch"]}
 
 
+_OUTSIDE_FORMS = (
+    "not a git repository (or any of the parent directories)",  # git's setup.c: the walk reached /
+    "not a git repository (or any parent up to mount point",  # the walk stopped at a filesystem boundary
+)
+
+
 def _outside_repository(proc: subprocess.CompletedProcess[str]) -> bool:
     """git's "no repository here" answer; `not a git repository: <gitdir>` (a worktree whose repository moved) is not it."""
-    return proc.returncode == 128 and "not a git repository (or any of the parent directories)" in proc.stderr
+    return proc.returncode == 128 and any(form in proc.stderr for form in _OUTSIDE_FORMS)
 
 
 def _remove_target(path: Path, *, dry_run: bool, state_dir: Path | None) -> dict[str, Any]:

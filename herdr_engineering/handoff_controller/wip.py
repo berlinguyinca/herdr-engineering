@@ -48,9 +48,11 @@ def _timed_out(proc: subprocess.CompletedProcess[str]) -> bool:
 
 
 def _describe(proc: subprocess.CompletedProcess[str]) -> str:
-    stderr = proc.stderr.strip().splitlines() if isinstance(proc.stderr, str) else []
-    first = stderr[0] if stderr else "no output"
-    return f"git {' '.join(proc.args[3:5])} exit {proc.returncode}: {first}"
+    stderr = [line.strip() for line in proc.stderr.splitlines() if line.strip()] if isinstance(proc.stderr, str) else []
+    # A rejected push opens with "To <url>", which says nothing: take the first line that is not that header
+    # (a hook's own output, "remote: ...", "! [rejected] ...", "error: ..."), else the last line.
+    why = next((line for line in stderr if not line.startswith("To ")), stderr[-1] if stderr else "no output")
+    return f"git {' '.join(proc.args[3:5])} exit {proc.returncode}: {why}"
 
 
 def _unpushed(worktree: Path, timeout_s: float) -> tuple[tuple[str, ...], str | None]:

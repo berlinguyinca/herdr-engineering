@@ -735,7 +735,20 @@ def _walk_error(error: OSError) -> NoReturn:
     raise error
 
 
+class _RecordVanished(OSError):
+    pass
+
+
 def _live_ids(roots: list[Path], cutoff: float, limit: int = 50_000) -> set[str]:
+    """One re-list when a record vanishes mid-walk (a tool-result delete, a *.tmp rename): a session doing
+    that must not stop the reaper for good. A second vanish fails closed."""
+    try:
+        return _live_ids_once(roots, cutoff, limit)
+    except _RecordVanished:
+        return _live_ids_once(roots, cutoff, limit)
+
+
+def _live_ids_once(roots: list[Path], cutoff: float, limit: int) -> set[str]:
     live: set[str] = set()
     inspected = 0
     for root in roots:
@@ -763,7 +776,9 @@ def _live_ids(roots: list[Path], cutoff: float, limit: int = 50_000) -> set[str]
                 except (
                     FileNotFoundError
                 ) as error:  # a rename (tmp -> final, rotation) looks the same: its ids may be live
-                    raise OSError(f"session record vanished during the scan: {path}") from error
+                    raise _RecordVanished(
+                        f"session record vanished during the scan: {path}"
+                    ) from error
     return live
 
 

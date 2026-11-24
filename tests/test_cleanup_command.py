@@ -399,8 +399,9 @@ def test_target_scope_refuses_when_git_cannot_say_what_is_tracked(env: Env) -> N
     (env.repo / "target" / "tracked.txt").write_text("t")
     git(env.repo, "add", "-f", "target/tracked.txt")
     (env.repo / ".git" / "index").write_bytes(b"not an index")  # git ls-files now exits 128: "index file corrupt"
-    with pytest.raises(Refusal):
+    with pytest.raises(Refusal) as refused:
         cleanup("target", env.repo / "target", roots=env.roots)
+    assert refused.value.code == "git_repository"
     assert (env.repo / "target" / "tracked.txt").read_text() == "t"
 
 
@@ -424,6 +425,24 @@ def test_target_of_a_worktree_whose_repository_moved_is_refused(env: Env) -> Non
     (wt / "target" / "tracked.txt").write_text("t")
     git(wt, "add", "-f", "Cargo.toml", "target/tracked.txt")
     env.repo.rename(env.roots[0] / "moved")  # git now says "not a git repository: <gitdir>", not the plain form
-    with pytest.raises(Refusal):
+    with pytest.raises(Refusal) as refused:
         cleanup("target", wt / "target", roots=env.roots)
+    assert refused.value.code == "git_repository"
     assert (wt / "target" / "tracked.txt").read_text() == "t"
+
+
+@pytest.mark.parametrize("stderr", [
+    "fatal: not a git repository (or any of the parent directories): .git\n",
+    "fatal: not a git repository (or any parent up to mount point /tmp)\nStopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).\n",
+])
+def test_outside_repository_accepts_both_of_gits_no_repository_messages(stderr: str) -> None:
+    from herdr_engineering.cleanup_command import _outside_repository
+    # git's setup.c wording; a real mount boundary needs root, so the matcher is tested on the exact strings
+    assert _outside_repository(subprocess.CompletedProcess([], 128, "", stderr))
+
+
+def test_outside_repository_rejects_a_moved_gitdir_and_other_failures() -> None:
+    from herdr_engineering.cleanup_command import _outside_repository
+    moved = "fatal: not a git repository: /old/place/.git/worktrees/x\n"
+    assert not _outside_repository(subprocess.CompletedProcess([], 128, "", moved))
+    assert not _outside_repository(subprocess.CompletedProcess([], 1, "", "fatal: not a git repository (or any parent up to mount point /x)\n"))

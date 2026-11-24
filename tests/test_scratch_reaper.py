@@ -1539,3 +1539,78 @@ def test_recent_session_records_over_the_inspection_limit_fail_closed(tmp_path: 
         (root / f"new-{i}.jsonl").write_text("")
     with pytest.raises(OSError, match="inspection limit"):
         _live_ids([root], time.time() - 3600, limit=3)
+
+
+def _sessions_with_many_records(root: Path) -> str:
+    root.mkdir()
+    uuid = "12345678-1234-1234-1234-123456789abc"
+    (root / f"{uuid}.jsonl").write_text("")
+    for i in range(3000):
+        (root / f"r{i}.jsonl").write_text("")
+    return uuid
+
+
+def test_a_record_that_vanishes_once_is_retried_with_a_fresh_listing(tmp_path: Path) -> None:
+    """A real race: a thread deletes *.tmp files in one short burst while the scan walks the directory. Before
+    the retry, a scan that met a deleted file raised; now the second listing is clean. The burst is over
+    long before the second listing, so the scan must always succeed. Without the retry it fails nearly every
+    attempt, because the burst starts after the scan listed the directory."""
+    import threading
+
+    from herdr_engineering.scratch_reaper import _live_ids
+
+    for attempt in range(8):
+        root = tmp_path / f"s{attempt}"
+        uuid = _sessions_with_many_records(root)
+        victims = [root / f"v{i}.tmp" for i in range(3)]
+        for path in victims:
+            path.write_text("")
+
+        def burst() -> None:
+            time.sleep(0.002)  # the scan has listed the directory and is part way through it
+            for path in victims:
+                path.unlink()
+
+        thread = threading.Thread(target=burst)
+        thread.start()
+        try:
+            assert _live_ids([root], time.time() - 3600) == {uuid}
+        finally:
+            thread.join()
+
+
+def test_records_that_keep_vanishing_fail_closed(tmp_path: Path) -> None:
+    """A thread that keeps creating and deleting *.tmp files: some listing sees one that is gone by stat time,
+    in both passes, so the scan fails closed. Retried a few times because the interleaving is real."""
+    import threading
+
+    from herdr_engineering.scratch_reaper import _live_ids
+
+    root = tmp_path / "sessions"
+    _sessions_with_many_records(root)
+    stop = threading.Event()
+
+    def churn() -> None:
+        n = 0
+        while not stop.is_set():
+            batch = [root / f"c{n}-{i}.tmp" for i in range(100)]
+            for path in batch:
+                path.write_text("")
+            for path in batch:
+                path.unlink()
+            n += 1
+
+    thread = threading.Thread(target=churn)
+    thread.start()
+    try:
+        errors = []
+        for _ in range(40):
+            try:
+                _live_ids([root], time.time() - 3600)
+            except OSError as error:
+                errors.append(error)
+                break
+    finally:
+        stop.set()
+        thread.join()
+    assert errors and "vanished" in str(errors[0])

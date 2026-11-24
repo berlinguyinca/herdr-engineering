@@ -298,3 +298,16 @@ def test_a_failed_push_whose_unpushed_list_cannot_be_read_is_a_git_error(tmp_pat
     result = wip_commit(work, push_allowed=True)
     assert result.reason is not WipReason.PUSH_FAILED and result.reason is WipReason.GIT_ERROR
     assert result.error and "refused" in result.error
+
+
+def test_rejected_push_error_names_the_reason_not_the_remote_url(tmp_path: Path) -> None:
+    work = make_repo(tmp_path)
+    other = tmp_path / "other"
+    subprocess.run(["git", "clone", "-q", str(tmp_path / "remote.git"), str(other)], check=True)
+    git(other, "-c", "user.name=O", "-c", "user.email=o@example.com", "commit", "-q", "--allow-empty", "-m", "theirs")
+    git(other, "push", "-q", "origin", "HEAD:refs/heads/feat/x")  # the checkpoint push is now a non-fast-forward
+    (work / "a.txt").write_text("two\n")
+    result = wip_commit(work, push_allowed=True)
+    assert result.reason is WipReason.PUSH_FAILED and result.error
+    assert "exit 1: To " not in result.error  # git's first stderr line is "To <remote url>"
+    assert "rejected" in result.error or "failed to push" in result.error
