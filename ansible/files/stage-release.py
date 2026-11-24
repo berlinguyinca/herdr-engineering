@@ -7,6 +7,7 @@ receipt and can be retried; an existing modified directory is never reset.
 from __future__ import annotations
 
 import argparse
+import base64
 import fcntl
 import hashlib
 import json
@@ -14,6 +15,7 @@ import os
 import platform
 import re
 import subprocess
+import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -119,11 +121,31 @@ def record_patch(root, revision, *, path, before, after, actor, reason):
     return entry
 
 
+class DirtyRelease(RuntimeError):
+    """A managed release has local modifications; they are preserved, never reset."""
+
+    def __init__(self, files):
+        self.files = files
+        super().__init__('Managed release is dirty; preserving local work')
+
+
+def release_error_line(error):
+    """One quote-free line the controller can find inside Ansible's escaped output."""
+    detail = {
+        'files': error.files[:20],
+        'error': 'managed release is dirty: ' + ', '.join(error.files[:20])
+                 + '; local work preserved',
+    }
+    payload = base64.urlsafe_b64encode(json.dumps(detail).encode()).decode()
+    return 'HERDR_STAGE_ERROR:managed_release_dirty:' + payload
+
+
 def verify_checkout(path, revision, runner):
     if runner(['git', '-C', str(path), 'rev-parse', 'HEAD']) != revision:
         raise RuntimeError('Managed release has the wrong commit; refusing overwrite')
-    if runner(['git', '-C', str(path), 'status', '--porcelain', '--untracked-files=all']):
-        raise RuntimeError('Managed release is dirty; preserving local work')
+    dirty = runner(['git', '-C', str(path), 'status', '--porcelain', '--untracked-files=all'])
+    if dirty:
+        raise DirtyRelease([line.split(None, 1)[-1] for line in dirty.splitlines()])
 
 
 def checkout(root, revision, repository, runner):
@@ -323,8 +345,13 @@ def main():
         return 0 if result else 1
     if not args.revision:
         parser.error('--revision is required for staging')
-    result, changed = stage_or_reuse(args.home, args.revision, args.kind,
-                                     REPOSITORIES[args.kind], run)
+    try:
+        result, changed = stage_or_reuse(args.home, args.revision, args.kind,
+                                         REPOSITORIES[args.kind], run)
+    except DirtyRelease as error:
+        print(release_error_line(error), file=sys.stderr)
+        print(error, file=sys.stderr)
+        return 3
     print(json.dumps({**result, 'changed': changed}))
     return 0
 

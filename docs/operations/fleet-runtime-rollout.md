@@ -14,7 +14,8 @@ installs its dependencies under
 
 ```sh
 herdr-eng fleet rollout plan --pi-revision FULL_COMMIT_SHA --host bender
-# Omit --host to select every host in the private fleet inventory.
+# Repeat --host to plan several hosts in one rollout (a duplicate is rejected);
+# omit it to select every host in the private fleet inventory.
 # Optional: --inventory /absolute/path/hosts.yml --state /private/state/directory
 ```
 
@@ -276,6 +277,27 @@ next pass restarts it as a fresh `discovered` session: prepare, reload and resum
 `prepared`, `loaded`, `missions` and `hostAcceptance` from the old process are discarded and
 only `previousIncarnations` (pid, instanceId, endedAt, last status) is kept for the report. A discovered session that is unreachable (not exited) and
 absent from the native inventory is treated as transient, not as a missing-session blocker.
+
+## Correctness rules
+
+- **Offline detection** uses the staging return code (4, 124, 255) and the controller's own
+  typed errors only. Playbook output is never searched, because every Ansible recap contains
+  `unreachable=0`.
+- **Stale herdr registration.** When a pane's native conversation id names a registration with
+  no reachable row (for example a dead predecessor whose row reports `session_process_gone`),
+  the live Pi in that pane is identified by its foreground PID before anything settles. A host
+  is never marked `complete` while a live Pi session in a pane was not reloaded.
+- **No Pi sessions.** A host with no native Pi sessions and nothing tracked is settled
+  `complete` with `statusReason: no Pi sessions on host; release staged, nothing to reload`.
+  The release is staged and attested, so the revision is ready when a session starts.
+- **Hosts added later.** The unattended step compares the settled plans for the pinned revision
+  with the current inventory and mints a delta plan for the hosts no completed plan covers.
+- **State directory.** An existing rollout state directory owned by you that is group or
+  world readable is tightened to `0700`; symlinks and foreign owners are still refused.
+- **Dirty managed release.** If the staged release directory has local changes, staging fails
+  with a typed `managed_release_dirty` error. The host is `blocked` with
+  `managed release is dirty: <files>; local work preserved` and a `nextStep` naming the
+  release directory. Local work is never reset; clean or move it, then re-run apply.
 
 ## Validation coverage
 

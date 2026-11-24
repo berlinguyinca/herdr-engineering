@@ -549,9 +549,10 @@ def test_daily_unit_never_remints_a_settled_pinned_revision(checkout, monkeypatc
 
     monkeypatch.setenv("HERDR_PI_ROLLOUT_REVISION", PIN)
     settled = {"id": PLAN_ID, "revision": PIN, "status": settled_status,
-               "createdAt": "2026-11-01T00:00:00+00:00"}
+               "createdAt": "2026-11-01T00:00:00+00:00", "hosts": {"bender": {}}}
     with patch.object(fleet_rollout, "latest_unfinished", return_value=None), \
          patch.object(fleet_rollout, "list_rollouts", return_value=[settled]), \
+         patch.object(fleet_rollout, "inventory_targets", return_value=[{"host": "bender"}]), \
          patch.object(fleet_rollout, "run_rollout") as run, \
          patch.object(fleet_rollout, "create_rollout") as create, \
          patch.object(fleet_rollout, "prune_settled") as prune:
@@ -585,3 +586,29 @@ def test_daily_unit_keeps_drain_result_when_prune_is_locked(checkout, monkeypatc
     assert out["ok"] is True
     assert out["pi_rollout"]["status"] == "complete"
     assert "lock" in out["pi_rollout"]["prunedError"]
+
+
+def test_daily_unit_mints_a_delta_plan_for_a_host_added_after_the_plan_settled(
+        checkout, monkeypatch, tmp_path):
+    """A settled plan never covers a host added to the inventory later; only that host drains."""
+    from herdr_engineering import fleet_autoupdate, fleet_rollout
+
+    store = fleet_rollout.RolloutStore(tmp_path / "rollouts")
+    old = [{"host": "bender", "sshTarget": "bender", "port": 22, "local": False}]
+    settled = fleet_rollout.create_rollout(store, PIN, old, inventory=tmp_path / "hosts.yml")
+    settled["status"] = "complete"
+    store.write(settled)
+    new = {"host": "newbox", "sshTarget": "newbox", "port": 22, "local": False}
+    ran = []
+    with patch.object(fleet_rollout, "inventory_targets", return_value=[*old, new]), \
+         patch.object(fleet_rollout, "run_rollout",
+                      side_effect=lambda s, rid, **kw: ran.append(rid) or {"status": "pending"}):
+        first = fleet_autoupdate._drain_pinned_rollout(checkout, store, PIN)
+    delta = store.read(ran[0])
+    assert list(delta["hosts"]) == ["newbox"] and delta["id"] != settled["id"]
+    assert first["id"] == delta["id"]
+    delta["status"] = "complete"
+    store.write(delta)
+    with patch.object(fleet_rollout, "inventory_targets", return_value=[*old, new]):
+        again = fleet_autoupdate._drain_pinned_rollout(checkout, store, PIN)
+    assert again["status"] == "skipped"

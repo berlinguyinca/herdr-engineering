@@ -13,6 +13,7 @@ Everything is idempotent and non-disruptive to running agents.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -597,6 +598,27 @@ def _summary_state(parts: list[str], root: Path) -> str:
     return "current" if sha == want else "differs"
 
 
+_STAGE_ERROR = re.compile(r"HERDR_STAGE_ERROR:([a-z_]+):([A-Za-z0-9_=-]*)")
+
+
+def parse_stage_error(*streams: str) -> dict | None:
+    """The typed error stage-release.py emits, found in its (possibly Ansible-wrapped) output.
+
+    The marker is quote-free, so it survives Ansible's JSON escaping of captured stderr.
+    """
+    for text in streams:
+        found = _STAGE_ERROR.search(text or "")
+        if not found:
+            continue
+        try:
+            detail = json.loads(base64.urlsafe_b64decode(found[2].encode()))
+        except (ValueError, TypeError):
+            continue
+        if isinstance(detail, dict):
+            return {"code": found[1], **detail}
+    return None
+
+
 def stage_pi_runtime(revision: str, *, host: str, inventory: Path | None = None) -> dict:
     """Install/register a pinned Pi package; never reload or restart live sessions."""
     report: dict = {"ok": False, "revision": revision, "host": host}
@@ -615,6 +637,9 @@ def stage_pi_runtime(revision: str, *, host: str, inventory: Path | None = None)
            str(root / "ansible" / "playbooks" / "pi-runtime-stage.yml"), "-l", host,
            "-e", json.dumps({"pi_engineering_revision": revision})]
     rc, out, err = _run(cmd, timeout=1800)
+    typed = parse_stage_error(out, err)
+    if typed is not None:
+        return {**report, "rc": rc, "stdout": out[-4000:], "stderr": err[-1000:], **typed}
     status = fleet_status(inventory=inv, host=host)
     parity = _parity(status, expected, revision, revision, pi_only=True)
     ok = rc == 0 and parity["ok"]

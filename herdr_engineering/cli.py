@@ -455,7 +455,8 @@ def _build_parser() -> argparse.ArgumentParser:
             rp.add_argument("--pi-revision", default=None,
                             help="full immutable Pi commit SHA; defaults to the pinned "
                                  "revision (~/.config/herdr-engineering/pi-rollout-revision)")
-            rp.add_argument("--host", default=None)
+            rp.add_argument("--host", action="append", default=None,
+                            help="plan only this host; repeat to plan several hosts in one rollout")
             rp.add_argument("--inventory", default=None)
         elif action != "latest":
             rp.add_argument("--id", required=True, help="rollout ID printed by plan")

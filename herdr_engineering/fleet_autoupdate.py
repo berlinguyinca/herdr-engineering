@@ -302,20 +302,27 @@ def _drain_pinned_rollout(root: Path, store, pin: str) -> dict:
         # fleet forever and write a fresh record every night (#844).
         settled_for_pin = [p for p in fleet_rollout.list_rollouts(store)
                            if p["revision"] == pin]
-        if settled_for_pin:
-            newest = max(settled_for_pin, key=lambda p: (p.get("createdAt", ""), p["id"]))
-            return {
-                "status": "skipped",
-                "id": newest["id"],
-                "reason": (
-                    f"pinned revision {pin[:12]} is already {newest['status']} "
-                    f"(rollout {newest['id']}) - plan a new revision to roll out again"
-                ),
-            }
         inventory = root / "ansible" / "inventory" / "hosts.yml"
-        plan = fleet_rollout.create_rollout(
-            store, pin, fleet_rollout.inventory_targets(inventory, None), inventory=inventory
-        )
+        if settled_for_pin:
+            targets = []
+            newest = max(settled_for_pin, key=lambda p: (p.get("createdAt", ""), p["id"]))
+            # A host added to the inventory after the plan settled is in none of its hosts:
+            # mint a delta plan for just those hosts instead of skipping them forever.
+            if newest["status"] == "complete":
+                targets = fleet_rollout.delta_targets(
+                    store, pin, fleet_rollout.inventory_targets(inventory, None))
+            if not targets:
+                return {
+                    "status": "skipped",
+                    "id": newest["id"],
+                    "reason": (
+                        f"pinned revision {pin[:12]} is already {newest['status']} "
+                        f"(rollout {newest['id']}) - plan a new revision to roll out again"
+                    ),
+                }
+        else:
+            targets = fleet_rollout.inventory_targets(inventory, None)
+        plan = fleet_rollout.create_rollout(store, pin, targets, inventory=inventory)
     report = fleet_rollout.run_rollout(
         store, plan["id"], interval_seconds=30, max_passes=PI_ROLLOUT_MAX_PASSES
     )
