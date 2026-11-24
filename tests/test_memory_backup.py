@@ -1,5 +1,6 @@
 """deploy/control-plane/memory-backup.sh against a stub `docker` (pg_dump/pg_restore/psql are scripted); the user units
-must follow the repo's unit conventions. Nothing real is contacted."""
+must follow the repo's unit conventions. Nothing real is contacted. `--target control-plane` covers the main
+control-plane database and its object store with the same script."""
 import json
 import os
 import stat
@@ -31,13 +32,18 @@ case "$*" in
   *"pg_restore --list"*) cat >/dev/null; [ -z "${{FAIL_LIST:-}}" ] || exit 1 ;;
   *"pg_restore -U"*) cat >/dev/null; [ -z "${{FAIL_RESTORE:-}}" ] || exit 1 ;;
   *"select count"*) echo "${{TABLES:-7}}" ;;
+  *"printenv POSTGRES_USER"*) echo "${{CP_USER-cpadmin}}" ;;
+  *"cp herdr-cp-rustfs:/data -"*) [ -z "${{FAIL_OBJECTS:-}}" ] || exit 1; tar -cf - -C "$OBJ_SRC" . ;;
 esac
 exit 0
 ''')
     docker.chmod(0o755)
     (bindir / "systemctl").write_text(f'#!/bin/bash\necho "systemctl $*" >> {log}\n')
     (bindir / "systemctl").chmod(0o755)
-    env = dict(os.environ, HOME=str(home), PATH=f"{bindir}:{GNU}:{os.environ['PATH']}")
+    objects = tmp_path / "objects"
+    (objects / "data" / "bucket").mkdir(parents=True)
+    (objects / "data" / "bucket" / "payload").write_text("artifact bytes")
+    env = dict(os.environ, HOME=str(home), PATH=f"{bindir}:{GNU}:{os.environ['PATH']}", OBJ_SRC=str(objects))
     dest = tmp_path / "backups"
 
     class B:
@@ -165,3 +171,109 @@ def test_the_units_follow_the_repo_conventions():
 def test_the_script_never_reads_a_password():
     text = SCRIPT.read_text()
     assert "--no-password" in text and "PGPASSWORD" not in text and "HERDR_MEMORY_DB_PASSWORD" not in text
+
+
+# ---- --target control-plane: the main database and its object store ----------------------------------------------
+
+def test_control_plane_backup_dumps_the_database_and_the_object_store(b):
+    r = b.run("backup", "--target", "control-plane", "--dest", str(b.dest))
+    assert r.returncode == 0, r.stderr
+    lines = [json.loads(ln) for ln in r.stdout.splitlines()]
+    db, objects = Path(lines[0]["path"]), Path(lines[1]["path"])
+    assert db.name.startswith("controlplane-") and db.suffix == ".dump" and db.read_bytes() == b"PGDMP-synthetic"
+    assert objects.name.startswith("controlplane-objects-") and objects.suffix == ".tar"
+    assert "data/bucket/payload" in subprocess.run(["tar", "-tf", str(objects)], capture_output=True, text=True).stdout
+    assert stat.S_IMODE(objects.stat().st_mode) == 0o600 and list(b.dest.glob(".partial-*")) == []
+    log = b.log.read_text()
+    # the database user comes from the container's own environment; no password is read or passed
+    assert "exec herdr-cp-postgres printenv POSTGRES_USER" in log
+    assert "exec herdr-cp-postgres pg_dump -U cpadmin -d herdr --format=custom --no-password" in log
+    assert "pg_restore --list" in log and "docker cp herdr-cp-rustfs:/data -" in log
+
+
+def test_control_plane_backup_defaults_to_a_private_directory_under_the_stable_share(b):
+    r = b.run("backup", "--target", "control-plane", "--no-objects")
+    assert r.returncode == 0, r.stderr
+    d = b.home / ".local/share/herdr-engineering/backups/control-plane"
+    assert [p.name.split("-")[0] for p in d.iterdir()] == ["controlplane"] and stat.S_IMODE(d.stat().st_mode) == 0o700
+
+
+def test_no_objects_takes_the_database_only(b):
+    r = b.run("backup", "--target", "control-plane", "--dest", str(b.dest), "--no-objects")
+    assert r.returncode == 0 and len(r.stdout.splitlines()) == 1
+    assert "docker cp" not in b.log.read_text() and list(b.dest.glob("*.tar")) == []
+
+
+def test_a_failed_object_store_copy_fails_the_run_but_keeps_the_good_database_dump(b):
+    r = b.run("backup", "--target", "control-plane", "--dest", str(b.dest), FAIL_OBJECTS="1")
+    assert r.returncode == 1 and "Object store" in r.stdout
+    assert len(list(b.dest.glob("controlplane-*.dump"))) == 1
+    assert list(b.dest.glob("*.tar")) == [] and list(b.dest.glob(".partial-*")) == []
+
+
+def test_a_failed_control_plane_dump_exits_non_zero_and_leaves_nothing(b):
+    r = b.run("backup", "--target", "control-plane", "--dest", str(b.dest), FAIL_DUMP="1")
+    assert r.returncode == 1 and "error" in json.loads(r.stdout.splitlines()[0])
+    assert list(b.dest.iterdir()) == []
+
+
+def test_an_unreadable_container_user_is_an_error_not_a_default(b):
+    r = b.run("backup", "--target", "control-plane", "--dest", str(b.dest), CP_USER="")
+    assert r.returncode == 1 and "database user" in r.stdout and list(b.dest.iterdir()) == []
+
+
+def test_prefix_names_a_separate_retention_series_and_never_prunes_another(b):
+    b.dest.mkdir(mode=0o700)
+    for i in range(3):
+        (b.dest / f"controlplane-2026010{i}T000000.000000Z.dump").write_text("daily")
+        (b.dest / f"predeploy-controlplane-2026010{i}T000000.000000Z.dump").write_text("old")
+    r = b.run("backup", "--target", "control-plane", "--dest", str(b.dest), "--prefix", "predeploy-controlplane",
+              "--keep", "2", "--no-objects")
+    assert r.returncode == 0, r.stderr
+    assert len(list(b.dest.glob("predeploy-controlplane-*.dump"))) == 2
+    assert len(list(b.dest.glob("controlplane-2*.dump"))) == 3
+
+
+def test_object_archives_are_pruned_by_the_same_keep_count(b):
+    b.dest.mkdir(mode=0o700)
+    for i in range(4):
+        (b.dest / f"controlplane-objects-2026010{i}T000000.000000Z.tar").write_text("old")
+    assert b.run("backup", "--target", "control-plane", "--dest", str(b.dest), "--keep", "2").returncode == 0
+    assert len(list(b.dest.glob("controlplane-objects-*.tar"))) == 2
+
+
+def test_control_plane_age_and_restore_test_use_the_control_plane_series(b):
+    assert b.run("age", "--target", "control-plane", "--dest", str(b.dest)).returncode == 1
+    b.run("backup", "--target", "control-plane", "--dest", str(b.dest))
+    assert 0 <= int(b.run("age", "--target", "control-plane", "--dest", str(b.dest)).stdout) < 60
+    r = b.run("restore-test", "--target", "control-plane", "--dest", str(b.dest))
+    assert r.returncode == 0, r.stderr
+    log = b.log.read_text()
+    assert "exec -i herdr-cp-postgres pg_restore -U cpadmin -d restore_test_" in log
+    assert 'DROP DATABASE IF EXISTS "herdr"' not in log
+
+
+def test_control_plane_install_wires_its_own_units_and_leaves_the_memory_timer_alone(b):
+    r = b.run("install", "--target", "control-plane")
+    assert r.returncode == 0, r.stderr
+    u = b.home / ".config/systemd/user"
+    assert (u / "herdr-controlplane-backup.service").read_text() == (CP / "herdr-controlplane-backup.service").read_text()
+    assert (u / "herdr-controlplane-backup.timer").read_text() == (CP / "herdr-controlplane-backup.timer").read_text()
+    assert not (u / "herdr-hindsight-backup.timer").exists()
+    log = b.log.read_text()
+    assert "systemctl --user enable --now herdr-controlplane-backup.timer" in log and "hindsight" not in log
+
+
+def test_an_unknown_target_is_refused(b):
+    r = b.run("backup", "--target", "nope", "--dest", str(b.dest))
+    assert r.returncode == 2 and "unknown target" in r.stderr and "docker" not in b.log.read_text()
+
+
+def test_the_control_plane_units_follow_the_repo_conventions():
+    svc = (CP / "herdr-controlplane-backup.service").read_text()
+    tmr = (CP / "herdr-controlplane-backup.timer").read_text()
+    assert "Type=oneshot" in svc and "UMask=0077" in svc and "NoNewPrivileges=true" in svc
+    assert "ExecStart=%h/.local/share/herdr-engineering/memory-backup.sh backup --target control-plane" in svc
+    assert not [ln for ln in svc.splitlines() if ln.startswith(("Environment", "EnvironmentFile"))]
+    assert "OnCalendar=daily" in tmr and "Persistent=true" in tmr and "WantedBy=timers.target" in tmr
+    assert "Unit=herdr-controlplane-backup.service" in tmr
