@@ -5,6 +5,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: a dead Pi registration no longer blocks its host forever
+
+- `fleet rollout`: `_live` reported "no reachable registration" and "two live registrations claiming one conversation" with the same untyped error (`session identity missing or ambiguous`), and `retire_identityless` deliberately refuses that untyped text because it cannot tell a stale husk from a real disagreement. A session whose instance is therefore gone was un-settle-able by design: every pass repeated the refusal, every later plan re-read the same registrations and reproduced the block, and the host stayed `blocked` with no supported way past it. The two cases are now distinct -- zero reachable rows raise the typed `MissingInstanceIdentity` refusal ("has no live instance to act on", `blockReason=identity_missing`), which the operator can settle with `fleet rollout retire-identityless`, while more than one live row keeps the untyped ambiguity refusal and is still never retired. Observed on the live fleet: 80 of 143 blocked session entries across 17 rollout records carried that one error, 60 of them with no `pid` at all, and the same registrations recurred in up to 6 of 17 plans.
+
 ### Feat: `templates/ci-merge-defaults`, the "CI does the merging" defaults as a repo-agnostic template
 
 - `integrate-main.sh` (kept byte-identical to `scripts/ci/integrate-main.sh` by a test), Woodpecker `pr-gate.yml` and `main-gate.yml` snippets, and a README covering adoption plus the GitHub settings (`strict` off, required contexts, allow auto-merge, `gh pr merge --auto --squash`, `CHANGELOG.md merge=union`). Tested against real throwaway git repositories (`tests/test_ci_merge_defaults_template.py`).
