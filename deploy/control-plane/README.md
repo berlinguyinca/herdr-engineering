@@ -212,7 +212,7 @@ same-origin reverse proxy for browser traffic that adds the key server-side:
   rewrites `Host` (nginx without `proxy_set_header Host $http_host`, an ingress) sends its own upstream name
   (e.g. `dashboard-proxy:8081`): list that too, or the whole dashboard is 403. `public_scheme: https` additionally
   requires the scheme of an `Origin` that names a listed entry to match (set it when TLS is terminated in front of the
-  proxy); a direct `http` access by IP or `localhost` is not affected.
+  proxy); a direct `http` access by an IP or `localhost` that is not itself listed is not affected. An `Origin` on another port than the listed entry (or than the `Host`) is refused. Without `public_hosts`, a DNS-rebinding page whose `Host` equals its `Origin` still reaches the writes the control plane does not Origin-guard (as before this change); setting `public_hosts` closes that. An entry that does not parse (for example `dash.example:99999`) stops the proxy at start (exit 2).
 
 ```yaml
 control_plane:

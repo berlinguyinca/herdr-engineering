@@ -388,6 +388,8 @@ def test_parse_public_host_keys():
 @pytest.mark.parametrize("extra", [{"public_hosts": "dash"}, {"public_hosts": [""]}, {"public_hosts": [1]},
                                    {"public_hosts": ["user@dash"]}, {"public_hosts": ["dash example"]},
                                    {"public_hosts": ["dash.example:99999x"]},
+                                   {"public_hosts": ["dash.example:99999"]}, {"public_hosts": ["[abc]"]},
+                                   {"public_hosts": ["https://dash.example"]}, {"public_hosts": [":80"]},
                                    {"public_scheme": "ftp"}, {"public_scheme": 3}, {"public_scheme": ["https"]},
                                    {"public_scheme": {"a": 1}}])
 def test_parse_rejects_bad_public_host_keys(extra):
@@ -488,3 +490,65 @@ def test_allowlist_refusal_and_oversize_do_not_reset_a_sending_client(proxy):
 def test_malformed_origin_is_403_not_a_dropped_connection(proxy, origin):
     status, body = _browser_post(proxy, "/api/v1/attention/ack", origin=origin, host=f"127.0.0.1:{proxy.port}")
     assert status == 403 and b"cross-origin" in body
+
+
+# --- review round 3 ---
+
+def test_entry_that_cannot_be_parsed_is_a_config_error_not_a_disabled_gate(cp):
+    with pytest.raises(ValueError):
+        parse_dashboard_proxy({"viewer_key_file": "/k/v", "public_hosts": ["dash.example:99999"]})
+    with pytest.raises(ValueError):
+        start_proxy(cp.port, public_hosts=("dash.example:99999",))
+
+
+def _with_proxy(cp, fn, **kw):
+    px, thread = start_proxy(cp.port, **kw)
+    try:
+        return fn(px)
+    finally:
+        px.shutdown()
+        thread.join(timeout=3)
+
+
+def test_default_port_entry_still_enforces_public_scheme(cp):
+    def run(px):
+        return _browser_post(px, "/api/v1/attention/ack", origin="http://dash.example", host="dash.example")[0]
+    assert _with_proxy(cp, run, public_hosts=("dash.example:443",), public_scheme="https") == 403
+
+
+def test_portless_entry_refuses_an_origin_on_another_port(cp):
+    def run(px):
+        other = _browser_post(px, "/api/v1/attention/ack", origin="https://dash.example:9999", host="dash.example")[0]
+        same = _browser_post(px, "/api/v1/attention/ack", origin="http://dash.example", host="dash.example")[0]
+        return other, same
+    assert _with_proxy(cp, run, public_hosts=("dash.example",)) == (403, 200)
+
+
+def test_port_stripping_front_by_ip_works_on_default_config(proxy):
+    # nginx `proxy_set_header Host $host` drops the port: Host 127.0.0.1, Origin http://127.0.0.1:8080 (worked on main)
+    status, body = _browser_post(proxy, "/api/v1/attention/ack", origin="http://127.0.0.1:8080", host="127.0.0.1")
+    assert status == 200 and json.loads(body)["reason"] == "not_current", body
+
+
+def test_refusal_does_not_wait_for_a_body_the_client_withholds(proxy):
+    conn = http.client.HTTPConnection("127.0.0.1", proxy.port, timeout=6)
+    try:
+        conn.putrequest("POST", "/api/v1/ingest")
+        conn.putheader("Content-Length", "1000000")
+        conn.endheaders()
+        started = time.monotonic()
+        assert conn.getresponse().status == 403
+        assert time.monotonic() - started < 5
+    finally:
+        conn.close()
+
+
+def test_refused_head_has_no_body(public_proxy):
+    import socket
+    with socket.create_connection(("127.0.0.1", public_proxy.port), timeout=5) as sock:
+        sock.sendall(b"HEAD /api/v1/sessions HTTP/1.1\r\nHost: evil.example\r\n\r\n")
+        raw = b""
+        while chunk := sock.recv(4096):
+            raw += chunk
+    head, _, rest = raw.partition(b"\r\n\r\n")
+    assert head.startswith(b"HTTP/1.1 403") and rest == b""
