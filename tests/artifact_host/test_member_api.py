@@ -585,6 +585,49 @@ def test_share_lifecycle(host: Host) -> None:
     assert {e["kind"] for e in ev} >= {"created", "approved", "revoked"}
 
 
+UNLABELABLE_PAGES = {
+    "too_large": b"<html><body>" + b"x" * (2 * 1024 * 1024) + b"</body></html>",
+    "xml_prolog": b'<html><body><?xml version="1.0"?><svg></svg></body></html>',
+    "script_comment": b"<html><head><script>var a='<!-- x -->'</script></head><body>hi</body></html>",
+}
+
+
+@pytest.mark.parametrize("kind", sorted(UNLABELABLE_PAGES))
+def test_a_share_the_label_gate_would_404_is_refused_up_front(host: Host, kind: str) -> None:
+    """A page the 'shared by' label cannot be put on is 404 for every viewer; say so at create, not never."""
+    s = sign_in(host)
+    aid, vid = published(host, s, {"index.html": UNLABELABLE_PAGES[kind]})
+    r = make_share(host, s, aid, vid)
+    assert r.status == 400, r.body
+    assert r.json()["error"] in ("html_too_large", "unsupported_html")
+    assert host.rows("SELECT 1 FROM shares WHERE artifact_id=$1", aid) == []
+
+
+def test_approve_refuses_a_pending_share_whose_page_cannot_be_labelled(host: Host) -> None:
+    s = sign_in(host)
+    aid, vid = published(host, s)
+    share = make_share(host, s, aid, vid).json()
+    v2 = publish_files(
+        host, s, aid, {"index.html": UNLABELABLE_PAGES["xml_prolog"]}, base=vid
+    ).json()["version_id"]
+    host.execute("UPDATE shares SET version_id=$2 WHERE share_id=$1", share["share_id"], v2)
+    ap = call(
+        host, s, "POST", f"/artifacts/{aid}/shares/{share['share_id']}/approve", {"confirm": True}
+    )
+    assert ap.status == 400 and ap.json()["error"] == "unsupported_html", ap.body
+    [row] = host.rows("SELECT state FROM shares WHERE share_id=$1", share["share_id"])
+    assert row["state"] == "pending"
+
+
+def test_ordinary_html_with_scripts_still_shares_and_serves(host: Host) -> None:
+    s = sign_in(host)
+    page = b"<!doctype html><html><head><title>t</title></head><body><script>var a=1<2;</script>hi</body></html>"
+    aid, vid = published(host, s, {"index.html": page})
+    made = make_share(host, s, aid, vid).json()
+    call(host, s, "POST", f"/artifacts/{aid}/shares/{made['share_id']}/approve", {"confirm": True})
+    assert host.get(f"/s/{made['token']}/f/index.html").status == 200
+
+
 def test_share_token_appears_only_in_the_creation_response(host: Host) -> None:
     s = sign_in(host)
     aid, vid = published(host, s)

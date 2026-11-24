@@ -119,6 +119,11 @@ MODE_SWITCH_TEMPLATE = (
     "z-index:2147483647;display:block;margin:0;padding:6px 12px;font:600 14px/1.4 system-ui,sans-serif;color:#fff;"
     'background:#1f4fd1;border-radius:6px;text-decoration:none;box-shadow:0 1px 4px rgba(0,0,0,.4)">Annotate</a>'
 )
+# Limit (finding: the shared page's own script can remove or rewrite this bar): the bar is injected into the author's
+# own document, which must run the author's scripts ('unsafe-inline'), and no CSP stops a script from editing its own
+# DOM. It is a fixed, early, hard-to-hide label for an honest author and for passive content; it is NOT a defence
+# against a hostile author. A non-bypassable label needs a host-owned wrapper page showing the author's HTML in a
+# sandboxed iframe (a separate change, as it alters the page contract: viewport, relative URLs, annotate mode).
 SHARED_BY_BAR = (
     '<div data-herdr-shared-by role="note" style="position:fixed!important;top:0!important;left:0!important;'
     "right:0!important;z-index:2147483647!important;display:block!important;visibility:visible!important;"
@@ -541,7 +546,7 @@ def labelled_html(data: bytes, content_type: str, bar: bytes, link: bytes = b"")
 
 
 def shared_by_bar(name: str) -> bytes:
-    """The fixed, non-dismissable top bar for a member-created link; ``name`` is HTML-escaped."""
+    """The fixed top bar for a member-created link (hard to hide with CSS, but removable by the page's own script); ``name`` is HTML-escaped."""
     text = f"Shared by {html.escape(name)} \u2014 content was not reviewed by the operator"
     return SHARED_BY_BAR.format(text=text).encode("utf-8")
 

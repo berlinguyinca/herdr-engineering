@@ -472,6 +472,9 @@ class PublicSurface:
         )  # None: the sandbox CSP keeps 'self' only
         self.session_per_share = RateLimiter(SESSION_PER_SHARE_PER_MINUTE, now)
         self.session_global = RateLimiter(SESSION_GLOBAL_PER_MINUTE, now, max_keys=1)
+        # Charged before any token check, so it is keyed by CLIENT: the per-share and global budgets above are charged
+        # only by exchanges that succeed, else a holder of a share link could burn them and lock every viewer out.
+        self.session_per_client = RateLimiter(SESSION_PER_SHARE_PER_MINUTE, now)
         limits = config.annotations
         self.annotations_enabled = bool(self.lab is not None and limits["enabled"])
         self.annotate_user = RateLimiter(int(limits["per_user_per_minute"]), now)
@@ -934,6 +937,19 @@ class PublicSurface:
             cors=False,
         )
 
+    def session_open(self, request: web.Request, share_id: str) -> bool:
+        """Whether a session exchange may be tried: this client's own budget is charged, the share's and the global
+        budgets are only consulted (they are charged by ``session_charge`` once the tokens verified)."""
+        return (
+            self.session_per_client.allow(MemberSurface._client(request))
+            and not self.session_per_share.blocked(share_id)
+            and not self.session_global.blocked("*")
+        )
+
+    def session_charge(self, share_id: str) -> bool:
+        """Charge the per-share and global budgets for one verified exchange."""
+        return self.session_per_share.allow(share_id) and self.session_global.allow("*")
+
     async def claim_session(
         self, request: web.Request, state: ShareState, token: str
     ) -> web.Response:
@@ -945,7 +961,7 @@ class PublicSurface:
             return await self.deny("lab_unconfigured", share_id)
         if _announces_body(request):
             return await self.deny("body", share_id)
-        if not self.session_per_share.allow(share_id) or not self.session_global.allow("*"):
+        if not self.session_open(request, share_id):
             return await self.deny("rate_limited", share_id)
         tokens = await self.verify_tokens(request, lab)
         if tokens is None:
@@ -985,6 +1001,8 @@ class PublicSurface:
             return await self.deny(
                 "bad_access_token" if not isinstance(user, str) else "bad_id_token", share_id
             )
+        if not self.session_charge(share_id):
+            return await self.deny("rate_limited", share_id, user)
         now = self.now()
         until = min(now + lab.session_seconds, exp)
         if state["expires"] is not None:
@@ -1011,22 +1029,21 @@ class PublicSurface:
         share_id = state["share_id"]
         if _announces_body(request):
             return await self.deny("body", share_id)
-        if not self.session_per_share.allow(share_id):
+        if not self.session_open(request, share_id):
             return await self.deny("rate_limited", share_id)
-        if not self.session_global.allow(
-            "*"
-        ):  # charged only by resolved live lab shares: an unknown
-            return await self.deny(
-                "rate_limited", share_id
-            )  # token cannot drain it and lock every share out
         tokens = await self.verify_tokens(request, lab)
         if tokens is None:
             return await self.deny("bad_headers", share_id)
+        nonce = _single(request, "X-Nonce")
+        if not nonce or len(nonce) > 256 or not nonce.isascii():
+            return await self.deny("bad_nonce", share_id)  # the page's own sign-in attempt
         grant, reason, identity = await asyncio.to_thread(
-            authorise, state, tokens[0], tokens[1], lab.authenticator
+            authorise, state, tokens[0], tokens[1], lab.authenticator, nonce
         )
         if grant is None:
             return await self.deny(reason, share_id, identity or "public")
+        if not self.session_charge(share_id):
+            return await self.deny("rate_limited", share_id, identity or "public")
         now = self.now()
         exp = min(now + lab.session_seconds, grant["exp"])
         if state["expires"] is not None:

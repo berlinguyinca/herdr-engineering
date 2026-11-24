@@ -29,7 +29,8 @@ def sign_in(
 ):
     headers = {
         "Authorization": f"Bearer {acc or access()}",
-        "X-Id-Token": idt or ident(),
+        "X-Id-Token": idt or ident(nonce="n-0"),
+        "X-Nonce": "n-0",
         "Content-Length": "0",
     }
     headers.update(extra or {})
@@ -68,6 +69,32 @@ def test_session_for_listed_email(host: Host) -> None:
     assert s.token not in r.body.decode().replace(body["landing"], "")
 
 
+def test_lab_session_binds_the_id_token_to_the_page_nonce(host: Host) -> None:
+    s = lab(host)
+    mine = ident(nonce="n-mine")
+    assert sign_in(host, s, idt=mine, extra={"X-Nonce": "n-mine"}).status == 200
+    assert sign_in(host, s, idt=mine, extra={"X-Nonce": "n-other"}).status == 404  # replayed token
+    bare = {"Authorization": f"Bearer {access()}", "X-Id-Token": mine, "Content-Length": "0"}
+    assert host.request("POST", f"/s/{s.token}/session", bare).status == 404  # no X-Nonce sent
+    assert (
+        sign_in(host, s, idt=ident(), extra={"X-Nonce": "n-mine"}).status == 404
+    )  # token has none
+    reasons = " ".join(e["detail"] for e in host.events(s.share_id, "denied"))
+    assert "bad_nonce" in reasons and "bad_id_token" in reasons
+
+
+def test_a_link_holder_cannot_lock_other_viewers_out_of_sign_in(host: Host) -> None:
+    """Unauthenticated session POSTs are charged to the sender, not to the share's or the global budget."""
+    s = lab(host)
+    junk = {"Content-Length": "0", "X-Forwarded-For": "203.0.113.9"}
+    codes = [host.request("POST", f"/s/{s.token}/session", junk).status for _ in range(60)]
+    assert set(codes) == {404}
+    ok = sign_in(host, s, extra={"X-Forwarded-For": "198.51.100.7"})
+    assert ok.status == 200
+    # the attacker's own address stays throttled, even with good tokens
+    assert sign_in(host, s, extra={"X-Forwarded-For": "203.0.113.9"}).status == 404
+
+
 def test_group_allow_list(host: Host) -> None:
     s = lab(host, emails=(), groups=("Readers",))
     assert sign_in(host, s).status == 404
@@ -76,8 +103,8 @@ def test_group_allow_list(host: Host) -> None:
 
 def test_denials_and_events(host: Host) -> None:
     s = lab(host)
-    assert sign_in(host, s, idt=ident(email="mallory@evil.example")).status == 404
-    assert sign_in(host, s, idt=ident(verified=False)).status == 404
+    assert sign_in(host, s, idt=ident(email="mallory@evil.example", nonce="n-0")).status == 404
+    assert sign_in(host, s, idt=ident(verified=False, nonce="n-0")).status == 404
     assert sign_in(host, s, acc=access(key=OTHER_KEY)).status == 404
     assert sign_in(host, s, acc=access(exp=time.time() - 10)).status == 404
     assert sign_in(host, s, acc=access(client="stranger")).status == 404

@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
 
+from .https_origin import https_origin
+
 SCHEMA_VERSION: Final = 1
 DEFAULT_CONFIG_PATH: Final = "/run/secrets/artifact-host-config"
 PUBLIC_PORT: Final = (
@@ -38,6 +40,10 @@ ROLE_DB_USER: Final = {
 }
 ROLES: Final = tuple(ROLE_DB_USER)
 
+# The runtime's own shapes (public_server._CLIENT_ID, cognito._POOL_RE): a value they reject would silently turn the
+# lab shares, member surface and housekeeping off while the host reports healthy, so refuse it at load instead.
+_CLIENT_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
+_POOL_ID = re.compile(r"[a-z]{2}-[a-z]+-\d_[A-Za-z0-9]+")
 _DIGEST = re.compile(r"[0-9a-f]{64}")
 _DNS = re.compile(
     r"(?=.{1,253}\Z)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+"
@@ -180,6 +186,14 @@ def _public(raw: Mapping[str, Any]) -> dict[str, Any]:
     for key in ("pool_id", "web_client_id", "domain", "group"):
         if not isinstance(cognito[key], str) or not cognito[key]:
             raise ValueError(f"cognito.{key} must be a non-empty string")
+    if https_origin(cognito["domain"]) is None:
+        raise ValueError("cognito.domain must be a bare https origin (https://host)")
+    if not _POOL_ID.fullmatch(cognito["pool_id"]):
+        raise ValueError("cognito.pool_id must look like <region>_<id>")
+    if not _CLIENT_ID.fullmatch(cognito["web_client_id"]):
+        raise ValueError("cognito.web_client_id must match [A-Za-z0-9_-]{1,128}")
+    if not all(_CLIENT_ID.fullmatch(c) for c in clients):
+        raise ValueError("cognito.client_ids must each match [A-Za-z0-9_-]{1,128}")
     session_secret = _secret("session_secret", raw.get("session_secret"))
     claim_key = _secret("claim_key", raw.get("claim_key"))
     if session_secret == claim_key:

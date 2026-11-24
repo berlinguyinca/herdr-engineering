@@ -5,6 +5,14 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: artifact host share and sign-in bug-hunt findings
+
+- Member shares of HTML the "shared by" label cannot be placed on (over 2 MiB, `<?xml`, CDATA, odd comments in head scripts, ...) were created and approved but 404 for every viewer. `share_create` and `share_approve` now refuse them with `html_too_large` / `unsupported_html` (same check as the serve path).
+- Lab and public-link session exchange: the per-share and global rate limits are now charged only by exchanges whose tokens verified; before verification a per-client limiter applies, so a holder of a link can no longer lock every viewer out of sign-in.
+- Lab session exchange now requires `X-Nonce` and binds the ID token to it, as the public-claim and member exchanges already did.
+- `host_config.parse` refuses a `cognito.domain` that is not a bare https origin and a malformed `pool_id`, `web_client_id` or `client_ids` entry, instead of starting healthy with lab shares, the member UI, MCP and housekeeping silently off. Existing configs with a scheme-less domain must be corrected.
+- Known and unchanged: the "shared by" bar is injected into the author's own document and can be removed by that page's own script; a non-bypassable label needs a host-owned sandboxed-iframe wrapper (documented at `SHARED_BY_BAR`).
+
 ### Feature: periodic `herdr-handoff reap --apply` timer (opt-in, off by default)
 
 - `herdr-eng handoff-reap {run,status}` and `scripts/install-handoff-reap.sh` install a systemd user timer (Linux) or LaunchAgent (macOS) that closes panes replaced by confirmed handoffs, including those whose `confirm` was refused because the source pane was still working. Wired into `scripts/install.sh` (step 7f2) and, for Linux fleet hosts, `ansible/tasks/handoff-reap.yml` (`site.yml`, `fleet-sync.yml`).

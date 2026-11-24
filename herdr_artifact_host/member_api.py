@@ -75,7 +75,7 @@ from .library import (
 from .media_type import safe_media_type
 from .member_session import check_session, mint_session
 from .share_bundle import ShareBundleError, choose_entry, content_type_for, normalise_name
-from .share_http import RateLimiter
+from .share_http import MODE_SWITCH_MAX_BYTES, RateLimiter, labelled_html, shared_by_bar
 from .share_store import token_digest
 
 log = logging.getLogger("herdr_artifact_host.member")
@@ -1383,6 +1383,7 @@ class MemberService:
                 entry = choose_entry(entry_arg, sorted(f["name"] for f in files))
             except ShareBundleError:
                 raise _bad("entry is not in the version") from None
+            await self._require_labelable(files)
             recent = await conn.fetchval(
                 "SELECT count(*) FROM shares WHERE created_by=$1 AND created_at > $2",
                 member,
@@ -1438,6 +1439,39 @@ class MemberService:
             "url": f"{base}/s/{token}/",
             "expires_at": iso(expires),
         }
+
+    async def _require_labelable(self, files: list[dict[str, Any]]) -> None:
+        """A member link labels every HTML page it serves ("shared by ... not reviewed") and fails closed with the uniform
+        404 when it cannot. Refuse such a version here, with the reason, rather than hand out a link that never opens."""
+        bar = shared_by_bar("a lab member")
+        for item in files:
+            name = item["name"]
+            ctype = content_type_for(name)
+            if ctype.split(";")[0].strip() != "text/html":
+                continue
+            if int(item["size_bytes"]) > MODE_SWITCH_MAX_BYTES:
+                raise MemberError(
+                    400,
+                    "html_too_large",
+                    f"{name} is over {MODE_SWITCH_MAX_BYTES} bytes, the most a member link can label",
+                )
+
+            def read(sha: str = item["sha256"]) -> bytes:
+                with self.blobs.open(sha) as handle:
+                    return handle.read()
+
+            try:
+                data = await asyncio.to_thread(read)
+            except (BlobCorrupt, BlobMissing, OSError):
+                raise _not_found() from None
+            if labelled_html(data, ctype, bar) is None:
+                raise MemberError(
+                    400,
+                    "unsupported_html",
+                    f"{name} cannot carry the 'shared by' label (unsupported encoding such as UTF-16, or "
+                    "ambiguous markup: CDATA, <?...>, odd comments, an unclosed template/textarea/svg/script "
+                    "before <body>); save it as plain UTF-8 HTML",
+                )
 
     @staticmethod
     def _allow_list(value: object, pattern: re.Pattern[str], *, lower: bool = False) -> list[str]:
@@ -1526,6 +1560,12 @@ class MemberService:
                 raise MemberError(409, "not_pending", "the share link is not pending")
             if row["expires_at"] is not None and row["expires_at"] <= now_dt(self.now):
                 raise MemberError(409, "expired", "the share link has expired")
+            manifest = await conn.fetchval(
+                "SELECT v.output_manifest::text FROM shares s JOIN artifact_versions v "
+                "ON v.version_id=s.version_id WHERE s.share_id=$1",
+                share_id,
+            )
+            await self._require_labelable(json.loads(manifest or "[]"))
             # an agent's link has no token yet: it is made here and shown to the owner once (only its digest is kept)
             token = secrets.token_urlsafe(32) if row["created_via"] == "agent" else None
             await conn.execute(
