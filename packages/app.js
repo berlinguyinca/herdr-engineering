@@ -32,6 +32,7 @@ import { agentStory, renderStory } from './agents-lineage.js';
 import { recordOutcome, statusOutcome } from './record-state.js';
 import { RANGES, safeHostId } from './host-view.js';
 import { mountHosts, loadHosts, mountDiagnostics } from './hosts-view.js';
+import { announceRoute } from './route-focus.js';
 import { createHostDiagnosticsSource } from './diagnostics-source.js';
 import { mountHostDetail, loadHostDetail } from './host-detail-view.js';
 import { mountActivity, loadActivity } from './activity-view.js';
@@ -381,11 +382,19 @@ async function render() {
     if (revision !== renderRevision) return;
     const detail = classifyDashboardError(err, Date.now() - startedAt);
     statusPage(`<herdr-error message="${esc(err.message || dashboardErrorMessage('This page', detail))}"></herdr-error><p>${esc(dashboardErrorMessage('This page', detail))} <button type="button" data-route-retry>Retry</button>${err.requestId ? ` Request ${esc(err.requestId)}` : ''}</p>`, false, err.message || 'request failed');
+    announceRoute(root, routeLabel(match));
     if (!streamsOwnDetail) mountView(rerenderView(load));
     return;
   }
   if (revision !== renderRevision) { view?.dispose(); return; }
   mountView(view || (streamsOwnDetail ? NO_REFRESH : rerenderView(load)));
+  announceRoute(root, routeLabel(match));
+}
+
+// Nav label of the section a route belongs to; the title fallback for a page with no h1 of its own.
+function routeLabel(match) {
+  const path = '/' + match.split('/').filter(Boolean)[0];
+  return (NAV.find((n) => n.path === path || n.match?.includes(path)) || {}).label || '';
 }
 
 // Every routed page carries one freshness chip (<herdr-freshness>) in its head.
