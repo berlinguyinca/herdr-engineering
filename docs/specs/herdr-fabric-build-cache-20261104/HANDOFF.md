@@ -22,12 +22,12 @@ Not verified: appearance on a real phone; the two small tables (sccache counters
 
 ## Update 2026-11-04: tailnet gap fixed in code
 
-Cause: `AgentForwarder._rewrite_head` rewrote `Host`, which SigV4 signs. Fix: signed requests pass through untouched (tests in `tests/test_fabric_agent.py`, `*sigv4*`). Proven via a throwaway forwarder on 100.104.39.6 (aws-cli + sccache cold/warm). ACTIVATES ONLY AFTER THE OPERATOR RESTARTS THE AGENT: `systemctl --user restart herdr-eng-fabric-agent.service` (not done here). Still untested: a real second host.
+Cause: `AgentForwarder._rewrite_head` rewrote `Host`, which SigV4 signs. Fix: signed requests pass through untouched (tests in `tests/test_fabric_agent.py`, `*sigv4*`). Proven via a throwaway forwarder on 100.64.8.6 (aws-cli + sccache cold/warm). ACTIVATES ONLY AFTER THE OPERATOR RESTARTS THE AGENT: `systemctl --user restart herdr-eng-fabric-agent.service` (not done here). Still untested: a real second host.
 
 ## Update 2026-11-04: shared tier on rustfs
 
 Done: provisioning command (`build_cache_rustfs.py`, applied once on bender: bucket `herdr-build-cache`, users `herdr-build-cache-rw`/`-ro`), explicit per-policy sccache server start (`build_cache_server.py`, credentials in the server env only), trusted-plaintext (loopback/tailnet) validation, TOML fix (`no_credentials = false`), policy-port stats in build events, honest `cache.shared.active`. Tests: `tests/test_build_cache_rustfs.py`, `test_build_cache_server.py`, `test_build_cache_rustfs_live.py` (real sccache + real rustfs; skips when absent).
-Measured (same host, loopback): cold write, warm hit from rustfs after cargo clean + new local dir, other namespace misses, RO user denied. NOT tested: a real second host (two-state-dir run is a simulation), tailnet endpoint (`100.104.39.6:9000` is the fabric agent forwarder; valid SigV4 requests are rejected through it, cause not isolated), toolchain-digest isolation end to end, concurrency.
+Measured (same host, loopback): cold write, warm hit from rustfs after cargo clean + new local dir, other namespace misses, RO user denied. NOT tested: a real second host (two-state-dir run is a simulation), tailnet endpoint (`100.64.8.6:9000` is the fabric agent forwarder; valid SigV4 requests are rejected through it, cause not isolated), toolchain-digest isolation end to end, concurrency.
 Operator: publish rustfs on the tailnet address or fix the forwarder; approve enabling the canary; second-host stage is operator-performed; Slurm stays parked. Operator-decision lists no longer contain "S3 endpoint" or "Slurm partition".
 Risks: sccache does not authenticate objects (RW holders can poison); same-uid code can read server env and creds file; `max_total_gib` unenforced by herdr (bucket quota 50 GiB is).
 

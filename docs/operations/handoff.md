@@ -94,9 +94,11 @@ herdr-handoff takeover hnd_123 --cwd "$(git rev-parse --show-toplevel)"
 ```
 
 The model argument is a hint, not a guarantee. The receiving harness must
-report the resolved model. Handoffs do not launch processes or publish
-anything automatically. Public sharing remains a separate, human-approved
-artifact-publication action.
+report the resolved model. Handoffs do not publish anything automatically; public
+sharing remains a separate, human-approved artifact-publication action. What IS
+automatic is the handoff itself: when a session nears its context limit the installed
+triggers tell the agent to run this skill without being asked. See
+[Automatic handoffs](../automatic-handoffs.md).
 
 ## Ordering and refusals
 
@@ -117,6 +119,12 @@ path and not the upstream checkout:
   of starting a second pane, and closes the source now that git reports it clean.
 * `status: launch_unconfirmed` or `launch_failed` — the close was refused and both panes remain up;
   nothing was destroyed. Report it rather than re-running the command to force it.
+* Takeover gave up waiting (`--confirm-timeout`) — since herdr-handoff 0.5.1 the successor's later
+  `herdr-handoff confirm` closes the source through the same gate (unpushed commits, a dirty worktree or
+  another tab refuse). Its JSON reports `close` (`source_closed`, `already_closed`, `refused`,
+  `not_attempted`), `source_closed`, `reason` and `source_closed_at`, and it exits 0 whenever the
+  confirmation is recorded. It never closes after `--keep-source`, for a 0.5.0-written record, with no
+  source pane recorded, or while a takeover holds the lock.
 * `status: source_close_failed` — the handoff completed and herdr refused the close; report it.
 
 Untracked files (`.claude/`, `.venv/`, build output) do not refuse a close: they appear in almost every
@@ -125,6 +133,23 @@ that really loses work. It skips only the worktree check — never the live-succ
 and `git -C <path> status --short` plus `git -C <path> log @{u}..HEAD --oneline` show what it would drop.
 
 To keep the old pane instead of handing over, pass `--keep-source` (or use `launch` directly).
+
+### Live pane checks and `reap` (herdr-handoff 0.6.0)
+
+A close made after the takeover (`confirm`, `reap`) first looks at the live pane and refuses with
+`source_working` (the source agent is still working), `source_is_caller` (it is the pane the command runs
+in), `source_pane_reused` (the pane id now holds a different terminal than the takeover recorded, from
+`close_options.source_terminal_id`) or `successor_gone` (the successor pane no longer exists). The reason is
+recorded in the handoff's takeover block. `takeover` itself is unchanged. Successor panes are named
+`<project>: <goal summary>`.
+
+`herdr-handoff reap` closes the panes that confirmed handoffs replaced and that are still open (the backlog,
+and any handoff whose `confirm` could not close). It is a dry run: it prints `would_close`, `closed`,
+`already_closed` or `skipped` with the reason per handoff and changes nothing until `--apply` is given. Each
+close goes through the same gate as a confirm-side close. A record written before close options were stored
+is skipped. `--include-unrecorded` closes those too, and is dangerous: an old record cannot detect pane-id
+reuse and its `--keep-source` choice is unknown, so always review the dry run first. `herdr-eng doctor`
+requires a CLI that offers `reap` (0.6.0 or newer).
 
 ## Optional `memory_context`
 
@@ -249,6 +274,23 @@ and prints nothing, even on garbage input or an unwritable state directory.
 Inspect the registry with `herdr-eng handoff subagents [--pane ID] [--json]` (default pane `$HERDR_PANE_ID`). It
 lists the live entries and deletes entries older than 6 hours (a subagent that never reported a stop) as stale. It
 always exits 0.
+
+Three mutually exclusive flags make the registry machine-readable for a controller; each needs a pane (`--pane ID`,
+else `$HERDR_PANE_ID`, else an argument error with exit 2):
+
+- `--status` prints `{"known": bool, "live": int}` with `--json` (else `known=true live=1`). `known` is false when no
+  hook ever fired for the pane, and true once its directory exists, even with zero live agents. Stale entries are not
+  counted.
+- `--wait SECONDS` polls until no subagent is live: exit 0 when idle (an unknown pane counts as idle; the caller decides
+  what unknown means), exit 3 on timeout. With `--json` it prints the status it last saw.
+- `--purge` deletes the pane's registry directory and prints the number of entries removed (`{"purged": N}` with
+  `--json`); run it when a pane closes so a reused pane id starts clean.
+
+Without these flags the command behaves as described above.
+
+`herdr-eng handoff context [--pane ID] [--json]` prints how full the pane's session context is (harness, used and
+window tokens, percent, source, window source), or `{"unknown": true}` when it cannot be read; it always exits 0.
+`--harness NAME --session-id ID [--cwd DIR]` reads a named session's record directly, without Herdr.
 
 `herdr-eng handoff auto install` installs these two hooks together with the `UserPromptSubmit` one. Manual
 alternative, merged into `~/.claude/settings.json`:

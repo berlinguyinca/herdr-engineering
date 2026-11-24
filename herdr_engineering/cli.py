@@ -12,16 +12,20 @@ import contextlib
 import io
 import json
 import logging
+import math
 import os
 import re
 import signal
 import socket
+import sqlite3
+import subprocess
 import sys
 import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .handoff_adapters.base import Harness
 from .version import __version__
 
 # The central fleet file, alone in its own directory (deploy.sh mounts the directory).
@@ -57,12 +61,21 @@ def _build_parser() -> argparse.ArgumentParser:
         cp.add_argument("--dry-run", action="store_true")
         cp.set_defaults(func=_cmd_build_cleanup)
 
+    from .cleanup_command import register as register_cleanup_command
+    register_cleanup_command(sub)
+    from .disk_hygiene import register as register_disk_hygiene
+    register_disk_hygiene(sub)
+
     from .build_cache_report_cli import register as register_build_cache_report
     register_build_cache_report(sub)
 
     p = sub.add_parser("cargo-host", help="install or inspect harness-neutral Cargo caching")
     p.add_argument("arguments", nargs=argparse.REMAINDER)
     p.set_defaults(func=_cmd_cargo_host)
+
+    p = sub.add_parser("build-hygiene", help="install or inspect default disk hygiene (cleanup job, cargo wrapper)")
+    p.add_argument("arguments", nargs=argparse.REMAINDER)
+    p.set_defaults(func=_cmd_build_hygiene)
 
     from .open_client import register_parser
     register_parser(sub)
@@ -430,14 +443,16 @@ def _build_parser() -> argparse.ArgumentParser:
 
     pr = fsub.add_parser("rollout", help="durable Pi runtime update and mission recovery")
     rsub = pr.add_subparsers(dest="rollout_command", required=True)
-    for action in ("plan", "apply", "run", "status"):
+    for action in ("plan", "apply", "run", "status", "latest"):
         rp = rsub.add_parser(action)
         rp.add_argument("--state", default=None, help="private rollout state directory")
         if action == "plan":
-            rp.add_argument("--pi-revision", required=True, help="full immutable Pi commit SHA")
+            rp.add_argument("--pi-revision", default=None,
+                            help="full immutable Pi commit SHA; defaults to the pinned "
+                                 "revision (~/.config/herdr-engineering/pi-rollout-revision)")
             rp.add_argument("--host", default=None)
             rp.add_argument("--inventory", default=None)
-        else:
+        elif action != "latest":
             rp.add_argument("--id", required=True, help="rollout ID printed by plan")
         if action == "run":
             rp.add_argument("--interval-seconds", type=int, default=30, help="initial retry interval, 1..3600 (backoff caps at max(interval, 300))")
@@ -457,6 +472,25 @@ def _build_parser() -> argparse.ArgumentParser:
         default="operator",
         help="who is settling the registration; recorded per session in the report",
     )
+    rp.set_defaults(func=_cmd_fleet_rollout)
+
+    rp = rsub.add_parser(
+        "abandon",
+        help="settle a rollout the operator no longer wants (e.g. it targets an unpinned "
+        "revision); the record stays until pruned, and the newest unfinished selector "
+        "moves on",
+    )
+    rp.add_argument("--state", default=None, help="private rollout state directory")
+    rp.add_argument("--id", required=True, help="rollout ID printed by plan")
+    rp.add_argument("--reason", default="abandoned by operator", help="why; recorded in the plan")
+    rp.set_defaults(func=_cmd_fleet_rollout)
+
+    rp = rsub.add_parser(
+        "prune",
+        help="delete settled (complete/abandoned) rollout records older than the horizon",
+    )
+    rp.add_argument("--state", default=None, help="private rollout state directory")
+    rp.add_argument("--older-than-days", type=int, default=30, help="settle horizon (default 30)")
     rp.set_defaults(func=_cmd_fleet_rollout)
 
     # artifacts ------------------------------------------------------------
@@ -513,6 +547,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--harness", default=None, help="skip detection and validate this name")
     p2.add_argument("--proc-root", default="/proc", help=argparse.SUPPRESS)
     p2.set_defaults(func=_cmd_handoff_harness)
+    p2 = hsub.add_parser("context", help="print how full this session's context is (always exit 0; {\"unknown\": true} when unreadable)")
+    p2.add_argument("--pane", default=None, help="pane id (default: $HERDR_PANE_ID)")
+    p2.add_argument("--harness", choices=[h.value for h in Harness], default=None,
+                    help="with --session-id: skip detection and the Herdr lookup")
+    p2.add_argument("--session-id", default=None, help="with --harness: the session whose record to read")
+    p2.add_argument("--cwd", default=None, help="working directory of the session (default: the current one)")
+    p2.add_argument("--json", action="store_true")
+    p2.set_defaults(func=_cmd_handoff_context)
     p2 = hsub.add_parser("context-hook", help="UserPromptSubmit hook body (opt-in): ask for /handoff when context is high; never fails")
     p2.add_argument("harness", help="only claude is supported; anything else is a silent no-op so a hook never fails")
     p2.set_defaults(func=_cmd_handoff_context_hook)
@@ -522,13 +564,92 @@ def _build_parser() -> argparse.ArgumentParser:
     p2 = hsub.add_parser("subagents", help="list running subagents registered for a pane (prunes entries older than 6h)")
     p2.add_argument("--pane", default=None, help="pane id (default: $HERDR_PANE_ID)")
     p2.add_argument("--json", action="store_true")
-    p2.set_defaults(func=_cmd_handoff_subagents)
+    mode = p2.add_mutually_exclusive_group()
+    mode.add_argument("--status", action="store_true", help='print {"known": bool, "live": int} instead of the entries')
+    mode.add_argument("--wait", type=_wait_seconds, default=None, metavar="SECONDS",
+                      help="wait until no subagent is live: exit 0 when idle, 3 on timeout")
+    mode.add_argument("--purge", action="store_true", help="delete the pane's registry entries (pane closed)")
+    p2.set_defaults(func=_cmd_handoff_subagents, subagents_parser=p2)
     p2 = hsub.add_parser("auto", help="install, remove or check the opt-in context-hook in ~/.claude/settings.json")
     p2.add_argument("auto_action", choices=("install", "uninstall", "check"))
     p2.add_argument("--home", default=None, help="override $HOME (tests)")
     p2.add_argument("--dry-run", action="store_true", help="report what would change without writing")
+    p2.add_argument("--subagents-only", action="store_true", help="install: only the SubagentStart/SubagentStop registry hooks")
     p2.add_argument("--json", action="store_true")
-    p2.set_defaults(func=_cmd_handoff_auto)
+    p2.set_defaults(func=_cmd_handoff_auto, auto_parser=p2)
+
+    # handoff autopilot ----------------------------------------------------
+    p2 = hsub.add_parser(
+        "autopilot", help="handoffs without being asked: install, status, check, record, hook"
+    )
+    asub = p2.add_subparsers(dest="autopilot_command", required=True)
+    for name, helptext in (
+        ("install", "install the automatic triggers (Pi extension, Claude Code hooks)"),
+        ("uninstall", "remove only what install wrote; the trigger ledger is kept"),
+    ):
+        p3 = asub.add_parser(name, help=helptext)
+        p3.add_argument("--home", default=None, help="override $HOME (tests)")
+        p3.add_argument("--dry-run", action="store_true")
+        p3.add_argument(
+            "--json", action="store_true", help="accepted for symmetry; output is always JSON"
+        )
+        p3.set_defaults(func=_cmd_handoff_autopilot_manage)
+    p3 = asub.add_parser(
+        "status", help="policy, what is installed, and the per-session trigger ledger"
+    )
+    p3.add_argument("--home", default=None, help="override $HOME (tests)")
+    p3.add_argument(
+        "--json", action="store_true", help="accepted for symmetry; output is always JSON"
+    )
+    p3.set_defaults(func=_cmd_handoff_autopilot_status)
+    for name, helptext in (
+        ("check", "read-only: should this session hand off now? (never records)"),
+        ("record", "record that the handoff instruction was delivered"),
+    ):
+        p3 = asub.add_parser(name, help=helptext)
+        p3.add_argument("--session-id", required=True)
+        p3.add_argument("--harness", default="pi", choices=("claude", "codex", "opencode", "pi"))
+        p3.add_argument(
+            "--percent",
+            type=_percent_arg,
+            default=None,
+            help="percent of the context window in use, as the harness reported it",
+        )
+        p3.add_argument(
+            "--tokens", type=int, default=None, help="tokens in use (fallback for --percent)"
+        )
+        p3.add_argument(
+            "--context-window", type=int, default=None, help="the harness's context window"
+        )
+        if name == "check":
+            p3.add_argument(
+                "--transcript",
+                default=None,
+                help="Claude Code transcript JSONL to measure, the way the Stop hook does",
+            )
+        p3.add_argument("--boundary", default="turn_end", help="what noticed the full context")
+        p3.add_argument(
+            "--cwd", default=None, help="project root to look for handoffs already underway"
+        )
+        p3.add_argument("--home", default=None, help="override $HOME (tests)")
+        p3.add_argument(
+            "--json", action="store_true", help="accepted for symmetry; output is always JSON"
+        )
+        p3.set_defaults(
+            func=_cmd_handoff_autopilot_check if name == "check" else _cmd_handoff_autopilot_record
+        )
+    p3 = asub.add_parser(
+        "hook", help="harness hook body: reads the event on stdin, prints the verdict, never fails"
+    )
+    p3.add_argument("--harness", required=True, choices=("claude", "codex", "opencode", "pi"))
+    p3.add_argument(
+        "--record", action="store_true", help="consume the trigger once the event is delivered"
+    )
+    p3.add_argument("--home", default=None, help="override $HOME (tests)")
+    p3.add_argument(
+        "--json", action="store_true", help="accepted for symmetry; output is always JSON"
+    )
+    p3.set_defaults(func=_cmd_handoff_autopilot_hook)
 
     # summary --------------------------------------------------------------
     p = sub.add_parser("summary", help="/summary skill: install, verify, remove, read session history")
@@ -732,10 +853,10 @@ def _build_parser() -> argparse.ArgumentParser:
                          "the gateway keeps using per-port URLs)")
     p2.add_argument("--apex-upstream", default=None, metavar="HOST:PORT",
                     help="where the bare fleet names (https://dev.lan, https://<acme-domain>) go: the dashboard, e.g. "
-                         "100.104.39.6:80. Needs the named listener (--acme-domain) and a certificate for the name")
+                         "100.64.8.6:80. Needs the named listener (--acme-domain) and a certificate for the name")
     p2.add_argument("--route", action="append", default=[], metavar="HOST=UP:PORT",
                     help="send one exact host name on the named port to an upstream (repeatable), e.g. "
-                         "bender.tail0c50da.ts.net=127.0.0.1:8787 to take over a `tailscale serve` rule")
+                         "bender.<tailnet>.ts.net=127.0.0.1:8787 to take over a `tailscale serve` rule")
     p2.add_argument("--tailscale-cert", default=None, metavar="NAME",
                     help="also serve this node's ts.net NAME with the certificate `tailscale cert` provides")
     p2.add_argument("--no-named-urls", action="store_true", help="do not serve stable service-name URLs")
@@ -1063,7 +1184,7 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="Cognito Hosted UI base URL, e.g. https://<prefix>.auth.us-west-2.amazoncognito.com")
     p2.add_argument("--collab-public-url", default=None,
                     help="the https URL users open (must equal a registered callback URL), e.g. "
-                         "https://bender.tail0c50da.ts.net:9447/")
+                         "https://bender.<tailnet>.ts.net:9447/")
     p2.add_argument("--collab-cognito-group", default=None,
                     help="required cognito:groups membership (default: local.dev)")
     p2.add_argument("--collab-open-signup", action="store_true",
@@ -1501,11 +1622,49 @@ def _cmd_handoff_harness(args) -> int:
     return 0
 
 
+def _cmd_handoff_context(args) -> int:
+    from . import handoff_harness as hh
+    from .handoff_adapters import adapter_for
+    if (args.harness is None) != (args.session_id is None):
+        _build_parser().error("handoff context: --harness and --session-id go together")
+    cwd = Path(args.cwd) if args.cwd else Path.cwd()
+    pane = args.pane or os.environ.get("HERDR_PANE_ID") or ""
+    reading, harness = None, None
+    try:
+        if args.harness is not None:
+            harness = Harness(args.harness)
+            adapter = adapter_for(harness)
+            ref = adapter.locate_session(args.session_id, cwd, pane)
+        elif pane:
+            harness = Harness(hh.detect().harness)
+            adapter = adapter_for(harness)
+            ref = adapter.locate(pane, cwd)
+        else:
+            ref = None
+        reading = adapter.read_context(ref) if ref is not None else None
+    except (hh.Undetectable, ValueError, OSError, sqlite3.Error, subprocess.SubprocessError):
+        reading = None  # whatever detecting, locating or reading raises, a reading that is unavailable must never fail a caller's script
+    if reading is None or harness is None:
+        print(json.dumps({"unknown": True}) if args.json else "unknown")
+        return 0
+    percent = round(reading.percent, 1)
+    if args.json:
+        _print_json({"harness": harness.value, "used_tokens": reading.used_tokens, "window_tokens": reading.window_tokens,
+                     "percent": percent, "source": reading.source, "window_source": reading.window_source})
+    else:
+        print(f"{harness.value}: {reading.used_tokens} of {reading.window_tokens} tokens ({percent}%)")
+    return 0
+
+
 def _cmd_handoff_auto(args) -> int:
     from . import handoff_auto_setup as ha
     home = Path(args.home) if args.home else None
+    if args.subagents_only and args.auto_action != "install":
+        args.auto_parser.error("--subagents-only only applies to the install action")
     if args.auto_action == "check":
         items = ha.check(home)
+    elif args.auto_action == "install" and args.subagents_only:
+        items = ha.install_subagent_hooks(home, dry_run=args.dry_run)
     else:
         items = (ha.install if args.auto_action == "install" else ha.uninstall)(home, dry_run=args.dry_run)
     ok = all(i.action not in ha.FAIL_ACTIONS for i in items)
@@ -1522,9 +1681,207 @@ def _cmd_handoff_subagent_hook(args) -> int:
     return run_subagent_hook(args.phase)
 
 
+def _wait_seconds(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {text!r}") from None
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError(f"must be a finite number of seconds >= 0, got {text!r}")
+    return value
+
+
 def _cmd_handoff_subagents(args) -> int:
-    from .handoff_subagent_registry import run_subagents
-    return run_subagents(args.pane, as_json=args.json)
+    from . import handoff_subagent_registry as registry
+    if not (args.status or args.wait is not None or args.purge):
+        return registry.run_subagents(args.pane, as_json=args.json)
+    pane = args.pane or os.environ.get("HERDR_PANE_ID")
+    if not pane:
+        args.subagents_parser.error("--pane is required (or set HERDR_PANE_ID)")
+    if args.purge:
+        removed = registry.purge_pane(pane, os.environ)
+        if args.json:
+            _print_json({"purged": removed})
+        else:
+            print(removed)
+        return 0
+    if args.wait is None:
+        state = registry.status(pane, os.environ)
+        idle = True
+    else:
+        state = registry.wait_status(pane, os.environ, args.wait)
+        idle = state.live == 0
+    if args.json:
+        _print_json({"known": state.known, "live": state.live})
+    else:
+        print(f"known={str(state.known).lower()} live={state.live}")
+    return 0 if idle else 3
+
+
+def _percent_arg(value: str) -> float:
+    try:
+        percent = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"percent must be a number, not {value!r}") from exc
+    if not 0 <= percent <= 100:
+        raise argparse.ArgumentTypeError(f"percent must be between 0 and 100, not {percent:g}")
+    return percent
+
+
+def _cmd_handoff_autopilot_manage(args) -> int:
+    from . import handoff_autopilot as autopilot
+
+    home = Path(args.home) if args.home else None
+    try:
+        if args.autopilot_command == "install":
+            result = autopilot.install(home=home, dry_run=args.dry_run)
+        else:
+            result = autopilot.uninstall(home=home, dry_run=args.dry_run)
+    except autopilot.InvalidError as exc:
+        _print_json({"code": "config", "message": str(exc)})
+        return 1
+    _print_json(result)
+    return 0
+
+
+def _cmd_handoff_autopilot_status(args) -> int:
+    from . import handoff_autopilot as autopilot
+
+    home = Path(args.home) if args.home else None
+    try:
+        _print_json(autopilot.status(home=home))
+    except autopilot.InvalidError as exc:
+        _print_json({"code": "config", "message": str(exc)})
+        return 1
+    return 0  # status reports; `herdr-eng doctor` is the command that judges
+
+
+def _autopilot_decision_args(args, *, boundary_default: str = "turn_end") -> dict:
+    return dict(
+        session_id=args.session_id,
+        harness=args.harness,
+        percent=args.percent,
+        tokens=args.tokens,
+        context_window=args.context_window,
+        cwd=Path(args.cwd) if args.cwd else None,
+        home=Path(args.home) if args.home else None,
+        boundary=getattr(args, "boundary", None) or boundary_default,
+    )
+
+
+def _autopilot_transcript_tokens(args) -> int | None:
+    """Prompt-side tokens from a Claude Code transcript, exactly as the Stop hook reads them.
+
+    `check --transcript` exists so the number the hook acts on can be asked for outside the
+    hook. Tokens, not a percentage: the transcript proves usage and not window size, so the
+    window - assumed or declared - stays visible in the answer instead of being hidden inside a
+    number that looks like the harness stated it.
+    """
+    from . import handoff_autopilot as autopilot
+
+    transcript = getattr(args, "transcript", None)
+    return autopilot.transcript_tokens(transcript) if transcript else None
+
+
+def _autopilot_transcript_model(args) -> str | None:
+    """The model a Claude Code transcript names, so `check`/`record` pick the same window."""
+    from . import handoff_autopilot as autopilot
+
+    transcript = getattr(args, "transcript", None)
+    return autopilot.transcript_model(transcript) if transcript else None
+
+
+def _autopilot_settle_uptake(autopilot, kwargs: dict) -> list[str]:
+    """Record which told sessions actually handed off; names of the sessions stamped.
+
+    Bookkeeping only, and it writes nothing when there is nothing new to record. A handoff tool
+    that is not installed, or a store that cannot be read, is not a reason to lose the decision
+    the caller came for, so any failure here is swallowed after being reported as no settlements.
+    """
+    try:
+        settled = autopilot.settle_uptake(cwd=kwargs.get("cwd"), home=kwargs.get("home"))
+    except Exception:  # noqa: BLE001 - an unmeasurable handoff must not stall the session
+        return []
+    return sorted(settled) if settled else []
+
+
+def _cmd_handoff_autopilot_check(args) -> int:
+    from . import handoff_autopilot as autopilot
+
+    kwargs = _autopilot_decision_args(args)
+    measured = _autopilot_transcript_tokens(args)
+    if measured is not None:
+        kwargs["tokens"] = measured
+        kwargs["model"] = _autopilot_transcript_model(args)
+    settled = _autopilot_settle_uptake(autopilot, kwargs)
+    verdict = autopilot.decide(**kwargs).to_dict()
+    if settled:
+        verdict["uptake_settled"] = settled
+    _print_json(verdict)
+    return 0
+
+
+def _cmd_handoff_autopilot_record(args) -> int:
+    from . import handoff_autopilot as autopilot
+
+    kwargs = _autopilot_decision_args(args)
+    # The ledger records the context the agent was told about, so it has to be resolved by the
+    # same rule `check` used to decide; recording None, or a percent derived against a window the
+    # usage already contradicted, would write an audit entry that never happened.
+    measured = _autopilot_transcript_tokens(args)
+    if measured is not None:
+        kwargs["tokens"] = measured
+    if kwargs["percent"] is None:
+        try:
+            active = autopilot.policy()
+        except autopilot.InvalidError:
+            active = autopilot.Policy()
+        kwargs["percent"] = autopilot.derive_percent(
+            None,
+            kwargs["tokens"],
+            kwargs["context_window"]
+            or autopilot.model_window(_autopilot_transcript_model(args), active.model_windows),
+            default_window=active.context_window_tokens,
+            large_window=active.large_context_window_tokens,
+        )
+    # `home` is the whole question for the settle step too, so read it before it is consumed.
+    autopilot_home = kwargs.get("home")
+    entry = autopilot.record_trigger(
+        session_id=kwargs.pop("session_id"),
+        harness=kwargs.pop("harness"),
+        percent=kwargs.pop("percent"),
+        boundary=kwargs.pop("boundary"),
+        home=kwargs.pop("home"),
+    )
+    settled = _autopilot_settle_uptake(autopilot, {"home": autopilot_home})
+    payload = {"schema_version": 1, "ok": True, "session_id": args.session_id, **entry}
+    if settled:
+        payload["uptake_settled"] = settled
+    _print_json(payload)
+    return 0
+
+
+def _cmd_handoff_autopilot_hook(args) -> int:
+    """Claude Code (and friends) hook body: read the event, print what to do, never fail.
+
+    A hook that can fail is a hook that can stall the agent it was installed to help, so
+    every path here returns 0; an unusable event simply produces no output.
+    """
+    from . import handoff_autopilot as autopilot
+
+    try:
+        payload = autopilot.hook(
+            args.harness,
+            sys.stdin.read(),
+            record=args.record,
+            home=Path(args.home) if args.home else None,
+        )
+    except Exception as exc:  # fail open: the session must keep running
+        _print_json({"schema_version": 1, "trigger": False, "code": "internal", "reason": str(exc)})
+        return 0
+    if payload:
+        _print_json(payload)
+    return 0
 
 
 def _cmd_summary_manage(args) -> int:
@@ -2009,9 +2366,13 @@ def _cmd_fleet_rollout(args) -> int:
     from .fleet import FleetError, repo_root
     from .fleet_rollout import (
         RolloutStore,
+        abandon_rollout,
         apply_rollout,
         create_rollout,
         inventory_targets,
+        latest_unfinished,
+        prune_settled,
+        resolve_plan_revision,
         retire_identityless,
         run_rollout,
     )
@@ -2019,14 +2380,22 @@ def _cmd_fleet_rollout(args) -> int:
     store = RolloutStore(Path(args.state) if args.state else None)
     try:
         if args.rollout_command == "plan":
+            revision = resolve_plan_revision(args.pi_revision)
             inventory = Path(args.inventory) if args.inventory else repo_root() / "ansible/inventory/hosts.yml"
-            report = create_rollout(store, args.pi_revision, inventory_targets(inventory, args.host), inventory=inventory)
+            report = create_rollout(store, revision, inventory_targets(inventory, args.host), inventory=inventory)
         elif args.rollout_command == "apply":
             report = apply_rollout(store, args.id)
         elif args.rollout_command == "run":
             report = run_rollout(store, args.id, interval_seconds=args.interval_seconds, max_passes=args.max_passes, max_unchanged_online_passes=args.max_unchanged_online_passes)
         elif args.rollout_command == "retire-identityless":
             report = retire_identityless(store, args.id, settled_by=args.settled_by)
+        elif args.rollout_command == "latest":
+            plan = latest_unfinished(store)
+            report = plan if plan is not None else {"status": "none", "reason": "no unfinished rollout"}
+        elif args.rollout_command == "abandon":
+            report = abandon_rollout(store, args.id, reason=args.reason)
+        elif args.rollout_command == "prune":
+            report = {"pruned": prune_settled(store, older_than_days=args.older_than_days)}
         else:
             report = store.read(args.id)
     except (OSError, ValueError, RuntimeError, FleetError) as exc:
@@ -3173,6 +3542,11 @@ def _cmd_dev_gateway(args) -> int:
     return 0
 
 
+def _cmd_build_hygiene(args) -> int:
+    from .build_hygiene import main
+    return main(args.arguments)
+
+
 def _cmd_cargo_host(args) -> int:
     from .cargo_host import main
     return main(args.arguments)
@@ -3189,7 +3563,7 @@ def _cmd_build_coordinate(args) -> int:
     from .build_coord import BuildGate, _default_slots, _default_state_dir, run_gated
     from .build_metrics import summarize
 
-    cache_cfg = _build_cache_config()
+    cache_cfg, cleanup_policy = _build_cache_config_and_policy()
     slots = args.slots if args.slots is not None else effective_slots(
         cache_cfg, _default_slots(), _default_state_dir())
     if getattr(args, "status", False):
@@ -3232,11 +3606,40 @@ def _cmd_build_coordinate(args) -> int:
     if getattr(args, "trace_session", None) and trace is None:
         print("build-coordinate: --trace-session ignored (not a plain non-secret id)",
               file=sys.stderr)
+    if cmd and _guarded_build(cmd):
+        from .cargo_host import _disk_guard_refusal
+        probe = Path.cwd()
+        if os.path.basename(cmd[0]) == "cargo":  # measure where cargo's output really lands
+            from .cargo_target_storage import target_override
+            where = target_override(cmd[1:], os.environ, probe)
+            probe = where if isinstance(where, Path) else probe
+        refused = _disk_guard_refusal(probe, cleanup_policy)
+        if refused is not None:
+            return refused
     return run_gated(cmd, slots=slots, max_load=args.max_load,
                      wait_seconds=args.wait, json_out=args.json,
                      bypass_on_timeout=args.bypass_on_timeout,
                      record=getattr(args, "record", False),
                      cache_config=cache_cfg, trace=trace)
+
+
+# Commands whose output size the disk-budget guard protects here. Cargo is guarded here only when the
+# cargo on PATH is not the managed wrapper: the wrapper guards it against the filesystem its target really
+# lands on, also under build-coordinate. Scripts are never refused.
+_GUARDED_BUILD_COMMANDS = frozenset({"rustc", "make", "cmake", "ninja", "tsc"})
+_GUARDED_GO_SUBCOMMANDS = frozenset({"build", "install", "generate"})
+
+
+def _guarded_build(cmd: list[str]) -> bool:
+    name = os.path.basename(cmd[0])
+    if name == "cargo":
+        from .cargo_host import BUILD_SUBCOMMANDS, cargo_subcommand, path_cargo_is_wrapper
+        subcommand = cargo_subcommand(cmd[1:])
+        return (subcommand in BUILD_SUBCOMMANDS and subcommand != "clean"
+                and not path_cargo_is_wrapper(cmd[0]))
+    if name == "go":
+        return len(cmd) > 1 and cmd[1] in _GUARDED_GO_SUBCOMMANDS
+    return name in _GUARDED_BUILD_COMMANDS
 
 
 def _is_gate_command(cmd: list[str]) -> bool:
@@ -3247,20 +3650,31 @@ def _is_gate_command(cmd: list[str]) -> bool:
         and cmd[1] == "build-coordinate")
 
 
-def _build_cache_config():
-    """Effective ``fabric_build_cache`` config, or None when absent/disabled/invalid.
+def _build_cache_config_and_policy():
+    """(effective ``fabric_build_cache`` config or None, ``build_cleanup`` policy), from one config load.
 
-    A config problem must never block a build: it just runs uncached.
+    A config problem must never block a build: the cache config is then None (it runs uncached) and
+    the policy falls back to the non-strict load, so the disk guard still applies.
     """
     from .build_cache_config import validate
     from .config import load_config
     try:
-        section = load_config(strict_build_cache=True).get("fabric_build_cache")
+        loaded = load_config(strict_build_cache=True)
+        section = loaded.get("fabric_build_cache")
         cfg = validate(section) if section else None
     except Exception as exc:  # noqa: BLE001
         print(f"build-coordinate: build cache config ignored: {exc}", file=sys.stderr)
-        return None
-    return cfg if cfg is not None and cfg.enabled else None
+        try:
+            loaded = load_config()
+        except Exception:  # noqa: BLE001
+            loaded = {}
+        return None, loaded.get("build_cleanup", {})
+    return (cfg if cfg is not None and cfg.enabled else None), loaded.get("build_cleanup", {})
+
+
+def _build_cache_config():
+    """Effective ``fabric_build_cache`` config, or None when absent/disabled/invalid."""
+    return _build_cache_config_and_policy()[0]
 
 
 def _cmd_build_cache_inventory(args) -> int:
@@ -3339,7 +3753,7 @@ def _cmd_dev_agent(args) -> int:
 
     from .config import InvalidError, load_config
     from .fabric import FabricClient, gateway_url_from_config, tailnet_ipv4
-    from .fabric_agent import AgentConfig, FabricAgent, parse_agent_binaries
+    from .fabric_agent import AgentConfig, FabricAgent, parse_agent_binaries, parse_deny_processes
     from .host_config import ConfigRefresher, HostConfigUnavailable, exit_unavailable, host_config
 
     logging.basicConfig(level=logging.INFO,
@@ -3380,6 +3794,7 @@ def _cmd_dev_agent(args) -> int:
         "agent_exclude_ports", []))
     try:
         agent_binaries = parse_agent_binaries(fabric_cfg.get("agent_binaries"))
+        deny_processes = parse_deny_processes(fabric_cfg.get("agent_deny_processes"))
     except ValueError as exc:
         _print_json({"code": "config", "message": str(exc)})
         return 1
@@ -3403,6 +3818,9 @@ def _cmd_dev_agent(args) -> int:
             host_report_interval=float(fabric_cfg.get("host_report_interval", 30.0)),
             host_slow_interval=float(fabric_cfg.get("host_slow_interval", 3600.0)),
             agent_binaries=agent_binaries,
+            deny_processes=deny_processes,
+            orphan_grace=float(fabric_cfg.get("agent_orphan_grace_seconds", 60.0)),
+            lease_max_age=float(fabric_cfg.get("agent_lease_max_age_seconds", 86400.0)),
         ))
     if args.once:
         summary = agent.scan_once()
@@ -5912,8 +6330,8 @@ def _parse_api_keys(single_key, pairs_str):
 
 def _seed_demo(repo):
     """Populate a fresh repo with demo missions/sessions/hosts/services."""
-    hid1 = repo.register_host("bender", "100.104.39.6")
-    hid2 = repo.register_host("beast", "100.96.156.65")
+    hid1 = repo.register_host("bender", "100.64.8.6")
+    hid2 = repo.register_host("beast", "100.64.8.65")
     repo.record_telemetry(hid1, {"cpu_pct": 12, "mem_pct": 38, "disk_pct": 54})
     repo.record_telemetry(hid2, {"cpu_pct": 3, "mem_pct": 21, "disk_pct": 30})
 

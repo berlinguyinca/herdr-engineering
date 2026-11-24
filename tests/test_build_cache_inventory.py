@@ -103,8 +103,9 @@ def test_view_is_redacted(tmp_path):
 
 def test_disabled_collects_nothing(tmp_path, monkeypatch):
     monkeypatch.setenv("HERDR_ENGINEERING_STATE", str(tmp_path / "st"))
-    assert inv.collect(validate(None)) is None
-    assert inv.inventory_view(validate(None), []) == {"enabled": False, "hosts": []}
+    off = validate({"enabled": False})
+    assert inv.collect(off) is None
+    assert inv.inventory_view(off, []) == {"enabled": False, "hosts": []}
     assert not (tmp_path / "st").exists()
 
 
@@ -119,8 +120,10 @@ def test_collect_with_real_rustc(tmp_path, monkeypatch):
 
 
 def test_cli_disabled_and_json(tmp_path):
+    off = tmp_path / "off.yaml"
+    off.write_text("fabric_build_cache:\n  enabled: false\n")
     env = {**os.environ, "HERDR_ENGINEERING_STATE": str(tmp_path / "st"),
-           "HOME": str(tmp_path)}
+           "HOME": str(tmp_path), "HERDR_ENGINEERING_CONFIG": str(off)}
     r = subprocess.run([sys.executable, "-c",
                         "import sys; from herdr_engineering.cli import main; "
                         "sys.exit(main(['build-cache-inventory', '--json']))"], capture_output=True, text=True, env=env,

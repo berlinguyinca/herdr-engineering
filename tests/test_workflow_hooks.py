@@ -98,7 +98,7 @@ def run_hook(event, stdin="{}"):
 def test_session_start_reminder_is_short_and_covers_defaults():
     ctx = run_hook("SessionStart")["hookSpecificOutput"]["additionalContext"]
     assert len(ctx.splitlines()) <= 15
-    for needle in ("sonnet", "verify", "never push herdr-engineering", "/tmp", "woodpecker", "/handoff"):
+    for needle in ("sonnet", "verify", "never push main", "never force-push", "/tmp", "woodpecker", "/handoff"):
         assert needle in ctx.lower()
     assert run_hook("SessionStart")["hookSpecificOutput"]["hookEventName"] == "SessionStart"
 
@@ -165,3 +165,39 @@ def test_generated_command_with_missing_executable_is_silent_noop(home):
     cmds = _hook_commands(home, ["/nonexistent/python", "-m", "herdr_engineering.cli"])
     done = subprocess.run(["sh", "-c", cmds["SessionStart"]], input="{}", capture_output=True, text=True, timeout=60)
     assert done.returncode == 0 and done.stdout == ""
+
+
+def test_install_adds_cleanup_allow_rule_and_reminder_mentions_command(home):
+    settings(home).write_text(json.dumps({"permissions": {"allow": ["Bash(ls:*)"]}}))
+    inst(home).install()
+    assert json.loads(settings(home).read_text())["permissions"]["allow"] == [
+        "Bash(ls:*)", "Bash(herdr-eng cleanup:*)"]
+    assert inst(home).install().action == "noop"
+    ctx = run_hook("SessionStart")["hookSpecificOutput"]["additionalContext"]
+    assert "herdr-eng cleanup" in ctx and "--print-run-args" in ctx
+    inst(home).uninstall()
+    assert json.loads(settings(home).read_text()) == {"permissions": {"allow": ["Bash(ls:*)"]}}
+
+
+def test_installed_rule_is_exactly_the_cleanup_command(home):
+    inst(home).install()
+    assert json.loads(settings(home).read_text())["permissions"]["allow"] == ["Bash(herdr-eng cleanup:*)"]
+
+
+def test_removed_allow_rule_is_not_drift_and_never_re_added(home):
+    inst(home).install()
+    data = json.loads(settings(home).read_text())
+    del data["permissions"]
+    settings(home).write_text(json.dumps(data, indent=2))
+    before = settings(home).read_bytes()
+    assert inst(home).status().state == "current"
+    assert inst(home).install().action == "noop"
+    assert inst(home).repair().action == "noop"
+    assert settings(home).read_bytes() == before
+    # a genuine hook drift is repaired, still without resurrecting the permission
+    data["hooks"]["SessionStart"][0]["hooks"][0]["command"] = "tampered # " + wh.MARKER
+    settings(home).write_text(json.dumps(data, indent=2))
+    assert inst(home).status().state == "stale"
+    inst(home).repair()
+    assert inst(home).status().state == "current"
+    assert "permissions" not in json.loads(settings(home).read_text())

@@ -87,6 +87,25 @@ _IGNORED_PROCESSES: frozenset[str] = frozenset({
     "kube-proxy",
 })
 
+# Ephemeral test/dev-server processes spawned by test runs and dev tooling.
+# They come and go by the hundred, so leasing them floods the gateway's lease
+# table. Matched case-insensitively against the START of a word in the listener's
+# process name (``node (vitest 12`` and ``next-server (v14`` both match).
+# Config ``fabric.agent_deny_processes`` replaces this list.
+DEFAULT_DENY_PROCESSES: tuple[str, ...] = (
+    "vitest", "jest", "playwright", "vite", "next-server", "next-router-worker",
+    "webpack-dev-server", "storybook", "cypress", "karma",
+)
+
+
+def process_denied(process: str | None, deny: tuple[str, ...]) -> bool:
+    """True when ``process`` contains any ``deny`` name at a word start."""
+    if not process:
+        return False
+    low = process.lower()
+    return any(re.search(r"(?<![a-z0-9])" + re.escape(n.lower()), low)
+               for n in deny if n)
+
 
 # ---------------------------------------------------------------------------
 # Listener scanning (per-OS, best effort, no dependencies)
@@ -739,6 +758,19 @@ def parse_agent_binaries(value: Any) -> tuple[str, ...]:
     return tuple(v.strip() for v in value)
 
 
+def parse_deny_processes(value: Any) -> tuple[str, ...]:
+    """``fabric.agent_deny_processes`` from YAML: a list of process-name
+    fragments (a single string is one). ``None`` keeps the default."""
+    if value is None:
+        return DEFAULT_DENY_PROCESSES
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple)) or not all(
+            isinstance(v, str) and v.strip() for v in value):
+        raise ValueError("fabric.agent_deny_processes must be a list of process names")
+    return tuple(v.strip() for v in value)
+
+
 _SLOW_RETRY_S = (300.0, 900.0)  # then hourly
 
 
@@ -811,6 +843,16 @@ class AgentConfig:
     host_slow_interval: float = 3600.0
     # Process names counted as running agents (``fabric.agent_binaries``).
     agent_binaries: tuple[str, ...] = ("pi", "claude", "codex")
+    # Processes never auto-leased (``fabric.agent_deny_processes``).
+    deny_processes: tuple[str, ...] = DEFAULT_DENY_PROCESSES
+    # A forwarded lease whose loopback origin has refused connections for this
+    # long is released. The agent's own forwarder keeps the port listening after
+    # the app dies, so "port vanished" alone never releases it.
+    orphan_grace: float = 60.0
+    # Backstop: a watcher (auto-registered) lease older than this is released;
+    # a still-live app is re-registered by the same scan, so this refreshes
+    # rather than bans. 0 disables (``fabric.agent_lease_max_age_seconds``).
+    lease_max_age: float = 86400.0
 
     def fabric_names(self) -> frozenset[str]:
         """The host names the fabric owns: its control-plane host and this
@@ -844,6 +886,7 @@ class FabricAgent:
         self._store: dict[str, dict[str, Any]] = self._load_store()
         self._forwards: dict[int, AgentForwarder] = {}
         self._warned_unleased: set[int] = set()
+        self._origin_down_since: dict[str, float] = {}
         self._cp_last_report: dict[str, float] = {}
         self._cp_unavailable: dict[str, dict[str, Any]] = {}
         self._probe_cache: dict[int, tuple[tuple, bool, float]] = {}
@@ -891,6 +934,13 @@ class FabricAgent:
             try:
                 data = json.loads(self.cfg.store_path.read_text())
                 if isinstance(data, dict):
+                    # ``last_hb`` is a time.monotonic() reading, meaningless in
+                    # a new process: after a reboot it can lie in the future,
+                    # and the lease would never be due again. Make every
+                    # loaded lease due on the first cycle.
+                    for entry in data.values():
+                        if isinstance(entry, dict):
+                            entry["last_hb"] = 0.0
                     return data
             except (OSError, json.JSONDecodeError) as exc:
                 log.warning("agent store unreadable (%s); starting fresh", exc)
@@ -990,7 +1040,10 @@ class FabricAgent:
                 process = entry.get("process") or ""
                 if (port not in live_ports
                         or port in gateway_front
-                        or process in _IGNORED_PROCESSES):
+                        or process in _IGNORED_PROCESSES
+                        or process_denied(process, self.cfg.deny_processes)
+                        or self._origin_orphaned(port_s, entry)
+                        or self._lease_expired(entry)):
                     self._release(port_s)
                     closed.append(port_s)
 
@@ -1050,7 +1103,8 @@ class FabricAgent:
                     or not self._is_dev_web_port(port)):
                 continue
             info = listeners[port]
-            if (info.get("process") or "") in _IGNORED_PROCESSES:
+            if ((info.get("process") or "") in _IGNORED_PROCESSES
+                    or process_denied(info.get("process"), self.cfg.deny_processes)):
                 continue
             if port in gateway_ext_ports:
                 addrs = (info.get("addrs") or set())
@@ -1069,6 +1123,32 @@ class FabricAgent:
         self._save_store()
         return {"registered": registered, "closed": closed,
                 "unleased": [str(p) for p in unleased]}
+
+    def _lease_expired(self, entry: dict[str, Any]) -> bool:
+        """True when a watcher lease has outlived ``lease_max_age``. The store
+        only holds agent-created leases, so manual leases are never affected.
+        Entries from before ``registered_at`` existed are stamped now, so the
+        clock starts at upgrade instead of releasing them all at once."""
+        registered = entry.get("registered_at")
+        if not isinstance(registered, (int, float)):
+            entry["registered_at"] = time.time()
+            return False
+        if self.cfg.lease_max_age <= 0:
+            return False
+        return time.time() - registered >= self.cfg.lease_max_age
+
+    def _origin_orphaned(self, port_s: str, entry: dict[str, Any]) -> bool:
+        """True when a forwarded service's loopback origin has been down for
+        ``orphan_grace`` seconds. Only forwarded entries qualify (their
+        forwarder, not the app, is what keeps the port listening)."""
+        if not entry.get("fwd_port"):
+            self._origin_down_since.pop(port_s, None)
+            return False
+        if tcp_open("127.0.0.1", int(port_s)):
+            self._origin_down_since.pop(port_s, None)
+            return False
+        since = self._origin_down_since.setdefault(port_s, time.monotonic())
+        return time.monotonic() - since >= self.cfg.orphan_grace
 
     def _probe_web_cached(self, port: int, info: dict[str, Any]) -> bool:
         """Probe a listener once per stable observation window.
@@ -1152,6 +1232,9 @@ class FabricAgent:
             log.debug("ignoring container/VM networking shim %r on port %s",
                       process, port)
             return None
+        if process_denied(process, self.cfg.deny_processes):
+            log.debug("ignoring denylisted process %r on port %s", process, port)
+            return None
         label = (f"{self.cfg.label_prefix}"
                  f"{process or 'web'} on {self._machine} (port {port})")
         fwd: AgentForwarder | None = None
@@ -1206,6 +1289,7 @@ class FabricAgent:
                 "project": None,
                 "source_port": port,
                 "last_hb": time.monotonic(),
+                "registered_at": time.time(),
             }
         log.info("auto-registered %s -> dev port %s",
                  label, lease.get("external_port"))
@@ -1445,6 +1529,7 @@ class FabricAgent:
 
     def _release(self, port_s: str) -> None:
         entry = self._store.pop(port_s, None)
+        self._origin_down_since.pop(port_s, None)
         port = int(port_s)
         fwd = self._forwards.pop(port, None)
         if fwd is not None:

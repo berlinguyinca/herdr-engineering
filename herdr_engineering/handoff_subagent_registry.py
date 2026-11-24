@@ -9,9 +9,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import sys
+import threading
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TextIO
 
@@ -49,7 +52,7 @@ def record(phase: str, raw: str, env: Mapping[str, str]) -> None:
     agent_type = data.get("agent_type")
     entry = {"agent_id": agent_id, "agent_type": agent_type if isinstance(agent_type, str) else "", "started": int(time.time())}
     directory.mkdir(parents=True, exist_ok=True)
-    tmp = directory / f".{target.name}.{os.getpid()}.tmp"
+    tmp = directory / f".{target.name}.{os.getpid()}.{threading.get_ident()}.tmp"
     tmp.write_text(json.dumps(entry), encoding="utf-8")
     os.replace(tmp, target)
 
@@ -86,6 +89,60 @@ def live_entries(env: Mapping[str, str], pane: str, now: float | None = None) ->
             except OSError:
                 pass
     return entries
+
+
+@dataclass(frozen=True)
+class SubagentStatus:
+    """``known`` is False when no hook ever fired for the pane; ``live`` counts non-stale entries."""
+
+    known: bool
+    live: int
+
+
+def status(pane_id: str, env: Mapping[str, str], now: float | None = None) -> SubagentStatus:
+    """Never raises: a vanished or unreadable registry is reported as unknown, the safe direction (the drain order
+    then asks the session to list and wait for its own agents)."""
+    try:
+        if not pane_id or not _pane_dir(env, pane_id).is_dir():
+            return SubagentStatus(known=False, live=0)
+        return SubagentStatus(known=True, live=len(live_entries(env, pane_id, now)))
+    except OSError:
+        return SubagentStatus(known=False, live=0)
+
+
+def wait_status(pane_id: str, env: Mapping[str, str], timeout_s: float, poll_s: float = 2.0) -> SubagentStatus:
+    """The status that ended the wait: the idle one, or the last one seen when ``timeout_s`` ran out."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        current = status(pane_id, env)
+        if current.live == 0:
+            return current
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return current
+        time.sleep(min(poll_s, remaining))
+
+
+def wait_until_idle(pane_id: str, env: Mapping[str, str], timeout_s: float, poll_s: float = 2.0) -> bool:
+    """True when no live subagent remains before ``timeout_s``. An unknown pane (``known=False``) returns True at
+    once: nothing is recorded to wait for, and the caller decides what "unknown" means."""
+    return wait_status(pane_id, env, timeout_s, poll_s).live == 0
+
+
+def purge_pane(pane_id: str, env: Mapping[str, str]) -> int:
+    """Delete the pane's registry directory (call when the pane closes so a reused id starts clean); returns the
+    number of entries actually removed (0 when the directory is still there)."""
+    if not pane_id:
+        return 0
+    directory = _pane_dir(env, pane_id)
+    try:
+        if not directory.is_dir():
+            return 0
+        count = sum(1 for p in directory.iterdir() if not p.name.endswith(".tmp"))
+    except OSError:
+        count = 0
+    shutil.rmtree(directory, ignore_errors=True)
+    return 0 if directory.exists() else count
 
 
 def run_subagents(pane: str | None, env: Mapping[str, str] | None = None, *, as_json: bool = False,

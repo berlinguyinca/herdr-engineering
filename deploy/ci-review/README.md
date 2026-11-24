@@ -1,6 +1,6 @@
 # ci-review: the `Independent AI review` status
 
-> As of 2026-11-13 the required status is `Opus agent review`, posted by a Claude session; this script's status is advisory. See `docs/operations/independent-ai-review.md`.
+> As of 2026-11-13 the required status is `Opus agent review`, posted by `always-on-review.py`, run by the `herdr-always-on-review` systemd user timer (the only path; the status token is a 0600 host file); this script's status is advisory. See `docs/operations/independent-ai-review.md`.
 
 The repository ruleset used to require a commit status named exactly `Independent AI review`. `ai-review.py` posts it.
 Before this script, the operator posted it by hand. Operator guide: `docs/operations/independent-ai-review.md`.
@@ -133,7 +133,7 @@ another run is working or a run crashed recently. Every other head is reviewed, 
 PR's failure does not stop the others, and the exit code is 1 if any PR failed. Each PR has its own `flock`, and
 so does `poll`, so overlapping timer runs never review the same PR twice.
 
-Exit codes: 0 the review completed; 1 the review failed; 2 refused; 3 the head moved; 4 another run holds the PR.
+Exit codes: 0 the review completed; 1 the review failed; 2 refused; 3 the head moved; 4 nothing to do (another run holds the PR or the host-wide review slot, draft, cooldown, budget). `review --host-lock-wait N` waits up to N seconds for the host slot shared with the Woodpecker pipeline and fails (1) if it runs out; `poll` never waits and skips the PR. A parent-death watchdog kills an orphaned reviewer, and each review first removes stale worktrees and `refs/herdr-review/*`.
 
 ## Always-on review (two tiers, pluggable backends)
 
@@ -174,6 +174,15 @@ Backends (`tiers.<t>.backend`, settings under `backends.<name>`):
 - Replay: `always-on-review.py replay --corpus DIR --tier tier1|tier2 --config YAML [--limit N] [--out FILE]` checks out each case's head in a detached worktree, runs the tier read-only and posts nothing (no gh client is built; posting functions refuse inside replay). The corpus is one JSON per case: `{repo, pr, head_sha, base_sha?, source: opus|human|revert|follow-up-fix, notes, ground_truth: [{id, file, line|null, category, summary, severity, confirmed?}], known_false_claims?}`. Scoring: FOUND (same file and line within 10, or two shared keywords), PARTIAL (file only), MISSED; a blocking finding matching no ground truth is FALSE_BLOCKER_CANDIDATE (unconfirmed), one matching a known false claim is FALSE_BLOCKER. The report gives per-case and aggregate recall, false-blocker rate, per-category recall, cost and duration. `replay compare a.json b.json` compares two runs.
 - Intended corpus: thousands of PRs across the org's repos. Replay is resumable (cases already scored in `--out` are skipped; failed and skipped ones are retried, and a case whose head or ground truth changed is scored again) and runs one case at a time (a lock refuses a second replay). `corpus build --repo OWNER/NAME --since YYYY-MM-DD --out DIR` derives cases from merged PRs with read-only `gh` calls (reverts, follow-up fixes, review comments). Only thread-root comments by humans, or by logins listed in `replay.reviewers` (pass `--config`), and not by the PR author, count; the case is pinned to the commit most comments were made on (`original_commit_id`) and only those comments keep their line; its ground truth is `confirmed: false` and is not scored until confirmed.
 
+### One command, every repo
+
+`review --repo OWNER/NAME` works for any repository the `gh` login can read. The worktree comes from the clone that
+belongs to that repo: a `clones: [{repo, path}]` entry, else `clone:` if its `origin` is that repo (or is not a
+github.com URL, as before), else a bare clone the script creates itself under `state_dir/clones/OWNER__NAME.git` from
+`clone_url` (default `https://github.com/{repo}.git`, using the `gh auth git-credential` helper). Locks, state, cooldowns
+and `reviews.jsonl` are keyed by `OWNER/NAME#N`. Enrollment (`repos:`, the backfill cutoff) only matters to `poll`; a
+`review` of a named PR needs none.
+
 ### Choosing a pi model or alias
 
 pi "aliases" are the gateway aliases listed as model entries under a provider in `~/.pi/agent/models.json` (for
@@ -207,13 +216,26 @@ Codex review of the same head is also clean:
   posts `failure` (with the usual marked comment); both approving posts `success`.
 - If Codex cannot produce a verified verdict (not installed or not logged in, time cap, non-zero exit, malformed
   answer or wrong `head_sha`, a block whose blockers fail the evidence rule, or a daily budget that cannot be
-  counted) the status stays `pending`: never `success`, and it counts toward the failure cooldown. Opus has already
-  run by then and runs again on the retry; the cooldown bounds that.
+  counted) the status stays `pending`: never `success`, and it counts toward the failure cooldown. A clean Opus
+  approve is remembered in `state.json` for that exact head, base and tier model, so the retry runs Codex only (same
+  cooldown and budget rules); a new head, a changed model or `--force` runs Opus again.
 - Non-risky PRs and tier 1 never call Codex. A head that moved posts nothing. Dry-run is unchanged (Codex runs, nothing
   is posted; posting needs `post: true` and `--post`).
 - Cost: `risky.codex.daily_budget_usd` (optional) is summed from `reviews.jsonl` lines with `tier: codex`, since
   00:00 UTC. Codex reports tokens only, so the cost is `input_usd_per_mtok` and `output_usd_per_mtok` (both required
   with a budget) times the tokens. At or over the budget a risky PR is skipped before Opus runs, status unchanged.
+  A Codex run that fails or times out after reporting tokens is logged (`tier: codex`, `state: not-run`) with its
+  cost and counts too; if no tokens were reported the line says `usage_unknown: true` and no cost is invented.
+- `risky:` and `risky.codex:` left empty or `null` mean the defaults. `risky.globs` must be a list of strings (the
+  error names the bad entry). A glob ending in `/` means everything below it: `deploy/` is `deploy/**`.
+- A failed reviewer's `why` is the first 300 characters of its stderr, or of its stdout when stderr is empty (`claude`
+  prints its errors there; control characters are stripped). A usage-limit message ("hit your ... limit", "usage
+  limit") logs `why: usage-limit: ...`, is no cooldown strike, and stops `poll` launching more reviews of that
+  quota in the same run (it is retried on the next run). Codex has its own quota: a Codex limit only skips the later
+  risky PRs (before Opus runs) and never stops Opus on non-risky PRs; an Opus limit stops Opus. A PR stuck on a limit
+  is retried after the others. For Codex only stderr and the `error`/`turn.failed` events are scanned, never command
+  output (it holds the PR's own text). A `risky.globs` entry that is only `**` or `**/` is refused (it would make every
+  PR risky).
 - `show-command --tier codex` prints the command line. The host needs `codex` on PATH and `codex login` (or API key
   in codex's own auth store); concurrency stays 1 and nothing uses a GPU.
 

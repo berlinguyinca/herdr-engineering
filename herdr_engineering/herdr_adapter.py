@@ -224,26 +224,6 @@ class NativeHerdrAdapter:
             args += ["--remote-session", remote_session]
         return self._run(args, timeout=timeout)
 
-    def devfabric_list(self) -> list[dict[str, Any]]:
-        """List active fabric leases (gateway's view of registered machines).
-
-        ``herdr-eng devfabric list --json`` returns ``{"leases": [...]}``;
-        this unwraps the list for callers.
-        """
-        data = self._run_json(["devfabric", "list", "--json"])
-        if isinstance(data, dict):
-            return data.get("leases") or []
-        return data if isinstance(data, list) else []
-
-    def devfabric_register(self, machine_id: str, port: int, url: str, **kwargs) -> dict[str, Any]:
-        """Register a dev service lease for a machine (idempotent)."""
-        args = ["devfabric", "register", "--machine", machine_id, "--port", str(port),
-                "--url", url]
-        for flag, val in kwargs.items():
-            if val is not None:
-                args += [f"--{flag.replace('_', '-')}", str(val)]
-        return self._run_json(args)
-
     # -- snapshot ----------------------------------------------------------
     @staticmethod
     def _routing(machine: str | None, session: str | None) -> list[str]:

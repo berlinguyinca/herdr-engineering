@@ -181,6 +181,9 @@ def test_quotas(registry_pg):
 def test_liveness_window_and_clamp(registry_pg):
     async def body(store, conn):
         _, _, sid = await seed(conn)
+        # approved_at and revoked_at are both the database clock; on a fast host they can be less than the 1 ms the "early"
+        # event sits before revocation (pipeline 1799: 'not_live'). Pin approval well before so the window has real width.
+        await conn.execute("UPDATE artifact_shares SET approved_at = approved_at - interval '1 hour' WHERE share_id=$1", sid)
         await ShareStore(conn).mark_revoked(sid, actor="o")
         revoked = await conn.fetchval("SELECT revoked_at FROM artifact_shares WHERE share_id=$1", sid)
         early = (revoked - timedelta(milliseconds=1)).isoformat()

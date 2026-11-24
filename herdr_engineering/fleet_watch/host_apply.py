@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -499,6 +500,48 @@ class Autospec:
 
 # --------------------------------------------------------------------------- pi-engineering (D7)
 
+# #881: a release receipt must prove the content it names, not merely exist. The
+# digest contract matches ansible/files/stage-release.py (a standalone, stdlib-only
+# script pushed to hosts); it is duplicated here rather than imported because the two
+# live in different deployment units. sha256 over sorted relpath + NUL + bytes for
+# every git-tracked file -- the artifact a release name denotes is its tracked tree,
+# so install/build output (node_modules, setuptools build/ + *.egg-info, __pycache__)
+# is untracked and never enters the digest, keeping it deterministic across stagings.
+
+
+def _artifact_digest(release: Path) -> str:
+    listing = subprocess.run(["git", "-C", str(release), "ls-files", "-z"],
+                             check=True, capture_output=True, timeout=120).stdout
+    digest = hashlib.sha256()
+    for raw in sorted(part for part in listing.split(b"\x00") if part):
+        digest.update(raw)
+        digest.update(b"\x00")
+        digest.update((release / os.fsdecode(raw)).read_bytes())
+    return "sha256:" + digest.hexdigest()
+
+
+def receipt_status(release: Path, receipt: dict) -> str:
+    """Classify a staged release by content against its receipt: ``verified`` (digest
+    matches, or a recorded patch chain explains the difference), ``drift`` (content
+    changed with no ledger entry -- the 599c06d0 shape), or ``unknown`` (a pre-#881
+    receipt carries no digest, so it is neither trusted nor condemned)."""
+    recorded = receipt.get("artifactDigest")
+    if not recorded:
+        return "unknown"
+    current = _artifact_digest(release)
+    if current == recorded:
+        return "verified"
+    expected = recorded
+    patches = receipt.get("patches") or []
+    for patch in patches:
+        if patch.get("beforeDigest") != expected:
+            return "drift"
+        expected = patch.get("afterDigest")
+    if patches and expected == current:
+        return "verified"
+    return "drift"
+
+
 class Pi:
     def root(self, ctx: Context) -> Path:
         return ctx.home / ".local" / "share" / "herdr-engineering" / "pi"
@@ -514,8 +557,28 @@ class Pi:
     def complete(self, ctx: Context, sha: str) -> bool:
         root = self.root(ctx)
         release = root / "releases" / sha
-        return ((release / "package.json").is_file() and (release / "node_modules").is_dir()
-                and (root / "receipts" / f"{sha}.json").is_file())
+        receipt = root / "receipts" / f"{sha}.json"
+        if not ((release / "package.json").is_file() and (release / "node_modules").is_dir()
+                and receipt.is_file()):
+            return False
+        # Existence is not integrity (#881): a receipt that records a digest is checked
+        # against the on-disk content, so an in-place edit reads as incomplete, not clean.
+        # A pre-#881 receipt has no digest (unknown) and stays reusable. Any failure to
+        # read the receipt or hash the tree (unreadable JSON, a non-dict receipt, a file
+        # that vanished mid-walk, git missing) is a release we cannot attest: incomplete,
+        # never an exception out of converged()/apply()/checks().
+        try:
+            data = json.loads(receipt.read_text())
+            if not isinstance(data, dict):
+                raise ValueError("receipt is not an object")
+            status = receipt_status(release, data)
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            ctx.note(f"release {sha} receipt could not be verified: {type(exc).__name__}")
+            return False
+        if status == "drift":
+            ctx.note(f"release {sha} content does not match its receipt digest")
+            return False
+        return True
 
     def converged(self, ctx: Context) -> bool:
         return self.installed(ctx) == ctx.sha and self.complete(ctx, ctx.sha)

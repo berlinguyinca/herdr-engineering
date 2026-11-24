@@ -146,7 +146,7 @@ def test_container_ids_are_not_hosts():
 
 def test_host_heartbeat_and_unavailable():
     r = repo.ControlPlaneRepo()
-    hid = r.register_host("bender", "100.104.39.6")
+    hid = r.register_host("bender", "100.64.8.6")
     r.record_heartbeat(hid)
     assert r.get_host(hid)["status"] == "healthy"
     # marking unavailable retains the host (never deletes)
@@ -220,13 +220,13 @@ def test_leases_list_and_close():
 
 def test_identity_is_stable_across_location_change():
     r = repo.ControlPlaneRepo()
-    hid = r.register_host("bender", "100.104.39.6")
+    hid = r.register_host("bender", "100.64.8.6")
     before = r.get_host(hid)
     # location (ip) can change; identity (host_id) does not
-    r.record_heartbeat(hid, tailnet_ip="100.104.40.1")
+    r.record_heartbeat(hid, tailnet_ip="100.64.9.1")
     after = r.get_host(hid)
     assert before["host_id"] == after["host_id"]
-    assert after["tailnet_ip"] == "100.104.40.1"
+    assert after["tailnet_ip"] == "100.64.9.1"
 
 
 def test_message_is_queued_without_dispatcher_and_replay_does_not_send():

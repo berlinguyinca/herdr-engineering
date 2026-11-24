@@ -29,7 +29,7 @@ reviewer:
   busy_wait_s: 1800                      # total time to wait out 429 (single-slot model busy); not counted in retries
   backoff_s: 5                           # doubles each retry; a Retry-After header wins (capped at 60 s)
   parallel: 1                            # chunks in flight at once; the gateway is shared
-  # Exact tailnet IPv4 literals (100.64.0.0/10) whose baseUrl may be plain http, e.g. ["100.104.39.6"]. The key
+  # Exact tailnet IPv4 literals (100.64.0.0/10) whose baseUrl may be plain http, e.g. ["100.64.8.6"]. The key
   # then crosses the tailnet without TLS (WireGuard still encrypts the link). Empty = https only.
   allow_plain_http_hosts: []
 

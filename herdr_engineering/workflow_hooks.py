@@ -25,6 +25,7 @@ from .memory_install import (
     ClaudeHooksUnit,
     _atomic_write,
     _diff,
+    _dump_json,
 )
 from .workflow_guard import MATCHER as GUARD_MATCHER
 from .workflow_guard import decide
@@ -37,7 +38,9 @@ REMINDER = """Engineering defaults (herdr-engineering managed hook):
 - Verify claims with command output before saying work is done.
 - Ship via branch -> PR -> review -> CI green -> ready; never commit to main.
 - Use real dependencies in tests; no mocks, stubs or fakes.
-- Never push herdr-engineering. Keep nothing under /tmp.
+- Push your own work branches and open PRs yourself; never push main, never force-push or push someone else's branch. Keep nothing under /tmp.
+- To delete a worktree, build target, scratch dir or test container you created, run `herdr-eng cleanup --scope {worktree,target,tmp,docker} --path <p>`; never raw rm -rf, git worktree remove or docker rm.
+- Start throwaway containers with `docker run $(herdr-eng cleanup --print-run-args)` so they are reaped.
 - CI is Woodpecker (ci.metabolomics.us) where the repo uses it.
 - Do not ask the user about choices these defaults already settle; apply them.
 - Context getting long? Run /handoff yourself, without asking: first wait for background subagents to report and commit/push the work where pushing is allowed. It moves the work to a fresh Herdr pane on the same harness."""
@@ -48,9 +51,45 @@ PRECOMPACT_MESSAGE = ("Context is about to be compacted. Run /handoff yourself n
                       "with a self-sufficient briefing. The hook only prints this; nothing was started.")
 
 
+ALLOW_RULE = "Bash(herdr-eng cleanup:*)"
+
+
 class _WorkflowHooksUnit(ClaudeHooksUnit):
+    """Managed hooks plus the allow rule for the cleanup command, offered ONCE.
+
+    The rule is the user's to keep or revoke: it never counts toward drift. ``offer_rule`` is
+    True only while no "offered" marker exists (``WorkflowInstaller`` writes it the first time
+    the rule is added or seen), so a later removal is respected and never re-added.
+    """
     marker = MARKER
     matchers = {"PreToolUse": GUARD_MATCHER}
+
+    def install(self, text: str, offer_rule: bool = False) -> str:
+        data = self._load(super().install(text))
+        if offer_rule:
+            allow = data.setdefault("permissions", {}).setdefault("allow", [])
+            if ALLOW_RULE not in allow:
+                allow.append(ALLOW_RULE)
+        return _dump_json(data, text)
+
+    def offer(self, text: str) -> str:
+        """``text`` with the allow rule added when absent (hooks untouched)."""
+        data = self._load(text)
+        allow = data.setdefault("permissions", {}).setdefault("allow", [])
+        if ALLOW_RULE not in allow:
+            allow.append(ALLOW_RULE)
+        return _dump_json(data, text)
+
+    def remove(self, text: str) -> str:
+        data = self._load(super().remove(text))
+        permissions = data.get("permissions", {})
+        if ALLOW_RULE in permissions.get("allow", []):
+            permissions["allow"].remove(ALLOW_RULE)
+            if not permissions["allow"]:
+                del permissions["allow"]
+            if not permissions:
+                del data["permissions"]
+        return _dump_json(data, text)
 
 
 def _hook_command(command: list[str], event: str) -> str:
@@ -82,6 +121,14 @@ class WorkflowInstaller:
             "workflow-hooks", self.home / ".claude" / "settings.json",
             {ev: _hook_command(self.command, ev) for ev in EVENTS})
 
+    def _offered_marker(self) -> Path:
+        return self.home / ".local" / "share" / "herdr-engineering" / "workflow" / "allow-rule-offered"
+
+    def _mark_offered(self) -> None:
+        marker = self._offered_marker()
+        marker.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        marker.write_text("the cleanup allow rule was added once; removing it is respected\n")
+
     def _text(self) -> str | None:
         return self.unit.path.read_text(encoding="utf-8") if self.unit.path.is_file() else None
 
@@ -109,17 +156,28 @@ class WorkflowInstaller:
         text = self._text()
         state = self.unit.state(text)
         res = Result(True, "noop", state, str(self.unit.path), dry_run=dry_run)
-        if state == CURRENT:
-            return res
+        offer = not self._offered_marker().exists()
         if state in (INVALID, FOREIGN):
             res.ok, res.action = False, "invalid" if state == INVALID else "conflict"
             return res
-        new = self.unit.install(text)
-        res.action = "create" if state == ABSENT else "update"
-        res.diff = _diff(text, new, self.unit.path.name)
+        if state == CURRENT:
+            if not offer:
+                return res
+            # hooks installed before the rule existed: offer it once, then respect removal
+            new = self.unit.offer(text)
+            if new != text:
+                res.action = "update"
+                res.diff = _diff(text, new, self.unit.path.name)
+        else:
+            new = self.unit.install(text, offer_rule=offer)
+            res.action = "create" if state == ABSENT else "update"
+            res.diff = _diff(text, new, self.unit.path.name)
         if not dry_run:
-            self._backup()
-            _atomic_write(self.unit.path, new)
+            if new != text:
+                self._backup()
+                _atomic_write(self.unit.path, new)
+            if offer:
+                self._mark_offered()
         return res
 
     repair = install
@@ -134,6 +192,7 @@ class WorkflowInstaller:
             if not dry_run:
                 self._backup()
                 _atomic_write(self.unit.path, new)
+                self._offered_marker().unlink(missing_ok=True)  # a reinstall offers the rule again
         elif state == INVALID:
             res.ok, res.action = False, "invalid"
         return res

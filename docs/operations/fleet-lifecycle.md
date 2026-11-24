@@ -63,7 +63,7 @@ and Tailscale must be told to forward `dev.lan` queries there. In the
 **Tailscale admin console → DNS → Nameservers**:
 
 1. **Add nameserver** → the master host's tailnet IPv4
-   (`tailscale ip -4` on the master, e.g. `100.104.39.6`).
+   (`tailscale ip -4` on the master, e.g. `100.64.8.6`).
 2. Enable **"Restrict to domain"** and set it to **`dev.lan`**.
 3. Save.
 

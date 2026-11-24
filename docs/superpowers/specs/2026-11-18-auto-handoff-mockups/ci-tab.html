@@ -1,0 +1,60 @@
+<style>
+.tab{background:#0f1115;color:#d7dae0;font:12px/1.45 ui-monospace,Menlo,monospace;border-radius:8px;overflow:hidden;border:1px solid #2a2f3a;max-width:760px}
+.tabbar{background:#1a1d24;padding:6px 10px;color:#8b93a4;display:flex;gap:14px}
+.tabbar b{color:#e6e9ef}
+.body{display:flex;height:400px}
+.pane{flex:1;border-right:1px solid #2a2f3a;padding:8px 10px}
+.pane .hd{color:#8b93a4;margin-bottom:6px}
+.side{width:330px;background:#13161c;display:flex;flex-direction:column}
+.stabs{display:flex;border-bottom:1px solid #2a2f3a}
+.stabs span{padding:6px 10px;color:#8b93a4}
+.stabs span.on{color:#e6e9ef;border-bottom:2px solid #5b8cff}
+.stabs .col{margin-left:auto}
+.sbody{padding:10px;overflow:auto}
+.pr{background:#1a1d24;border-radius:6px;padding:7px 8px;margin-bottom:8px}
+.pr .t{display:flex;justify-content:space-between}
+.pr .t b{color:#e6e9ef}
+.muted{color:#6b7385}
+.chk{display:flex;gap:6px;flex-wrap:wrap;margin-top:5px}
+.c{padding:1px 6px;border-radius:4px;font-size:11px}
+.ok{background:#23863633;color:#3fb950}
+.bad{background:#f8514933;color:#ff7b72}
+.run{background:#d2992233;color:#d29922}
+.blk{background:#6e768133;color:#9aa4b2}
+.why{margin-top:4px;color:#ff7b72;font-size:11px}
+.sess{font-size:11px;color:#6b7385;margin-top:3px}
+.stat{display:flex;gap:10px;margin-bottom:10px}
+.stat div{background:#1a1d24;padding:4px 8px;border-radius:5px}
+.stat b{display:block;color:#e6e9ef;font-size:14px}
+</style>
+
+<h2>Third tab: CI for the work in this chain</h2>
+<p class="subtitle">Same side pane, same look. Only PRs and branches the current chain of sessions opened or pushed to.</p>
+
+<div class="tab"><div class="tabbar"><b>screenwright</b><span>tab 2</span></div>
+<div class="body">
+ <div class="pane"><div class="hd">claude · session #4 · context 31%</div>&gt; waiting on gh pr checks 44 --watch…</div>
+ <div class="side"><div class="stabs"><span>Summary</span><span>Handoffs</span><span class="on">CI ●</span><span class="col">⟩</span></div>
+  <div class="sbody">
+   <div class="stat"><div><b>4</b>PRs open</div><div><b>1</b>running</div><div><b>1</b>failing</div></div>
+
+   <div class="pr"><div class="t"><b>#44 box size + Copy as CSS</b><span class="c run">running</span></div>
+    <div class="chk"><span class="c run">woodpecker ci · 3m</span><span class="c ok">GitGuardian</span><span class="c blk">verify · not started</span></div>
+    <div class="sess">pushed by session #4 · 2 min ago</div></div>
+
+   <div class="pr"><div class="t"><b>#45 compare/live-edit controls</b><span class="c bad">failing</span></div>
+    <div class="chk"><span class="c bad">woodpecker ci</span><span class="c ok">GitGuardian</span></div>
+    <div class="why">unit-gates: 1 test failed · retried once</div>
+    <div class="sess">pushed by session #3 · 40 min ago</div></div>
+
+   <div class="pr"><div class="t"><b>#43 filter toggles</b><span class="c ok">ready</span></div>
+    <div class="chk"><span class="c ok">woodpecker ci</span><span class="c ok">GitGuardian</span><span class="c ok">Opus review</span></div>
+    <div class="sess">session #2 · 1h ago</div></div>
+
+   <div class="pr"><div class="t"><b>herdr-eng #882 guard</b><span class="c ok">ready</span></div>
+    <div class="chk"><span class="c ok">unit-gates</span><span class="c ok">structural</span><span class="c ok">handoff</span><span class="c ok">Opus review</span></div>
+    <div class="sess">session #2 · 2h ago</div></div>
+
+   <div class="muted">merged in this chain: #39 #41 #862 ▸</div>
+  </div></div>
+</div></div>

@@ -5,7 +5,7 @@ Authorization: user stated nobody uses production Herdr; GET only. No mutation, 
 ## Deployment map (docker + systemd on bender)
 | Component | Evidence | Runs commit |
 |---|---|---|
-| Dashboard/control API (`herdr-cp-web`, `100.104.39.6:80`) | `docker ps`; `/api/v1/health` -> `commit` | `676b4420f1a4` = origin/main HEAD of herdr-engineering at audit time (PR #358) |
+| Dashboard/control API (`herdr-cp-web`, `100.64.8.6:80`) | `docker ps`; `/api/v1/health` -> `commit` | `676b4420f1a4` = origin/main HEAD of herdr-engineering at audit time (PR #358) |
 | Worker (`herdr-cp-worker`), collab edge (`herdr-collab-public`) | `HERDR_ENGINEERING_COMMIT` container env | `676b4420f1a4` |
 | Fabric gateway (`herdr-fabric-gateway`, control API `:29999`) | container env | `17d2b21b3149` (older, ancestor of main) |
 | Postgres 16 (`herdr-cp-postgres`), object store (`herdr-cp-rustfs`) | images `postgres:16-alpine`, `quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z` | n/a |
@@ -14,9 +14,9 @@ Authorization: user stated nobody uses production Herdr; GET only. No mutation, 
 
 DB migrations applied in production: latest `0021_artifact_reports.sql` (2026-10-29 01:37 UTC), `0020_project_intelligence.sql`. So the audit baseline (`fb964ed`) is stale: 36 commits merged since, including **#348/#349/#351 (artifact reports + renderers), #317 (memory-hindsight), #353/#357 (dashboard refinement)**, all deployed.
 
-Note: `:29999` is the fabric gateway, not the control API. `GET :29999/api/v1/health` -> 404 `{"error":"not found"}`. Health and all dashboard APIs are on `http://100.104.39.6` (the `herdr-cp-web` bind).
+Note: `:29999` is the fabric gateway, not the control API. `GET :29999/api/v1/health` -> 404 `{"error":"not found"}`. Health and all dashboard APIs are on `http://100.64.8.6` (the `herdr-cp-web` bind).
 
-## Results (GET; base `http://100.104.39.6` unless noted)
+## Results (GET; base `http://100.64.8.6` unless noted)
 | Path | Status | Shape / finding |
 |---|---|---|
 | `/api/v1/health` | 200 | `status, events, missions(74), sessions(431), hosts(15), services, inspector{...}, source:"postgres", rustfs:"s3", version:"0.1.0", commit:"676b4420f1a4", performance{...}, capabilities[]`. Occasional 500s in its own route stats (63 of 1469, max 10 s): health is slow under load. |
@@ -49,7 +49,7 @@ Screenshots: NOT taken (no Playwright in the host python; skipped as not cheap).
 
 ## Reproduce
 ```bash
-curl -s http://100.104.39.6/api/v1/health | python3 -m json.tool | head -40
+curl -s http://100.64.8.6/api/v1/health | python3 -m json.tool | head -40
 docker ps --format '{{.Names}} {{.Image}}'; docker inspect herdr-cp-web --format '{{range .Config.Env}}{{println .}}{{end}}' | grep COMMIT
 docker exec herdr-cp-postgres psql -U <pg_user> -d herdr_pa -Atc 'select count(*),max(updated_at) from pa_store_snapshot'   # read-only
 ```

@@ -56,7 +56,7 @@ collection warnings. Real command + live-fleet snapshots are captured under
 | 0150 Unified engineering UX | COMPLETE | `web.py` navigation surfaces |
 | 0160 Attention/notifications/review | COMPLETE | `attention.py`, `herdr-eng attention`, attention tests |
 | 0170 Observability/security/update/rollback | COMPLETE | `observability.py`, `doctor.py`, listener tests |
-| 0180 Fleet validation/release/docs | COMPLETE (docs/repo/CI); live fleet `BLOCKED_EXTERNAL` | README, `.github/workflows/ci.yml`, `scripts/`, acceptance matrix |
+| 0180 Fleet validation/release/docs | COMPLETE (docs/repo/CI); live fleet `BLOCKED_EXTERNAL` | README, `.woodpecker/`, `scripts/`, acceptance matrix |
 
 ## One-shot installer
 
@@ -72,7 +72,9 @@ cd herdr-engineering && scripts/install.sh
 ```
 
 Machine-local config now auto-discovered by the CLI (`~/.config/herdr-engineering/config.yaml`),
-overridden by repo `config/herdr-engineering.yaml`, then `$HERDR_ENGINEERING_CONFIG`.
+overridden by the repo's `config/herdr-engineering.yaml` for only `web.port`, `tests.adapters`,
+`ci.provider` and `ci.pileated_extensions` (a checkout is untrusted input; every other key is ignored
+with a one-time warning naming it), then `$HERDR_ENGINEERING_CONFIG` (machine config, all keys).
 
 ## What exists (verified, not assumed)
 
@@ -115,8 +117,8 @@ overridden by repo `config/herdr-engineering.yaml`, then `$HERDR_ENGINEERING_CON
   devfabric gateway` on bender (control :29999 on tailnet+loopback,
   router on loopback+tailnet). `register --host auto` for a local app
   allocated external port 18000 and bound it immediately; both
-  `curl http://bender.tail0c50da.ts.net:18000/` and
-  `curl http://100.104.39.6:18000/` returned the app's page (HTTP 200).
+  `curl http://bender.<tailnet>.ts.net:18000/` and
+  `curl http://100.64.8.6:18000/` returned the app's page (HTTP 200).
   A gateway restart auto-rebound a surviving lease from the store
   (port 18001) without any registrar action. Dead-target port release is
   probe/TTL-driven (unhealthy → no renewal → TTL expiry → unbind with
