@@ -2919,3 +2919,53 @@ def test_dirty_release_error_is_sanitised_before_it_is_stored(tmp_path):
     assert not any(ord(c) < 32 or ord(c) == 127 for c in state["error"])
     assert "\x1b" not in state["error"] and "[31m" not in state["error"]
     assert "evil" in state["error"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "ssh: connect to host bender port 22: Network is unreachable",
+        "ssh: connect to host bender port 22: Host is unreachable",
+        "ssh: connect to host bender port 22: No route to host",
+        "ssh: connect to host bender port 22: Connection timed out",
+    ],
+)
+@pytest.mark.parametrize("field", ["state", "staging"])
+def test_ssh_transport_text_means_offline_without_a_return_code(text, field):
+    from herdr_engineering.fleet_rollout import _offline_failure
+
+    state = {"error": text} if field == "state" else {"staging": {"rc": 2, "error": text}}
+    assert _offline_failure(state) is True
+
+
+def test_ansible_recap_and_its_unreachable_counter_stay_online():
+    from herdr_engineering.fleet_rollout import _offline_failure
+
+    state = {"error": "staging unavailable", "staging": {"rc": 2, "stdout": ANSIBLE_RECAP}}
+    assert _offline_failure(state) is False
+    assert _offline_failure({"error": "unreachable=0 failed=1"}) is False
+
+
+def test_dirty_release_filenames_never_read_as_an_offline_marker(tmp_path):
+    from herdr_engineering.fleet_rollout import _automatic_blocker, _offline_failure
+
+    store, plan = setup_rollout(tmp_path)
+    wire = Wire()
+    wire.offline.clear()
+    wire.stage = lambda revision, *, host, inventory: {
+        "ok": False,
+        "rc": 3,
+        "code": "managed_release_dirty",
+        "files": ["offline", "timed out.txt", "No route to host"],
+        "error": "managed release is dirty: offline, timed out.txt, No route to host; "
+        "local work preserved",
+    }
+    result = apply(store, plan, wire)
+    state = result["hosts"]["bender"]
+    assert state["status"] == "blocked" and state["blockCode"] == "managed_release_dirty"
+    assert _offline_failure(state) is False
+    assert "dirty" in _automatic_blocker(result)
+    # Clearing the block on a later successful pass drops the flag with the error.
+    wire.stage = Wire().stage
+    again = apply(store, plan, wire)
+    assert "blockCode" not in again["hosts"]["bender"]

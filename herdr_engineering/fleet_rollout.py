@@ -1140,6 +1140,7 @@ def apply_rollout(store, rollout_id, *, transport=None, stage=None):
             host_state.pop("error", None)
             host_state.pop("hostLevelError", None)
             host_state.pop("nextStep", None)
+            host_state.pop("blockCode", None)
             try:
                 if not host_state.get("sourceRoot"):
                     if inventory_targets(Path(plan["inventory"]), host) != [target]:
@@ -1152,6 +1153,7 @@ def apply_rollout(store, rollout_id, *, transport=None, stage=None):
                     if report.get("ok") is not True and report.get("code") == DIRTY_RELEASE:
                         host_state.update(
                             status="blocked",
+                            blockCode=DIRTY_RELEASE,
                             error=_printable(report.get("error") or "managed release is dirty")[:500],
                             nextStep=(
                                 "inspect and commit or move the local changes in "
@@ -1554,11 +1556,16 @@ DIRTY_RELEASE = "managed_release_dirty"
 
 
 def _offline_failure(state):
-    """Offline is decided from the return code and our own typed error strings only.
+    """Offline is decided from the return code and error text the controller itself recorded.
 
     Playbook stdout/stderr is never searched: every Ansible recap contains `unreachable=0`,
-    so a substring match made every Ansible-staged host look offline.
+    so a substring match made every Ansible-staged host look offline. The phrases below are
+    whole ssh transport messages, none of which is a substring of that recap. A dirty-release
+    block is excluded outright: its text carries remote file names.
     """
+    if state.get("blockCode") == DIRTY_RELEASE:
+        # Its error text embeds file names from the remote host: untrusted, never evidence.
+        return False
     staging = state.get("staging") or {}
     evidence = " ".join(
         str(value) for value in (state.get("error", ""), staging.get("error", ""))
@@ -1570,6 +1577,9 @@ def _offline_failure(state):
             "timed out",
             "connection refused",
             "no route to host",
+            "network is unreachable",
+            "host is unreachable",
+            "connection timed out",
             "could not resolve hostname",
             "control transport failed (exit 255)",
         )
