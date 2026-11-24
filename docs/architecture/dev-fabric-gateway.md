@@ -52,12 +52,22 @@ close|list`).
   (`HERDR_ENGINEERING_FABRIC_TOKEN`, host config `fabric.token`, or the file
   `~/.config/herdr-engineering/fabric-token` / `HERDR_ENGINEERING_FABRIC_TOKEN_FILE`;
   never in the repo). With none configured the gateway refuses to start unless
-  `--allow-open` is passed. Precedence is env var, host config, file; the first two are
-  fixed for the process, only the file is followed live (re-read per request) and only when
-  neither of them is set. Replace the file atomically (temp file, then rename). Superseded
-  tokens stay valid for an hour; an unreadable file (not merely missing) fails closed.
+  `--allow-open` is passed. Precedence is env var, then the token file (re-read per request,
+  must be a regular file, not a symlink, mode 0600, UTF-8), then host config `fabric.token`
+  (re-fetched every 300 s; a failed fetch fails closed, it never reads as "no token").
+  Replace the file atomically (temp file, then rename). Superseded tokens stay valid for an
+  hour, so rotation does not revoke a leaked token for that hour: for an emergency, restart
+  the gateway (the previous-token list lives in memory only). An unreadable file (not merely
+  missing) fails closed and the startup banner reports `control_auth: "unreadable"`.
   `/healthz` answers `{"ok": ...}` without a token; `FabricClient.healthz()` treats that as
-  "token not accepted".
+  "token not accepted" (`TokenNotAccepted`), which is different from "down": in an HA pair a
+  peer that is reachable but rejects our token pauses HA (a warning on stderr) and is never
+  counted toward `promote_after`, so give both nodes the same token.
+  `GET /resolve-loopback/<port>` and `POST /rewrite` need no token: session tools only get
+  `HERDR_ENGINEERING_FABRIC_URL` (non-secret), and both only map a loopback port to its fabric
+  address (what any session already sees). Without a token `/resolve-loopback` omits the lease
+  record, ambiguity messages stay generic and `/rewrite` takes at most 64 KiB; everything
+  else (`/list`, `/resolve`, `/names`, `/register`, ...) still needs the token.
 - **GatewayRouter** — dynamic per-lease listeners. Each leased external port
   is bound on every configured interface (loopback + tailnet) and proxied to
   the lease's `target_host:target_port` with `proxy_pair()` (shared with the

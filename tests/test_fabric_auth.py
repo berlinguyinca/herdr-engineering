@@ -1,23 +1,32 @@
 """Gateway control-API auth: documented token sources, fail-closed default, open health probe, rotation."""
 import json
+import os
 import urllib.error
 import urllib.request
 
 import pytest
 
 from herdr_engineering import cli
+from herdr_engineering import host_config as _hc
 from herdr_engineering.devfabric import DevServiceRegistry
 from herdr_engineering.errors import UnreachableError
 from herdr_engineering.fabric import FabricClient, FabricGateway, GatewayRouter, read_fabric_token
 from tests.test_fabric import _port_range
 
+_REAL_HOST_CONFIG = _hc.host_config   # captured at import, before the autouse fixture replaces it
+
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch, tmp_path):
+    old_umask = os.umask(0o077)                       # token files the tests write are 0600, as the gateway requires
     # Real process environment (not internals): point the file source at an empty temp dir.
     monkeypatch.delenv("HERDR_ENGINEERING_FABRIC_TOKEN", raising=False)
     monkeypatch.setenv("HERDR_ENGINEERING_FABRIC_TOKEN_FILE", str(tmp_path / "fabric-token"))
     monkeypatch.setenv("HOME", str(tmp_path))
+    from herdr_engineering.fabric import reset_fabric_token_cache
+    reset_fabric_token_cache()
+    yield
+    os.umask(old_umask)
 
 
 def _gw(tmp_path, **kw):
@@ -242,3 +251,184 @@ def test_a_long_lived_client_follows_a_rotated_token_file_after_the_grace(tmp_pa
             pinned.list()
     finally:
         gw.stop()
+
+
+# -- review round 2 ---------------------------------------------------------------------------------------------------
+
+def _post(gw, path, payload, token=None):
+    req = urllib.request.Request(f"http://127.0.0.1:{gw.control_port}{path}", data=json.dumps(payload).encode(),
+                                 method="POST", headers={"Content-Type": "application/json"})
+    if token is not None:
+        req.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read())
+
+
+def test_an_open_standby_never_promotes_over_a_peer_that_only_rejects_its_token(tmp_path):
+    """The token was written on one node of an HA pair only: the other node sees a minimal /healthz. That peer is
+    alive, so it must not count as a miss, and the pair must not flip."""
+    tokened = _gw(tmp_path / "t", token="sekrit", node_id="zz-tokened", promote_after=1, auto_ha=False)
+    open_node = _gw(tmp_path / "o", allow_open=True, node_id="aa-open", promote_after=1, auto_ha=False,
+                    peer_url=f"http://127.0.0.1:{tokened.control_port}")
+    try:
+        assert tokened.role == "active"
+        open_node.demote()
+        for _ in range(4):
+            open_node._ha_step()
+        assert open_node.role == "standby" and open_node.peer_unauthorised
+        assert tokened.role == "active"
+    finally:
+        tokened.stop()
+        open_node.stop()
+
+
+def test_a_dead_peer_still_promotes_after_the_misses(tmp_path):
+    gw = _gw(tmp_path, allow_open=True, promote_after=2, auto_ha=False, peer_url="http://127.0.0.1:1")
+    try:
+        gw.demote()
+        gw._ha_step()
+        assert gw.role == "standby"
+        gw._ha_step()
+        assert gw.role == "active" and not gw.peer_unauthorised
+    finally:
+        gw.stop()
+
+
+def test_a_node_starting_beside_a_peer_that_rejects_its_token_waits_as_standby(tmp_path):
+    tokened = _gw(tmp_path / "t", token="sekrit", auto_ha=False)
+    try:
+        gw = _gw(tmp_path / "o", allow_open=True, auto_ha=False, peer_url=f"http://127.0.0.1:{tokened.control_port}")
+        try:
+            assert gw.role == "standby"
+        finally:
+            gw.stop()
+    finally:
+        tokened.stop()
+
+
+def test_sessions_resolve_and_rewrite_loopback_without_a_token_but_see_no_lease_record(tmp_path):
+    gw = _gw(tmp_path, token="sekrit")
+    try:
+        lease = FabricClient(f"http://127.0.0.1:{gw.control_port}", token="sekrit").register(
+            target_machine_id="box", target_host="127.0.0.1", target_port=4321, label="svc")
+        port = lease["lease"]["external_port"] if "lease" in lease else lease["external_port"]
+        code, body = _raw(gw, "/resolve-loopback/4321?from=other")
+        assert code == 200 and body["url"] == f"http://dev.test:{port}" and "lease" not in body
+        assert "target_host" not in json.dumps(body) and "box" not in json.dumps(body)
+        code, body = _post(gw, "/rewrite", {"text": "see http://localhost:4321/x", "from": "other"})
+        assert code == 200 and f"dev.test:{port}" in body["text"]
+        assert _raw(gw, "/resolve-loopback/4321?from=other", token="sekrit")[1].get("lease")
+        assert _post(gw, "/register", {})[0] == 401
+        assert _post(gw, "/close", {"lease_id": "x"})[0] == 401
+        assert _raw(gw, "/list")[0] == 401
+        assert _post(gw, "/rewrite", {"text": "x" * (70 * 1024)})[0] == 413
+        assert _post(gw, "/rewrite", {"text": "x" * (70 * 1024)}, token="sekrit")[0] == 200
+    finally:
+        gw.stop()
+
+
+def test_a_non_utf8_token_file_fails_closed_everywhere(tmp_path):
+    f = tmp_path / "fabric-token"
+    f.write_bytes(b"\xff\xfe\x80")
+    f.chmod(0o600)
+    with pytest.raises(OSError):
+        read_fabric_token()
+    gw = _gw(tmp_path, allow_open=True)
+    try:
+        assert _raw(gw, "/list")[0] == 401
+        assert gw.control_auth == "unreadable"
+        with pytest.raises(UnreachableError):
+            FabricClient(f"http://127.0.0.1:{gw.control_port}").list()
+    finally:
+        gw.stop()
+
+
+@pytest.mark.parametrize("make", ["wide", "symlink"])
+def test_a_token_file_with_a_wide_mode_or_a_symlink_is_refused(tmp_path, make):
+    f = tmp_path / "fabric-token"
+    if make == "wide":
+        f.write_text("tok")
+        f.chmod(0o644)
+    else:
+        (tmp_path / "real").write_text("tok")
+        (tmp_path / "real").chmod(0o600)
+        f.symlink_to(tmp_path / "real")
+    with pytest.raises(OSError):
+        read_fabric_token()
+
+
+def test_an_empty_or_missing_token_file_is_no_token(tmp_path):
+    assert read_fabric_token() is None
+    f = tmp_path / "fabric-token"
+    f.write_text("")
+    f.chmod(0o600)
+    assert read_fabric_token() is None
+
+
+def test_an_open_gateway_reports_open_and_a_tokened_one_token(tmp_path):
+    gw = _gw(tmp_path, allow_open=True)
+    try:
+        assert gw.control_auth == "open"
+        (tmp_path / "fabric-token").write_text("t")
+        (tmp_path / "fabric-token").chmod(0o600)
+        assert gw.control_auth == "token"
+    finally:
+        gw.stop()
+
+
+def _enrol_host(tmp_path, url):
+    cfg = tmp_path / ".config" / "herdr-engineering"
+    cfg.mkdir(parents=True)
+    (cfg / "host.json").write_text(json.dumps({"control_plane_url": url, "host_id": "h1", "token": "host-token"}))
+
+
+def test_a_failed_host_config_fetch_is_not_read_as_no_token_and_is_retried(tmp_path, monkeypatch):
+    """Control plane down and nothing cached: the host config says nothing, which must not read as "no token"."""
+    from herdr_engineering import host_config as hc
+    from herdr_engineering.fabric import reset_fabric_token_cache
+    monkeypatch.setattr(hc, "host_config", _REAL_HOST_CONFIG)
+    reset_fabric_token_cache()
+    _enrol_host(tmp_path, "http://127.0.0.1:1")
+    with pytest.raises(OSError):
+        read_fabric_token()
+    gw = _gw(tmp_path, allow_open=True)
+    try:
+        assert _raw(gw, "/list")[0] == 401 and gw.control_auth == "unreadable"
+    finally:
+        gw.stop()
+        reset_fabric_token_cache()
+
+
+def test_the_token_file_wins_over_a_pinned_host_config_token_and_digits_in_yaml_are_text(tmp_path, fake_host_config):
+    from herdr_engineering.fabric import reset_fabric_token_cache
+    reset_fabric_token_cache()
+    fake_host_config({"fabric": {"token": 123456}})
+    assert read_fabric_token() == "123456"                    # an int from YAML must not crash accepts()
+    f = tmp_path / "fabric-token"
+    f.write_text("from-file")
+    f.chmod(0o600)
+    assert read_fabric_token() == "from-file"
+    gw = _gw(tmp_path)
+    try:
+        assert _raw(gw, "/list", "from-file")[0] == 200
+        f.write_text("rotated")
+        assert _raw(gw, "/list", "rotated")[0] == 200
+    finally:
+        gw.stop()
+        reset_fabric_token_cache()
+
+
+def test_a_numeric_host_config_token_is_accepted_not_a_crash(tmp_path, fake_host_config):
+    from herdr_engineering.fabric import reset_fabric_token_cache
+    reset_fabric_token_cache()
+    fake_host_config({"fabric": {"token": 987654}})
+    gw = _gw(tmp_path)
+    try:
+        assert _raw(gw, "/list", "987654")[0] == 200
+        assert _raw(gw, "/list", "nope")[0] == 401
+    finally:
+        gw.stop()
+        reset_fabric_token_cache()

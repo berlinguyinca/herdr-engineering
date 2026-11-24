@@ -236,6 +236,12 @@ def host_config() -> HostConfig:
     return value
 
 
+def forget_memoised_host_config() -> None:
+    """Drop the memoised value (or memoised failure) so the next ``host_config()`` fetches again; an installed
+    source stays."""
+    _MEMO.clear()
+
+
 def reset_host_config() -> None:
     _MEMO.clear()
     _SOURCE.clear()

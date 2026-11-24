@@ -3601,7 +3601,7 @@ def _cmd_dev_gateway(args) -> int:
     gateway.start()
     _print_json({
         "ok": True, "gateway": True, "https": bool(tls_cert), "role": gateway.role, "peer": gateway.peer_url, "access_enforced": bool(users or tags),
-        "control_auth": "token" if gateway.token else "open",
+        "control_auth": gateway.control_auth,
         "control_url": f"http://{gateway.control_host}:{control_port}",
         "url_base": gateway.url_base,
         "named_urls": (f"https://<service>.{gateway.named_domain}" + ("" if gateway.named_port == 443 else f":{gateway.named_port}"))
