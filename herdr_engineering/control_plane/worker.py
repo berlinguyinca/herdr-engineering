@@ -354,69 +354,108 @@ async def run_one_pass(conn, *, mission_store=None, session_store=None,
                        inspector_snapshotter=None, fabric_compactor=None,
                        share_housekeeper=None, artifact_reconciler=None,
                        annotation_housekeeper=None,
-                       inspector_archiver=None) -> dict:
+                       inspector_archiver=None,
+                       isolate_steps: bool = False, on_step=None) -> dict:
+    """One pass over every step. With ``isolate_steps`` a step that raises is logged and recorded under
+    ``step_errors`` and the other steps still run (a pass abandons at once if the connection is closed); without it the
+    first exception propagates. ``on_step`` is called at the start and after every step (the worker's heartbeat)."""
     summary: dict[str, Any] = {}
+    step_errors: dict[str, str] = {}
+
+    async def step(name, fn):
+        try:
+            await fn()
+        except Exception as exc:  # noqa: BLE001 - one broken step must not stop the others
+            if not isolate_steps or (conn is not None and conn.is_closed()):
+                raise
+            log.warning("worker step %s failed: %s: %s", name, type(exc).__name__, exc)
+            step_errors[name] = f"{type(exc).__name__}: {exc}"
+        if on_step is not None:
+            on_step()
+
+    if on_step is not None:
+        on_step()
 
     # Stale services -> unavailable (never delete).
     stale_services = []
-    if service_store is not None:
-        for svc in await service_store.list():
-            last = svc.get("last_seen")
-            if last is None:
-                continue
-            if datetime.now(UTC) - last > timedelta(seconds=lease_ttl) \
-                    and svc.get("health") != "unavailable" \
-                    and svc.get("status") != "stopped":
-                await service_store.update_health(svc["service_id"], "unavailable")
-                stale_services.append(svc["service_id"])
     summary["stale_services"] = stale_services
+
+    async def stale_services_step():
+        if service_store is not None:
+            for svc in await service_store.list():
+                last = svc.get("last_seen")
+                if last is None:
+                    continue
+                if datetime.now(UTC) - last > timedelta(seconds=lease_ttl) \
+                        and svc.get("health") != "unavailable" \
+                        and svc.get("status") != "stopped":
+                    await service_store.update_health(svc["service_id"], "unavailable")
+                    stale_services.append(svc["service_id"])
+    await step("stale_services", stale_services_step)
 
     # Stale hosts -> unavailable (never delete).
     stale_hosts = []
-    if host_store is not None:
-        rows = await host_store.fetch("SELECT host_id, last_heartbeat FROM hosts")
-        for row in rows:
-            hb = row.get("last_heartbeat")
-            if hb is None:
-                continue
-            if datetime.now(UTC) - hb > timedelta(seconds=host_ttl):
-                await host_store.execute(
-                    "UPDATE hosts SET status='unavailable' WHERE host_id=$1",
-                    row["host_id"])
-                stale_hosts.append(row["host_id"])
     summary["stale_hosts"] = stale_hosts
 
+    async def stale_hosts_step():
+        if host_store is not None:
+            rows = await host_store.fetch("SELECT host_id, last_heartbeat FROM hosts")
+            for row in rows:
+                hb = row.get("last_heartbeat")
+                if hb is None:
+                    continue
+                if datetime.now(UTC) - hb > timedelta(seconds=host_ttl):
+                    await host_store.execute(
+                        "UPDATE hosts SET status='unavailable' WHERE host_id=$1",
+                        row["host_id"])
+                    stale_hosts.append(row["host_id"])
+    await step("stale_hosts", stale_hosts_step)
+
     # Snapshots for active missions.
-    snapshots = 0
-    if mission_store is not None and snapshot_store is not None:
-        for m in await mission_store.list(status="active"):
-            await snapshot_store.save("mission", m["mission_id"],
-                                      dict(m), sequence=0)
-            snapshots += 1
-    summary["snapshots"] = snapshots
+    summary["snapshots"] = 0
+
+    async def snapshots_step():
+        if mission_store is not None and snapshot_store is not None:
+            for m in await mission_store.list(status="active"):
+                await snapshot_store.save("mission", m["mission_id"],
+                                          dict(m), sequence=0)
+                summary["snapshots"] += 1
+    await step("snapshots", snapshots_step)
 
     # Artifact GC: Phase 1 scaffold only; real reachability GC in Phase 5.
     summary["artifact_gc"] = 0
     summary.update({"artifact_jobs_claimed": 0,
                     "artifact_jobs_completed": 0,
                     "artifact_jobs_failed": 0})
-    if conn is not None and worker_id and artifact_job_runner is not None:
-        summary.update(await _run_artifact_job_pass(
-            conn, worker_id=worker_id, runner=artifact_job_runner,
-            max_jobs=max_artifact_jobs))
-    if conn is not None and inspector_snapshotter is not None:
-        summary["inspector_snapshot"] = await inspector_snapshotter.tick(conn)
-    if conn is not None and fabric_compactor is not None:
-        summary["fabric_compaction"] = await fabric_compactor.tick(conn)
-    if conn is not None and inspector_archiver is not None:
-        summary["inspector_archive"] = await inspector_archiver.tick(conn)
-    if conn is not None and share_housekeeper is not None:
-        summary["share_housekeeping"] = await share_housekeeper.tick(conn)
-    if conn is not None and annotation_housekeeper is not None:
-        summary["annotation_housekeeping"] = await annotation_housekeeper.tick(conn)
-    if conn is not None and artifact_reconciler is not None:
-        summary["artifact_reconcile"] = await artifact_reconciler.tick(conn)
+
+    async def artifact_jobs_step():
+        if conn is not None and worker_id and artifact_job_runner is not None:
+            summary.update(await _run_artifact_job_pass(
+                conn, worker_id=worker_id, runner=artifact_job_runner,
+                max_jobs=max_artifact_jobs))
+    await step("artifact_jobs", artifact_jobs_step)
+
+    for key, name, ticker in (("inspector_snapshot", "inspector_snapshotter", inspector_snapshotter),
+                              ("fabric_compaction", "fabric_compactor", fabric_compactor),
+                              ("inspector_archive", "inspector_archiver", inspector_archiver),
+                              ("share_housekeeping", "share_housekeeper", share_housekeeper),
+                              ("annotation_housekeeping", "annotation_housekeeper", annotation_housekeeper),
+                              ("artifact_reconcile", "artifact_reconciler", artifact_reconciler)):
+        if conn is not None and ticker is not None:
+            async def tick_step(key=key, ticker=ticker):
+                summary[key] = await ticker.tick(conn)
+            await step(name, tick_step)
+    if step_errors:
+        summary["step_errors"] = step_errors
     return summary
+
+
+# Shutdown budget (seconds): stop_grace_period in deploy/control-plane/compose.yaml must cover all of it plus a margin.
+PASS_GRACE_SECONDS = 20.0         # a pass running at stop may finish this long
+UNWIND_SECONDS = 5.0              # then an abandoned pass gets this long to react to its cancellation
+BRIDGE_TEARDOWN_SECONDS = 5.0     # the collab bridge's teardown (cli.py) is waited for this long
+CONNECTION_CLOSE_SECONDS = 2.0    # closing a postgres connection
+BACKOFF_CAP = 120.0               # longest wait between attempts while postgres is unreachable
 
 
 class WorkerGaveUp(RuntimeError):
@@ -442,9 +481,19 @@ async def _discard(conn) -> None:
         conn.terminate()
 
 
-async def _guarded_pass(conn, stop: asyncio.Event, grace: float, stores: dict) -> None:
-    """One pass. A stop requested mid-pass lets it finish for ``grace`` seconds, then abandons it."""
-    task = asyncio.ensure_future(run_one_pass(conn, **stores))
+def _touch(heartbeat: Path | None) -> None:
+    if heartbeat is None:
+        return
+    try:
+        Path(heartbeat).touch()
+    except OSError as exc:
+        log.warning("worker heartbeat not written: %s", exc)
+
+
+async def _guarded_pass(conn, stop: asyncio.Event, grace: float, unwind: float, stores: dict) -> dict | None:
+    """One pass; returns its summary, or None when it was abandoned. A stop requested mid-pass lets it finish for
+    ``grace`` seconds, then abandons it; the abandoned pass gets ``unwind`` seconds to react to its cancellation."""
+    task = asyncio.ensure_future(run_one_pass(conn, isolate_steps=True, **stores))
     stopped = asyncio.ensure_future(stop.wait())
     try:
         await asyncio.wait({task, stopped}, return_when=asyncio.FIRST_COMPLETED)
@@ -452,64 +501,86 @@ async def _guarded_pass(conn, stop: asyncio.Event, grace: float, stores: dict) -
             await asyncio.wait({task}, timeout=grace)
             if not task.done():
                 log.warning("worker stopping: abandoned a pass still running after %.0fs", grace)
-                return
+                return None
         if task.done() and not task.cancelled():
-            task.result()
+            return task.result()
+        return None
     finally:
         stopped.cancel()
         if not task.done():
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            done, _ = await asyncio.wait({task}, timeout=unwind)
+            if not done:
+                log.warning("worker stopping: the abandoned pass did not unwind within %.0fs; leaving it", unwind)
+        if task.done() and not task.cancelled():
+            task.exception()        # retrieved, so an abandoned pass that failed late is not reported as never-awaited
 
 
 async def run_worker(conn, *, interval: float = 30.0, stop: asyncio.Event | None = None,
                      connect=None, rebind=None, max_failed_passes: int | None = None,
-                     backoff_base: float = 1.0, backoff_cap: float = 30.0, pass_grace: float = 20.0,
+                     backoff_base: float = 1.0, backoff_cap: float = BACKOFF_CAP,
+                     pass_grace: float = PASS_GRACE_SECONDS, unwind: float = UNWIND_SECONDS,
                      heartbeat: Path | None = None, **stores) -> None:
-    """Run passes until ``stop``. With ``connect`` (an async factory) a connection that is closed or fails a probe after a
-    failed pass is replaced; ``rebind(conn)`` returns the stores that hold the connection, rebuilt on it. Failed passes
-    retry with a capped exponential backoff; ``max_failed_passes`` in a row raises WorkerGaveUp. ``heartbeat`` is touched
-    after every successful pass."""
+    """Run passes until ``stop``.
+
+    Steps inside a pass are isolated: one that raises is logged and the others still run, and only a lost or unreachable
+    database counts as a failed pass. With ``connect`` (an async factory) the connection is probed before every pass and
+    replaced when it is closed or the probe fails; ``rebind(conn)`` returns the stores that hold the connection, rebuilt on
+    it. Consecutive connection failures back off exponentially (``backoff_base`` doubling up to ``backoff_cap``, never
+    below ``interval``); ``max_failed_passes`` in a row raises WorkerGaveUp. ``heartbeat`` is touched after a successful
+    probe, at the start of a pass and after every step, so a long single step does not look like a wedged worker.
+    With ``connect`` the worker owns the current connection and closes it on every exit."""
     stop = stop or asyncio.Event()
     failed = 0
-    while not stop.is_set():
-        delay = interval
-        try:
-            if connect is not None and (conn is None or conn.is_closed()):
-                conn = await connect()
-                if rebind is not None:
-                    stores.update(rebind(conn))
-            await _guarded_pass(conn, stop, pass_grace, stores)
-            if stop.is_set():
-                break
-            if failed:
-                log.warning("worker recovered after %d failed pass(es)", failed)
-            failed = 0
-            if heartbeat is not None:
-                try:
-                    Path(heartbeat).touch()
-                except OSError as exc:
-                    log.warning("worker heartbeat not written: %s", exc)
-        except Exception as exc:  # bounded: never crash the worker on one bad pass
-            failed += 1
-            if failed == 1:
-                log.exception("worker pass failed: %s", exc)
-            else:
-                log.warning("worker pass failed (%d in a row): %s: %s", failed, type(exc).__name__, exc)
-            if connect is not None and not await _connection_alive(conn):
-                if conn is not None:
-                    log.warning("worker lost its postgres connection; reconnecting")
-                await _discard(conn)
-                conn = None
-            if max_failed_passes is not None and failed >= max_failed_passes:
-                log.error("worker giving up after %d consecutive failed passes", failed)
-                await _discard(conn if connect is not None else None)
-                raise WorkerGaveUp(f"{failed} consecutive failed passes") from exc
-            delay = min(interval, backoff_cap, backoff_base * 2 ** (failed - 1))
-        try:
-            await asyncio.wait_for(stop.wait(), timeout=delay)
-        except TimeoutError:
-            continue
+
+    def beat() -> None:
+        _touch(heartbeat)
+
+    try:
+        while not stop.is_set():
+            delay = interval
+            try:
+                if connect is not None:
+                    if conn is None or conn.is_closed():
+                        conn = await connect()
+                        if rebind is not None:
+                            stores.update(rebind(conn))
+                    elif not await _connection_alive(conn):
+                        raise ConnectionError("the postgres connection failed its probe")
+                summary = await _guarded_pass(conn, stop, pass_grace, unwind, {**stores, "on_step": beat})
+                if stop.is_set():
+                    break
+                if summary and summary.get("step_errors") and connect is not None and not await _connection_alive(conn):
+                    raise ConnectionError("the postgres connection was lost during the pass")
+                if failed:
+                    log.warning("worker recovered after %d failed pass(es)", failed)
+                failed = 0
+                beat()
+            except Exception as exc:  # bounded: never crash the worker on one bad pass
+                if connect is None:
+                    log.exception("worker pass failed: %s", exc)
+                    delay = interval
+                else:
+                    failed += 1
+                    if failed == 1:
+                        log.exception("worker could not run a pass: %s", exc)
+                    else:
+                        log.warning("worker could not run a pass (%d in a row): %s: %s", failed, type(exc).__name__, exc)
+                    if conn is not None:
+                        log.warning("worker lost its postgres connection; reconnecting")
+                        await _discard(conn)
+                        conn = None
+                    if max_failed_passes is not None and failed >= max_failed_passes:
+                        log.error("worker giving up after %d consecutive connection failures", failed)
+                        raise WorkerGaveUp(f"{failed} consecutive connection failures") from exc
+                    delay = max(interval, min(backoff_cap, backoff_base * 2 ** (failed - 1)))
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=delay)
+            except TimeoutError:
+                continue
+    finally:
+        if connect is not None:
+            await _discard(conn)
 
 
 # ----------------------------------------------------------------------------------------------------------------------

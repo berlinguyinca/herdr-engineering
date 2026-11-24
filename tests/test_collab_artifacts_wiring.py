@@ -190,7 +190,9 @@ class SpyLoop:
 
 
 def worker_args(path, **kw):
-    return argparse.Namespace(interval=0.05, once=False, migrations=None, fleet_config=str(path), host_id="h", **kw)
+    return argparse.Namespace(interval=0.05, once=False, migrations=None, fleet_config=str(path), host_id="h",
+                              heartbeat_file=None, max_failed_passes=10, connect_timeout=10.0, statement_timeout=120.0,
+                              **kw)
 
 
 def run_worker_cmd(monkeypatch, registry_pg, tmp_path, *, cp_extra):

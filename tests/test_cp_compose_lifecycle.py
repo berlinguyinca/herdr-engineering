@@ -13,6 +13,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from herdr_engineering.control_plane import worker
+
 ROOT = Path(__file__).resolve().parents[1]
 COMPOSE = yaml.safe_load((ROOT / "deploy/control-plane/compose.yaml").read_text())["services"]
 SERVICES = ("control-plane-web", "control-plane-worker")
@@ -27,6 +29,20 @@ def test_service_has_init_grace_period_and_healthcheck(name):
     check = svc["healthcheck"]
     assert check["test"][0] == "CMD"
     assert {"interval", "timeout", "retries", "start_period"} <= set(check)
+
+
+def test_worker_stop_grace_period_covers_the_whole_shutdown_budget_with_a_margin():
+    budget = (worker.PASS_GRACE_SECONDS + worker.UNWIND_SECONDS + worker.BRIDGE_TEARDOWN_SECONDS
+              + worker.CONNECTION_CLOSE_SECONDS)                # 20 + 5 + 5 + 2 = 32 s, then the refresh thread's join
+    grace = int(COMPOSE["control-plane-worker"]["stop_grace_period"][:-1])
+    assert budget == 32
+    assert grace >= budget + 10, f"docker would SIGKILL the worker mid-teardown: {grace} s for a {budget} s budget"
+
+
+def test_worker_healthcheck_window_outlasts_the_backoff_between_attempts():
+    window = int(re.search(r"< (\d+) else", COMPOSE["control-plane-worker"]["healthcheck"]["test"][-1]).group(1))
+    assert window > worker.BACKOFF_CAP + 30             # a worker waiting out a backoff is not wedged
+    assert window >= 300                                # documented: keep above the longest single step
 
 
 def test_image_ships_the_tools_the_healthchecks_use():

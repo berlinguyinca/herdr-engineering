@@ -241,10 +241,18 @@ services:
     container_name: herdr-cp-worker
     restart: unless-stopped
     init: true
-    stop_grace_period: 30s      # the worker lets a running pass finish for up to 20 s after SIGTERM
-    # The worker touches this file after every successful pass; the check is its age (passes run every 30 s, so
-    # 300 s without one means the loop is wedged or Postgres has been unreachable). It also exits 1 after 10
-    # consecutive failed passes and restart: unless-stopped brings it back.
+    # Shutdown budget after SIGTERM: a running pass may finish for 20 s (PASS_GRACE_SECONDS) + 5 s for an abandoned pass
+    # to unwind + 5 s for the collab bridge teardown + 2 s to close the connection = 32 s, plus the projection
+    # refresh thread's join; 45 s leaves a margin so docker never SIGKILLs the worker mid-teardown.
+    # (tests/test_cp_compose_lifecycle.py derives the sum from control_plane/worker.py.)
+    stop_grace_period: 45s
+    # Heartbeat: the worker touches this file once its connection probes healthy, at the start of every pass and after
+    # every step of a pass, so a long single step (a large artifact render) does not look like a wedged loop. The
+    # check is the file's age: unhealthy once 300 s pass with no step finishing (keep it above the longest expected
+    # single step) or, with Postgres down, no probe succeeding. While Postgres is unreachable the worker retries with
+    # a backoff of 30 s growing to 120 s and exits 1 after 10 consecutive connection failures (about 8 minutes, up to
+    # 10 with connect timeouts); restart: unless-stopped brings it back. Unhealthy therefore shows after 5 minutes,
+    # before the restart.
     healthcheck:
       test: ["CMD", "python3", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.stat('/tmp/herdr-worker-heartbeat').st_mtime < 300 else 1)"]
       interval: 30s
