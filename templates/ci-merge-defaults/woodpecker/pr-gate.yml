@@ -1,0 +1,35 @@
+# Template: pull-request gate that proves "PR + current main". Copy to .woodpecker/<name>.yml and replace the `gates` command.
+# Woodpecker checks out only the PR head; integrate-main.sh merges the target branch into it (throwaway merge commit) first.
+when:
+  - event: pull_request
+  - event: manual
+
+# One run per PR branch at a time; a newer push queues instead of running beside the old one.
+concurrency:
+  limit: 1
+  group: "${CI_WORKFLOW_NAME}-${CI_COMMIT_SOURCE_BRANCH}"
+
+skip_clone: true
+
+steps:
+  - name: checkout
+    image: bash
+    commands:
+      - 'set -eu'
+      - 'git init -q -b "${CI_COMMIT_BRANCH:-main}" .'
+      - 'git remote add origin "https://github.com/${CI_REPO}.git"'
+      - 'git fetch --no-tags origin "$CI_COMMIT_SHA"'
+      - 'git checkout -q FETCH_HEAD'
+
+  # Needs full history for the merge base; the script unshallows by itself.
+  - name: integrate-main
+    image: bash
+    commands:
+      - 'set -eu'
+      - 'bash scripts/ci/integrate-main.sh'
+
+  - name: gates
+    image: bash
+    commands:
+      - 'set -eu'
+      - 'echo "REPLACE ME: your repo test/lint/build command"'

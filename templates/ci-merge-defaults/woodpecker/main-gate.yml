@@ -1,0 +1,39 @@
+# Template: full gates on every push to main. With branch protection `strict` off, two PRs that were each green alone can break
+# together; this run catches that on main. Do NOT add integrate-main here: main is tested exactly as pushed.
+# Keep this context OUT of the required checks until it has proven stable.
+when:
+  - event: push
+    branch: main
+
+# Pushes queue instead of running side by side.
+concurrency:
+  limit: 1
+  group: gates-main
+
+skip_clone: true
+
+steps:
+  - name: checkout
+    image: bash
+    commands:
+      - 'set -eu'
+      - 'git init -q -b main .'
+      - 'git remote add origin "https://github.com/${CI_REPO}.git"'
+      - 'git fetch --no-tags origin "$CI_COMMIT_SHA"'
+      - 'git checkout -q FETCH_HEAD'
+
+  # A newer push to main has made this run stale: finish green instead of raising a false "CI failed - main".
+  - name: superseded
+    image: bash
+    commands:
+      - 'set -eu'
+      - 'rm -f .ci-main-superseded'
+      - 'head="$(git ls-remote origin refs/heads/main | awk "{print \$1}")"'
+      - 'if [ -n "$head" ] && [ "$head" != "$CI_COMMIT_SHA" ]; then echo "superseded by newer push"; touch .ci-main-superseded; fi'
+
+  - name: gates
+    image: bash
+    commands:
+      - 'set -eu'
+      - 'if [ -f .ci-main-superseded ]; then echo "superseded; nothing to run"; exit 0; fi'
+      - 'echo "REPLACE ME: the same command as pr-gate.yml"'

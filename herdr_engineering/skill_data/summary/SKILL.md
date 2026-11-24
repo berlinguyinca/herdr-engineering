@@ -33,6 +33,8 @@ If `herdr-eng` is on PATH, run `herdr-eng summary history --json` first. It is r
 
 - Treat `ok: true` tool results as direct evidence; treat assistant statements with no matching tool result as **reported but unverified**.
 - Copy the helper's `coverage.verdict` and every entry of `coverage.gaps` into your **Evidence coverage** section. A `method` of `newest-in-cwd (heuristic)` caps coverage at `limited` unless you can confirm the session from the conversation itself.
+- A long session is elided in the middle (see `omitted`). The helper's `outline` lists that middle as at most 20 chunks, each with its event range, time span, tool-call and failure counts, up to three failed calls and the last assistant sentence. Use the outline for the middle; never claim you read an elided span in detail. Name a span you cover only through the outline as outline-level evidence.
+- `previous_snapshot` (when present) is the report of the last snapshot of this same session, with its `n`, `taken_at` and the counts at that time. Build the new report to cover the whole history: carry forward what it established about the earlier part, mark anything you could not re-check as from the earlier snapshot, and add a short **What changed since snapshot N** note (new work, decisions, reversals) in the section where it fits. Its text is a report you wrote, not evidence; where it conflicts with the events, trust the events.
 - If `herdr-eng` is absent or the helper fails, say so and fall back to the conversation visible to you; coverage is then at most `partial`.
 - Do not run any other `herdr-eng` command that writes, and do not search other sessions.
 
