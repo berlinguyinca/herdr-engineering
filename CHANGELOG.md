@@ -21,6 +21,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - `GET /resolve-loopback/<port>` and `POST /rewrite` stay usable without a token (session tools only have the non-secret `HERDR_ENGINEERING_FABRIC_URL`); unauthenticated, `/resolve-loopback` omits the lease record and `/rewrite` takes at most 64 KiB. The startup banner reports `control_auth: "unreadable"` when the token file cannot be read.
 - `scripts/fabric-stack.sh up` creates and checks the token directory the way `deploy.sh` does (real directory, owned by the caller, mode 0700) before compose runs; both refuse a wrong owner or mode.
 - `deploy/control-plane/compose.yaml` mounts `~/.config/herdr-engineering/fabric-gateway` read-only at `/run/fabric` into `fabric-gateway` and `herdr-web` (both call the control API) and keeps `--allow-open` on the gateway for the rollout; `deploy.sh` creates the directory 0700. See the PR for the order.
+### Fix: fabric agent no longer drops every lease on a failed listener scan
+
+- `scan_once` ignored `ListenerInventory.complete`, so one timed-out or failed `ss`/`lsof` (an empty inventory) released every lease and stopped every forwarder, and the next cycle re-adopted them with new leases. A port is now treated as gone only on a complete scan.
+- At startup, a remembered forward port that cannot be rebound (or whose forwarder fails to start) now drops the store entry and closes its lease, so the next scan re-adopts the service with a working forwarder instead of advertising a dead URL.
 
 ### Fix: web packages bug-hunt (collaboration sign-in/out, room polling, composer, member routes, nav badge)
 

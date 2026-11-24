@@ -31,6 +31,9 @@ from herdr_engineering.control_plane.fleet_rollout import (
 )
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 from herdr_engineering.fleet_watch import core, events, run, state
+from herdr_engineering.fleet_watch.plan import (
+    HOST_ORDER as PLAN_HOSTS,  # hosts a rollout walks; control-plane HOST_ORDER also accepts mac-studio
+)
 from herdr_engineering.service_metadata_feed import MetadataClient
 from tests.test_fleet_watch import FakeGitHub, Forge, git
 
@@ -83,7 +86,7 @@ class Fleet:
         self.ssh = script(root / "fake-ssh", FAKE_SSH.split("\n", 1)[1])
         self.lock = root / "fleet.lock.yaml"
         self.shims: dict[str, Path] = {}
-        for host in HOST_ORDER:
+        for host in PLAN_HOSTS:
             self.add_host(host)
 
     def home(self, host: str) -> Path:
@@ -230,7 +233,7 @@ def test_apply_rolls_out_serially_canary_first_and_converges(fleet):
     order = [c.split()[0] for c in fleet.calls()]
     assert order == ["beast"] * 3 + ["bender"] * 3 + ["macbook-pro"] * 3          # precheck, apply, health each
     assert [c.split("--phase ")[1].split()[0] for c in fleet.calls("beast")] == ["precheck", "apply", "health"]
-    for host in HOST_ORDER:
+    for host in PLAN_HOSTS:
         assert fleet.installed(host) == head
         assert git(fleet.checkout(host), "rev-parse", "HEAD") == head
     assert fleet.saved()["converged"] == {HE: head}
@@ -348,7 +351,7 @@ def test_crash_mid_rollout_resumes_at_the_first_unfinished_host(fleet):
     assert types[-2:] == TAIL
     seqs = [e["payload"]["seq"] for e in fleet.queued()]
     assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs)
-    for host in HOST_ORDER:
+    for host in PLAN_HOSTS:
         assert fleet.installed(host) == fleet.forge.head(HE)
 
 
@@ -358,7 +361,7 @@ def pi_world(fleet, tmp_path_factory=None) -> tuple[str, str]:
     """pi-engineering with a known 'before' release installed and current on every host."""
     before = fleet.forge.head(PI)
     fleet.lock.write_text(f"repos:\n  pi-engineering: {before}\n")
-    for host in HOST_ORDER:
+    for host in PLAN_HOSTS:
         root = fleet.home(host) / ".local/share/herdr-engineering/pi"
         (root / "releases" / before / "node_modules").mkdir(parents=True)
         (root / "releases" / before / "package.json").write_text("{}")
@@ -392,7 +395,7 @@ def test_rollback_scope_all_updated_also_flips_earlier_hosts_back(fleet):
     (fleet.home("bender") / "smoke_fail").write_text("")
     out = fleet.cli("--rollback-scope", "all_updated", repo=PI)
     assert out.returncode == 1
-    assert [current(fleet, h) for h in HOST_ORDER] == [before] * 3
+    assert [current(fleet, h) for h in PLAN_HOSTS] == [before] * 3
     assert [p["status"] for p in fleet.finished()["beast"]] == ["ok", "rolled_back"]
 
 
