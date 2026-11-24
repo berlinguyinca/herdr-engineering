@@ -1273,7 +1273,7 @@ class FabricClient:
         ``ok``, ``role``, ``epoch``, ``node_id`` and ``auth`` (so the container healthcheck needs no token); that is "reachable, but not
         authorised", not healthy, so it raises."""
         health = self._req("GET", "/healthz")
-        if "bound_ports" not in health:
+        if "auth" in health or set(health) <= {"ok"}:      # only the tokenless reply has "auth" (or is a bare ok)
             raise TokenNotAccepted("fabric gateway reachable but the token was not accepted (minimal /healthz)",
                                    target=self.gateway_url, info=health)
         return health

@@ -686,3 +686,26 @@ def test_fabric_stack_status_sends_the_bearer_when_a_token_file_exists():
     text = (Path(__file__).parent.parent / "scripts" / "fabric-stack.sh").read_text()
     status = text[text.index("status() {"):text.index("down()")]
     assert "Authorization: Bearer" in status
+
+
+def test_healthz_is_minimal_only_when_the_reply_says_so_not_when_a_field_is_missing(tmp_path):
+    """A full reply from a gateway that lacks some field (an older build, a test fake) is still a full reply."""
+    import http.server
+    import threading
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            body = json.dumps({"ok": True, "port_lo": 18000, "port_hi": 28999}).encode()
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        assert FabricClient(f"http://127.0.0.1:{srv.server_port}", token="t").healthz()["port_lo"] == 18000
+    finally:
+        srv.shutdown()
