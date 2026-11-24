@@ -28,6 +28,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from .endpoint_guard import validate_model_endpoint
+
 log = logging.getLogger("herdr.llm_proxy")
 
 FORWARDED_PATHS = ("/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/v1/models")
@@ -217,6 +219,9 @@ class ProxyState:
         self._catalog_lock = threading.Lock()
         self._catalog_last = float("-inf")
         self._catalog: list[dict] = []
+        # Every id and alias the gateway has ever advertised. A failed or contended catalog read empties
+        # ``_catalog`` (no stale success), but must not let a registered name capture a gateway model.
+        self._upstream_names: frozenset[str] = frozenset()
         self.reports: ReportQueue | None = None      # set by serve(); None = report inline (tests)
 
     def refresh(self, force: bool = False) -> None:
@@ -286,6 +291,11 @@ class ProxyState:
             custom = self._models.get(model or "")
             return dict(custom) if custom else None
 
+    def serves_upstream(self, model: str | None) -> bool:
+        """True when the normal upstream serves ``model``: a registered model of that name must not shadow it."""
+        self._fabric_catalog()
+        return bool(model) and model in self._upstream_names
+
     def _fabric_catalog(self) -> list[dict]:
         # Catalog I/O never holds the key/routing/admission lock. Concurrent
         # refresh contenders use CPU while the first request refreshes evidence.
@@ -312,6 +322,11 @@ class ProxyState:
             if not isinstance(data, list) or any(not isinstance(item, dict) for item in data):
                 raise ValueError("invalid catalog")
             self._catalog = data
+            names = {item["id"] for item in data if isinstance(item.get("id"), str)}
+            for item in data:
+                if isinstance(item.get("aliases"), list):
+                    names.update(a for a in item["aliases"] if isinstance(a, str))
+            self._upstream_names = frozenset(names)
         except Exception:
             # No stale success on failure, redirects, or malformed metadata.
             self._catalog = []
@@ -613,15 +628,16 @@ def make_handler(state: ProxyState):
         def _forward_slotted(self, key: dict, raw: bytes, body: dict | None, meta: dict):
             model = body.get("model") if body else None
             custom = state.custom_model(model)
+            if custom and custom.get("project") and custom["project"] != key["project"]:
+                meta.update(status=403, error_class="model_project_mismatch")
+                return self._json(403, {"error": {"code": "model_project_mismatch"}})
+            if custom is not None and state.serves_upstream(model):
+                custom = None       # a registered name never captures a model the upstream serves
             guarded = self.headers.get(REGISTERED_MODEL_HEADER, "").lower() == "true"
             if guarded and custom is None:
                 meta.update(status=503, error_class="model_not_registered")
                 return self._json(503, {"error": {"code": "model_not_registered",
                                                  "message": "required model is not registered"}})
-            if (custom and (guarded or custom.get("fabric_model")) and custom.get("project")
-                    and custom["project"] != key["project"]):
-                meta.update(status=403, error_class="model_project_mismatch")
-                return self._json(403, {"error": {"code": "model_project_mismatch"}})
             base, bearer, upstream_model, route_kind = (state.resolve_route(custom, model) if custom
                                                         else (state.upstream, state.upstream_key, model, "cpu"))
             policy = bool(custom and custom.get("fabric_model"))
@@ -645,6 +661,12 @@ def make_handler(state: ProxyState):
                         meta.update(status=503, error_class="model_unavailable")
                         return self._json(503, {"error": {"code": "model_unavailable",
                                                          "message": "no route is available for this model"}})
+                    if custom and base != state.upstream:
+                        try:        # the stored URL is checked again here: it may predate the registration check
+                            validate_model_endpoint(base, resolve=True)
+                        except ValueError:
+                            meta.update(status=403, error_class="model_endpoint_refused")
+                            return self._json(403, {"error": {"code": "model_endpoint_refused"}})
                     parts = urlsplit(base + self.path)
                     conn_cls = (http.client.HTTPSConnection if parts.scheme == "https"
                                 else http.client.HTTPConnection)
