@@ -629,3 +629,88 @@ def test_publish_prints_a_digest_with_status_path_and_dashboard_reference(tmp_pa
     nothing = sr.publish_report("claude", "abc-123", REPORT, home=tmp_path, environ={}, run=_fake_herdr([]),
                                 dashboard=False, pane=False)
     assert nothing["digest"] == "" and nothing["ok"] is False
+
+
+# -- the snapshot history: every publish keeps its snapshot, the viewer plots them ---------------------
+def _snap_history(prompts=6, events=40, verdict="complete", **extra):
+    def history(agent, session_id):
+        data = _history(prompts)(agent, session_id)
+        data.update(events_total=events, counts={"tool_calls": 9, "tool_failures": 1}, compactions=0,
+                    coverage={"verdict": verdict, "gaps": []}, **extra)
+        return data
+    return history
+
+
+def _store(out):
+    from herdr_engineering import summary_snapshots as ss
+    return ss.load(out["file"][:-3] + ".snapshots.json")
+
+
+def test_each_publish_keeps_its_snapshot_instead_of_overwriting(tmp_path):
+    first = _publish(tmp_path, [], history=_snap_history(6, 40))
+    second = _publish(tmp_path, [], history=_snap_history(9, 70, verdict="partial"))
+    rows = _store(second)
+    assert [(r["n"], r["prompts"], r["events"], r["coverage"]) for r in rows] == [(1, 6, 40, "complete"), (2, 9, 70, "partial")]
+    assert first["snapshot"] == {"ok": True, "n": 1, "count": 1} and second["snapshot"] == {"ok": True, "n": 2, "count": 2}
+    assert rows[1]["report"].startswith("# Session summary") and "drift-graph" not in rows[1]["report"]
+    assert rows[0]["segments"] == 2 and rows[0]["drift"] is True          # from the validated graph, not the model text
+    path = Path(second["file"][:-3] + ".snapshots.json")
+    assert (path.stat().st_mode & 0o777) == 0o600
+
+
+def test_the_dashboard_post_carries_the_snapshot_numbers_not_its_text(tmp_path):
+    posted = []
+    _publish(tmp_path, [], posted=posted, history=_snap_history(6, 40))
+    snap = posted[0]["snapshot"]
+    assert snap["prompts"] == 6 and snap["events"] == 40 and snap["coverage"] == "complete" and "report" not in snap
+
+
+def test_a_history_that_cannot_be_read_records_no_snapshot_and_still_publishes(tmp_path):
+    out = _publish(tmp_path, [], history=_history(boom=RuntimeError("boom")))
+    assert out["ok"] and out["snapshot"]["ok"] is False and _store(out) == []
+    empty = _publish(tmp_path, [], history=lambda a, s: {"events_total": 0, "prompts_total": 0, "prompts": []})
+    assert empty["ok"] and empty["snapshot"] == {"ok": False, "error": "no_history"}
+
+
+def test_without_a_pane_the_snapshot_is_still_recorded_without_graph_numbers(tmp_path):
+    out = sr.publish_report("claude", "abc-123", WITH_BLOCK, home=tmp_path, environ={}, run=_fake_herdr([]),
+                            dashboard=False, pane=False, history=_snap_history())
+    row = _store(out)[0]
+    assert out["snapshot"]["ok"] and row["segments"] is None and row["drift"] is None
+
+
+def test_history_command_never_writes_the_snapshot_store(tmp_path):
+    from herdr_engineering import summary_snapshots as ss
+    rows = [{"type": "user", "timestamp": "2026-01-01T09:00:00Z", "message": {"content": "hi"}}]
+    path = tmp_path / ".claude/projects/-w/abc-123.jsonl"
+    path.parent.mkdir(parents=True)
+    path.write_text("\n".join(json.dumps(r) for r in rows))
+    ss.record(ss.cache_dir(tmp_path), "claude", "abc-123", {"prompts": 1, "events": 1}, REPORT)
+    before = sorted((p.name, p.stat().st_mtime_ns, p.read_bytes()) for p in (tmp_path / ".cache").rglob("*") if p.is_file())
+    r = subprocess.run([sys.executable, "-m", "herdr_engineering.cli", "summary", "history", "--agent", "claude",
+                        "--session", "abc-123", "--home", str(tmp_path)], capture_output=True, text=True,
+                       cwd=str(tmp_path), env={"PYTHONPATH": str(Path(sr.__file__).parents[1]), "PATH": "/usr/bin:/bin"})
+    assert r.returncode == 0, r.stderr
+    prev = json.loads(r.stdout)["previous_snapshot"]
+    assert prev["n"] == 1 and prev["report"].startswith("# Session summary")
+    assert sorted((p.name, p.stat().st_mtime_ns, p.read_bytes()) for p in (tmp_path / ".cache").rglob("*") if p.is_file()) == before
+
+
+def test_the_summary_view_ends_with_the_snapshot_plot(tmp_path, monkeypatch):
+    monkeypatch.setenv("NO_COLOR", "1")
+    for i in range(4):
+        out = _publish(tmp_path, [], history=_snap_history(6 + i * 3, 40 + i * 20))
+    drawn = {}
+    sr.view_report(out["file"], run=_recorder([]), out=_Tty(True), viewer=lambda render, **kw: drawn.update(l=render(70, 20)) or 0)
+    text = "\n".join(drawn["l"])
+    assert "Snapshot history: 4 snapshots" in text and text.index("completed") < text.index("Snapshot history")
+    assert all(visible_width(line) <= 70 for line in drawn["l"])
+    assert any(line.startswith("prompts") and "6 → 15" in line for line in drawn["l"][-10:])
+
+
+def test_the_summary_view_without_snapshots_is_unchanged(tmp_path):
+    f = tmp_path / "claude-x.md"
+    f.write_text("# Title\n\nbody\n")
+    drawn = {}
+    sr.view_report(f, run=_recorder([]), out=_Tty(True), viewer=lambda render, **kw: drawn.update(l=render(60, 10)) or 0)
+    assert "Snapshot history" not in "\n".join(drawn["l"])
