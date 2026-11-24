@@ -73,7 +73,9 @@ def test_only_the_oversized_target_goes(env):
     root, state = env
     big = project(root, "big")
     small = project(root, "small")
-    (big / "debug/filler.bin").write_bytes(b"x" * 4_000_000)
+    # Random bytes, then a sync: allocated blocks are what is measured, and ZFS reports none for dirty or compressible data.
+    (big / "debug/filler.bin").write_bytes(os.urandom(4_000_000))
+    os.sync()
     for path in (big / "debug/filler.bin", big / "debug"):
         os.utime(path, (time.time() - 48 * 3600,) * 2)
     cap = cleanup._inspect(big)[1] - 1_000_000

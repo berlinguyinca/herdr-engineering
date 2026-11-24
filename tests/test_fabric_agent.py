@@ -1445,3 +1445,31 @@ def test_legacy_entry_without_registration_time_is_stamped_not_released(
         server.shutdown()
         agent.stop()
         gw.stop()
+
+
+# -- persisted heartbeat clock across a reboot -------------------------------
+
+def test_lease_loaded_after_reboot_is_heartbeated_on_first_cycle(tmp_path, monkeypatch):
+    """``last_hb`` is a ``time.monotonic()`` reading. A host reboot resets the
+    monotonic clock, so a persisted value can sit far in the future: the lease
+    was then never "due" again and the gateway's copy expired for good. A
+    loaded lease must be heartbeated (and re-registered when gone) at once."""
+    gw = _FakeGateway()
+    server, port = _http_target(tmp_path)
+    entry = {"lease_id": "lease_from_before_reboot", "label": f"x (port {port})",
+             "external_port": 18001, "url": "http://dev.lan:18001",
+             "target_host": "127.0.0.1", "target_port": port,
+             "process": "node", "last_hb": time.monotonic() + 1_000_000.0,
+             "registered_at": time.time()}
+    (tmp_path / "fabric-agent.json").write_text(json.dumps({str(port): entry}))
+    monkeypatch.setattr(fa, "scan_listening_ports",
+                        lambda: _listeners({port: "node"}))
+    agent = _agent(tmp_path, gw, heartbeat_ttl=90.0)
+    try:
+        agent.scan_once()
+        stored = _store(tmp_path)[str(port)]
+        assert stored["lease_id"] in gw.leases  # the gateway holds it again
+    finally:
+        server.shutdown()
+        agent.stop()
+        gw.stop()

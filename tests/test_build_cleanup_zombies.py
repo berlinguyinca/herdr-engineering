@@ -2,6 +2,7 @@
 ``feat/disk-cleanup-command`` branch, which carries the same ``_gone_or_zombie``). Real processes."""
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import time
@@ -63,3 +64,34 @@ def test_a_zombie_leader_with_a_live_thread_still_counts_its_cwd(tmp_path: Path)
 
 def test_a_starting_pid_that_is_already_gone_is_not_managed(tmp_path: Path) -> None:
     assert _managed_process(tmp_path / "424242", tmp_path) is False
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="needs a real Linux /proc")
+def test_an_unreadable_zombie_leader_thread_outside_herdr_does_not_fail_the_scan(tmp_path: Path) -> None:
+    """A zombie leader whose surviving thread's ``fd`` is closed to us (another user's process, or a non-dumpable
+    one) and that does not descend from Herdr cannot be a managed build job: the scan skips it instead of raising."""
+    code = ("import ctypes,threading,time,os\n"
+            "libc=ctypes.CDLL(None)\n"
+            "libc.prctl(4,0,0,0,0)\n"  # PR_SET_DUMPABLE=0: /proc/<pid>/task/<tid>/fd turns root-owned
+            "threading.Thread(target=time.sleep,args=(60,),daemon=False).start()\n"
+            "print(os.getpid(),flush=True)\n"
+            "libc.pthread_exit(None)\n")
+    proc = subprocess.Popen([sys.executable, "-c", code], cwd=tmp_path, stdout=subprocess.PIPE, text=True)
+    try:
+        assert proc.stdout is not None
+        pid = int(proc.stdout.readline())
+        deadline = time.time() + 10
+        state = ""
+        while time.time() < deadline:
+            state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+            if state == "Z":
+                break
+            time.sleep(0.05)
+        assert state == "Z"
+        thread = next(name for name in os.listdir(f"/proc/{pid}/task") if name != str(pid))
+        with pytest.raises(PermissionError):  # the premise: the live thread's fd really is closed to us
+            os.scandir(f"/proc/{pid}/task/{thread}/fd").close()
+        assert all(hold[0] != pid for hold in _scan())
+    finally:
+        proc.kill()
+        proc.wait()
