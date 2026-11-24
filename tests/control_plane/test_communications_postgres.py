@@ -20,14 +20,34 @@ from herdr_engineering.control_plane.db import Migrator
 from herdr_engineering.control_plane.projection_history import PostgresHistory
 from herdr_engineering.control_plane.repo import ControlPlaneRepo
 from herdr_engineering.control_plane.sink import DurableEventSink
+from tests.e2e.pg import ThrowawayPostgres, find_bins
 
 pytestmark = pytest.mark.integration
 
 
-def test_postgres_recovery_and_paginated_deduplication(tmp_path):
+@pytest.fixture(scope="module")
+def communication_dsn(tmp_path_factory):
+    """A disposable herdr_comm_test database: the one named by HERDR_COMMUNICATION_TEST_DSN, else a real throwaway local
+    PostgreSQL (initdb/pg_ctl on a unix socket, the same helper the e2e tests use). Skips only when no server binaries exist."""
     dsn = os.environ.get("HERDR_COMMUNICATION_TEST_DSN")
-    if not dsn:
-        pytest.skip("Set HERDR_COMMUNICATION_TEST_DSN to a disposable herdr_comm_test database")
+    if dsn:
+        yield dsn
+        return
+    if os.getuid() == 0:
+        pytest.skip("isolated initdb cannot run as root")
+    bins = find_bins({})
+    if bins is None:
+        pytest.skip("PostgreSQL server binaries unavailable and HERDR_COMMUNICATION_TEST_DSN not set")
+    server = ThrowawayPostgres(bins, tmp_path_factory.mktemp("comm-pg"), db="herdr_comm_test")
+    server.start()
+    try:
+        yield server.dsn
+    finally:
+        server.close()
+
+
+def test_postgres_recovery_and_paginated_deduplication(tmp_path, communication_dsn):
+    dsn = communication_dsn
     assert urlsplit(dsn).path.rsplit("/", 1)[-1].startswith("herdr_comm_test")
 
     async def migrate():
@@ -81,12 +101,10 @@ def test_postgres_recovery_and_paginated_deduplication(tmp_path):
             sink._run(sink._conn.close())
 
 
-def test_real_mirror_database_failure_does_not_break_primary_command_receipts(tmp_path, caplog):
+def test_real_mirror_database_failure_does_not_break_primary_command_receipts(tmp_path, caplog, communication_dsn):
     from herdr_engineering.control_plane.api import ControlPlaneServer
 
-    dsn = os.environ.get("HERDR_COMMUNICATION_TEST_DSN")
-    if not dsn:
-        pytest.skip("Set HERDR_COMMUNICATION_TEST_DSN to a disposable herdr_comm_test database")
+    dsn = communication_dsn
     assert urlsplit(dsn).path.rsplit("/", 1)[-1].startswith("herdr_comm_test")
 
     async def setup(block):

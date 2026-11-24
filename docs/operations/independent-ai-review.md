@@ -6,18 +6,15 @@ Ruleset 25691548 on the default branch now requires a commit status named exactl
 automation posts it, on the exact head SHA it reviewed, and nothing else should: `always-on-review.py review ... --post`
 runs `claude` with the Opus model against that head and posts `pending`, then `success` or `failure`.
 
-- **Per PR, through Woodpecker (the normal path).** `.woodpecker/opus-review.yaml` runs the review for every
-  `pull_request` event (opened, synchronized, reopened) and `pull_request_metadata` event (draft marked ready) of any enrolled repo. Setup, the YAML other repos copy and
-  fork safety (approving a fork PR runs its code on the review host with the token): `docs/operations/per-pr-opus-review.md`.
-- **Hourly backup sweep.** `deploy/ci-review/herdr-always-on-review.{service,timer}` polls open PRs once an hour and
-  reviews any head that has no terminal status. It only catches a missed webhook or a lost pipeline; it is not the
-  trigger. A head with a terminal status is never reviewed twice, so the two paths do not duplicate work.
+- **The `herdr-always-on-review` systemd user timer (the only path).** `deploy/ci-review/herdr-always-on-review.{service,timer}`
+  polls open PRs and reviews any head that has no terminal status. A head with a terminal status is never reviewed twice.
+  There is no per-PR Woodpecker workflow: it needed an agent and a wrapper that were never set up, so its check stayed pending on every PR.
 
 Never post the status by hand: a hand-posted `success` is a review nobody did.
 
 - The ruleset is still named "Independent AI review" in the GitHub UI, although the context it requires is now `Opus agent review`.
 - Anyone with push access can post a commit status, so the identity of the poster is a convention, not enforced. The
-  token that the automation uses is the host token file `~/.config/herdr-engineering/opus-review.token` (see `per-pr-opus-review.md`).
+  token that the automation uses is the host token file `~/.config/herdr-engineering/opus-review.token`.
 - Any push moves the head and makes the status stale. The new `synchronize` event starts a review of the new head.
 - The `Independent AI review` check below (`deploy/ci-review/ai-review.py`, a deepseek or qwen model) is **no
   longer required**. The script and timer remain, but their status is advisory.
@@ -141,8 +138,8 @@ Both tiers now get the operator's project rules and a review checklist (`deploy/
   as the `Authorization` header, to that provider's https `baseUrl` host. Redirects are not followed. The key is
   redacted from every message.
 - **Plain http to a tailnet node is an explicit opt-in.** `reviewer.allow_plain_http_hosts` takes exact IPv4
-  literals in `100.64.0.0/10`, for example `["100.104.39.6"]` for pi's `development` provider
-  (`http://100.104.39.6:8390/v1`). Hostnames, IPv6, public addresses and other private ranges are refused, and so
+  literals in `100.64.0.0/10`, for example `["100.64.8.6"]` for pi's `development` provider
+  (`http://100.64.8.6:8390/v1`). Hostnames, IPv6, public addresses and other private ranges are refused, and so
   is a tailnet IP that is not listed. The default is empty: https only. With a listed host:
   - the key, the diff and the verdict cross the tailnet as plain HTTP. WireGuard still encrypts the link between
     the two machines, but anything on either end can read them: a proxy or sniffer on the reviewing host, the

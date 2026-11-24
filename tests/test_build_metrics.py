@@ -297,3 +297,32 @@ def test_bench_refuses_cold_outside_own_tempdir(tmp_path):
         capture_output=True, text=True, timeout=30)
     assert r.returncode != 0
     assert "refus" in r.stderr.lower()
+
+
+# --- disk sectors: both resolution paths, independent of the host's mounts ---
+
+def test_disk_sectors_prefer_the_device_holding_the_cwd(tmp_path):
+    dev = os.makedev(8, 1)
+    stats = {"sda": (8, 0, 900), "sda1": (8, 1, 400)}
+    assert bm.disk_sectors_from(stats, dev, tmp_path) == ("device:sda1", 400)
+
+
+def test_disk_sectors_fall_back_to_whole_physical_devices(tmp_path):
+    # A cwd on an overlay/tmpfs has no diskstats row: sum whole devices only,
+    # skipping partitions (no /sys/block entry) and virtual devices.
+    for name in ("sda", "nvme0n1", "loop0", "dm-0"):
+        (tmp_path / name).mkdir()
+    stats = {"sda": (8, 0, 100), "sda1": (8, 1, 60), "nvme0n1": (259, 0, 50),
+             "loop0": (7, 0, 999), "dm-0": (253, 0, 999)}
+    dev = os.makedev(0, 42)
+    assert bm.disk_sectors_from(stats, dev, tmp_path) == ("host_wide_physical_ish", 150)
+
+
+def test_disk_sectors_none_without_any_whole_device(tmp_path):
+    assert bm.disk_sectors_from({"sda1": (8, 1, 60)}, os.makedev(0, 42), tmp_path) is None
+
+
+def test_host_disk_sectors_reads_the_real_host():
+    got = bm.host_disk_sectors(".")
+    if Path("/proc/diskstats").exists():
+        assert got is None or (isinstance(got[0], str) and got[1] >= 0)

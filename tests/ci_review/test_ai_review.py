@@ -486,12 +486,12 @@ def test_bad_base_urls_are_refused(env, base):
 
 # ---------- plain http, only to a listed tailnet IP ----------
 
-TAILNET_IP = "100.104.39.6"
+TAILNET_IP = "100.64.8.6"
 
 
 @pytest.fixture
 def plain(env, cert, monkeypatch):
-    """A plain-http fake gateway reached as http://100.104.39.6:<port>: every dial is recorded, the tailnet IP is
+    """A plain-http fake gateway reached as http://100.64.8.6:<port>: every dial is recorded, the tailnet IP is
     redirected to the loopback server, and any other address fails at once (never a real connection)."""
     gw = Gateway(cert[0], cert[1], env.rev_log, [MODEL, LONG_MODEL], tls=False)
     dials: list = []
@@ -530,8 +530,8 @@ def test_plain_http_is_refused_by_default(env, plain):
 
 
 @pytest.mark.parametrize("host", ["8.8.8.8", "llm.metabolomics.us", "10.0.0.1", "192.168.1.5", "127.0.0.1",
-                                  "100.63.255.255", "100.128.0.1", "100.104.039.6", "fd7a:115c:a1e0::1",
-                                  "100.104.39.6/32", " 100.104.39.6", 1684285190])
+                                  "100.63.255.255", "100.128.0.1", "100.64.008.6", "fd7a:115c:a1e0::1",
+                                  "100.64.8.6/32", " 100.64.8.6", 1681917958])
 def test_allow_plain_http_hosts_takes_only_exact_tailnet_ips(env, plain, host):
     env.config({"reviewer": {"model": MODEL, "allow_plain_http_hosts": [host]}})
     assert review(env) == 2
@@ -544,11 +544,11 @@ def test_allow_plain_http_hosts_must_be_a_list(env, plain):
     assert env.dials == []
 
 
-@pytest.mark.parametrize("base", ["http://100.104.39.7:{port}/v1",        # a tailnet IP, but not the listed one
+@pytest.mark.parametrize("base", ["http://100.64.8.7:{port}/v1",        # a tailnet IP, but not the listed one
                                   "http://8.8.8.8:{port}/v1",             # public
                                   "http://10.0.0.1:{port}/v1",            # another private range
                                   "http://gateway.tailnet.ts.net:{port}/v1",   # a hostname
-                                  "http://user:pw@100.104.39.6:{port}/v1"])    # credentials
+                                  "http://user:pw@100.64.8.6:{port}/v1"])    # credentials
 def test_a_plain_http_base_url_not_in_the_list_is_refused(env, plain, base):
     env.config({"reviewer": {"model": MODEL, "allow_plain_http_hosts": [TAILNET_IP]}})
     env.models_json({"baseUrl": base.format(port=plain.port), "apiKey": KEY})

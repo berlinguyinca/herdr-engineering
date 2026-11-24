@@ -8,6 +8,78 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 ### Feat: `templates/ci-merge-defaults`, the "CI does the merging" defaults as a repo-agnostic template
 
 - `integrate-main.sh` (kept byte-identical to `scripts/ci/integrate-main.sh` by a test), Woodpecker `pr-gate.yml` and `main-gate.yml` snippets, and a README covering adoption plus the GitHub settings (`strict` off, required contexts, allow auto-merge, `gh pr merge --auto --squash`, `CHANGELOG.md merge=union`). Tested against real throwaway git repositories (`tests/test_ci_merge_defaults_template.py`).
+### Agent rules: push work branches and open PRs autonomously
+
+- `AGENTS.md` and the managed `SessionStart` reminder no longer require an explicit per-message ask before pushing herdr-engineering or opening a PR. Agents push their own work branches and open PRs themselves; pushing `main` and force-pushing or pushing someone else's branch stay forbidden (the reminder says so). The managed `PreToolUse` guard matches: a plain herdr-engineering push of a non-main branch is allowed, while force/destructive pushes (`-f`, `--force*`, `--mirror`, `--delete`/`-d`, `--prune`, `+` or `:branch` refspecs) still need the one-shot human token, including in the untokenizable-command fallback. Push to main/master stays denied.
+### Fix: the control-plane inspector runs on the repo's clock
+
+- `ControlPlaneRepo` now hands its own clock to `InspectorStore`. The inspector clamped event times to its 30-day
+  retention ceiling around the wall clock, so with a fixed test clock (2026-10-24) four `tests/control_plane/test_llm_stats.py`
+  transcript tests started failing on 2026-11-23 and turned unit-gates shard 3 red on every PR.
+
+### Fix: Codex second-reviewer follow-ups from #820 (always-on-review.py)
+
+- Codex spend is counted when Codex fails: a non-zero exit, time cap or missing answer after it reported tokens logs a
+  `tier: codex` line with the priced `usage` (counts toward `daily_budget_usd`); with no tokens the line says
+  `usage_unknown: true` and no cost is invented.
+- A clean Opus approve is remembered per head in `state.json` (`opus_approved`, with the tier model) when only Codex
+  failed to run, so the retry runs Codex alone; a new head, another model or `--force` reruns Opus. Cooldown and
+  budget rules are unchanged; the entry is cleared once a verdict is posted.
+- Config: `risky: null` / `risky.codex: null` mean the defaults; non-list or non-string `risky.globs` raise a config
+  error naming the entry; a glob with a trailing `/` (`deploy/`) means `deploy/**`.
+- A failed reviewer's `why` falls back to the first 300 characters of stdout (control characters stripped) when stderr is
+  empty (claude prints its errors to stdout). A usage-limit message logs `why: usage-limit: ...`, is not a cooldown
+  strike (state `limit_sha` lets the next poll retry), and stops the poll launching more reviews of that tier in the run.
+- Review fixes: Codex has its own usage-limit bucket (a Codex limit skips only later risky PRs, before Opus; an Opus
+  limit still stops Opus for the poll; a PR stuck on a limit is polled after the others). Codex limit detection scans
+  only stderr and the `error` / `turn.failed` events, never command output. `opus_approved` also records the base sha
+  (a retarget reruns Opus). A glob of only `**` / `**/` is refused.
+- Rollback: revert this PR. The extra `state.json` keys (`opus_approved`, `limit_sha`) are ignored by older code;
+  `risky: null` then fails the old config check, so restore a mapping (or remove the key) first.
+
+### Fix: `fleet join` works from the installed copy (inventory import, verify step)
+
+- The private-inventory helper moved into the package as `herdr_engineering/fleet_inventory.py`; `scripts/fleet_inventory.py` is now a thin shim that re-exports it (and still runs as a file for `scripts/fleet-join.sh`). The wheel ships only `herdr_engineering*`, so the installed venv could not import it, silently skipped the inventory, and the provision step then failed with "Could not match supplied host pattern". `herdr_engineering.fleet` no longer rewrites `sys.path` and the silent stub fallback is gone.
+- `fleet join` step 4 (verify registration) read the leases through the native `herdr` binary, which has no `devfabric` command, so it always failed. It now runs `herdr-eng devfabric list --json` via this interpreter (`fleet.devfabric_leases`). `NativeHerdrAdapter.devfabric_list` and `devfabric_register` (same mistake, no other callers) are removed.
+### Fix(ci): main push pipeline records green in the shared CI store (#931)
+
+- `.woodpecker/unit-gates-main.yml` now exports `HERDR_CI_STATE` from the runner's `WPCI_CI_DIR` before `main-cron-gates.sh --record-green`, as `main-cron.yml` does. Without it every main push failed after a fully green suite with `HERDR_CI_STATE is not set`, and the cron never learned the commit was already green.
+- `tests/test_ci_integrate_main.py` checks that every pipeline step calling `main-cron-gates.sh` exports the state dir first, and that the main push step passes it to `--record-green`.
+### Chore(ci): drop the Woodpecker `opus-review` workflow; the always-on timer posts the status
+
+- Removed `.woodpecker/opus-review.yaml`, `scripts/ci/opus-review.sh`, `tests/ci_review/test_per_pr_opus_review.py` and `docs/operations/per-pr-opus-review.md`.
+- Why: the workflow needed an agent labelled `review-host=true` and `/usr/local/bin/herdr-opus-review`; neither ever existed, so `ci/woodpecker/pr/opus-review` stayed pending on every PR.
+- The `herdr-always-on-review` systemd user timer is the only path and posts `Opus agent review`; docs and timer header updated to say so.
+
+### Chore: bump herdr-handoff to 0.6.0 (c16c2dfd), `reap` required by the capability gate
+
+- `lock/upstreams.yaml` pins herdr-handoff `c16c2dfdd86d6c0f22d8523f894718420e23d3a1` (v0.6.0; herdr-handoff#14, #16): `herdr-handoff reap [--apply] [--include-unrecorded]` (dry run by default) closes panes replaced by confirmed handoffs; `confirm` and `reap` check the live pane first and refuse with `source_is_caller`, `successor_gone`, `source_pane_reused` or `source_working`; takeover records `close_options.source_terminal_id`; successor panes are named `<project>: <goal summary>`.
+- `herdr_engineering.handoff_dependency` now requires `reap` beside `takeover --direction`. 0.5.1 has every other command and flag but none of the live pane checks, and `reap` is the only marker its help gives for them. `herdr-eng doctor` on a host still on 0.5.x reports `does not provide reap (herdr-handoff 0.6.0 or newer is needed)`; fix with `scripts/install-handoff.sh`.
+- `docs/operations/handoff.md` and the vendored handoff skill describe `reap`: dry run by default, `--apply` to close, and `--include-unrecorded` only after reviewing the dry run, because old records cannot detect pane-id reuse.
+### Fix: Pi fleet rollouts converge - pinned target, resumable drain, bounded state (#844)
+
+- **Pin the target**: `~/.config/herdr-engineering/pi-rollout-revision` (one 40-hex SHA; `HERDR_PI_ROLLOUT_REVISION` overrides) is now the canonical Pi runtime revision. `fleet rollout plan` falls back to it when `--pi-revision` is omitted and fails closed without one; an invalid pin is a failure, never a fallback.
+- **Resume, don't re-mint**: new `fleet rollout latest` selector returns the newest unsettled plan (never `complete`/`abandoned`); the daily controller (`fleet_autoupdate`) now drains it after each successful controller update with a bounded pass window (`max_passes=3`) and mints a plan only when nothing unfinished exists **and** the pinned revision has never been rolled out - once a plan for the pin settles, every later night reports a skip instead of re-staging the converged fleet, and an abandoned plan for the pin is respected. A mismatched unfinished plan is reported, not resumed: settle it with the new `fleet rollout abandon --id ... [--reason ...]` (refused for complete rollouts) or finish it. Settled means settled: `apply`, `run` and `retire-identityless` now all refuse abandoned rollouts.
+- **The nightly verdict stays the controller's**: the pi step's own failures - malformed pin file, unreadable store, rollout lock held by an operator command - are recorded as `pi_rollout.status: error` (or `prunedError` beside a completed drain) in the unattended run state; they never undo or replace a successful controller update.
+- **Transient classification**: resume skips with `INTERACTIVE_BUSY` (a busy interactive session) now retry with a fresh operation instead of blocking the rollout forever; the Pi runtime's other not-yet conditions already report `busy` and were retried once a driver ran the passes. `bootstrap_required` sessions record a durable operator-facing `nextStep` (restart the stable Pi Host on that host so it loads the selected release).
+- **Bound the state**: `fleet rollout prune [--older-than-days N]` (default 30, bounded 0-3650 - a negative horizon would delete every settled record) deletes settled records, judged by last pass or creation time; unsettled records are never touched. The daily driver prunes after each drain, and its pi-step result is recorded in the unattended run state so a skipped or blocked drain is visible without the journal.
+### CI: unit-gates sharded into three parallel workflows, plus a mid-run main freshness check
+
+- `.woodpecker/unit-gates-shard-{1,2,3}.yml` each run a third of the suite (`HERDR_UNIT_SHARD=<i>/3`) with the full PR pipeline (checkout, freshness, integrate-main, applicability, `unit-gates.sh`). `scripts/ci/unit-shard.py` splits test files by `sha256(path)`; `tests/test_ci_unit_shards.py` proves the shards partition the real suite (no test dropped or run twice) and that exactly one shard owns the slow tail (a shard without slow tests no longer runs an empty tail). The client (node) tests run in shard 1. `.woodpecker/unit-gates.yml` is now the aggregate: it `depends_on` the shards, so the required context `ci/woodpecker/pr/unit-gates` keeps its name, needs no branch-protection change and only goes green when every shard did, and goes red (not stuck `pending`) when one failed: it runs after the shards with `runs_on: [success, failure]` and fails closed on the shard states read from the Woodpecker API. Coverage is not enforced in this gate, so there is nothing to combine. `unit-gates-main.yml` is unchanged (one unsharded run per push to main). Rollback: restore `.woodpecker/unit-gates.yml` from the previous commit and delete the shard files.
+- `scripts/ci/main-moved-check.sh` (last step of each shard): one `git fetch` after the tests; if main moved since integrate-main, a conflicting merge fails with the files named, a move in uncovered paths passes, and a move in covered paths with a clean merge passes with a WARNING (the push-to-main run proves the combination; `HERDR_MAIN_MOVED_POLICY=fail` makes it fail).
+### CI: ui-gates covered-path list widened and locked by structural tests
+
+- `ui-gates` already always reports (no `when: path`, `applicability` step, #719/#901 pattern), so the required `ci/woodpecker/pr/ui-gates` context cannot hang; what was left was drift. The `ui` list in `scripts/ci/unit-gates-applicable.sh` now also covers `herdr_artifact_host/member_static/`, `herdr_artifact_host/share_static/`, `schemas/`, the root `playwright.*` configs, `eslint.*.config.mjs` and `tsconfig.communications.json`, so a change to those runs the heavy Playwright steps instead of getting a skip-green.
+- `tests/test_ci_gate_routing.py` asks the real script's matcher (no copy of the list) whether every tracked UI source, root browser-test config, helper script sourced by `ui-gates.sh` and file named by the `test:ui-gates` npm script is covered, so adding a UI tree without listing it fails the structural test. `docs/operations/ci-gates.md` states the rule.
+### Per-target size cap and home-wide discovery
+
+- New `build_cleanup.max_target_gb` (default 50, 0 turns it off) and `build_cleanup.size_cap_idle_hours` (default 2, minimum 1): a Cargo target over the cap that has been idle that long is cleaned by the 15-minute sweep, also below `high_water_percent`. The cap is enforced by the sweep alone: no pass runs after a build, and `build-coordinate` and the cargo wrapper are unchanged. It goes through the same checks as the pressure sweep (verified target, git-untracked, leases, per-target process scan, the lock, `cargo clean`); the sweep result names it `size_cap` in the new `reasons` map. Why: on 2026-11-20 beast's disk hit 100% with two checkouts holding 821 GB and 521 GB of stale `target/debug`; the old cleanup acted only at 85% and only under configured roots, and the service was never installed.
+- Default roots are now `~`, `~/work`, `~/IdeaProjects` and `~/.cache` (each swept once, by its real path; the home walk skips roots listed separately). **This widens the earlier narrowed "explicit roots only" contract, at the user's explicit request** ("we have dozens of rust projects"). Every walk is bounded (depth 6, 500,000 directories) and never follows symlinks; on Linux it never stats into a mount point. Under the home directory it does not enter dot directories (`~/.cargo`, `~/.rustup`, `~/.local/share/Trash`) or `Library`; no root enters `.git`, `node_modules`, `.venv`, `venv`, `.cache` or `__pycache__`. A directory counts only when the existing verification accepts it (`Cargo.toml` beside it, Cargo's markers). A project outside any git repository, or whose only repository is `$HOME`, is still never cleaned. Explicit `roots` replace the default, and a root you name is searched as named.
+- Huge targets (millions of entries) are capped: the size walk stops at the cap and idleness comes from Cargo's bookkeeping; an undecidable target is a warning. A target over the cap must pass the full foreign-content guard (owners, mounts, symlinks, special files, nested `Cargo.toml` or `.git`) over all of its content in a streaming walk before it is cleaned; one that cannot be walked in time is kept with a warning.
+- Discovery and size checks run in a separate interpreter with a deadline per root (`HERDR_SURVEY_SECONDS`, 600): it holds none of the sweep's locks, is killed with its process group and reaped, and a cut-off survey keeps the rows it had. The 6 h target-list cache (`build-cleanup-targets.json`) is best effort and validated; the disk guard uses it and never walks `~`, and says when `~` was not searched. `max_target_gb` and `size_cap_idle_hours` are validated (`false`, `null`, text and negatives fall back to the default with one warning per process). `GIT_*` variables are ignored by the git checks.
+
+- A busy check that times out keeps that one target with a warning; the sweep goes on with the others (before, it aborted the sweep). A target with no manifest beside it is skipped before any walk, and one in use is turned away by a scan that walks nothing, so neither is walked three or four times per sweep. A survey cut off by its deadline keeps what the child had written to the pipe. The depth limit reaches the survey child. A `max_target_gb` that rounds to zero bytes is the default with a warning. The docs now say that a target over the cap needs only `size_cap_idle_hours` whatever the pressure.
+
 ### Feat: per-PR `Opus agent review` through Woodpecker, as a template for any repo
 
 - `.woodpecker/opus-review.yaml` (copy it unchanged into any repo): on `pull_request` and `pull_request_metadata` (the latter so a draft marked ready is reviewed) it runs on an agent labelled `review-host: "true"` (never the hive-heavy pool), `concurrency` limit 1, `skip_clone`, one step with the absolute command `/usr/local/bin/herdr-opus-review` and no Woodpecker secret (a missing secret fails every pipeline of a repo at compile time, so the status token is read by the wrapper from a host file, default `<passwd home>/.config/herdr-engineering/opus-review.token`, `--token-file` or `OPUS_REVIEW_TOKEN_FILE` to override; it must be owned by the running user and mode 0600, a missing, empty or loose file fails the step with exit 1; it is read into memory only). `scripts/ci/opus-review.sh` holds the logic: it does not use `$HOME` (the local backend isolates it; the real home comes from passwd, `--home`/`--config` override, `ISOLATED_HOME` documented), skips non-PR events, refuses a malformed `CI_REPO` or PR number, fails on an empty token, skips (exit 0) a fork head (`gh pr view --jq .isCrossRepository` prints `true`; any answer other than exactly `false` or `true` fails the step), then runs `always-on-review.py review --repo "$CI_REPO" --pr N --post --host-lock-wait`. Review exit 3 (head moved) and 4 (nothing to do) map to 0, which also masks no-review cases (draft, cooldown, budget, gates not green): the head status is the truth. 1 and 2 keep the pipeline red and the status pending. Guide, template and operator steps: `docs/operations/per-pr-opus-review.md`.
@@ -205,6 +277,13 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 - `wpci-agent-prune`: a null or non-object queue response, a null `agent_id` in a queue task, or a non-list agents response now exits 1 with the normal `abort: API error` line instead of a traceback. The unreachable "more candidates than agents" abort is removed (candidates are a subset of the agents listed). README documents that after a >24h Woodpecker outage up to `--max-deletions` live agents per run may be removed (they re-register) and how to lower the cap.
 - `collab-fabric-firewall.sh --check`: a missing iptables binary is exit 3 with a clear message (was folded into 2, "need root"); one chain absent plus the other unreadable reports absent (1). `deploy.sh` treats 3 like absent (the strong WARNING). `--install`/`--remove` unchanged apart from the message. Exit-code list in `docs/operations/fabric-trust.md` updated.
+
+### Chore: scrub private infrastructure identifiers from tracked files
+
+- Tailscale IPs, the tailnet name, and a personal hostname in docs, tests, examples and help text are now documentation placeholders (100.64.8.x, <tailnet>, operator-laptop). Git history still contains the old values; a history rewrite has not been done (owner decision). deploy/fabric-stack/config.yaml keeps the live tailnet name because the deployment mounts it.
+
+- scripts/ci/main-cron-gates.sh no longer defaults HERDR_CI_STATE to a personal home path and now fails (exit 2) when it is unset, rather than guessing a non-persistent directory. .woodpecker/main-cron.yml sets it to $${WPCI_CI_DIR}/state/herdr; the runner must export WPCI_CI_DIR as the in-container mount of the shared CI store (the runner WPCI_CI_MOUNT).
+- New ansible/playbooks/ci-runner-env.yml provisions that runner side: a systemd drop-in for the Woodpecker agent exporting WPCI_CI_DIR (WOODPECKER_ENVIRONMENT) and mounting the shared CI store at it (WOODPECKER_BACKEND_DOCKER_VOLUMES). Paths come from private inventory vars `wpci_ci_store` / `wpci_ci_mount` on group `ci_runners`; none are committed.
 
 ### Fix: deploy.sh no longer warns that the fabric firewall is missing when it merely cannot read it
 
@@ -602,7 +681,7 @@ Key files must be mode 0600 and are refused otherwise; the key is never printed.
 - New routes `POST/GET /api/v1/assistant-team-briefs` and `GET /api/v1/assistant-references/<id>`, and `herdr-eng assistant brief-offer|brief-list|brief-reference`; `rooms queue` shows the brief card. No migration. Flag off changes nothing (pinned). Not built: web UI, automatic inbox scanning, external actions, `direct`. Roll back the flag, not the image (references are lost on an image rollback). See `docs/operations/team-rooms.md`; threat model section 3.8.
 
 ### Fix: the fabric agent forwarder no longer breaks SigV4-signed requests
-- `AgentForwarder` rewrote `Host:` to `127.0.0.1:<port>`, which invalidates AWS SigV4 (the signature covers Host), so rustfs/MinIO answered `SignatureDoesNotMatch` on the tailnet address. SigV4-signed requests (Authorization header or presigned query) are now forwarded byte-for-byte; unsigned requests behave as before. Takes effect when the operator restarts the agent (`systemctl --user restart herdr-eng-fabric-agent.service`). Proven with a throwaway forwarder on the tailnet IP: aws-cli list/put/get/delete and sccache cold+warm via `http://100.104.39.6:<port>`.
+- `AgentForwarder` rewrote `Host:` to `127.0.0.1:<port>`, which invalidates AWS SigV4 (the signature covers Host), so rustfs/MinIO answered `SignatureDoesNotMatch` on the tailnet address. SigV4-signed requests (Authorization header or presigned query) are now forwarded byte-for-byte; unsigned requests behave as before. Takes effect when the operator restarts the agent (`systemctl --user restart herdr-eng-fabric-agent.service`). Proven with a throwaway forwarder on the tailnet IP: aws-cli list/put/get/delete and sccache cold+warm via `http://100.64.8.6:<port>`.
 
 ### Fabric build cache: the shared tier works against the herdr rustfs server
 - `herdr-eng build-cache-rustfs-provision` (dry-run default, `--apply`): additive, idempotent creation of bucket `herdr-build-cache` (hard quota), read/write and read-only users with bucket-limited policies, and 0600 credential/registry files. Admin credential from the central fleet config, never echoed; MinIO client runs in the container with a private removed config dir; never touches `herdr-artifacts`; no delete path.
@@ -1400,7 +1479,7 @@ Key files must be mode 0600 and are refused otherwise; the key is never printed.
   owning machine, and a probe loop that renews healthy leases, expires dead
   ones (TTL), and releases their ports. Every lease gets a stable fleet-wide
   address `http://<gateway-magicdns>:<port>` (e.g.
-  `http://bender.tail0c50da.ts.net:18000`) reachable from any tailnet device.
+  `http://bender.<tailnet>.ts.net:18000`) reachable from any tailnet device.
 - `HERDR_ENGINEERING_FABRIC_URL` / `fabric.gateway_url` config: registrar
   commands route through the gateway automatically and degrade to local mode
   with an explicit warning when it is unreachable.

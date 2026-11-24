@@ -62,13 +62,13 @@ herdr_pytest_run_fast() {
   failed_file="$(mktemp "${TMPDIR:-/tmp}/herdr-pytest-failed.XXXXXX")"
   set +e
   "$runner" env "PYTHONPATH=$HERDR_PYTEST_PLUGIN_DIR${PYTHONPATH:+:$PYTHONPATH}" "HERDR_PYTEST_FAILED_FILE=$failed_file" \
-    python -m pytest -q -p herdr_flaky_plugin -m "$markexpr" ${PYTEST_REPORT[@]+"${PYTEST_REPORT[@]}"} ${PYTEST_PARALLEL[@]+"${PYTEST_PARALLEL[@]}"} 2>&1 | tee "$log"
+    python -m pytest -q -p herdr_flaky_plugin -m "$markexpr" ${PYTEST_REPORT[@]+"${PYTEST_REPORT[@]}"} ${PYTEST_PARALLEL[@]+"${PYTEST_PARALLEL[@]}"} ${PYTEST_SHARD_FILES[@]+"${PYTEST_SHARD_FILES[@]}"} 2>&1 | tee "$log"
   status=${PIPESTATUS[0]}
   if [ "${#PYTEST_PARALLEL[@]}" -gt 0 ] && herdr_pytest_rerun_wanted "$status" "$log"; then
     words="$(herdr_pytest_rerun_args)" || { rm -f "$log"; [ -n "$restore" ] && set -e; return 1; }
     while IFS= read -r word; do [ -z "$word" ] || args+=("$word"); done <<<"$words"
     echo "== pytest: the parallel pass exited $status and its output shows the xdist machinery broke (worker crash or internal error, not a test failure); rerunning the parallel pytest pass once ${args[*]:+with ${args[*]}}${args[*]:-serially} =="
-    "$runner" python -m pytest -q -m "$markexpr" ${PYTEST_REPORT[@]+"${PYTEST_REPORT[@]}"} ${args[@]+"${args[@]}"}
+    "$runner" python -m pytest -q -m "$markexpr" ${PYTEST_REPORT[@]+"${PYTEST_REPORT[@]}"} ${args[@]+"${args[@]}"} ${PYTEST_SHARD_FILES[@]+"${PYTEST_SHARD_FILES[@]}"}
     status=$?
     crash_rerun=1
   fi
@@ -117,19 +117,25 @@ herdr_pytest_run_gate() {
   local slow_nice="nice -n 5"
   command -v ionice >/dev/null 2>&1 && ionice -c3 true >/dev/null 2>&1 && slow_nice="ionice -c3 nice -n 5"
   statusf="$(mktemp "${TMPDIR:-/tmp}/herdr-pytest-slow.XXXXXX")"
-  if [ "${HERDR_PYTEST_SLOW_CONCURRENT:-1}" != 0 ]; then
+  # A shard that owns no slow-marked file has no tail (pytest would exit 5, nothing collected): tests/test_ci_unit_shards.py checks
+  # that exactly one shard owns it, so the tail cannot vanish unnoticed.
+  if [ "${HERDR_UNIT_SHARDED:-0}" = 1 ] && [ "${#PYTEST_SLOW_FILES[@]}" -eq 0 ]; then
+    echo "== pytest: this shard owns no slow tests; no serial tail here =="
+  elif [ "${HERDR_PYTEST_SLOW_CONCURRENT:-1}" != 0 ]; then
     echo "== pytest (slow tests: serial tail, running alongside the fast pass; its lines start with [slow]) =="
-    ( "$slow_runner" $slow_nice python -m pytest -q -p no:cacheprovider -m "$slow_expr" ${PYTEST_REPORT[@]+"${PYTEST_REPORT[@]}"}
+    ( "$slow_runner" $slow_nice python -m pytest -q -p no:cacheprovider -m "$slow_expr" ${PYTEST_REPORT[@]+"${PYTEST_REPORT[@]}"} ${PYTEST_SLOW_FILES[@]+"${PYTEST_SLOW_FILES[@]}"}
       echo $? >"$statusf" ) 2>&1 | sed -u 's/^/[slow] /' &
     pid=$!
   fi
   herdr_pytest_run_fast "$fast_runner" "$fast_expr"; fast=$?
-  if [ -n "$pid" ]; then
+  if [ "${HERDR_UNIT_SHARDED:-0}" = 1 ] && [ "${#PYTEST_SLOW_FILES[@]}" -eq 0 ]; then
+    slow=0
+  elif [ -n "$pid" ]; then
     wait "$pid"
     slow="$(cat "$statusf" 2>/dev/null)"; slow="${slow:-1}"
   else
     echo "== pytest (slow tests, serial tail) =="
-    "$slow_runner" python -m pytest -q -m "$slow_expr" ${PYTEST_REPORT[@]+"${PYTEST_REPORT[@]}"}; slow=$?
+    "$slow_runner" python -m pytest -q -m "$slow_expr" ${PYTEST_REPORT[@]+"${PYTEST_REPORT[@]}"} ${PYTEST_SLOW_FILES[@]+"${PYTEST_SLOW_FILES[@]}"}; slow=$?
   fi
   rm -f "$statusf"
   [ "$fast" -eq 0 ] || echo "== pytest: the fast parallel pass failed (exit $fast) =="

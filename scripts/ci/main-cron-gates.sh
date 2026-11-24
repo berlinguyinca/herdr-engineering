@@ -13,11 +13,17 @@
 # (a dev host, a docker agent, a first run) the script cannot tell, so it runs the suite - the same fail-open rule as
 # unit-gates-applicable.sh: a guard that cannot read state must not hand back a green.
 #
-# Override the memo location with HERDR_CI_STATE for a dev host or a test.
+# HERDR_CI_STATE (the memo directory) is REQUIRED: .woodpecker/main-cron.yml sets it from the runner-provided WPCI_CI_DIR, the
+# persistent shared CI store. There is deliberately no default: a writable but per-job directory would silently re-run the whole
+# suite on every cron tick, so an unset value fails loudly instead.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
-state_dir="${HERDR_CI_STATE:-/home/wohlgemuth/woodpecker/ci/state/herdr}"
+state_dir="${HERDR_CI_STATE:-}"
+if [ -z "$state_dir" ]; then
+  echo "main-cron: HERDR_CI_STATE is not set; refusing to guess a memo directory (it must be the persistent shared CI store)" >&2
+  exit 2
+fi
 memo="${state_dir}/main-unit-gates-green.txt"
 head_sha="$(git rev-parse HEAD)"
 

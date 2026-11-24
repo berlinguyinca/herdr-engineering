@@ -10,7 +10,7 @@ import shutil
 import subprocess
 import sys
 import tomllib
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 from .errors import InvalidError
@@ -203,23 +203,29 @@ def _real_cargo(home: Path) -> Path:
     return real
 
 
-def enroll_storage(volume: Path, name: str, directory: str, config_path: Path,
+def enroll_storage(volume: Path, name: str, directory: str, config_path: Path,  # pragma: darwin-only
                    priority: int = 0) -> dict[str, str]:
-    """Enroll a writable volume without erasing/moving any existing data."""
+    """Enroll a writable volume without erasing/moving any existing data (identity read by diskutil)."""
     import plistlib
+    result = subprocess.run(["/usr/sbin/diskutil", "info", "-plist", str(volume)],
+                            capture_output=True, timeout=3, check=True)
+    identity = plistlib.loads(result.stdout).get("VolumeUUID")
+    return enroll_volume(identity, name, directory, config_path, priority)
 
+
+def enroll_volume(identity: str | None, name: str, directory: str, config_path: Path,
+                  priority: int = 0, *, resolve_volume: Callable[[str], Path | None] | None = None,
+                  internal_cache: Path | None = None) -> dict[str, str]:
+    """Platform-neutral enrollment of the volume with ``identity``; ``resolve_volume`` maps identity to mount."""
     import yaml
 
     from .build_cache_config import validate
     from .build_cache_location import mounted_volume, parse_storage_tiers
     from .build_coord import _default_state_dir
-    result = subprocess.run(["/usr/sbin/diskutil", "info", "-plist", str(volume)],
-                            capture_output=True, timeout=3, check=True)
-    info = plistlib.loads(result.stdout)
-    identity = info.get("VolumeUUID")
+    resolve = resolve_volume or mounted_volume
     tier = parse_storage_tiers([{"name": name, "directory": directory,
                                  "volume_uuid": identity}])[0]
-    mount = mounted_volume(tier.volume_uuid or "")
+    mount = resolve(tier.volume_uuid or "")
     if mount is None:
         raise ValueError("Volume is not mounted and writable")
     cache = mount / directory
@@ -237,12 +243,12 @@ def enroll_storage(volume: Path, name: str, directory: str, config_path: Path,
              if item.get("name") != name and str(item.get("volume_uuid", "")).lower() != str(identity).lower()]
     tiers.insert(max(0, priority), {"name": name, "directory": directory, "volume_uuid": identity})
     if not any(not item.get("volume_uuid") for item in tiers):
-        tiers.append({"name": "internal", "directory": str(_default_state_dir() / "sccache")})
+        tiers.append({"name": "internal", "directory": str(internal_cache or _default_state_dir() / "sccache")})
     local["storage_tiers"] = tiers
     validate(section)
     # Creation is explicit enrollment only; runtime selection creates nothing.
     cache.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if mounted_volume(tier.volume_uuid or "") != mount:
+    if resolve(tier.volume_uuid or "") != mount:
         raise ValueError("Volume changed during enrollment")
     _atomic_write(marker, json.dumps({"version": 1, "volume_uuid": identity}) + "\n")
     if config_path.exists() and config_path.read_text() != original:

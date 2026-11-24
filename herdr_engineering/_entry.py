@@ -1,8 +1,7 @@
 """Where the interpreter started, captured before anything can rewrite it.
 
-`herdr_engineering.fleet` does `sys.path.insert(0, <checkout>/scripts)` at import time so it can
-reach `fleet_inventory.py` beside the repository. By the time an updater runs, `sys.path[0]`
-therefore names that scripts directory and says nothing about where the process began - reading it
+`sys.path[0]` can be rewritten after start-up (older `herdr_engineering.fleet` inserted the checkout's
+scripts directory), so it says nothing reliable about where the process began - reading it
 at call time is how the first version of the shadowing guard (herdr-engineering#584) let bender's
 real `python -m` invocation walk past it. Modules that must know whether the *working directory*
 supplied their code import this one first.

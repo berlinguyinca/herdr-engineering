@@ -6,7 +6,7 @@
   when: ansible_facts['system'] == 'Linux'
   environment:
     HOME: "{{ fleet_home }}"
-    XDG_RUNTIME_DIR: "/run/user/{{ ansible_user_uid }}"
+    XDG_RUNTIME_DIR: "/run/user/{{ ansible_facts['user_uid'] }}"
   block:
     - name: "Read the host's cleanup opt-in policy"
       ansible.builtin.command:

@@ -237,7 +237,7 @@ def steps(name: str) -> list[dict]:
     return yaml.safe_load((WOODPECKER / name).read_text())["steps"]
 
 
-@pytest.mark.parametrize("name", ["unit-gates.yml", "ui-gates.yml", "artifact-handoff.yml", "structural-gates.yml"])
+@pytest.mark.parametrize("name", ["unit-gates-shard-1.yml", "unit-gates-shard-2.yml", "unit-gates-shard-3.yml", "ui-gates.yml", "artifact-handoff.yml", "structural-gates.yml"])
 def test_pr_pipelines_integrate_main_right_after_checkout_and_freshness(name):
     steps_ = steps(name)
     names = [s["name"] for s in steps_]
@@ -312,15 +312,31 @@ def test_unit_gates_main_skips_and_never_records_green_on_the_marker(tmp_path):
         (root / "scripts" / "ci").mkdir(parents=True)
         log = tmp_path / f"log{marked}"
         for name in ("unit-gates.sh", "main-cron-gates.sh"):
-            (root / "scripts" / "ci" / name).write_text(f'#!/bin/bash\necho "{name} $*" >> "{log}"\n')
+            (root / "scripts" / "ci" / name).write_text(f'#!/bin/bash\necho "{name} $* state=${{HERDR_CI_STATE:-}}" >> "{log}"\n')
         if marked:
             (root / SUPERSEDED_MARKER).write_text("x")
-        script = "\n".join(steps_by_name["unit-gates"]["commands"])
-        r = subprocess.run(["bash", "-c", script], cwd=root, capture_output=True, text=True)
+        # Woodpecker turns $$ into $ before the shell sees the command.
+        script = "\n".join(steps_by_name["unit-gates"]["commands"]).replace("$$", "$")
+        env = {k: v for k, v in os.environ.items() if k != "HERDR_CI_STATE"}
+        env["WPCI_CI_DIR"] = str(tmp_path / "ci")
+        r = subprocess.run(["bash", "-c", script], cwd=root, env=env, capture_output=True, text=True)
         assert r.returncode == 0, r.stdout + r.stderr
         ran = log.read_text() if log.exists() else ""
         assert ("unit-gates.sh" in ran) is expect_run
         assert ("--record-green" in ran) is expect_run, "a superseded run must never record green"
+        if expect_run:
+            assert f"--record-green state={tmp_path / 'ci'}/state/herdr" in ran, "record-green needs the runner's shared CI store"
+
+
+def test_every_pipeline_step_running_the_cron_gate_names_its_state_dir():
+    for path in sorted(WOODPECKER.glob("*.y*ml")):
+        for step in yaml.safe_load(path.read_text()).get("steps", []):
+            cmds = step.get("commands", [])
+            calls = [i for i, c in enumerate(cmds) if "main-cron-gates.sh" in c]
+            if not calls:
+                continue
+            export = [i for i, c in enumerate(cmds) if 'export HERDR_CI_STATE="$${WPCI_CI_DIR' in c]
+            assert export and export[0] < calls[0], f"{path.name}:{step['name']} runs main-cron-gates.sh without HERDR_CI_STATE"
 
 
 def test_current_main_push_pipeline_runs(origin):

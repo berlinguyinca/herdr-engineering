@@ -9,7 +9,7 @@ runs the service.
  any tailnet device (desktop / phone / iPad)
       │  http://dev.lan:18052            (CoreDNS split-DNS -> gateway IP)
       ▼
- master host (bender):  dev.lan resolves to 100.104.39.6
+ master host (bender):  dev.lan resolves to 100.64.8.6
       ├─ herdr-coredns      CoreDNS, answers dev.lan + *.dev.lan
       └─ herdr-fabric-gateway  binds 18000-28999, proxies to the owning host
              └─ target: beast:5678 / mac:8080 / bender:3000 (any fleet host)
@@ -20,8 +20,8 @@ runs the service.
 | Service | Image | Role |
 |---|---|---|
 | `coredns` | `coredns/coredns:1.11.4` | Private nameserver for the shared `dev.lan` domain (Option B split-DNS). |
-| `fabric-gateway` | `herdr-engineering:0.1.0` (built) | The `dev:<port>` front door (spec 0110 #3): control API + per-port router + probe loop. |
-| `herdr-web` | `herdr-engineering:0.1.0` (built) | Private web/mobile control surface (spec 0060), loopback-only, tailnet-only via `tailscale serve`. |
+| `fabric-gateway` | `herdr-engineering:${HERDR_CP_IMAGE_TAG}` (built) | The `dev:<port>` front door (spec 0110 #3): control API + per-port router + probe loop. |
+| `herdr-web` | `herdr-engineering:${HERDR_CP_IMAGE_TAG}` (built) | Private web/mobile control surface (spec 0060), loopback-only, tailnet-only via `tailscale serve`. |
 
 The per-host **auto-registration agent** is intentionally *not* containerized:
 it must see host listeners via `ss`/`lsof`, so it stays a host service on
@@ -56,7 +56,7 @@ admin-console action:
 
 1. Open the Tailscale **admin console → DNS → Nameservers**.
 2. **Add nameserver** → enter the master host's tailnet IPv4
-   (e.g. `100.104.39.6`).
+   (e.g. `100.64.8.6`).
 3. Enable **"Restrict to domain"** and set it to `dev.lan`.
 4. Save.
 
@@ -100,8 +100,8 @@ docker compose up -d --build
 
 ```bash
 # DNS: dev.lan resolves to the gateway IP (loopback + tailnet)
-dig @127.0.0.1 dev.lan A                 # -> 100.104.39.6
-dig @100.104.39.6 foo.dev.lan A          # -> 100.104.39.6
+dig @127.0.0.1 dev.lan A                 # -> 100.64.8.6
+dig @100.64.8.6 foo.dev.lan A          # -> 100.64.8.6
 
 # Gateway control plane is up and advertises dev.lan
 curl -s http://127.0.0.1:29999/healthz     # -> {"url_base":"dev.lan", ...}

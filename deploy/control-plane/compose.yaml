@@ -563,8 +563,8 @@ services:
     build:
       context: ../..
       dockerfile: deploy/fabric-stack/Dockerfile
-    # Not rolled by deploy.sh: reads no fleet config, and recreating it drops leases.
-    image: herdr-engineering:0.1.0
+    # Tagged like every other herdr-engineering service so a deploy that recreates it runs the new image.
+    image: herdr-engineering:${HERDR_CP_IMAGE_TAG:?run deploy.sh}
     container_name: herdr-fabric-gateway
     restart: unless-stopped
     # One listening socket per leased port per bind host: the default 1024 fds ran out (EMFILE) and killed the 443 front.
@@ -613,7 +613,7 @@ services:
       start_period: 5s
 
   herdr-web:
-    image: herdr-engineering:0.1.0
+    image: herdr-engineering:${HERDR_CP_IMAGE_TAG:?run deploy.sh}
     container_name: herdr-web
     restart: unless-stopped
     network_mode: host

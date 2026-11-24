@@ -269,8 +269,9 @@ class ControlPlaneRepo:
         self.agent_identities = AgentIdentityRegistry(persist=self._persist_agent_projection,
             verify_noop=bool(getattr(self._sink, "verify_agent_identity_noop", False)))
         # Agent inspector (spec 0200): bounded per-session detail projection.
+        # The repo's clock, not the wall clock: the inspector clamps event times to its retention ceiling around `now`.
         self.inspector = InspectorStore.from_config(inspector_limits, persist=self._persist_inspector,
-                                                    journal_suppression=self._journal_policy)
+                                                    journal_suppression=self._journal_policy, clock=lambda: self._now())
         self.mission_activity_mirror = mission_activity_mirror is True
         self.mission_activity = self._new_mission_activity()
         self._mission_activity_pruned_at = 0.0

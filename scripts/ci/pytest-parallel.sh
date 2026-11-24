@@ -95,3 +95,23 @@ herdr_pytest_parallel_load() {
 # expressions repeat its `not e2e and not integration and not herdr_live` and must be kept in step with it (tests/test_ci_pytest_parallel.py checks).
 HERDR_PYTEST_FAST_MARKEXPR='not e2e and not integration and not herdr_live and not slow'
 HERDR_PYTEST_SLOW_MARKEXPR='slow and not e2e and not integration and not herdr_live'
+
+# Sharding (.woodpecker/unit-gates-shard-N.yml). HERDR_UNIT_SHARD=<i>/<n> restricts the gate to the test files of shard i of n
+# (scripts/ci/unit-shard.py: a deterministic split by path hash, checked to be a partition by tests/test_ci_unit_shards.py). Unset = the
+# whole suite, as before. Fills PYTEST_SHARD_FILES (the fast pass's file arguments; empty when unsharded) and PYTEST_SLOW_FILES (the
+# slow-marked files of this shard: the serial tail runs only on those, and not at all in a shard that owns none, because pytest exits 5
+# when nothing is collected). HERDR_UNIT_SHARDED is 1 when a shard is active. A malformed value fails loudly: an empty shard is a
+# green that proved nothing.
+PYTEST_SHARD_FILES=(); PYTEST_SLOW_FILES=(); HERDR_UNIT_SHARDED=0
+herdr_pytest_shard_load() {
+  PYTEST_SHARD_FILES=(); PYTEST_SLOW_FILES=(); HERDR_UNIT_SHARDED=0
+  [ -n "${HERDR_UNIT_SHARD:-}" ] || return 0
+  local tool="$(dirname "${BASH_SOURCE[0]}")/unit-shard.py" f out
+  out="$(python3 "$tool" files "$HERDR_UNIT_SHARD")" || return 1
+  while IFS= read -r f; do [ -z "$f" ] || PYTEST_SHARD_FILES+=("$f"); done <<<"$out"
+  [ "${#PYTEST_SHARD_FILES[@]}" -gt 0 ] || { echo "shard $HERDR_UNIT_SHARD has no test files" >&2; return 1; }
+  out="$(python3 "$tool" slow-files "$HERDR_UNIT_SHARD")" || return 1
+  while IFS= read -r f; do [ -z "$f" ] || PYTEST_SLOW_FILES+=("$f"); done <<<"$out"
+  HERDR_UNIT_SHARDED=1
+  echo "unit shard $HERDR_UNIT_SHARD: ${#PYTEST_SHARD_FILES[@]} test files, ${#PYTEST_SLOW_FILES[@]} with a slow tail"
+}
