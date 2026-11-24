@@ -5,6 +5,13 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: `handoff autopilot status` names both state roots, labelled (#934)
+
+- `status` returns `state_roots`: `trigger_ledger` (path, `moves_with: XDG_STATE_HOME`, what it holds) and `controller_state` (path, `moves_with: HERDR_ENGINEERING_STATE`, what it holds), and its `summary` says the two do not move each other. The output used to carry one unlabelled `installed.state_path`, which read as "the state root": a probe that redirected `HERDR_ENGINEERING_STATE` to a scratch directory, expecting to sandbox itself, spent a real automatic trigger against a session that never happened and wrote it into the operator's live ledger - which `uninstall` deliberately keeps (#933 pinned the resolution split; this makes the split visible at a glance).
+- The controller root is reported through `handoff_subagent_registry.state_root`, the accessor the controller itself resolves through, rather than a second copy of the default path: two copies drift, and they drift silently, with `status` naming a directory nothing writes. A test pins the two accessors together for the default root and a redirected one.
+- `installed.state_path` and `ledger.path` stay as aliases for one release for scripts already reading them, documented as replaced by `state_roots`.
+- `docs/automatic-handoffs.md` no longer describes the retired `handoff context-hook` marker directory as live state (#943 deleted the hook and nothing writes `$HERDR_ENGINEERING_STATE/handoff-context/<session>.fired` any more); the second root is now documented as the controller state, with a note that old marker directories are inert.
+
 ### Fix: assistant store snapshot loading, ordering and locking
 
 - `PostgresStoreBackend.load()` no longer turns a failed read into "no snapshot": it raises `StoreLoadError`, so a control plane that boots while Postgres is unreachable fails startup instead of running with an empty store whose first mutation overwrote the stored snapshot.

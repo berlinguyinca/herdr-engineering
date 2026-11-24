@@ -66,6 +66,16 @@ DEFAULT_HARNESSES = ("pi", "claude")
 
 STATE_DIR_NAME = "herdr-engineering"
 STATE_FILE_NAME = "handoff-autopilot.json"
+#: The two state roots automatic handoffs resolve, and the variable that moves each.
+# They are different directories under different variables on purpose: the trigger ledger is
+# freedesktop state under `$XDG_STATE_HOME`, while this project's own state root - the handoff
+# controller's per-pane switch and the subagent registry, which together decide whether the
+# autopilot acts in a pane at all - sits under `$HERDR_ENGINEERING_STATE`. Setting one does not move
+# the other, which is why `status` prints both with their labels (#934): the output used to show a
+# single unlabelled `state_path`, and a probe that redirected the wrong name still spent a real
+# trigger against the live ledger.
+ENV_STATE_HOME = "XDG_STATE_HOME"
+ENV_HERDR_STATE = "HERDR_ENGINEERING_STATE"
 EXTENSION_FILE_NAME = "herdr-handoff-autopilot.ts"
 PI_EXTENSION_DIR = ("pi", "agent", "extensions")  # ~/.pi/agent/extensions
 CLAUDE_HOOK_EVENTS = ("Stop", "PreCompact")
@@ -123,10 +133,24 @@ def _home(home: Path | str | None = None) -> Path:
 
 
 def _state_home(home: Path | str | None = None) -> Path:
-    env = os.environ.get("XDG_STATE_HOME", "").strip()
+    env = os.environ.get(ENV_STATE_HOME, "").strip()
     if env:
         return Path(env)
     return _home(home) / ".local" / "state"
+
+
+def herdr_state_root(env: Mapping[str, str] | None = None) -> Path:
+    """This project's own state root: `$HERDR_ENGINEERING_STATE`, else `~/.local/share/herdr-engineering/state`.
+
+    The second root `status` prints (#934), and the one a sandboxing probe picks by mistake because
+    the two variable names read alike. It resolves through `handoff_subagent_registry.state_root`,
+    where every herdr-eng feature computes it, rather than by repeating the default path here: two
+    copies of a default drift, and they drift silently - `status` would then name a directory the
+    controller never writes while the controller carried on underneath the real one.
+    """
+    from .handoff_subagent_registry import state_root  # circular at module scope, so lazy by design
+
+    return state_root(dict(os.environ) if env is None else env)
 
 
 def state_path(home: Path | str | None = None) -> Path:
@@ -1397,7 +1421,31 @@ def installed(home: Path | str | None = None) -> dict[str, Any]:
         "pi_extension_path": str(target),
         "claude_hooks": claude,
         "claude_settings_path": str(claude_settings_path(base)),
+        # Deprecated alias of `state_roots.trigger_ledger.path` in `status` output; kept for one
+        # release because scripts read it (#934).
         "state_path": str(state_path(base)),
+    }
+
+
+def state_roots(home: Path | str | None = None) -> dict[str, Any]:
+    """Every root automatic handoffs resolve, each labelled with the variable that moves it.
+
+    Printing one path and calling it "the state" is what made sandboxing a guess (#934): the ledger
+    follows `XDG_STATE_HOME`, the controller state follows `HERDR_ENGINEERING_STATE`, and only an
+    explicit label tells a reader which to redirect - or which one a probe that set the wrong name
+    has failed to redirect.
+    """
+    return {
+        "trigger_ledger": {
+            "path": str(state_path(home)),
+            "moves_with": ENV_STATE_HOME,
+            "holds": "the record of every automatic trigger, kept through `uninstall`",
+        },
+        "controller_state": {
+            "path": str(herdr_state_root()),
+            "moves_with": ENV_HERDR_STATE,
+            "holds": "the handoff controller's per-pane switch and the subagent registry",
+        },
     }
 
 
@@ -1426,6 +1474,7 @@ def status(*, home: Path | str | None = None) -> dict[str, Any]:
             "code": CODE_HERDR_MANAGED if managed is not None else None,
             "reason": managed,
         },
+        "state_roots": state_roots(home),
         "ledger": {"path": str(state_path(home)), "sessions": ledger["sessions"]},
         "uptake": _uptake_counts(ledger["sessions"]),
         "summary": "",
@@ -1441,6 +1490,10 @@ def status(*, home: Path | str | None = None) -> dict[str, Any]:
             f"; {counts['taken']} of {counts['told']} sessions that were told went on to create "
             "a handoff"
         )
+    out["summary"] += (
+        f"; `state_roots` names both directories - the trigger ledger follows ${ENV_STATE_HOME} "
+        f"and the controller state follows ${ENV_HERDR_STATE}, so setting one does not move the other"
+    )
     if managed is not None:
         out["summary"] = f"the autopilot stands down in this pane: {managed}"
     if note:

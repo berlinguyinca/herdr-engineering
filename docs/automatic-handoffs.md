@@ -6,7 +6,7 @@ summarizer replaces the conversation with a lossy recap.
 
 ```bash
 scripts/install.sh                       # arms it (step 7e); re-running is idempotent
-herdr-eng handoff autopilot status       # policy, what is installed, what has fired
+herdr-eng handoff autopilot status       # policy, what is installed, what has fired, where state lives
 herdr-eng handoff autopilot install      # arm it on a machine that was installed earlier
 herdr-eng handoff autopilot uninstall    # remove both triggers; the audit ledger is kept
 herdr-eng doctor                         # handoff-autopilot: ok | warn | skip | fail
@@ -197,7 +197,7 @@ whenever the cached threshold is crossed.
 ## Audit
 
 ```bash
-herdr-eng handoff autopilot status --json      # policy + installed state + per-session ledger
+herdr-eng handoff autopilot status --json      # policy + installed state + both state roots + per-session ledger
 cat "${XDG_STATE_HOME:-$HOME/.local/state}"/herdr-engineering/handoff-autopilot.json
 ```
 
@@ -209,15 +209,37 @@ file — it is the audit record of when the machine took over on its own. A `ski
 it is not in `uptake.told`, is never stamped `taken_at`, and does not count in `doctor`.
 
 Only `XDG_STATE_HOME` moves that file. `HERDR_ENGINEERING_STATE` sounds like the same knob and is
-not: it relocates the *other* trigger's marker directory
-(`$HERDR_ENGINEERING_STATE/handoff-context/<session>.fired`), and the ledger keeps resolving
-through `XDG_STATE_HOME`. A probe that redirects `HERDR_ENGINEERING_STATE` to a scratch directory,
-expecting to sandbox itself, spends a real trigger against a session that never happened — and
-`uninstall` deliberately keeps whatever it writes. Sandbox with `XDG_STATE_HOME`:
+not: it relocates this project's own state root (`$HERDR_ENGINEERING_STATE`, default
+`~/.local/share/herdr-engineering/state`) — the handoff controller's per-pane switch and the
+subagent registry, which decide whether the autopilot acts in a pane at all — while the ledger keeps
+resolving through `XDG_STATE_HOME`. A probe that redirects `HERDR_ENGINEERING_STATE` to a scratch
+directory, expecting to sandbox itself, spends a real trigger against a session that never happened
+— and `uninstall` deliberately keeps whatever the ledger holds. Sandbox with `XDG_STATE_HOME`:
 
 ```bash
 XDG_STATE_HOME="$PWD/.tmp/autopilot-probe" herdr-eng handoff autopilot status --json
 ```
+
+`status` names both roots, so the choice is not a guess. Each carries the variable that moves it and
+what lives under it:
+
+```json
+"state_roots": {
+  "trigger_ledger":   { "path": "…/state/herdr-engineering/handoff-autopilot.json", "moves_with": "XDG_STATE_HOME",
+                        "holds": "the record of every automatic trigger, kept through `uninstall`" },
+  "controller_state": { "path": "…/state",                                          "moves_with": "HERDR_ENGINEERING_STATE",
+                        "holds": "the handoff controller's per-pane switch and the subagent registry" }
+}
+```
+
+The controller root is reported through the same accessor the controller resolves, not a second copy
+of the default path: a printed root that drifts from the written one is worse than no root at all,
+because the reader redirects a directory nothing uses. (The retired `handoff context-hook` kept
+per-session `<session>.fired` markers under this root; nothing writes them now, and old marker
+directories are inert.)
+
+`installed.state_path` and `ledger.path` still appear, both naming the trigger ledger. They are
+aliases kept for one release for scripts already reading them; `state_roots` replaces them.
 
 `install` rewrites `~/.claude/settings.json` in place through a temp file in the same directory,
 preserving the file's existing mode, its unrelated keys and every foreign hook group, but it takes

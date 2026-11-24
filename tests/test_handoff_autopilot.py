@@ -987,6 +987,69 @@ def test_only_xdg_state_home_moves_the_trigger_ledger(
     )
 
 
+def test_status_names_both_state_roots_and_the_variable_that_moves_each(
+    host: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`status` has to say where each kind of state lives, not just one of them.
+
+    Automatic handoffs resolve two directories, moved by two different variables: the trigger ledger
+    under `$XDG_STATE_HOME`, and this project's own state root - controller switch and subagent
+    registry - under `$HERDR_ENGINEERING_STATE`. The old output printed one unlabelled `state_path`,
+    which read as "the state root" - so an operator who redirected `$HERDR_ENGINEERING_STATE` to
+    sandbox a test still spent real triggers in the real ledger (#934, and the probe incident behind
+    #933). A reader who cannot tell the two apart cannot sandbox either safely, so both are printed
+    with the variable that moves each and what each holds.
+    """
+    write_config(host["home"], "handoff_autopilot:\n  enabled: true\n\n")
+    markers = host["tmp"] / "marker-root"
+    monkeypatch.setenv("HERDR_ENGINEERING_STATE", str(markers))
+
+    roots = ha.status(home=host["home"])["state_roots"]
+
+    assert roots["trigger_ledger"]["path"] == str(ha.state_path(host["home"]))
+    assert roots["trigger_ledger"]["moves_with"] == "XDG_STATE_HOME"
+    assert roots["controller_state"]["path"] == str(markers)
+    assert roots["controller_state"]["moves_with"] == "HERDR_ENGINEERING_STATE"
+    assert roots["trigger_ledger"]["path"] != roots["controller_state"]["path"], (
+        "one labelled root is the same bug as no labels: the reader cannot tell which file a "
+        "variable moves"
+    )
+
+
+def test_the_controller_root_status_prints_is_the_one_the_controller_resolves(
+    host: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The second root `status` names must be the directory the rest of the feature actually uses.
+
+    A root printed from a second copy of a default path is a lie with a label on it: the reader
+    redirects the directory `status` named while the controller switch and the subagent registry
+    carry on underneath another one, and nothing reports the mismatch. So `herdr_state_root` defers
+    to `handoff_subagent_registry.state_root` - the accessor the controller itself resolves through
+    - and this test pins the two together for both the default and a redirected root (#934).
+    """
+    from herdr_engineering import handoff_subagent_registry as registry
+
+    for env in ({}, {"HERDR_ENGINEERING_STATE": str(host["tmp"] / "alt-root")}):
+        assert ha.herdr_state_root(env) == registry.state_root(env), env
+
+    alt = host["tmp"] / "alt-root"
+    monkeypatch.setenv("HERDR_ENGINEERING_STATE", str(alt))
+    roots = ha.status(home=host["home"])["state_roots"]
+    assert roots["controller_state"]["path"] == str(alt)
+    assert Path(roots["trigger_ledger"]["path"]) != Path(roots["controller_state"]["path"])
+
+
+def test_status_keeps_the_unlabelled_ledger_path_as_an_alias(host: dict) -> None:
+    """`installed.state_path` and `ledger.path` stay, pointing at the trigger ledger.
+
+    Scripts already read them; the labels arrive alongside rather than replacing them, and the
+    alias is documented to go away one release after `state_roots` (#934).
+    """
+    status = ha.status(home=host["home"])
+    assert status["installed"]["state_path"] == status["state_roots"]["trigger_ledger"]["path"]
+    assert status["ledger"]["path"] == status["installed"]["state_path"]
+
+
 def test_precompact_advises_without_spending_the_trigger(host: dict) -> None:
     """PreCompact cannot reach the model, so it must not consume the per-session trigger.
 
