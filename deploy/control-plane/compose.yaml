@@ -145,6 +145,19 @@ services:
     image: herdr-engineering:${HERDR_CP_IMAGE_TAG:?run deploy.sh}
     container_name: herdr-cp-web
     restart: unless-stopped
+    # init reaps children and forwards signals; the web command also handles SIGTERM itself (clean shutdown of
+    # the stores and the assistant hub), so `docker stop` ends it well inside the grace period.
+    init: true
+    stop_grace_period: 30s
+    # Passes while the process answers /api/v1/health at all: curl without -f, so a degraded (non-2xx) answer
+    # still counts as alive and only a refused connection or a timeout fails. deploy.sh already waits for every
+    # recreated service to leave "starting" and not be "unhealthy" (services_settled).
+    healthcheck:
+      test: ["CMD", "curl", "-sS", "-o", "/dev/null", "-m", "5", "http://127.0.0.1:8080/api/v1/health?probe=1"]
+      interval: 15s
+      timeout: 6s
+      retries: 3
+      start_period: 120s
     depends_on:
       postgres:
         condition: service_healthy
@@ -235,6 +248,25 @@ services:
     image: herdr-engineering:${HERDR_CP_IMAGE_TAG:?run deploy.sh}
     container_name: herdr-cp-worker
     restart: unless-stopped
+    init: true
+    # Shutdown budget after SIGTERM: a running pass may finish for 20 s (PASS_GRACE_SECONDS) + 5 s for an abandoned pass
+    # to unwind + 5 s for the collab bridge teardown + 2 s to close the connection = 32 s, plus the projection
+    # refresh thread's join; 45 s leaves a margin so docker never SIGKILLs the worker mid-teardown.
+    # (tests/test_cp_compose_lifecycle.py derives the sum from control_plane/worker.py.)
+    stop_grace_period: 45s
+    # Heartbeat: the worker touches this file once its connection probes healthy, at the start of every pass and after
+    # every step of a pass, so a long single step (a large artifact render) does not look like a wedged loop. The
+    # check is the file's age: unhealthy once 300 s pass with no step finishing (keep it above the longest expected
+    # single step) or, with Postgres down, no probe succeeding. While Postgres is unreachable the worker retries with
+    # a backoff of 30 s growing to 120 s and exits 1 after 10 consecutive connection failures (about 8 minutes, up to
+    # 10 with connect timeouts); restart: unless-stopped brings it back. Unhealthy therefore shows after 5 minutes,
+    # before the restart.
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.stat('/tmp/herdr-worker-heartbeat').st_mtime < 300 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
     depends_on:
       postgres:
         condition: service_healthy
@@ -261,6 +293,9 @@ services:
       - ${HERDR_COLLAB_SPOOL_DIR:?run deploy.sh}:/collab-spool
     environment:
       HERDR_ENGINEERING_CONFIG: /app/control-plane/config.yaml
+      HERDR_WORKER_HEARTBEAT: /tmp/herdr-worker-heartbeat
+      # Overrides (optional): HERDR_WORKER_MAX_FAILED_PASSES (10; 0 = never exit), HERDR_WORKER_CONNECT_TIMEOUT (10 s),
+      # HERDR_WORKER_STATEMENT_TIMEOUT (120 s).
       # The group of collab-public (compose.collab.yaml runs it as this uid:uid): the worker hands member share URLs to
       # it through group-readable files. Same default as collab-public; members refuse to start without a group.
       HERDR_COLLAB_CERT_UID: ${HERDR_COLLAB_CERT_UID:-1000}

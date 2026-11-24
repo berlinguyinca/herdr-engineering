@@ -32,6 +32,7 @@ import { agentStory, renderStory } from './agents-lineage.js';
 import { recordOutcome, statusOutcome } from './record-state.js';
 import { RANGES, safeHostId } from './host-view.js';
 import { mountHosts, loadHosts, mountDiagnostics } from './hosts-view.js';
+import { announceRoute } from './route-focus.js';
 import { createHostDiagnosticsSource } from './diagnostics-source.js';
 import { mountHostDetail, loadHostDetail } from './host-detail-view.js';
 import { mountActivity, loadActivity } from './activity-view.js';
@@ -65,19 +66,10 @@ import { mountBuildCache, mountBuildDetail } from './build-cache-view.js';
 import { classifyDashboardError, dashboardErrorMessage } from './dashboard-load-state.js';
 import { mountEventHistory } from './event-history.js';
 import { mountCommunications } from './communications-view.js';
+import { createMissionTitles } from './mission-titles.js';
 
-// Cache of { [mission_id]: title } so activity/session text can resolve
-// cryptic mission ids to their human names. Fetched lazily, best-effort.
-let missionTitleCache = null;
-async function missionTitles() {
-  if (missionTitleCache) return missionTitleCache;
-  try {
-    const { missions } = await client.listMissions();
-    missionTitleCache = {};
-    for (const m of missions) missionTitleCache[m.mission_id] = m.title;
-  } catch { missionTitleCache = {}; }
-  return missionTitleCache;
-}
+// { [mission_id]: title } so activity/session text can resolve cryptic mission ids to their human names (see mission-titles.js).
+const missionTitles = createMissionTitles(() => client.listMissions());
 const titles = (cache) => cache || {};
 
 // Non-herdr-sourced missions are keyed by mission_key (e.g. 'pi:MSN-1'); the
@@ -390,11 +382,19 @@ async function render() {
     if (revision !== renderRevision) return;
     const detail = classifyDashboardError(err, Date.now() - startedAt);
     statusPage(`<herdr-error message="${esc(err.message || dashboardErrorMessage('This page', detail))}"></herdr-error><p>${esc(dashboardErrorMessage('This page', detail))} <button type="button" data-route-retry>Retry</button>${err.requestId ? ` Request ${esc(err.requestId)}` : ''}</p>`, false, err.message || 'request failed');
+    announceRoute(root, routeLabel(match));
     if (!streamsOwnDetail) mountView(rerenderView(load));
     return;
   }
   if (revision !== renderRevision) { view?.dispose(); return; }
   mountView(view || (streamsOwnDetail ? NO_REFRESH : rerenderView(load)));
+  announceRoute(root, routeLabel(match));
+}
+
+// Nav label of the section a route belongs to; the title fallback for a page with no h1 of its own.
+function routeLabel(match) {
+  const path = '/' + match.split('/').filter(Boolean)[0];
+  return (NAV.find((n) => n.path === path || n.match?.includes(path)) || {}).label || '';
 }
 
 // Every routed page carries one freshness chip (<herdr-freshness>) in its head.

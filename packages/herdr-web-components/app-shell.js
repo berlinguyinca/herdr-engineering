@@ -87,7 +87,7 @@ export class HerdrAppShell extends HTMLElement {
   // {count, critical}; null or a zero count removes it. Updated in place so focus and an open menu survive.
   setBadge(path, badge) {
     const count = badge && Number.isFinite(badge.count) && badge.count > 0 ? Math.floor(badge.count) : 0;
-    if (count) this._badges.set(path, { count, critical: Number(badge.critical) > 0 });
+    if (count) this._badges.set(path, { count, critical: Number.isFinite(Number(badge.critical)) && Number(badge.critical) > 0 ? Math.floor(Number(badge.critical)) : 0 });
     else this._badges.delete(path);
     const link = [...this.shadowRoot.querySelectorAll('.hd-shell__link')].find((a) => a.getAttribute('data-path') === path);
     if (!link) return;
@@ -179,7 +179,7 @@ const SHARED = `
 .hd-shell__display { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; padding: 10px 14px 14px; border-top: 1px solid var(--border-subtle); position: sticky; bottom: 0; background: var(--surface); }
 .hd-shell__icon { display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; padding: 0; color: var(--text-secondary); background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); cursor: pointer; }
 .hd-shell__icon:hover { background: var(--surface-hover); color: var(--text); }
-:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
 .hd-shell__main { flex: 1; min-width: 0; }
 .hd-shell__content { width: auto; max-width: none; margin: 0; padding: clamp(20px,1.25vw,48px); }
 @media (max-width: 900px) {

@@ -56,7 +56,13 @@ def browser_write_refusal(headers, extra_hosts=()):
             return 403, "cross-origin request refused"
     elif site is not None and site.strip().lower() not in _SAME_SITE:
         return 403, "cross-site request refused"
-    if origin is not None or site is not None:
+    return browser_body_refusal(headers)
+
+
+def browser_body_refusal(headers):
+    """``(415, message)`` when a browser request (one carrying Origin or Sec-Fetch-Site) has a body that is not JSON:
+    a cross-site form or ``text/plain`` post needs no preflight. Else None."""
+    if headers.get("Origin") is not None or headers.get("Sec-Fetch-Site") is not None:
         has_body = (headers.get("Content-Length") or "0").strip() not in {"", "0"}
         if has_body and headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != _JSON:
             return 415, "browser requests with a body must be application/json"
