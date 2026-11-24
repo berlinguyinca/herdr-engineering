@@ -5,6 +5,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Feature: periodic `herdr-handoff reap --apply` timer (opt-in, off by default)
+
+- `herdr-eng handoff-reap {run,status}` and `scripts/install-handoff-reap.sh` install a systemd user timer (Linux) or LaunchAgent (macOS) that closes panes replaced by confirmed handoffs, including those whose `confirm` was refused because the source pane was still working. Wired into `scripts/install.sh` (step 7f2) and, for Linux fleet hosts, `ansible/tasks/handoff-reap.yml` (`site.yml`, `fleet-sync.yml`).
+- Policy is the `handoff_reap` section of `~/.config/herdr-engineering/config.yaml`: `enabled` (default `false`), `interval_minutes` (default 15, must divide 60), `legacy_roots` (per-project `.herdr/handoffs` directories imported into the shared store first). The unit files are always installed but the timer is only started where `enabled: true`; a malformed section fails closed to disabled. No environment variables.
+- Covers the shared handoff store (`herdr-handoff` with no `--root`); `HERDR_HANDOFF_FILE`/`HERDR_HANDOFF_DIR` are removed from the job's environment so it cannot be redirected to one project's root. It never passes `--include-unrecorded` (tests pin this in the code, the units, the installer and the Ansible task).
+- Nothing is enabled by this change: each host opts in separately.
 ### Fix: a dead Pi registration no longer blocks its host forever
 
 - `fleet rollout`: `_live` reported "no reachable registration" and "two live registrations claiming one conversation" with the same untyped error (`session identity missing or ambiguous`), and `retire_identityless` deliberately refuses that untyped text because it cannot tell a stale husk from a real disagreement. A session whose instance is therefore gone was un-settle-able by design: every pass repeated the refusal, every later plan re-read the same registrations and reproduced the block, and the host stayed `blocked` with no supported way past it. The two cases are now distinct -- zero reachable rows raise the typed `MissingInstanceIdentity` refusal ("has no live instance to act on", `blockReason=identity_missing`), which the operator can settle with `fleet rollout retire-identityless`, while more than one live row keeps the untyped ambiguity refusal and is still never retired. Observed on the live fleet: 80 of 143 blocked session entries across 17 rollout records carried that one error, 60 of them with no `pid` at all, and the same registrations recurred in up to 6 of 17 plans.

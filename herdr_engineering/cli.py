@@ -65,6 +65,8 @@ def _build_parser() -> argparse.ArgumentParser:
     register_cleanup_command(sub)
     from .disk_hygiene import register as register_disk_hygiene
     register_disk_hygiene(sub)
+    from .handoff_reap import register as register_handoff_reap
+    register_handoff_reap(sub)
 
     from .build_cache_report_cli import register as register_build_cache_report
     register_build_cache_report(sub)

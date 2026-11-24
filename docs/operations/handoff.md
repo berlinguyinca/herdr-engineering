@@ -151,6 +151,38 @@ is skipped. `--include-unrecorded` closes those too, and is dangerous: an old re
 reuse and its `--keep-source` choice is unknown, so always review the dry run first. `herdr-eng doctor`
 requires a CLI that offers `reap` (0.6.0 or newer).
 
+### Periodic reap (`handoff-reap`, off by default)
+
+`confirm` refuses to close a source pane that is still working (`source_working`), and nothing else returns for
+that pane. A timer can run `herdr-handoff reap --apply` for you. It is installed on every host and **started on
+none**: a host opts in from its own `~/.config/herdr-engineering/config.yaml`.
+
+```yaml
+handoff_reap:
+  enabled: true            # default false
+  interval_minutes: 15     # default 15; must divide 60 (1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 30, 60)
+  legacy_roots: []         # optional: <project>/.herdr/handoffs directories written by an older herdr-handoff
+```
+
+* **Which records.** The shared store, which `herdr-handoff` uses when given no `--root`
+  (`~/.local/share/herdr-handoff/store`). The job removes `HERDR_HANDOFF_FILE` and `HERDR_HANDOFF_DIR` from the
+  environment it runs `herdr-handoff` in, because a pane inherits them from its handoff and they would point the
+  CLI at one project's root. Each `legacy_roots` entry is copied in first with `herdr-handoff store
+  import-legacy <root>` (copy only; the legacy directory is never changed). Records older than close options
+  are skipped by `reap`, so most legacy records are listed, not closed.
+* **Never `--include-unrecorded`.** The job runs exactly `herdr-handoff reap --apply`. A record from before close
+  options were stored cannot detect pane-id reuse and its `--keep-source` choice is unknown; closing those is a
+  decision for a person who has read the dry run (`herdr-handoff reap`). A test pins this.
+* **Linux** installs the systemd user units `herdr-eng-handoff-reap.service` and `.timer`
+  (`OnCalendar=*:0/<interval>`, `Persistent=true`); **macOS** installs the LaunchAgent
+  `com.herdr-engineering.handoff-reap` (`StartInterval`). Both come from `scripts/install-handoff-reap.sh`, which
+  `scripts/install.sh` (step 7f2) runs; on Linux fleet hosts `ansible/tasks/handoff-reap.yml` does the same from
+  `site.yml` and `fleet-sync.yml`. The unit files are always written; the timer is enabled and started only when
+  the YAML says `enabled: true`, and stopped again when it does not. A malformed section means disabled.
+* `herdr-eng handoff-reap status` prints the policy; `herdr-eng handoff-reap run` is what the timer runs and exits
+  0 while disabled. Output goes to the journal (Linux) or `~/.local/state/herdr-engineering/handoff-reap.log`
+  (macOS).
+
 ## Optional `memory_context`
 
 Packages may carry an optional, additive `memory_context` block (Herdr Unified
