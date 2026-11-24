@@ -50,7 +50,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import quote
 
 from .errors import HerdrEngineeringError
@@ -71,6 +71,26 @@ DEFAULT_DENY_PORTS: frozenset[int] = frozenset({
     9200,   # Elasticsearch
     9300,   # Elasticsearch cluster transport
     9500,   # Netdata
+    # Debuggers and administration surfaces (SECURITY.md: browser/CDP/debug
+    # endpoints must not be reachable beyond the host). Their own loopback-only
+    # guard is the only thing protecting them, so they are never published.
+    2375,   # Docker Engine API (plain)
+    2376,   # Docker Engine API (TLS)
+    2379,   # etcd client
+    4444,   # Selenium / WebDriver
+    5601,   # Kibana
+    5858,   # legacy Node debugger
+    5984,   # CouchDB (Fauxton admin)
+    7474,   # Neo4j browser
+    8086,   # InfluxDB
+    8200,   # Vault
+    8500,   # Consul
+    9222,   # Chrome DevTools Protocol (default remote-debugging-port)
+    9223,   # Chrome DevTools Protocol (alternate)
+    9229,   # Node inspector (--inspect)
+    9230,   # Node inspector (second instance)
+    9515,   # chromedriver
+    15672,  # RabbitMQ management
 })
 # Ports below ``AgentConfig.web_port_min`` that are still web services.
 COMMON_WEB_PORTS: frozenset[int] = frozenset({80, 443, 8080, 8443})
@@ -96,6 +116,45 @@ DEFAULT_DENY_PROCESSES: tuple[str, ...] = (
     "vitest", "jest", "playwright", "vite", "next-server", "next-router-worker",
     "webpack-dev-server", "storybook", "cypress", "karma",
 )
+
+
+AdoptMode = Literal["denylist", "allowlist"]
+
+
+def parse_adopt_mode(value: Any) -> AdoptMode:
+    """``fabric.agent_adopt_mode``: ``denylist`` (default) or ``allowlist``."""
+    if value is None:
+        return "denylist"
+    if value in ("denylist", "allowlist"):
+        return value
+    raise ValueError("fabric.agent_adopt_mode must be 'denylist' or 'allowlist'")
+
+
+def parse_ports(value: Any, key: str) -> frozenset[int]:
+    """A ``fabric.<key>`` list of TCP ports. ``None`` is the empty set."""
+    if value is None:
+        return frozenset()
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"fabric.{key} must be a list of ports")
+    try:
+        ports = frozenset(int(p) for p in value if not isinstance(p, bool))
+    except (TypeError, ValueError):
+        raise ValueError(f"fabric.{key} must be a list of ports") from None
+    if len(ports) != len(value) or not all(0 < p < 65536 for p in ports):
+        raise ValueError(f"fabric.{key} must be a list of ports (1-65535)")
+    return ports
+
+
+def parse_allow_processes(value: Any) -> tuple[str, ...]:
+    """``fabric.agent_allow_processes``: process-name fragments; ``None`` is none."""
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple)) or not all(
+            isinstance(v, str) and v.strip() for v in value):
+        raise ValueError("fabric.agent_allow_processes must be a list of process names")
+    return tuple(v.strip() for v in value)
 
 
 def process_denied(process: str | None, deny: tuple[str, ...]) -> bool:
@@ -529,6 +588,39 @@ def probe_web(port: int, timeout: float = 2.0) -> bool:
         return False
 
 
+_DEBUG_PROBE_MAX_BYTES = 65536
+
+
+def _get_json(port: int, path: str, timeout: float) -> Any:
+    """GET a small JSON document from 127.0.0.1; None on any failure."""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}",
+                                    timeout=timeout) as resp:
+            return json.loads(resp.read(_DEBUG_PROBE_MAX_BYTES))
+    except (OSError, ValueError, http.client.HTTPException):
+        return None
+
+
+def probe_debug_surface(port: int, timeout: float = 0.5) -> str | None:
+    """Reason string when 127.0.0.1:<port> is a debugger or notebook server.
+
+    Chrome DevTools Protocol answers ``/json/version`` with a
+    ``webSocketDebuggerUrl``; the Node inspector answers it with a ``node.js``
+    ``Browser``; Jupyter (server, notebook, lab) answers ``/api`` with only a
+    ``version``. None when none of them match (or the port does not answer).
+    """
+    version = _get_json(port, "/json/version", timeout)
+    if isinstance(version, dict):
+        if "webSocketDebuggerUrl" in version:
+            return "Chrome DevTools Protocol endpoint (/json/version)"
+        if str(version.get("Browser", "")).lower().startswith("node"):
+            return "Node inspector (/json/version)"
+    api = _get_json(port, "/api", timeout)
+    if isinstance(api, dict) and set(api) == {"version"}:
+        return "Jupyter notebook server (/api)"
+    return None
+
+
 def tcp_open(host: str, port: int, timeout: float = 1.0) -> bool:
     try:
         with socket.create_connection((host, port), timeout=timeout):
@@ -860,6 +952,13 @@ class AgentConfig:
     # a still-live app is re-registered by the same scan, so this refreshes
     # rather than bans. 0 disables (``fabric.agent_lease_max_age_seconds``).
     lease_max_age: float = 86400.0
+    # ``denylist`` adopts every web port that is not denied; ``allowlist``
+    # adopts only ``allow_ports`` and processes matching ``allow_processes``
+    # (``fabric.agent_adopt_mode``, ``agent_allow_ports``, ``agent_allow_processes``).
+    # Denied ports and debugger probes apply in both modes.
+    adopt_mode: AdoptMode = "denylist"
+    allow_ports: frozenset[int] = frozenset()
+    allow_processes: tuple[str, ...] = ()
 
     def fabric_names(self) -> frozenset[str]:
         """The host names the fabric owns: its control-plane host and this
@@ -897,6 +996,8 @@ class FabricAgent:
         self._cp_last_report: dict[str, float] = {}
         self._cp_unavailable: dict[str, dict[str, Any]] = {}
         self._probe_cache: dict[int, tuple[tuple, bool, float]] = {}
+        self._debug_cache: dict[int, tuple[tuple, str | None, float]] = {}
+        self._refused: dict[int, str] = {}
         self._lock = threading.Lock()
         from .host_metrics import HostSampler, read_updates, read_versions
         self._sampler = HostSampler(agent_lookup=self._agent_for_pid,
@@ -1049,14 +1150,22 @@ class FabricAgent:
                         or port in gateway_front
                         or process in _IGNORED_PROCESSES
                         or process_denied(process, self.cfg.deny_processes)
+                        or self._static_refusal(port, process) is not None
                         or self._origin_orphaned(port_s, entry)
                         or self._lease_expired(entry)):
                     self._release(port_s)
                     closed.append(port_s)
 
         # 2) adopt new web services
+        self._refused = {p: r for p, r in self._refused.items() if p in live_ports}
         for port in sorted(live_ports):
-            if port <= 0 or not self._is_dev_web_port(port):
+            if port <= 0:
+                continue
+            reason = self._static_refusal(port, listeners[port].get("process"))
+            if reason:
+                self._note_refused(port, reason)
+                continue
+            if not self._is_dev_web_port(port):
                 continue
             if port in gateway_front:
                 # Reserved gateway front-door range: the gateway binds these on
@@ -1076,6 +1185,10 @@ class FabricAgent:
                         or port in fwd_ports):
                     continue
             if not self._probe_web_cached(port, listeners[port]):
+                continue
+            reason = self._debug_surface_cached(port, listeners[port])
+            if reason:
+                self._note_refused(port, reason)
                 continue
             entry = self._adopt(port, listeners[port])
             if entry:
@@ -1107,7 +1220,7 @@ class FabricAgent:
             tracked = set(self._store) | {str(p) for p in fwd_ports}
         for port in sorted(live_ports):
             if (port <= 0 or port in gateway_front or str(port) in tracked
-                    or not self._is_dev_web_port(port)):
+                    or port in self._refused or not self._is_dev_web_port(port)):
                 continue
             info = listeners[port]
             if ((info.get("process") or "") in _IGNORED_PROCESSES
@@ -1215,6 +1328,37 @@ class FabricAgent:
         except Exception as exc:  # gateway still down: retry next cycle
             log.warning("re-register failed for port %s: %s", port_s, exc)
 
+    def _static_refusal(self, port: int, process: str | None) -> str | None:
+        """Why policy refuses this port without touching the network, or None."""
+        if port in self.cfg.exclude_ports:
+            return "port is excluded (fabric.agent_exclude_ports or an own service port)"
+        if port in self.cfg.deny_ports:
+            return "port is on the debugger/database/admin denylist"
+        if self.cfg.adopt_mode == "allowlist" and not (
+                port in self.cfg.allow_ports
+                or (process and process_denied(process, self.cfg.allow_processes))):
+            return ("not on the allowlist (fabric.agent_adopt_mode: allowlist; add the port to "
+                    "fabric.agent_allow_ports or the process to fabric.agent_allow_processes)")
+        return None
+
+    def _debug_surface_cached(self, port: int, info: dict[str, Any]) -> str | None:
+        """``probe_debug_surface`` once per stable observation window."""
+        fingerprint = (tuple(sorted(info.get("addrs") or ())), info.get("process"),
+                       info.get("pid"))
+        now = time.monotonic()
+        prior = self._debug_cache.get(port)
+        if prior and prior[0] == fingerprint and now - prior[2] < 30.0:
+            return prior[1]
+        reason = probe_debug_surface(port, timeout=min(self.cfg.probe_timeout, 0.5))
+        self._debug_cache[port] = (fingerprint, reason, now)
+        return reason
+
+    def _note_refused(self, port: int, reason: str) -> None:
+        """Log one line per (port, reason) so an operator sees why it is unpublished."""
+        if self._refused.get(port) != reason:
+            self._refused[port] = reason
+            log.info("refusing to publish port %d: %s", port, reason)
+
     def _is_dev_web_port(self, port: int) -> bool:
         """Noise filter: is this port a candidate dev web service?
 
@@ -1235,6 +1379,10 @@ class FabricAgent:
     def _adopt(self, port: int,
                info: dict[str, Any]) -> dict[str, Any] | None:
         process = info.get("process")
+        reason = self._static_refusal(port, process) or self._debug_surface_cached(port, info)
+        if reason:  # no lease, no forwarder: nothing rewrites Host for this port
+            self._note_refused(port, reason)
+            return None
         if process and process in _IGNORED_PROCESSES:
             log.debug("ignoring container/VM networking shim %r on port %s",
                       process, port)

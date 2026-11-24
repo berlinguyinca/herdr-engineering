@@ -1496,3 +1496,243 @@ def test_forwarder_stop_releases_port_immediately():
             probe.listen(1)  # fails with EADDRINUSE while the old listener lives
         finally:
             probe.close()
+
+
+# ---------------------------------------------------------------------------
+# Debug / admin endpoints are never adopted (SECURITY.md: CDP/debug endpoints)
+# ---------------------------------------------------------------------------
+
+def _json_server(routes: dict[str, object], server_header: str = ""):
+    """A real loopback HTTP server answering GET <path> with JSON from routes."""
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            body = routes.get(self.path.split("?")[0])
+            if body is None:
+                self.send_response(404)
+                self.end_headers()
+                return
+            data = json.dumps(body).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, server.server_address[1]
+
+
+def _cdp_server():
+    return _json_server({
+        "/json/version": {
+            "Browser": "Chrome/130.0",
+            "Protocol-Version": "1.3",
+            "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/browser/abc",
+        },
+        "/": {"ok": True},
+    })
+
+
+def _node_inspector_server():
+    return _json_server({"/json/version": {"Browser": "node.js/v20.1.0", "Protocol-Version": "1.1"},
+                         "/": {"ok": True}})
+
+
+def _jupyter_server():
+    return _json_server({"/api": {"version": "2.14.0"}, "/": {"ok": True}})
+
+
+def _ordinary_app():
+    # Has /api and /json/version too, but they are not a debugger's answers.
+    return _json_server({"/api": {"version": "1", "name": "shop", "status": "up"},
+                         "/json/version": {"build": "7"}, "/": {"ok": True}})
+
+
+def _leased_ports(gw) -> list[int]:
+    return [lease["target"]["port"] for lease in gw.leases.values()]
+
+
+def test_probe_debug_surface_names_each_debugger():
+    cases = [(_cdp_server, "Chrome DevTools"), (_node_inspector_server, "Node inspector"),
+             (_jupyter_server, "Jupyter")]
+    for make, needle in cases:
+        server, port = make()
+        try:
+            reason = fa.probe_debug_surface(port, timeout=0.5)
+            assert reason is not None and needle in reason
+        finally:
+            server.shutdown()
+
+
+def test_probe_debug_surface_passes_ordinary_apps(tmp_path):
+    for make in (_ordinary_app, lambda: _http_target(tmp_path)):
+        server, port = make()
+        try:
+            assert fa.probe_debug_surface(port, timeout=0.5) is None
+        finally:
+            server.shutdown()
+
+
+def test_probe_debug_surface_is_quiet_on_dead_and_raw_ports():
+    raw, raw_port = _raw_tcp_listener()
+    try:
+        assert fa.probe_debug_surface(raw_port, timeout=0.3) is None
+    finally:
+        raw.close()
+    assert fa.probe_debug_surface(_free_port(), timeout=0.3) is None
+
+
+def test_default_deny_ports_cover_debuggers_databases_and_consoles():
+    for port in (9222, 9229, 5858, 2375, 2376, 5601, 15672, 8500, 8200, 2379, 9515, 4444):
+        assert port in fa.DEFAULT_DENY_PORTS, port
+    assert 8888 not in fa.DEFAULT_DENY_PORTS  # not unambiguous; Jupyter is caught by its probe
+
+
+def test_scan_never_adopts_debug_endpoints_and_logs_why(tmp_path, monkeypatch, caplog):
+    gw = _FakeGateway()
+    cdp, cdp_port = _cdp_server()
+    node, node_port = _node_inspector_server()
+    jup, jup_port = _jupyter_server()
+    app, app_port = _ordinary_app()
+    monkeypatch.setattr(fa, "scan_listening_ports", lambda: _listeners(
+        {cdp_port: "chrome", node_port: "node", jup_port: "jupyter-lab", app_port: "shop"}))
+    agent = _agent(tmp_path, gw)
+    try:
+        with caplog.at_level("INFO", logger="herdr_engineering.fabric_agent"):
+            agent.scan_once()
+            agent.scan_once()
+        assert _leased_ports(gw) == [app_port]
+        for port, needle in ((cdp_port, "Chrome DevTools"), (node_port, "Node inspector"),
+                             (jup_port, "Jupyter")):
+            lines = [r.getMessage() for r in caplog.records
+                     if f"port {port}" in r.getMessage() and "refus" in r.getMessage()]
+            assert len(lines) == 1 and needle in lines[0], lines   # once, naming the reason
+        assert not any("no fabric lease" in r.getMessage() for r in caplog.records)
+    finally:
+        for s in (cdp, node, jup, app):
+            s.shutdown()
+        agent.stop()
+        gw.stop()
+
+
+def test_denylisted_port_is_refused_with_a_logged_reason(tmp_path, monkeypatch, caplog):
+    gw = _FakeGateway()
+    server, port = _http_target(tmp_path)
+    monkeypatch.setattr(fa, "scan_listening_ports", lambda: _listeners({port: "thing"}))
+    agent = _agent(tmp_path, gw, deny_ports=frozenset({port}))
+    try:
+        with caplog.at_level("INFO", logger="herdr_engineering.fabric_agent"):
+            agent.scan_once()
+        assert _leased_ports(gw) == []
+        assert any(f"port {port}" in r.getMessage() and "denylist" in r.getMessage()
+                   for r in caplog.records)
+    finally:
+        server.shutdown()
+        agent.stop()
+        gw.stop()
+
+
+def test_allowlist_mode_adopts_only_listed_ports_or_processes(tmp_path, monkeypatch):
+    gw = _FakeGateway()
+    a, a_port = _http_target(tmp_path)
+    b, b_port = _http_target(tmp_path)
+    c, c_port = _http_target(tmp_path)
+    monkeypatch.setattr(fa, "scan_listening_ports", lambda: _listeners(
+        {a_port: "alpha", b_port: "beta", c_port: "gamma"}))
+    agent = _agent(tmp_path, gw, adopt_mode="allowlist",
+                   allow_ports=frozenset({a_port}), allow_processes=("beta",))
+    try:
+        agent.scan_once()
+        assert sorted(_leased_ports(gw)) == sorted([a_port, b_port])
+    finally:
+        for s in (a, b, c):
+            s.shutdown()
+        agent.stop()
+        gw.stop()
+
+
+def test_allowlist_mode_with_nothing_listed_adopts_nothing(tmp_path, monkeypatch):
+    gw = _FakeGateway()
+    server, port = _http_target(tmp_path)
+    monkeypatch.setattr(fa, "scan_listening_ports", lambda: _listeners({port: "app"}))
+    agent = _agent(tmp_path, gw, adopt_mode="allowlist")
+    try:
+        agent.scan_once()
+        assert _leased_ports(gw) == []
+    finally:
+        server.shutdown()
+        agent.stop()
+        gw.stop()
+
+
+def test_allowlisted_debugger_is_still_refused(tmp_path, monkeypatch):
+    gw = _FakeGateway()
+    cdp, cdp_port = _cdp_server()
+    monkeypatch.setattr(fa, "scan_listening_ports", lambda: _listeners({cdp_port: "chrome"}))
+    agent = _agent(tmp_path, gw, adopt_mode="allowlist", allow_ports=frozenset({cdp_port}))
+    try:
+        agent.scan_once()
+        assert _leased_ports(gw) == []
+    finally:
+        cdp.shutdown()
+        agent.stop()
+        gw.stop()
+
+
+def test_a_lease_for_a_port_that_became_denied_is_released(tmp_path, monkeypatch):
+    gw = _FakeGateway()
+    server, port = _http_target(tmp_path)
+    monkeypatch.setattr(fa, "scan_listening_ports", lambda: _listeners({port: "app"}))
+    agent = _agent(tmp_path, gw)
+    try:
+        agent.scan_once()
+        assert _leased_ports(gw) == [port]
+        agent.cfg = fa.replace(agent.cfg, adopt_mode="allowlist")
+        summary = agent.scan_once()
+        assert summary["closed"] == [str(port)]
+        assert str(port) not in _store(tmp_path)
+    finally:
+        server.shutdown()
+        agent.stop()
+        gw.stop()
+
+
+def test_no_forwarder_and_no_host_rewrite_for_a_refused_service(tmp_path, monkeypatch):
+    gw = _FakeGateway()
+    cdp, cdp_port = _cdp_server()
+    monkeypatch.setattr(fa, "scan_listening_ports", lambda: _listeners({cdp_port: "chrome"}))
+    agent = _agent(tmp_path, gw)
+    try:
+        agent.scan_once()
+        assert agent._forwards == {}
+        assert agent._adopt(cdp_port, {"addrs": {"127.0.0.1"}, "process": "chrome"}) is None
+        assert agent._forwards == {}
+    finally:
+        cdp.shutdown()
+        agent.stop()
+        gw.stop()
+
+
+def test_adoption_config_parsers():
+    assert fa.parse_adopt_mode(None) == "denylist"
+    assert fa.parse_adopt_mode("allowlist") == "allowlist"
+    for bad in ("allow", 1, ""):
+        try:
+            fa.parse_adopt_mode(bad)
+        except ValueError:
+            continue
+        raise AssertionError(bad)
+    assert fa.parse_ports(None, "x") == frozenset()
+    assert fa.parse_ports([3000, "4000"], "x") == frozenset({3000, 4000})
+    for bad in ([0], [70000], ["a"], "3000", [True]):
+        try:
+            fa.parse_ports(bad, "x")
+        except ValueError:
+            continue
+        raise AssertionError(bad)
+    assert fa.parse_allow_processes(None) == ()
+    assert fa.parse_allow_processes("vite") == ("vite",)
