@@ -635,6 +635,11 @@ def record_trigger(
     return entry
 
 
+def _was_told(entry: Any) -> bool:
+    """Whether the autopilot told this session to hand off. A stand-down note alone (`skipped`, no `count`) is not a trigger."""
+    return isinstance(entry, dict) and bool(entry.get("count"))
+
+
 def record_skip(
     *, session_id: str, harness: str, code: str, reason: str, home: Path | str | None = None
 ) -> bool:
@@ -931,7 +936,7 @@ def settle_uptake(
         pending = {
             session_id: entry
             for session_id, entry in sessions.items()
-            if isinstance(entry, dict) and not entry.get("taken_at")
+            if _was_told(entry) and not entry.get("taken_at")
         }
         if not pending:
             return None
@@ -1398,10 +1403,8 @@ def installed(home: Path | str | None = None) -> dict[str, Any]:
 
 def _uptake_counts(sessions: dict[str, Any]) -> dict[str, int]:
     """How many sessions were told, and how many of them actually handed off."""
-    told = sum(1 for entry in sessions.values() if isinstance(entry, dict))
-    taken = sum(
-        1 for entry in sessions.values() if isinstance(entry, dict) and entry.get("taken_at")
-    )
+    told = sum(1 for entry in sessions.values() if _was_told(entry))
+    taken = sum(1 for entry in sessions.values() if _was_told(entry) and entry.get("taken_at"))
     return {"told": told, "taken": taken}
 
 
@@ -1516,7 +1519,7 @@ def doctor_check(*, home: Path | str | None = None) -> dict[str, Any]:
         "status": "ok",
         "detail": (
             f"handoffs are automatic at {active_policy.context_percent:.0f}% of the "
-            f"context window; {sum(1 for e in ledger['sessions'].values() if e.get('count'))} session(s) triggered so far"
+            f"context window; {sum(1 for e in ledger['sessions'].values() if _was_told(e))} session(s) triggered so far"
         ),
         "fix": "",
         "data": data,

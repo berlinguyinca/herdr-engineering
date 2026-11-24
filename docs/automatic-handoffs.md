@@ -204,7 +204,9 @@ cat "${XDG_STATE_HOME:-$HOME/.local/state}"/herdr-engineering/handoff-autopilot.
 The ledger records, per session: how many times it was told to hand off, when, on which
 harness, the percent that triggered it, the boundary that noticed, and a hash of the
 instruction. `handoff autopilot uninstall` removes the extension and the hooks but keeps this
-file — it is the audit record of when the machine took over on its own.
+file — it is the audit record of when the machine took over on its own. A `skipped` note
+(the autopilot stood down for a Herdr-managed session) has no `count`: that session was never told, so
+it is not in `uptake.told`, is never stamped `taken_at`, and does not count in `doctor`.
 
 Only `XDG_STATE_HOME` moves that file. `HERDR_ENGINEERING_STATE` sounds like the same knob and is
 not: it relocates the *other* trigger's marker directory

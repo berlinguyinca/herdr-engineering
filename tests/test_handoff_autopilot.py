@@ -1718,6 +1718,37 @@ def test_status_reports_obeyed_triggers_against_issued_ones(host: dict) -> None:
     assert "1 of 3" in report["summary"], report["summary"]
 
 
+def test_a_stand_down_note_is_not_a_trigger_for_uptake(host: dict) -> None:
+    """A skip-only entry was never told anything, so it is not told, not pending and never taken."""
+    write_config(host["home"], "handoff_autopilot:\n  enabled: true\n")
+    ha.record_skip(session_id="s-managed", harness="claude", code="herdr_managed", reason="controller", home=host["home"])
+    ha.record_trigger(session_id="s-told", harness="claude", percent=88.0, prompt="go")
+    assert ha.status(home=host["home"])["uptake"] == {"told": 1, "taken": 0}
+
+    _envelope(
+        host["home"] / ".herdr" / "handoffs", handoff_id="handoff_managed", session_id="s-managed", state="queued"
+    )
+    path = ha.state_path(host["home"])
+    before = path.read_text()
+    assert ha.settle_uptake(home=host["home"]) is None, "the controller's handoff is not the autopilot's uptake"
+    assert path.read_text() == before
+    entry = json.loads(before)["sessions"]["s-managed"]
+    assert "taken_at" not in entry, entry
+    assert ha.status(home=host["home"])["uptake"] == {"told": 1, "taken": 0}
+
+
+def test_a_session_told_and_then_managed_still_counts_and_settles(host: dict) -> None:
+    write_config(host["home"], "handoff_autopilot:\n  enabled: true\n")
+    ha.record_trigger(session_id="s-both", harness="claude", percent=88.0, prompt="go")
+    ha.record_skip(session_id="s-both", harness="claude", code="herdr_managed", reason="controller", home=host["home"])
+    assert ha.status(home=host["home"])["uptake"] == {"told": 1, "taken": 0}
+    _envelope(host["home"] / ".herdr" / "handoffs", handoff_id="handoff_both", session_id="s-both", state="queued")
+    assert ha.settle_uptake(home=host["home"]) is not None
+    entry = json.loads(ha.state_path(host["home"]).read_text())["sessions"]["s-both"]
+    assert entry["taken_handoff"] == "handoff_both" and entry["skipped"]["code"] == "herdr_managed", entry
+    assert ha.status(home=host["home"])["uptake"] == {"told": 1, "taken": 1}
+
+
 def test_the_operator_doc_names_the_fields_that_measure_uptake() -> None:
     """An operator tunes the threshold from the doc, so the doc has to name what the code writes.
 
