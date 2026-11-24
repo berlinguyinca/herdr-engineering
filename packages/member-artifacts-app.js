@@ -339,7 +339,9 @@ async function viewArtifact(id) {
   if (own) paintUploads(id);
 }
 
+let routeGen = 0;    // a newer route() supersedes one still awaiting its data: the older must not paint over it
 async function route() {
+  const gen = ++routeGen;
   clearTimeout(searchTimer);
   shownShare = null;
   const abandoned = draft;
@@ -368,12 +370,13 @@ async function route() {
   paintNav();
   try {
     if (current.route === 'artifact' && current.id === null) { paint('<p class="empty" data-empty>This artifact is not available.</p>'); return; }
-    if (current.route === 'library' || current.route === 'folder') { await reloadLibrary(); viewLibrary(); return; }
+    if (current.route === 'library' || current.route === 'folder') { await reloadLibrary(); if (gen === routeGen) viewLibrary(); return; }
     if (current.route !== 'new') await reload();
+    if (gen !== routeGen) return;
     ({ mine: viewMine, shared: viewShared, links: viewLinks, usage: viewUsage, new: viewNew,
       artifact: () => viewArtifact(current.id) })[current.route]();
   } catch (e) {
-    if (!(e instanceof ApiError && e.status === 401)) paint(V.renderError(describe(e)));
+    if (gen === routeGen && !(e instanceof ApiError && e.status === 401)) paint(V.renderError(describe(e)));
   }
 }
 
