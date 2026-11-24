@@ -18,6 +18,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - `scripts/fabric-stack.sh up` creates and checks the token directory the way `deploy.sh` does (real directory, owned by the caller, mode 0700) before compose runs; both refuse a wrong owner or mode.
 - `deploy/control-plane/compose.yaml` mounts `~/.config/herdr-engineering/fabric-gateway` read-only at `/run/fabric` into `fabric-gateway` and `herdr-web` (both call the control API) and keeps `--allow-open` on the gateway for the rollout; `deploy.sh` creates the directory 0700. See the PR for the order.
 
+### Fix: required `unit-gates` no longer skips PRs that touch untested-by-list paths; Rust module gates fail in CI without cargo
+
+- `scripts/ci/unit-gates-applicable.sh unit` is now default-run with a short exempt list instead of an allow-list, so `herdr_artifact_host/`, `ansible/`, `skills/`, `scripts/*.sh`, `package.json`, `package-lock.json` and any new top-level path run the suite (they previously passed the required check with no tests; `main-moved-check.sh` shared the gap). A test checks every tracked file against the matcher.
+- `scripts/ci/module-gates.sh` no longer silently skips the scratch-retention and cargo-host gates when cargo is absent in CI: new `scripts/ci/require-cargo.sh` fails there unless `HERDR_ALLOW_NO_CARGO=1` is set explicitly.
 ### Fix: assistant store snapshot loading, ordering and locking
 
 - `PostgresStoreBackend.load()` no longer turns a failed read into "no snapshot": it raises `StoreLoadError`, so a control plane that boots while Postgres is unreachable fails startup instead of running with an empty store whose first mutation overwrote the stored snapshot.
