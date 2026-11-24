@@ -1288,6 +1288,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--fleet-config", default=FLEET_CONFIG_DEFAULT,
                     help="central fleet config file; control_plane.pg_dsn names the database")
     p2.add_argument("--host-id", default=None, help="worker host identity for artifact job placement")
+    p2.add_argument("--heartbeat-file", default=os.environ.get("HERDR_WORKER_HEARTBEAT"),
+                    help="touch this file after every successful pass (the container health check reads its age; "
+                         "env HERDR_WORKER_HEARTBEAT)")
+    p2.add_argument("--max-failed-passes", type=int, default=_env_int("HERDR_WORKER_MAX_FAILED_PASSES", 10),
+                    help="exit 1 after this many consecutive failed passes so the supervisor restarts the worker; "
+                         "0 never gives up (default 10, env HERDR_WORKER_MAX_FAILED_PASSES)")
+    p2.add_argument("--connect-timeout", type=float, default=_env_float("HERDR_WORKER_CONNECT_TIMEOUT", 10.0),
+                    help="seconds allowed to open a Postgres connection (default 10, env HERDR_WORKER_CONNECT_TIMEOUT)")
+    p2.add_argument("--statement-timeout", type=float, default=_env_float("HERDR_WORKER_STATEMENT_TIMEOUT", 120.0),
+                    help="seconds allowed per Postgres statement (default 120, env HERDR_WORKER_STATEMENT_TIMEOUT)")
     p2.set_defaults(func=_cmd_cp_worker)
     p2 = csub.add_parser("feed-pi", help="publish a read-only Pi orchestration snapshot",
                          description="Post a Pi snapshot using HERDR_CP_INGEST_KEY (ingest-role API key).")
@@ -4314,9 +4324,33 @@ def _cp_config(fleet_config_path=None) -> dict:
     return out
 
 
-async def _cp_connect(dsn: str):
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ[name])
+    except (KeyError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ[name])
+    except (KeyError, ValueError):
+        return default
+
+
+async def _cp_connect(dsn: str, *, timeout: float | None = None, command_timeout: float | None = None):
     import asyncpg
-    return await asyncpg.connect(dsn)
+    return await asyncpg.connect(dsn, timeout=60 if timeout is None else timeout, command_timeout=command_timeout)
+
+
+def _sigterm_as_interrupt() -> None:
+    """Make SIGTERM (docker stop) take the same cleanup path as Ctrl-C. Main thread only; a no-op elsewhere."""
+    def _raise(_signum, _frame):
+        raise KeyboardInterrupt
+    try:
+        signal.signal(signal.SIGTERM, _raise)
+    except ValueError:
+        pass
 
 
 def _cmd_cp_migrate(args) -> int:
@@ -5478,12 +5512,13 @@ def _cmd_cp_web(args) -> int:
     hub_server = _wire_assistant_hub(svr)
     if hub_server is not None:
         logging.info("assistant hub listening on %s:%s", hub_server.host, hub_server.port)
-    _print_json({"ok": True, "serving": "control plane UI + /api/v1 + SSE",
-                 "host": args.host, "port": args.port,
-                 "url": f"http://{args.host}:{svr.port if not args.port else args.port}"})
     watch = stall_watch.install()
     stall_watch.tune_gc(gc_tuning)
+    _sigterm_as_interrupt()      # before the ready line, so a SIGTERM sent on seeing it is never lost
     try:
+        _print_json({"ok": True, "serving": "control plane UI + /api/v1 + SSE",
+                     "host": args.host, "port": args.port,
+                     "url": f"http://{args.host}:{svr.port if not args.port else args.port}"})
         svr.serve()
     except KeyboardInterrupt:
         pass
@@ -6558,7 +6593,7 @@ def _cmd_cp_worker(args) -> int:
     from .control_plane.artifact_renderers import RendererRegistry
     from .control_plane.artifacts import ArtifactStore
     from .control_plane.db import Migrator
-    from .control_plane.worker import run_one_pass, run_worker
+    from .control_plane.worker import WorkerGaveUp, run_one_pass, run_worker
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     # validated before anything connects: an invalid collab_artifacts section refuses the start (also with --once)
@@ -6568,10 +6603,18 @@ def _cmd_cp_worker(args) -> int:
 
     async def _run():
         cp = _cp_config(getattr(args, "fleet_config", None))
-        conn = await _cp_connect(cp["postgres_dsn"])
+        dsn = cp["postgres_dsn"]
+        migration_conn = await _cp_connect(dsn, timeout=args.connect_timeout)   # no statement timeout: a migration may be long
         try:
-            migrations = args.migrations or _cp_migrations_dir()
-            await Migrator(conn).apply(migrations)
+            await Migrator(migration_conn).apply(args.migrations or _cp_migrations_dir())
+        finally:
+            await migration_conn.close()
+
+        def connect():
+            return _cp_connect(dsn, timeout=args.connect_timeout, command_timeout=args.statement_timeout or None)
+
+        conn = await connect()
+        try:
             rustfs = _maybe_rustfs_client(cp)
             from .config import load_config
             from .control_plane.artifact_lineage import lineage_poster_from_section
@@ -6584,6 +6627,13 @@ def _cmd_cp_worker(args) -> int:
                                                    lineage=lineage_poster_from_section(worker_cfg.get("lineage")))
                              if rustfs is not None else None)
             runner = render_runner if render_runner is not None else None
+
+            def rebind(new_conn):       # the render runner's ArtifactStore holds the connection; rebuild it on the new one
+                if rustfs is None:
+                    return {}
+                return {"artifact_job_runner": ArtifactRenderRunner(
+                    ArtifactStore(new_conn, rustfs), RendererRegistry(),
+                    lineage=lineage_poster_from_section(worker_cfg.get("lineage")))}
             worker_id = args.host_id or socket.gethostname()
             snapshotter = _worker_snapshot_writer(getattr(args, "fleet_config", None))
             compactor = _worker_fabric_compactor(getattr(args, "fleet_config", None))
@@ -6598,12 +6648,16 @@ def _cmd_cp_worker(args) -> int:
                                               getattr(args, "fleet_config", None)),
                                           artifact_reconciler=reconciler)
             stop = asyncio.Event()
+            try:
+                for signum in (signal.SIGTERM, signal.SIGINT):
+                    asyncio.get_running_loop().add_signal_handler(signum, stop.set)   # finish or abandon the pass, then clean up
+            except (NotImplementedError, RuntimeError):
+                pass
             bridge_task = None
             mirror = None
             if collab_settings.enabled:     # a long-running loop on its own connections; --once never starts it
                 if rustfs is None:
                     raise SystemExit("control_plane.collab_artifacts needs RustFS (control_plane.rustfs_endpoint)")
-                dsn = cp["postgres_dsn"]
                 mirror = _build_collab_mirror(collab_settings, rustfs=rustfs)
             try:       # everything is validated and built before any task starts
                 annotation_hk = _worker_annotation_housekeeper(getattr(args, "fleet_config", None), mirror)
@@ -6633,6 +6687,9 @@ def _cmd_cp_worker(args) -> int:
                         heap_release=_heap_release_enabled(fleet_cp))
                     refresh.start()
                 await run_worker(conn, interval=args.interval, stop=stop, worker_id=worker_id,
+                                 connect=connect, rebind=rebind,
+                                 max_failed_passes=args.max_failed_passes or None,
+                                 heartbeat=Path(args.heartbeat_file) if args.heartbeat_file else None,
                                  artifact_job_runner=runner, inspector_snapshotter=snapshotter,
                                  fabric_compactor=compactor, inspector_archiver=archiver, share_housekeeper=share_hk,
                                  annotation_housekeeper=annotation_hk,
@@ -6654,6 +6711,9 @@ def _cmd_cp_worker(args) -> int:
         result = asyncio.run(_run())
     except KeyboardInterrupt:
         return 130
+    except WorkerGaveUp as exc:
+        print(f"herdr-eng control-plane worker: {exc}; exiting so the supervisor restarts it", file=sys.stderr)
+        return 1
     if result is not None:
         _print_json({"ok": True, "pass": result})
     return 0

@@ -419,16 +419,95 @@ async def run_one_pass(conn, *, mission_store=None, session_store=None,
     return summary
 
 
-async def run_worker(conn, *, interval: float = 30.0,
-                     stop: asyncio.Event | None = None, **stores) -> None:
+class WorkerGaveUp(RuntimeError):
+    """The worker failed ``max_failed_passes`` passes in a row; the caller exits non-zero so the supervisor restarts it."""
+
+
+async def _connection_alive(conn) -> bool:
+    if conn is None or conn.is_closed():
+        return False
+    try:
+        await conn.fetchval("SELECT 1", timeout=5)
+        return True
+    except Exception:  # noqa: BLE001 - any failure of the probe means the link is unusable
+        return False
+
+
+async def _discard(conn) -> None:
+    if conn is None:
+        return
+    try:
+        await asyncio.wait_for(conn.close(timeout=2), 5)
+    except Exception:  # noqa: BLE001 - a dead connection may refuse to close cleanly
+        conn.terminate()
+
+
+async def _guarded_pass(conn, stop: asyncio.Event, grace: float, stores: dict) -> None:
+    """One pass. A stop requested mid-pass lets it finish for ``grace`` seconds, then abandons it."""
+    task = asyncio.ensure_future(run_one_pass(conn, **stores))
+    stopped = asyncio.ensure_future(stop.wait())
+    try:
+        await asyncio.wait({task, stopped}, return_when=asyncio.FIRST_COMPLETED)
+        if not task.done():
+            await asyncio.wait({task}, timeout=grace)
+            if not task.done():
+                log.warning("worker stopping: abandoned a pass still running after %.0fs", grace)
+                return
+        if task.done() and not task.cancelled():
+            task.result()
+    finally:
+        stopped.cancel()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+async def run_worker(conn, *, interval: float = 30.0, stop: asyncio.Event | None = None,
+                     connect=None, rebind=None, max_failed_passes: int | None = None,
+                     backoff_base: float = 1.0, backoff_cap: float = 30.0, pass_grace: float = 20.0,
+                     heartbeat: Path | None = None, **stores) -> None:
+    """Run passes until ``stop``. With ``connect`` (an async factory) a connection that is closed or fails a probe after a
+    failed pass is replaced; ``rebind(conn)`` returns the stores that hold the connection, rebuilt on it. Failed passes
+    retry with a capped exponential backoff; ``max_failed_passes`` in a row raises WorkerGaveUp. ``heartbeat`` is touched
+    after every successful pass."""
     stop = stop or asyncio.Event()
+    failed = 0
     while not stop.is_set():
+        delay = interval
         try:
-            await run_one_pass(conn, **stores)
-        except Exception as exc:  # bounded: never crash the worker
-            log.exception("worker pass failed: %s", exc)
+            if connect is not None and (conn is None or conn.is_closed()):
+                conn = await connect()
+                if rebind is not None:
+                    stores.update(rebind(conn))
+            await _guarded_pass(conn, stop, pass_grace, stores)
+            if stop.is_set():
+                break
+            if failed:
+                log.warning("worker recovered after %d failed pass(es)", failed)
+            failed = 0
+            if heartbeat is not None:
+                try:
+                    Path(heartbeat).touch()
+                except OSError as exc:
+                    log.warning("worker heartbeat not written: %s", exc)
+        except Exception as exc:  # bounded: never crash the worker on one bad pass
+            failed += 1
+            if failed == 1:
+                log.exception("worker pass failed: %s", exc)
+            else:
+                log.warning("worker pass failed (%d in a row): %s: %s", failed, type(exc).__name__, exc)
+            if connect is not None and not await _connection_alive(conn):
+                if conn is not None:
+                    log.warning("worker lost its postgres connection; reconnecting")
+                await _discard(conn)
+                conn = None
+            if max_failed_passes is not None and failed >= max_failed_passes:
+                log.error("worker giving up after %d consecutive failed passes", failed)
+                await _discard(conn if connect is not None else None)
+                raise WorkerGaveUp(f"{failed} consecutive failed passes") from exc
+            delay = min(interval, backoff_cap, backoff_base * 2 ** (failed - 1))
         try:
-            await asyncio.wait_for(stop.wait(), timeout=interval)
+            await asyncio.wait_for(stop.wait(), timeout=delay)
         except TimeoutError:
             continue
 
