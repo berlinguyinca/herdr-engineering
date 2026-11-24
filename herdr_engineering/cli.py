@@ -855,6 +855,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--reset-lock", action="store_true",
                     help="take over a stale gateway.lock (e.g. after a crash/SIGKILL; "
                          "safe when no other gateway is running)")
+    p2.add_argument("--allow-open", action="store_true",
+                    help="serve the control API without a bearer token when none is configured "
+                         "(HERDR_ENGINEERING_FABRIC_TOKEN, host config fabric.token or the fabric-token "
+                         "file); without this flag the gateway refuses to start with no token. A token that "
+                         "appears later is enforced immediately")
     p2.add_argument("--rewrite-headers", action="store_true",
                     help="opt-in: rewrite loopback URLs in Location / CORS / cookie-domain "
                          "headers of HTTP leases to the fabric address (forces "
@@ -2733,9 +2738,15 @@ def _local_fabric_client():
         return None
     if not url:
         return None
+    from .fabric import TokenNotAccepted, TokenUnreadable
     try:
         FabricClient(url).healthz()
         return FabricClient(url)
+    except (TokenNotAccepted, TokenUnreadable) as exc:
+        # The gateway is there but this host's token does not work: say so instead of degrading silently.
+        print(f"herdr-eng: fabric gateway {url} NOT used, falling back to the local registry: {exc}",
+              file=sys.stderr, flush=True)
+        return None
     except Exception:
         return None  # gateway down: degrade to local mode, never break registration
 
@@ -2754,8 +2765,13 @@ def _gateway_configured_or_reachable() -> bool:
     if url:
         return True  # configured (even if currently unreachable)
     # Not configured: check if one is somehow reachable (e.g. via env override)
+    from .fabric import TokenNotAccepted, TokenUnreadable
     try:
         FabricClient("http://127.0.0.1:29999").healthz()
+        return True
+    except (TokenNotAccepted, TokenUnreadable) as exc:
+        print(f"herdr-eng: a fabric gateway is reachable but this host's token does not work with it: {exc}",
+              file=sys.stderr, flush=True)
         return True
     except Exception:
         return False
@@ -3600,7 +3616,7 @@ def _cmd_dev_gateway(args) -> int:
 
     from .config import InvalidError, load_config
     from .devfabric import DevServiceRegistry
-    from .fabric import FabricGateway, GatewayRouter, tailnet_ipv4
+    from .fabric import FabricGateway, GatewayRouter, read_fabric_token, tailnet_ipv4
     try:
         cfg = load_config().get("fabric") or {}
     except InvalidError:
@@ -3617,6 +3633,18 @@ def _cmd_dev_gateway(args) -> int:
     # through it): prefer the tailnet IP; loopback-only when no tailnet.
     control_host = next((h for h in bind_hosts if h != "127.0.0.1"), "127.0.0.1")
     acme_domain = getattr(args, "acme_domain", None) or cfg.get("acme_domain") or None
+    allow_open = bool(getattr(args, "allow_open", False))
+    try:
+        have_token = allow_open or bool(read_fabric_token())
+    except OSError as exc:
+        raise SystemExit(f"fabric gateway: the control-API token is unreadable ({exc}); "
+                         "fix it (token file: a regular 0600 file; host config: reachable control plane); "
+                         "refusing to start")
+    if not have_token:
+        raise SystemExit("fabric gateway: no control-API token configured. Set HERDR_ENGINEERING_FABRIC_TOKEN, "
+                         "fabric.token, or write ~/.config/herdr-engineering/fabric-token "
+                         "(or HERDR_ENGINEERING_FABRIC_TOKEN_FILE); pass --allow-open to serve the control "
+                         "API unauthenticated")
     registry = DevServiceRegistry()
     router = GatewayRouter(bind_hosts)
     gateway = FabricGateway(
@@ -3624,6 +3652,7 @@ def _cmd_dev_gateway(args) -> int:
         url_base=args.url_base or (cfg.get("url_base") or None) or acme_domain,
         probe_interval=float(cfg.get("probe_interval_seconds", 15)),
         reset_lock=bool(getattr(args, "reset_lock", False)),
+        allow_open=allow_open,
         rewrite_headers=bool(getattr(args, "rewrite_headers", False)),
         peer_url=getattr(args, "peer", None) or cfg.get("peer_url") or None,
         node_id=getattr(args, "node_id", None) or cfg.get("node_id") or None,
@@ -3677,6 +3706,7 @@ def _cmd_dev_gateway(args) -> int:
     gateway.start()
     _print_json({
         "ok": True, "gateway": True, "https": bool(tls_cert), "role": gateway.role, "peer": gateway.peer_url, "access_enforced": bool(users or tags),
+        "control_auth": gateway.control_auth,
         "control_url": f"http://{gateway.control_host}:{control_port}",
         "url_base": gateway.url_base,
         "named_urls": (f"https://<service>.{gateway.named_domain}" + ("" if gateway.named_port == 443 else f":{gateway.named_port}"))
@@ -3917,7 +3947,15 @@ def _cmd_dev_agent(args) -> int:
 
     from .config import InvalidError, load_config
     from .fabric import FabricClient, gateway_url_from_config, tailnet_ipv4
-    from .fabric_agent import AgentConfig, FabricAgent, parse_agent_binaries, parse_deny_processes
+    from .fabric_agent import (
+        AgentConfig,
+        FabricAgent,
+        parse_adopt_mode,
+        parse_agent_binaries,
+        parse_allow_processes,
+        parse_deny_processes,
+        parse_ports,
+    )
     from .host_config import ConfigRefresher, HostConfigUnavailable, exit_unavailable, host_config
 
     logging.basicConfig(level=logging.INFO,
@@ -3954,11 +3992,13 @@ def _cmd_dev_agent(args) -> int:
         str(Path.home() / ".local/share/herdr-engineering/state")))
     # Noise filter knobs (all optional, sensible defaults in AgentConfig):
     # extra excluded ports + the dev-port window the agent will register.
-    extra_exclude = frozenset(int(p) for p in fabric_cfg.get(
-        "agent_exclude_ports", []))
     try:
+        extra_exclude = parse_ports(fabric_cfg.get("agent_exclude_ports"), "agent_exclude_ports")
         agent_binaries = parse_agent_binaries(fabric_cfg.get("agent_binaries"))
         deny_processes = parse_deny_processes(fabric_cfg.get("agent_deny_processes"))
+        adopt_mode = parse_adopt_mode(fabric_cfg.get("agent_adopt_mode"))
+        allow_ports = parse_ports(fabric_cfg.get("agent_allow_ports"), "agent_allow_ports")
+        allow_processes = parse_allow_processes(fabric_cfg.get("agent_allow_processes"))
     except ValueError as exc:
         _print_json({"code": "config", "message": str(exc)})
         return 1
@@ -3983,6 +4023,9 @@ def _cmd_dev_agent(args) -> int:
             host_slow_interval=float(fabric_cfg.get("host_slow_interval", 3600.0)),
             agent_binaries=agent_binaries,
             deny_processes=deny_processes,
+            adopt_mode=adopt_mode,
+            allow_ports=allow_ports,
+            allow_processes=allow_processes,
             orphan_grace=float(fabric_cfg.get("agent_orphan_grace_seconds", 60.0)),
             lease_max_age=float(fabric_cfg.get("agent_lease_max_age_seconds", 86400.0)),
         ))
@@ -4004,7 +4047,7 @@ def _cmd_dev_agent(args) -> int:
         if fab == seen["fabric"] and cp == seen["cp"] and key == seen["key"]:
             return
         new_base = gateway_url_from_config(cfg, fabric_url=fab[0] or "") or base
-        agent.retarget(FabricClient(new_base, fab[1] or None), cp, key)
+        agent.retarget(FabricClient(new_base), cp, key)
         seen["fabric"], seen["cp"], seen["key"] = fab, cp, key
 
     try:
