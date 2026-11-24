@@ -309,8 +309,10 @@ absent from the native inventory is treated as transient, not as a missing-sessi
   the same way.
 - **State directory.** An existing rollout state directory owned by you that is group or
   world readable is tightened to `0700` by commands that write (apply, run, abandon, prune,
-  plan). Read-only commands (`status`, `latest`) never change permissions; symlinks and
-  foreign owners are refused on every path.
+  plan). Read-only commands (`status`, `latest`) never change permissions. Symlinks, foreign
+  owners and any group- or world-**writable** directory are refused on every path and never
+  repaired (another user may already have planted a plan), and a plan file not owned by you
+  is not trusted.
 - **Dirty managed release.** If the staged release directory has local changes, staging fails
   with a typed `managed_release_dirty` error. The host is `blocked` with
   `managed release is dirty: <files>; local work preserved` and a `nextStep` naming the

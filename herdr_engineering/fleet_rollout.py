@@ -115,11 +115,19 @@ class RolloutStore:
     def _directory(self, *, tighten=False):
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         info = self.root.lstat()
-        if self.root.is_symlink() or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        if (
+            self.root.is_symlink()
+            or not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_mode & 0o022
+        ):
+            # Group/world WRITE is never repaired: another user may already have planted a
+            # plan whose inventory ansible-inventory would execute.
             raise ValueError("rollout state must be a private, owned directory")
         if tighten and info.st_mode & 0o077:
-            # Ours and not a link: tighten rather than refuse (an older release or a umask
-            # may have left it 0755). Only write paths do; status/latest only look.
+            # Ours, not a link, not writable by others: only read bits remain (an older
+            # release or a umask may have left it 0755), so tighten rather than refuse.
+            # Only write paths do; status/latest only look.
             self.root.chmod(0o700)
 
     def _path(self, rollout_id):
@@ -142,6 +150,8 @@ class RolloutStore:
         path = self._path(rollout_id)
         if path.is_symlink():
             raise ValueError("rollout state must not be a symlink")
+        if path.stat().st_uid != os.getuid():
+            raise ValueError("rollout state file is not owned by this user")
         data = json.loads(path.read_text())
         if data.get("id") != rollout_id or not SHA.fullmatch(data.get("revision", "")):
             raise ValueError("invalid rollout state")

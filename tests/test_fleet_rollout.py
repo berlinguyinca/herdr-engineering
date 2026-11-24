@@ -2759,6 +2759,31 @@ def test_plan_host_flag_rejects_duplicates_and_unknown_hosts(tmp_path, monkeypat
         inventory_targets(tmp_path / "hosts.yml", ["a", "zzz"])
 
 
+@pytest.mark.parametrize("mode", [0o775, 0o777, 0o757])
+def test_writable_by_others_state_directory_is_refused_on_every_path(tmp_path, mode):
+    """Another user able to write the directory could plant a plan whose inventory is executed."""
+    root = tmp_path / "state"
+    root.mkdir()
+    root.chmod(mode)
+    from herdr_engineering.fleet_rollout import RolloutStore, latest_unfinished, list_rollouts
+
+    store = RolloutStore(root)
+    for call in (lambda: list_rollouts(store), lambda: latest_unfinished(store), lambda: store.lock().__enter__()):
+        with pytest.raises(ValueError, match="private, owned directory"):
+            call()
+    assert root.stat().st_mode & 0o777 == mode  # refused, not silently repaired
+
+
+def test_plan_file_owned_by_someone_else_is_not_trusted(tmp_path, monkeypatch):
+    store, plan = setup_rollout(tmp_path)
+    import os
+
+    real_uid = os.getuid()
+    monkeypatch.setattr(os, "getuid", lambda: real_uid + 1)
+    with pytest.raises(ValueError):
+        store.read(plan["id"])
+
+
 def test_existing_group_readable_state_directory_is_tightened_not_refused(tmp_path):
     from herdr_engineering.fleet_rollout import RolloutStore
 
