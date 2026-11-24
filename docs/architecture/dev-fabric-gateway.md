@@ -52,8 +52,12 @@ close|list`).
   (`HERDR_ENGINEERING_FABRIC_TOKEN`, host config `fabric.token`, or the file
   `~/.config/herdr-engineering/fabric-token` / `HERDR_ENGINEERING_FABRIC_TOKEN_FILE`;
   never in the repo). With none configured the gateway refuses to start unless
-  `--allow-open` is passed. The file is re-read per request, so rotation needs no
-  restart. `/healthz` answers `{"ok": ...}` without a token.
+  `--allow-open` is passed. Precedence is env var, host config, file; the first two are
+  fixed for the process, only the file is followed live (re-read per request) and only when
+  neither of them is set. Replace the file atomically (temp file, then rename). Superseded
+  tokens stay valid for an hour; an unreadable file (not merely missing) fails closed.
+  `/healthz` answers `{"ok": ...}` without a token; `FabricClient.healthz()` treats that as
+  "token not accepted".
 - **GatewayRouter** — dynamic per-lease listeners. Each leased external port
   is bound on every configured interface (loopback + tailnet) and proxied to
   the lease's `target_host:target_port` with `proxy_pair()` (shared with the

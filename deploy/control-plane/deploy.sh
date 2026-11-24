@@ -945,6 +945,12 @@ if [ ! -e "$PIPELINES_DIR" ]; then
   mkdir -p "$(dirname "$PIPELINES_DIR")" && mkdir -m 755 "$PIPELINES_DIR"
 fi
 check_pipelines_dir || exit 1
+# the fabric control-API token directory (mounted read-only into fabric-gateway and herdr-web): create it 0700 so
+# docker does not create it root-owned. It may stay empty during the --allow-open rollout.
+FABRIC_TOKEN_DIR="$HOME/.config/herdr-engineering/fabric-gateway"
+if [ ! -e "$FABRIC_TOKEN_DIR" ]; then
+  mkdir -p "$(dirname "$FABRIC_TOKEN_DIR")" && mkdir -m 700 "$FABRIC_TOKEN_DIR"
+fi
 
 # ---- host files this deploy may change, backed up so every failure path restores them
 BACKUP_DIR="$ENV_DIR/backup"; mkdir -p "$BACKUP_DIR"

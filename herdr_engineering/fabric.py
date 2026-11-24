@@ -42,12 +42,19 @@ _FABRIC_TOKEN_FILE = os.path.join("~", ".config", "herdr-engineering", "fabric-t
 
 _FABRIC_TOKEN_ENV = "HERDR_ENGINEERING_FABRIC_TOKEN"
 _FABRIC_TOKEN_FILE_ENV = "HERDR_ENGINEERING_FABRIC_TOKEN_FILE"
-_TOKEN_ROTATION_GRACE_SECONDS = 300.0
+# A superseded token stays valid this long. Well above the agents' host-config refresh (300 s,
+# ``host_config.REFRESH_INTERVAL``) so a client that only learns the new token on its next refresh is not locked out.
+_TOKEN_ROTATION_GRACE_SECONDS = 3600.0
 
 
 def read_fabric_token() -> str | None:
     """The fabric bearer token: env var, then host config ``fabric.token``, then the token file
-    (``HERDR_ENGINEERING_FABRIC_TOKEN_FILE`` or ``~/.config/herdr-engineering/fabric-token``)."""
+    (``HERDR_ENGINEERING_FABRIC_TOKEN_FILE`` or ``~/.config/herdr-engineering/fabric-token``).
+
+    Only the file is followed live: the env var and the host config (cached per process; agents re-fetch it
+    every 300 s and rebuild their client) are fixed, so the file is consulted only when neither is set.
+    A missing file means "no token" (None); any other read error (a directory where the file should be,
+    permissions, I/O) raises ``OSError`` so callers fail closed instead of treating it as "no token"."""
     from .host_config import host_value
     env = os.environ.get(_FABRIC_TOKEN_ENV, "").strip()
     if env:
@@ -58,7 +65,7 @@ def read_fabric_token() -> str | None:
     try:
         with open(os.path.expanduser(os.environ.get(_FABRIC_TOKEN_FILE_ENV) or _FABRIC_TOKEN_FILE)) as f:
             return f.read().strip() or None
-    except OSError:
+    except FileNotFoundError:
         return None
 
 
@@ -383,7 +390,7 @@ class FabricGateway:
                  named_domain: str | None = None, named_port: int = 443,
                  apex_upstream: tuple[str, int] | None = None,
                  host_routes: dict[str, tuple[str, int]] | None = None,
-                 allow_open: bool = False) -> None:
+                 allow_open: bool = False, rotation_grace: float | None = None) -> None:
         self.registry = registry
         registry.port_free = router.can_bind
         # Stable service-name URLs (https://<service>.<named_domain>[:named_port]); off unless a domain is given
@@ -432,9 +439,11 @@ class FabricGateway:
         # configured serve open. Otherwise a missing token rejects every control request (fail closed).
         self._fixed_token = token
         self.allow_open = allow_open or token == ""
+        self.rotation_grace = float(_TOKEN_ROTATION_GRACE_SECONDS if rotation_grace is None else rotation_grace)
         self._token_lock = threading.Lock()
         self._last_token: str | None = None
-        self._prev_token: tuple[str, float] | None = None   # (token, accepted until monotonic)
+        self._prev_tokens: dict[str, float] = {}     # superseded token -> accepted until (monotonic)
+        self._token_unreadable = False
         self._httpd: ThreadingHTTPServer | None = None
         self._probe_thread: threading.Thread | None = None
         self._stop = threading.Event()
@@ -442,30 +451,43 @@ class FabricGateway:
 
     @property
     def token(self) -> str | None:
-        """The current bearer token. Re-read on every use so a rotated env-less source (the token file) is
-        followed without a restart; once a token has been seen it is never forgotten (a vanished file must not
-        reopen the API)."""
+        """The current bearer token. Re-read on every use so a rotated token file is followed without a
+        restart (the file must be replaced atomically: write a temp file, then rename). A token seen once is
+        never forgotten (a vanished file must not reopen the API), and every superseded token stays valid for
+        ``rotation_grace`` so a mistyped or torn value cannot evict the real previous one. An unreadable file
+        keeps the last known token; with none known the gateway fails closed (see ``accepts``)."""
         if self._fixed_token is not None:
             return self._fixed_token or None
-        fresh = read_fabric_token()
+        try:
+            fresh = read_fabric_token()
+            unreadable = False
+        except OSError:
+            fresh, unreadable = None, True
+        now = time.monotonic()
         with self._token_lock:
+            self._token_unreadable = unreadable
             if fresh and fresh != self._last_token:
                 if self._last_token:
-                    self._prev_token = (self._last_token, time.monotonic() + _TOKEN_ROTATION_GRACE_SECONDS)
+                    self._prev_tokens[self._last_token] = now + self.rotation_grace
                 self._last_token = fresh
+            self._prev_tokens = {t: until for t, until in self._prev_tokens.items() if until > now}
             return self._last_token
 
     def accepts(self, presented: str | None) -> bool:
-        """True when ``presented`` matches the current token (or the previous one inside the rotation grace)."""
+        """True when ``presented`` matches the current token (or a previous one inside its rotation grace)."""
         current = self.token
         if not current:
-            return self.allow_open
+            return self.allow_open and not self._token_unreadable
         presented = presented or ""
         if hmac.compare_digest(presented.encode(), current.encode()):
             return True
+        now = time.monotonic()
         with self._token_lock:
-            prev = self._prev_token
-        return bool(prev and time.monotonic() < prev[1] and hmac.compare_digest(presented.encode(), prev[0].encode()))
+            prev = list(self._prev_tokens.items())
+        ok = False
+        for tok, until in prev:                      # no early exit: keep the work independent of which matched
+            ok |= now < until and hmac.compare_digest(presented.encode(), tok.encode())
+        return ok
 
     # -- router sync -------------------------------------------------------
     def _sync_router(self) -> None:
@@ -948,8 +970,12 @@ class FabricClient:
 
     def __init__(self, gateway_url: str, token: str | None = None) -> None:
         self.gateway_url = gateway_url.rstrip("/")
-        self.token = token if token is not None else read_fabric_token()
+        self._token = token                              # None: resolve per request (a rotated file is followed)
         self._resolved: tuple[str, float] | None = None  # (url-with-IP, monotonic ts)
+
+    @property
+    def token(self) -> str | None:
+        return self._token if self._token is not None else read_fabric_token()
 
     def _control_url(self) -> str:
         """The gateway URL with its hostname replaced by a resolved IPv4.
@@ -997,9 +1023,13 @@ class FabricClient:
     def _req(self, method: str, path: str, payload: dict | None = None) -> dict:
         url = self._control_url() + path
         data = json.dumps(payload or {}).encode()
+        try:
+            token = self.token
+        except OSError as exc:
+            raise UnreachableError(f"fabric token file unreadable: {exc.__class__.__name__}", target=url) from exc
         req = urllib.request.Request(url, data=data, method=method, headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.token or ''}",
+            "Authorization": f"Bearer {token or ''}",
             "Host": self._host_header(),
         })
         try:
@@ -1040,7 +1070,14 @@ class FabricClient:
         return self._req("GET", "/names")
 
     def healthz(self) -> dict[str, Any]:
-        return self._req("GET", "/healthz")
+        """The gateway's full health payload. A gateway answers a missing or wrong token with only
+        ``{"ok": ...}`` (so the container healthcheck needs no token); that is "reachable, but not
+        authorised", not healthy, so it raises."""
+        health = self._req("GET", "/healthz")
+        if set(health) <= {"ok"}:
+            raise UnreachableError("fabric gateway reachable but the token was not accepted (minimal /healthz)",
+                                   target=self.gateway_url)
+        return health
 
 
 def gateway_url_from_config(config: dict[str, Any], *, fabric_url: str | None = None) -> str | None:

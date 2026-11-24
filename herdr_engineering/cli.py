@@ -3530,7 +3530,12 @@ def _cmd_dev_gateway(args) -> int:
     control_host = next((h for h in bind_hosts if h != "127.0.0.1"), "127.0.0.1")
     acme_domain = getattr(args, "acme_domain", None) or cfg.get("acme_domain") or None
     allow_open = bool(getattr(args, "allow_open", False))
-    if not allow_open and not read_fabric_token():
+    try:
+        have_token = allow_open or bool(read_fabric_token())
+    except OSError as exc:
+        raise SystemExit(f"fabric gateway: the control-API token file is unreadable ({exc.__class__.__name__}); "
+                         "fix it (a directory or wrong permissions?); refusing to start")
+    if not have_token:
         raise SystemExit("fabric gateway: no control-API token configured. Set HERDR_ENGINEERING_FABRIC_TOKEN, "
                          "fabric.token, or write ~/.config/herdr-engineering/fabric-token "
                          "(or HERDR_ENGINEERING_FABRIC_TOKEN_FILE); pass --allow-open to serve the control "

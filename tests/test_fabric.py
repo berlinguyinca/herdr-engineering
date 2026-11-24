@@ -387,7 +387,7 @@ def _make_host_handler(gw: _FakeGatewayForHostHeader):
 
         def do_GET(self):
             gw.last_host_header = self.headers.get("Host")
-            body = b'{"ok": true}'
+            body = b'{"ok": true, "bound_ports": []}'
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
