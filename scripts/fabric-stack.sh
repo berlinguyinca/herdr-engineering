@@ -134,21 +134,25 @@ memory_route() {
 }
 
 status() {
-    local rc=0
-    "${COMPOSE[@]}" ps || { echo "docker compose failed (see the error above); the stack state is unknown" >&2; rc=1; }
+    # The exit status follows the gateway healthz and DNS checks. A compose problem is printed (it often only
+    # means this script's .env cannot render the file) but is not by itself a failure of the running stack.
+    local rc=0 answer
+    "${COMPOSE[@]}" ps || echo "docker compose could not list the stack (see the error above); judge it by the checks below" >&2
     say "hindsight memory (optional profile):"
     memory_status
     say "gateway healthz:"
-    curl -fsS "http://127.0.0.1:29999/healthz" || echo "(unreachable)"
+    curl -fsS "http://127.0.0.1:29999/healthz" || { echo "(unreachable)"; rc=1; }
     echo
     say "coredns dev.lan resolution (local):"
     if command -v dig >/dev/null; then
-        dig +short @127.0.0.1 dev.lan A
+        answer="$(dig +short @127.0.0.1 dev.lan A)"
+        if [ -n "$answer" ]; then echo "$answer"; else echo "(no answer)"; rc=1; fi
     else
-        getent hosts dev.lan || echo "(no getent result)"
+        getent hosts dev.lan || { echo "(no getent result)"; rc=1; }
     fi
     return "$rc"
 }
+
 
 down() { "${COMPOSE[@]}" stop coredns fabric-gateway herdr-web; }  # not the control plane
 

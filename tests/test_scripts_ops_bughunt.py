@@ -41,6 +41,8 @@ def _env(tmp_path: Path, bindir: Path | None = None, **extra: str) -> dict[str, 
         if not k.startswith(("HERDR_CP_", "GATEWAY_", "HERDR_GATEWAY"))
     }
     env.update(HOME=str(home), PATH=f"{bindir}:{BASE_PATH}" if bindir else BASE_PATH)
+    # never the live "herdr-control-plane" project, whatever a test runs through the real docker
+    env["COMPOSE_PROJECT_NAME"] = "herdr-test-throwaway"
     env.update(extra)
     return env
 
@@ -209,14 +211,9 @@ def test_up_replace_checks_compose_before_stopping_the_old_services(tmp_path):
     )
 
 
-@pytest.mark.skipif(not HAVE_DOCKER, reason="needs docker")
-def test_status_surfaces_a_compose_error_instead_of_stack_not_running(tmp_path):
-    r, _ = _stack_run(tmp_path, "status")
-    assert r.returncode != 0
-    assert "stack not running" not in r.stdout
-
-
-def _stack_with_docker(tmp_path: Path, docker_body: str, *args: str):
+def _stack_with_docker(
+    tmp_path: Path, docker_body: str, *args: str, curl_rc: int = 0, dig_answer: str = "100.64.0.9"
+):
     """Run fabric-stack.sh with a recording `docker` helper in place of the real one."""
     tree = _stack_tree(tmp_path)
     bindir = tmp_path / "bin"
@@ -226,8 +223,8 @@ def _stack_with_docker(tmp_path: Path, docker_body: str, *args: str):
     _helper(bindir, "systemctl", f'echo "systemctl $*" >> {calls}\nexit 0\n')
     _helper(bindir, "pgrep", f'echo "pgrep $*" >> {calls}\nexit 0\n')
     _helper(bindir, "pkill", f'echo "pkill $*" >> {calls}\nexit 0\n')
-    _helper(bindir, "curl", f'echo "curl $*" >> {calls}\nexit 0\n')
-    _helper(bindir, "dig", f'echo "dig $*" >> {calls}\nexit 0\n')
+    _helper(bindir, "curl", f'echo "curl $*" >> {calls}\nexit {curl_rc}\n')
+    _helper(bindir, "dig", f'echo "dig $*" >> {calls}\necho "{dig_answer}"\n')
     r = subprocess.run(
         ["bash", str(tree / "scripts" / "fabric-stack.sh"), *args],
         env=_env(tmp_path, bindir),
@@ -247,13 +244,26 @@ def test_up_replace_builds_the_image_before_stopping_the_old_services(tmp_path):
     assert build < stop, calls
 
 
-def test_status_goes_on_to_healthz_and_dns_when_compose_cannot_render(tmp_path):
-    r, calls = _stack_with_docker(
-        tmp_path, 'case "$*" in *" ps"*) echo "compose render error" >&2; exit 1;; esac', "status"
-    )
-    assert r.returncode != 0
-    assert "compose render error" in r.stderr
+_COMPOSE_CANNOT_RENDER = 'case "$*" in *" ps"*) echo "compose render error" >&2; exit 1;; esac'
+
+
+def test_status_is_healthy_when_healthz_and_dns_pass_though_compose_cannot_render(tmp_path):
+    r, calls = _stack_with_docker(tmp_path, _COMPOSE_CANNOT_RENDER, "status")
+    assert r.returncode == 0, (
+        r.stderr
+    )  # the stack is fine; only this script's .env cannot render the file
+    assert "compose render error" in r.stderr  # but the problem is still shown
     assert "curl" in calls and "dig" in calls, calls  # the other checks still ran
+
+
+def test_status_fails_when_healthz_is_unreachable(tmp_path):
+    r, _ = _stack_with_docker(tmp_path, "exit 0", "status", curl_rc=7)
+    assert r.returncode != 0 and "(unreachable)" in r.stdout
+
+
+def test_status_fails_when_dns_gives_no_answer(tmp_path):
+    r, _ = _stack_with_docker(tmp_path, "exit 0", "status", dig_answer="")
+    assert r.returncode != 0 and "(no answer)" in r.stdout
 
 
 def test_up_never_removes_orphans_and_names_its_services():
@@ -272,12 +282,36 @@ def test_install_passes_the_tailscale_key_by_file_not_argv():
     assert re.search(r'--auth-key="?file:', text)
 
 
+def test_install_keeps_the_tailscale_key_file_where_a_sandboxed_cli_can_read_it():
+    text = (ROOT / "scripts" / "install.sh").read_text()
+    assert 'TS_KEY_TMP="$(mktemp)"' not in text  # the default mktemp dir is /tmp
+    assert re.search(r'mktemp "\$TS_KEY_DIR/', text) and 'mkdir -p -m 700 "$TS_KEY_DIR"' in text
+    assert "trap 'rm -f \"$TS_KEY_TMP\"' EXIT" in text
+
+
 # --------------------------------------------------------------------------- 24 deploy-fleet-agents
 
 AGENTS = ROOT / "deploy" / "deploy-fleet-agents.sh"
 
 
+def _need_system_python() -> None:
+    """The fleet roll builds a venv with the host's /usr/bin/python3 (3.12+, with pip): skip where that is absent."""
+    py = Path("/usr/bin/python3")
+    if not py.exists():
+        pytest.skip("needs /usr/bin/python3")
+    probe = subprocess.run(
+        [str(py), "-c", "import sys;print(sys.version_info >= (3, 12))"],
+        capture_output=True,
+        text=True,
+    )
+    if probe.stdout.strip() != "True":
+        pytest.skip("needs /usr/bin/python3 3.12 or newer")
+    if subprocess.run([str(py), "-m", "pip", "--version"], capture_output=True).returncode != 0:
+        pytest.skip("needs pip for /usr/bin/python3")
+
+
 def test_a_failing_restart_restores_the_symlink_and_the_roll_goes_on(tmp_path):
+    _need_system_python()
     bindir = tmp_path / "bin"
     log = tmp_path / "ssh.log"
     # ssh/scp run the command here as bash under a temp HOME (a "local host" reached the way ssh would).
@@ -343,6 +377,7 @@ def test_a_failing_restart_restores_the_symlink_and_the_roll_goes_on(tmp_path):
 
 
 def test_a_failed_ssh_for_the_feed_dir_copies_nothing_to_the_host_root(tmp_path):
+    _need_system_python()
     bindir = tmp_path / "bin"
     scp_log = tmp_path / "scp.log"
     _helper(
@@ -652,3 +687,27 @@ def test_worker_runs_good_tasks_beside_a_malformed_one(tmp_path):
     assert "good-1 done" in r.stdout, (r.stdout, r.stderr)
     assert "bad-1" in r.stderr  # the skipped task is named, not dropped silently
     assert "../evil" in r.stderr or "evil" in r.stderr
+
+
+def test_worker_runs_good_tasks_beside_a_non_object_entry_and_a_null_attempt(tmp_path):
+    seen: list[str] = []
+    srv = _serve(
+        [
+            _tasks_reply(
+                [
+                    "not-an-object",
+                    {"task_id": "null-attempt", "text": "x", "attempt": None},
+                    {"task_id": "good-2", "text": "x", "attempt": 1},
+                ]
+            ),
+        ],
+        seen,
+    )
+    try:
+        r = _run_worker(tmp_path, srv, 12)
+    finally:
+        srv.shutdown()
+    assert r.returncode == -9, f"worker exited early: {r.stderr}"  # still looping, not dead
+    assert "good-2 done" in r.stdout, (r.stdout, r.stderr)
+    assert "null-attempt done" not in r.stdout
+    assert "not an object" in r.stderr and "null-attempt" in r.stderr

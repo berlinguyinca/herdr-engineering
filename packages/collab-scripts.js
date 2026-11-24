@@ -114,12 +114,25 @@ audit worker_start agent="$NAME" sandbox="\${SANDBOX:+yes}" cmd="\${HERDR_AGENT_
 echo "waiting for tasks as $NAME..."
 while :; do
   call tasks_wait '{"seconds":20}' > "$TMP/r.json" || { sleep 5; continue; }
-  python3 - "$TMP/r.json" "$TMP" <<'PY'
-import sys, json
+  python3 - "$TMP/r.json" "$TMP" <<'PY' || { sleep 5; continue; }   # an error reply (no result) must not end the worker
+import sys, json, os
 reply = json.load(open(sys.argv[1]))
 import re
-tasks = json.loads(reply["result"]["content"][0]["text"]).get("tasks", [])
+try:
+    tasks = json.loads(reply["result"]["content"][0]["text"]).get("tasks", [])
+except (KeyError, IndexError, TypeError, ValueError):
+    sys.exit(1)   # an error reply or one without a result: wait and ask again
 for t in tasks:
+  if not isinstance(t, dict):   # a task entry that is not an object cannot be handled or cleaned up after
+    print(f"skipped a task entry that is not an object: {str(t)[:80]!r}", file=sys.stderr)
+    continue
+  try:
+    # the id becomes a file name: only a plain token may, never a path
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", str(t.get("task_id", ""))):
+        print(f"skipped a task with an invalid id: {str(t.get('task_id'))[:80]!r}", file=sys.stderr)
+        continue
+    # the lease fence: report back with the attempt this run was handed (a requeued task rejects any other)
+    attempt = int(t.get("attempt", 1))
     # The room keeps the literal text. The harness gets it without ONE leading "@<this agent>" (address,
     # name or old name) so the request reads as written to it; any other text stays exactly as typed.
     text, own = t["text"], {n for n in [t.get("target_address"), t.get("target_name"), *(t.get("target_aliases") or [])] if n}
@@ -127,9 +140,13 @@ for t in tasks:
     if m and m.group(1).lower() in own:
         text = text[m.end():]
     open(f"{sys.argv[2]}/tasks/{t['task_id']}.txt", "w").write(text)
-    # the lease fence: report back with the attempt this run was handed (a requeued task rejects any other)
-    open(f"{sys.argv[2]}/tasks/{t['task_id']}.attempt", "w").write(str(t.get("attempt", 1)))
+    open(f"{sys.argv[2]}/tasks/{t['task_id']}.attempt", "w").write(str(attempt))
     print(t["task_id"])
+  except Exception as e:   # one malformed task must not starve the others
+    print(f"skipped task {str(t.get('task_id'))[:80]!r}: {type(e).__name__}: {e}", file=sys.stderr)
+    for ext in ("txt", "attempt"):
+        try: os.remove(f"{sys.argv[2]}/tasks/{t.get('task_id')}.{ext}")
+        except (OSError, TypeError): pass
 PY
   for f in "$TMP"/tasks/*.txt; do
     [ -e "$f" ] || continue

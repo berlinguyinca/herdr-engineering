@@ -58,6 +58,12 @@
     fi   # report only, never fail: nothing in this role installs herdr (the operator does); a missing or other version must not stop the fleet update
   changed_when: false
   failed_when: false
+  register: herdr_check
+
+- name: "Report Herdr drift"
+  ansible.builtin.debug:
+    msg: "{{ herdr_check.stderr }}"   # an ok task's stderr is hidden by default, so the drift line is printed here
+  when: "'DRIFT' in herdr_check.stderr"
 
 - name: "Verify Pi is present"
   ansible.builtin.shell: |
@@ -67,6 +73,12 @@
     fi   # report only, never fail: nothing in this role installs pi (the operator does)
   changed_when: false
   failed_when: false
+  register: pi_check
+
+- name: "Report Pi drift"
+  ansible.builtin.debug:
+    msg: "{{ pi_check.stderr }}"   # an ok task's stderr is hidden by default, so the drift line is printed here
+  when: "'DRIFT' in pi_check.stderr"
 
 - name: "Clone berlinguyinca/pi-engineering"
   ansible.builtin.git:
