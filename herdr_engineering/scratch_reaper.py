@@ -748,12 +748,15 @@ def _live_ids(roots: list[Path], cutoff: float) -> set[str]:
             if any((Path(directory) / name).is_symlink() for name in _dirs):
                 raise OSError("session activity directory contains an unverifiable alias")
             for name in files:
+                path = Path(directory) / name
+                try:
+                    if path.is_symlink() or path.stat().st_mtime < cutoff:
+                        continue  # old files are never read, so they do not count toward the limit
+                except FileNotFoundError:
+                    continue  # removed between the walk and the stat: not live
                 inspected += 1
                 if inspected > 50_000:
                     raise OSError("session activity inspection limit reached")
-                path = Path(directory) / name
-                if path.is_symlink() or path.stat().st_mtime < cutoff:
-                    continue
                 if _UUID.fullmatch(path.stem):
                     live.add(path.stem)
                 with path.open("rb") as stream:

@@ -5,6 +5,13 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: bug-hunt wave 2 (handoff checkpoint, scratch reaper, cleanup target, architecture runner)
+
+- Auto-handoff checkpoint: a refused push (non-fast-forward, protected upstream, failing hook) now records `handoff.wip_committed` with reason `push_failed` and the chain continues, instead of ending red as `git_state_unknown`.
+- Scratch reaper and `cleanup --scope tmp`: session records older than the live window no longer count toward the 50,000-file inspection limit, and a record deleted mid-scan is skipped. The limit still fails closed for recent records.
+- `cleanup --scope target` refuses when `git ls-files` fails for any reason other than "not a git repository".
+- Architecture worker output over 64 MiB is reported as a size error at once, not after the 300 s wall-clock limit.
+
 ### Fix: Slack approval of unseen text, calendar block-list alias, Rakazo first-bot cache
 
 - Slack ask: the Approve buttons are only offered when the command is shown in full; a long (truncated) command gets Deny only and a "cannot be approved from Slack" note, and an approve tap on such an ask is refused (`not_fully_shown`).

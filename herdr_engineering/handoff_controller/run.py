@@ -442,7 +442,7 @@ def _checkpoint(ctl: Controller, ref: SessionRef, chain_id: str, worktree: Path,
                 pct: float | None) -> WipResult | None:
     """Commit the worktree's tracked changes; None when the chain ended stuck instead."""
     result: WipResult = wip_commit(worktree, push_allowed=allowed)
-    if result.error:
+    if result.error and result.reason is not WipReason.PUSH_FAILED:  # a refused push left a good local commit: recorded below
         _stuck(ctl, ref, chain_id, stuck_reason(StuckReason.GIT_STATE_UNKNOWN, result.reason.value if result.reason else None,
                                                 result.error), pct)
         return None

@@ -6,6 +6,7 @@ import os
 import plistlib
 import subprocess
 import sys
+import time
 from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
@@ -1512,3 +1513,17 @@ def test_claude_config_dirs_includes_configured_dir(
     assert tmp_path / "projects" in default_live_roots()
     monkeypatch.delenv("CLAUDE_CONFIG_DIR")
     assert claude_config_dirs() == [Path.home() / ".claude"]
+
+
+def test_old_session_records_do_not_count_toward_the_inspection_limit(tmp_path: Path) -> None:
+    from herdr_engineering.scratch_reaper import _live_ids
+    root = tmp_path / "sessions"
+    root.mkdir()
+    old = time.time() - 10 * 86400
+    uuid = "12345678-1234-1234-1234-123456789abc"
+    for i in range(50_001):
+        path = root / f"old-{i}.jsonl"
+        path.write_text("")
+        os.utime(path, (old, old))
+    (root / f"{uuid}.jsonl").write_text("")
+    assert _live_ids([root], time.time() - 3600) == {uuid}

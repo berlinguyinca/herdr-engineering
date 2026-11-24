@@ -573,6 +573,8 @@ def _remove_target(path: Path, *, dry_run: bool, state_dir: Path | None) -> dict
     tracked = _git(path.parent, "ls-files", "--", "target")
     if tracked.returncode == 0 and tracked.stdout.strip():
         raise Refusal("tracked_files", f"{path} contains tracked files")
+    if tracked.returncode != 0 and not (tracked.returncode == 128 and "not a git repository" in tracked.stderr):
+        raise Refusal("git_repository", f"{path}: cannot verify it has no tracked files")  # fail closed, as _refuse_git
     if state_dir is not None and (reason := _lease_block(state_dir, path)):
         raise Refusal(reason, f"{path} is protected by the build registry")
     _not_in_use(path)

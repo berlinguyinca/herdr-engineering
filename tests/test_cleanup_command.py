@@ -391,3 +391,14 @@ def test_ignored_secret_file_blocks_worktree_removal(env: Env) -> None:
     with pytest.raises(Refusal, match="ignored_files"):
         cleanup("worktree", wt, roots=env.roots)
     assert (wt / ".env").read_text() == "SECRET=1\n"
+
+
+def test_target_scope_refuses_when_git_cannot_say_what_is_tracked(env: Env) -> None:
+    (env.repo / "Cargo.toml").write_text("[package]\n")
+    (env.repo / "target" / "debug" / ".fingerprint").mkdir(parents=True)
+    (env.repo / "target" / "tracked.txt").write_text("t")
+    git(env.repo, "add", "-f", "target/tracked.txt")
+    (env.repo / ".git" / "index").write_bytes(b"not an index")  # git ls-files now exits 128: "index file corrupt"
+    with pytest.raises(Refusal):
+        cleanup("target", env.repo / "target", roots=env.roots)
+    assert (env.repo / "target" / "tracked.txt").read_text() == "t"
