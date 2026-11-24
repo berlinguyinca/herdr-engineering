@@ -405,3 +405,92 @@ def test_order_keys_are_held_compactly_and_come_back_in_key_order():
         held.add(*k)
     assert list(held.merged()) == sorted(keys)
     assert held.nbytes <= 32 * len(keys)        # the previous tuple + event_id string per row was about 200 bytes
+
+
+def _late_row(after, event_id, text):
+    """A row that ties ``after`` on the fabric sequence (the journal's millisecond clock) and sorts after it on event_id."""
+    return {"event_type": "inspector.message", "entity_id": "s1", "sequence": after, "event_id": event_id,
+            "source_timestamp": datetime.fromtimestamp(T0 + 9_000, UTC).isoformat(),
+            "payload": {"kind": "message", "role": "user", "text": text, "_received_at": T0 + 9_000, "_sequence": 9_999}}
+
+
+def _with_real_log(tmp_path, scenario):
+    """Run ``scenario(conn)`` on a real Postgres that has the archive table, the snapshot table and both indexes."""
+    asyncpg = pytest.importorskip("asyncpg")
+    fabric, archive = tmp_path / "fabric.sql", tmp_path / "archive.sql"
+    fabric.write_text(FABRIC)
+    archive.write_text(ARCHIVE_SQL)
+    with private_postgres(fabric, archive, MIGRATIONS / "0030_inspector_snapshots.sql", INDEX_MIGRATION,
+                          ARCHIVE_INDEX_MIGRATION) as dsn:
+        if dsn is None:
+            pytest.skip("no postgres binaries")
+
+        async def go():
+            conn = await asyncpg.connect(dsn)
+            try:
+                return await scenario(conn)
+            finally:
+                await conn.close()
+
+        return asyncio.run(go())
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("strip_cursor", [False, True], ids=["cursor", "snapshot-without-cursor"])
+def test_an_incremental_tick_takes_a_row_that_ties_the_watermark_on_sequence(tmp_path, caplog, strip_cursor):
+    """The row shares the last consumed sequence and sorts later on event_id. Resuming from (watermark + 1, "") skips it
+    and only the count check notices; resuming from the consumed (sequence, event_id) pair takes it incrementally. A
+    snapshot written without the pair still loads, and falls back to the count check."""
+    rows = tied(stream(120, seed=4), width=1)
+    ingest = ingest_of(rows)
+    last = rows[-1]["sequence"]
+    late = _late_row(last, "zz-late", "arrived in the same millisecond")
+
+    async def scenario(conn):
+        await insert(conn, rows, ingest)
+        writer = snap.SnapshotWriter(make_store, interval=0, settle=-10**9)
+        assert (await writer.tick(conn)).startswith("written")
+        if strip_cursor:
+            state = snap.decode(await conn.fetchval("SELECT body FROM inspector_snapshots WHERE id = 1"))
+            state.pop("cursor")
+            await conn.execute("UPDATE inspector_snapshots SET body = $1 WHERE id = 1", snap.encode(state))
+            writer = snap.SnapshotWriter(make_store, interval=0, settle=-10**9)
+        else:
+            assert writer._cursor == (last, rows[-1]["event_id"])
+        await insert(conn, [late], ingest_of([late]))
+        first = writer._shadow
+        with caplog.at_level("WARNING"):
+            outcome = await writer.tick(conn)
+        return writer, first, outcome
+
+    writer, first, outcome = _with_real_log(tmp_path, scenario)
+    assert outcome.startswith("written"), outcome
+    reference = full_replay([*rows, late], lambda e: ingest_of(rows)(e) if e is not late else ingest_of([late])(e))
+    assert canon(writer._shadow.export_state()) == canon(reference.export_state())
+    if strip_cursor:
+        assert "missed or lost events" in caplog.text
+    else:
+        assert "missed or lost events" not in caplog.text and writer._shadow is first
+
+
+@pytest.mark.integration
+def test_an_unusable_stored_snapshot_with_archived_rows_rebuilds_once_without_a_failed_incremental_pass(tmp_path, caplog):
+    rows = stream(300, seed=9)
+    ingest = ingest_of(rows)
+
+    async def scenario(conn):
+        await insert(conn, rows, ingest)
+        await conn.execute("INSERT INTO fabric_events_archive SELECT *, now() FROM fabric_events WHERE sequence <= 150")
+        await conn.execute("DELETE FROM fabric_events WHERE sequence <= 150")
+        await conn.execute("INSERT INTO inspector_snapshots (id, schema_version, fingerprint, watermark, event_count, body)"
+                           " VALUES (1, 1, 'x', 10, 10, $1)", b"not a snapshot")
+        writer = snap.SnapshotWriter(make_store, interval=0, settle=-10**9)
+        with caplog.at_level("WARNING"):
+            outcome = await writer.tick(conn)
+        return writer, outcome
+
+    writer, outcome = _with_real_log(tmp_path, scenario)
+    assert outcome.startswith("written"), outcome
+    assert "stored inspector snapshot ignored" in caplog.text
+    assert "missed or lost events" not in caplog.text          # the unpaged live-only pass that used to run first
+    assert canon(writer._shadow.export_state()) == canon(full_replay(rows, ingest).export_state())

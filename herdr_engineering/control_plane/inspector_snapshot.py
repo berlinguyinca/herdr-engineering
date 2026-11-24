@@ -150,6 +150,14 @@ async def archived_inspector_count(conn, watermark: int) -> int:
                                    f"AND {_NOT_LIVE}", int(watermark)))
 
 
+def _cursor_of(state: dict) -> tuple[int, str] | None:
+    """The (sequence, event_id) a stored snapshot says it consumed up to; None for one written without it."""
+    cursor = state.get("cursor")
+    if isinstance(cursor, list) and len(cursor) == 2 and isinstance(cursor[0], int) and isinstance(cursor[1], str):
+        return cursor[0], cursor[1]
+    return None
+
+
 def encode(state: dict) -> bytes:
     return gzip.compress(json.dumps(state, separators=(",", ":")).encode(), compresslevel=3)
 
@@ -208,6 +216,9 @@ class SnapshotWriter:
         self._clock = clock
         self._last: float | None = None
         self._shadow: InspectorStore | None = None
+        # (sequence, event_id) of the last row the shadow consumed: the sequence is a millisecond clock, so a row can tie with
+        # the watermark on sequence and come later on event_id, and an incremental fetch must resume from the pair.
+        self._cursor: tuple[int, str] | None = None
         self.last_outcome = "not run"
 
     async def tick(self, conn) -> str:
@@ -220,15 +231,17 @@ class SnapshotWriter:
             log.info("inspector snapshot %s", self.last_outcome)
         except Exception as exc:        # never take the worker down; the boot falls back to a full replay
             log.exception("inspector snapshot failed: %s", exc)
-            self._shadow = None
+            self._shadow, self._cursor = None, None
             self.last_outcome = f"failed: {type(exc).__name__}"
         return self.last_outcome
 
     async def _advance(self, conn) -> str:
         if self._shadow is None:
             self._shadow = await self._seed(conn)
+            if self._shadow.replay_count == 0 and self._shadow.replay_watermark < 0:
+                return await self._rebuild(conn)       # nothing seeded: a live-only fetch would mismatch, then rebuild anyway
         shadow = self._shadow
-        events = await self._fetch(conn, shadow.replay_watermark)
+        events = await self._fetch(conn, shadow.replay_watermark, self._cursor)
         try:
             await asyncio.to_thread(shadow.hydrate_delta, events)
         except SnapshotStale as exc:
@@ -248,10 +261,13 @@ class SnapshotWriter:
         row = await conn.fetchrow("SELECT watermark, event_count, body FROM inspector_snapshots WHERE id = 1")
         if row is not None:
             try:
-                shadow.load_state(decode(row["body"]))
+                state = decode(row["body"])
+                shadow.load_state(state)
+                self._cursor = _cursor_of(state)
                 return shadow
             except (SnapshotStale, OSError, EOFError, ValueError, TypeError, KeyError) as exc:
                 log.warning("stored inspector snapshot ignored: %s", exc)
+        self._cursor = None
         return self._make_store()
 
     async def _rebuild(self, conn) -> str:
@@ -262,6 +278,7 @@ class SnapshotWriter:
         page's order keys do not precede what earlier pages consumed. The first page that does (``SnapshotStale``)
         abandons the streaming pass for :meth:`_replay_in_order`."""
         self._shadow = shadow = self._make_store()
+        self._cursor = None
         fetched = 0
         try:
             async for page in self._pages(conn, -1, archived=True):
@@ -270,13 +287,14 @@ class SnapshotWriter:
         except SnapshotStale as exc:
             log.warning("inspector snapshot rebuild is out of replay order across pages (%s); replaying the log in one pass", exc)
             self._shadow = shadow = self._make_store()
+            self._cursor = None
             fetched = await self._replay_in_order(conn, shadow)
         covered = await conn.fetchval(f"SELECT count(*) FROM fabric_events WHERE {_VALID} AND sequence <= $1 "
                                       "AND ingest_timestamp < now() - make_interval(secs => $2)",
                                       shadow.replay_watermark, self.settle)
         covered = int(covered) + await archived_inspector_count(conn, shadow.replay_watermark)
         if int(covered) != shadow.replay_count:
-            self._shadow = None
+            self._shadow, self._cursor = None, None
             return "rebuild did not match the stored log; nothing written"
         return await self._write(conn, shadow, fetched)
 
@@ -304,9 +322,11 @@ class SnapshotWriter:
                 tie = tie + 1 if probe["sequence"] == previous else 0
                 previous = probe["sequence"]
                 keys.add(recv, float(seq), probe["sequence"], tie)
+            if page:
+                last, last_id = int(page[-1]["sequence"]), page[-1]["event_id"]
+                self._cursor = (last, last_id)
             if len(page) < _PAGE:
                 break
-            last, last_id = int(page[-1]["sequence"]), page[-1]["event_id"]
         replayed = 0
         ordered = keys.merged()
         while wanted := [(k[2], k[3]) for k in itertools.islice(ordered, _PAGE)]:
@@ -327,30 +347,32 @@ class SnapshotWriter:
             replayed += len(batch)
         return replayed
 
-    async def _row_pages(self, conn, after: int, archived: bool = False):
-        """Raw inspector rows newer than ``after``, ``_PAGE`` rows at a time, in (fabric-sequence, event_id) order.
-        ``archived`` also reads the archive table (a full rebuild; an incremental fetch is above every archived row)."""
-        last, last_id = after + 1, ""         # (after + 1, "") sorts before every real row above ``after``
+    async def _row_pages(self, conn, after: int, archived: bool = False, cursor: tuple[int, str] | None = None):
+        """Raw inspector rows newer than ``after`` (or than the ``cursor`` pair, which also takes the rest of a sequence tie),
+        ``_PAGE`` rows at a time, in (fabric-sequence, event_id) order. ``archived`` also reads the archive table (a full
+        rebuild; an incremental fetch is above every archived row). ``self._cursor`` follows the last row yielded."""
+        last, last_id = cursor or (after + 1, "")         # (after + 1, "") sorts before every real row above ``after``
         source = await _source(conn, archived)
         while True:
             page = await conn.fetch(_page_sql(_COLUMNS, source, _SETTLED_BY_AGE), last, last_id, self.settle, _PAGE)
             if not page:
                 return
             last, last_id = int(page[-1]["sequence"]), page[-1]["event_id"]
+            self._cursor = (last, last_id)
             yield [dict(r) for r in _first_of_each(page)]
             if len(page) < _PAGE:
                 return
 
-    async def _pages(self, conn, after: int, archived: bool = False):
+    async def _pages(self, conn, after: int, archived: bool = False, cursor: tuple[int, str] | None = None):
         """Like :meth:`_row_pages`, each page folded into the shape a boot sees (via ``_rebuild_events``)."""
-        async for rows in self._row_pages(conn, after, archived):
+        async for rows in self._row_pages(conn, after, archived, cursor):
             streams, _ = _rebuild_events(rows)
             yield [e for stream in streams.values() for e in stream]
 
-    async def _fetch(self, conn, after: int) -> list[dict]:
-        """Inspector events newer than ``after`` (all pages), in the same shape a boot sees (via ``_rebuild_events``)."""
+    async def _fetch(self, conn, after: int, cursor: tuple[int, str] | None = None) -> list[dict]:
+        """Inspector events newer than ``after`` / ``cursor`` (all pages), in the same shape a boot sees (via ``_rebuild_events``)."""
         rows: list[dict] = []
-        async for page in self._row_pages(conn, after):
+        async for page in self._row_pages(conn, after, cursor=cursor):
             rows.extend(page)
         streams, _ = _rebuild_events(rows)
         return [e for stream in streams.values() for e in stream]
@@ -359,6 +381,8 @@ class SnapshotWriter:
         if fetched == 0 and await conn.fetchval("SELECT 1 FROM inspector_snapshots WHERE id = 1") == 1:
             return "unchanged"
         state = await asyncio.to_thread(shadow.export_state)
+        if self._cursor is not None:
+            state["cursor"] = list(self._cursor)       # an extra key: a snapshot without it (older code) still loads
         body = await asyncio.to_thread(encode, state)
         await conn.execute(
             "INSERT INTO inspector_snapshots (id, schema_version, fingerprint, watermark, event_count, body, created_at) "
