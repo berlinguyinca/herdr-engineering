@@ -258,6 +258,7 @@ To opt in, run:
 
 ```bash
 herdr-eng handoff auto install     # idempotent; also: uninstall | check [--dry-run] [--json]
+herdr-eng handoff auto off|on [--pane ID]   # per-pane switch for automatic handoff (default pane: $HERDR_PANE_ID)
 ```
 
 `install` appends one `UserPromptSubmit` entry (plus the `SubagentStart` and `SubagentStop` entries described in the next section), each carrying the marker `herdr-handoff-auto`
@@ -341,3 +342,260 @@ alternative, merged into `~/.claude/settings.json`:
   }
 }
 ```
+
+## Automatic handoff controller
+
+The controller watches every agent session that Herdr reports (Claude Code, Codex, Pi and OpenCode), and when a session's
+context fills up it asks the session to write a briefing, then hands the work to a fresh session of the same harness in a
+pane below it. It is on by default for every session. It is one process, `herdr-eng handoff controller run`, which looks at
+all sessions once every 5 seconds (`--interval` changes that; `--once` runs one tick and exits). It skips the pane it runs
+in and any side pane, and it only acts on an agent that Herdr names `claude`, `codex`, `pi` or `opencode`.
+
+This replaces the older per-harness automatic triggers. Those policies (the opt-in `context-hook`, and any Pi or
+OpenCode equivalents) are retired by plan 5 in the same release and must not run alongside the controller: two things
+typing a handoff order into one session would hand it off twice. Until plan 5 ships, do not run the controller on a
+host that has one of them installed.
+
+### When it acts
+
+The controller reads each session's context use from the session's own record. The limit is 80 percent of the
+context window; the hard ceiling is 12 points above it (92 percent); the drain timeout is 30 minutes and the briefing
+timeout is 5 minutes. A session with no usage yet is skipped; a session whose window is unknown is not skipped (the adapter
+falls back to a known window). Between the limit and the ceiling the controller tries a normal handoff. Above the
+ceiling the context is too full to wait for long, but a session that is busy is not given up on: the controller waits for
+it, tick by tick, up to the drain timeout (30 minutes from the trigger), and types the order as soon as the pane is ready.
+Only when that bound passes without the order typed, or when the pane was ready and typing still failed, does the
+controller take the last resort (see "Last resort").
+
+### The side pane
+
+The controller asks `herdr_engineering.side_pane` (plan 4) to create the tab's side pane when a managed session appears in a
+tab that did not have it before: the first session, a second one, or a successor that replaced a closed pane. It asks at most
+once per tab per tick and not again for an unchanged tab; the package decides whether to create one (it remembers a dismissal
+and clears it for a new session). A side pane is recognised through the package's `is_side_pane` and is never managed: no
+drain order is typed into it and no chain opens for it. If the check raises, the pane is left alone for that tick and one line
+names the exception type, because typing into a side pane viewer is the worse error. Without the package, nothing is a side pane
+and nothing is created. `herdr-eng side-pane ensure --tab` is documented with plan 4.
+
+### The steps, in order
+
+1. `handoff.triggered`: the session reached the limit.
+2. The drain order is typed into the session (next section). `handoff.drain_started` is written just before the first
+   attempt, so a restarted controller never types it twice. If the order could not be typed within 30 minutes, the chain
+   ends red (`drain_timeout`, `blocked` and so on, below); over the ceiling it takes the last resort instead.
+3. The session carries out the order: starts no new work, waits for its subagents, commits and pushes to the feature branch,
+   and writes the briefing with `herdr-handoff create`. The controller looks for the briefing once per tick, for up to
+   5 minutes after the order was typed. `handoff.drained` and `handoff.briefing_written` follow. The controller then
+   keeps looking while the session works: the fallback writer (step 4) runs only after the session has been quiet (idle,
+   no live subagents) for 5 minutes, or 30 minutes after the trigger, and never sooner than 5 minutes after the order was
+   typed. Over the ceiling the quiet time is not waited for: the fallback runs 5 minutes after the order was typed.
+4. If no briefing appeared by then, the controller writes one itself with the fallback writer (below):
+   `handoff.briefing_fallback`. If that cannot write one either, the chain ends red (`no_briefing`).
+5. A checkpoint commit of tracked changes on the feature branch (`wip: auto-handoff checkpoint`), `handoff.wip_committed`.
+   The controller never commits on main or master, and never on a detached head, and an unknown git state ends the chain red
+   rather than guessing. If the status shows tracked changes but `git add -u` stages none (a dirty submodule), nothing is
+   committed (`NOTHING_STAGEABLE`) and the takeover goes on with `--allow-dirty-source`. The last resort (below) makes no
+   checkpoint commit while the session is still working: that event has reason `session_working` and no commit.
+6. `handoff.takeover_started`: `herdr-handoff takeover` launches the same harness in a pane below the source, waits for proof
+   that it is live, asks the source session to exit, and closes the source pane. It is tried up to 3 times per chain (each call is counted in the log as a `handoff.takeover_started` with reason `attempt`, so
+   a restart or a pane that keeps going busy never raises the number); a rerun for the
+   same handoff reuses the recorded child pane and never launches a second one. Before every call to `herdr-handoff takeover` (the first,
+   each retry, and one resumed after a restart) the controller reads the session afresh: idle or done, an empty input, the
+   right agent and no live subagents. If it is not ready, no call is made and the chain keeps waiting (`handoff.waiting`) for
+   up to 5 minutes after the briefing; after that it takes the last resort.
+7. One terminal event ends the chain. `handoff.skipped` is not a step: it records why a session was left alone.
+
+### What is typed, and when nothing is
+
+The controller types into a session in three cases only: the drain order (once per chain), and, in the last resort,
+the harness's compact command and then a short pointer to the briefing file. The source harness's exit command is typed by
+`herdr-handoff takeover`, not by the controller, and only when Herdr reports an agent in the pane. The drain order is:
+
+> Context is nearly full; hand off now. 1) Start no new work. 2) Wait for your subagents to finish. 3) Commit and push to
+> the feature branch, never main. 4) Write the briefing with herdr-handoff create, target <harness>. 5) Stop.
+
+(When the controller does not know whether subagents run, step 2 says to list the background agents first.) It is submitted
+with `herdr agent prompt` (Herdr's own submission, bracketed paste), and only when Herdr reports the agent idle or done and
+the screen shows an empty input, read twice in a row. Nothing is typed when the agent is working or blocked on a dialog,
+when the input holds text (a person may be typing), when the pane runs another harness than the session's record, when the
+order would exceed the 900-byte typed-input limit, when the switch is off, when the session was already handed off, or when
+the controller has given up on the session. After a failed `herdr agent prompt` the controller never types the order
+again, except in the one case below (a doubled order is worse than a late one): it waits to see whether the agent starts
+working.
+
+Retyping: at most one retype per chain, and only after an uncertain prompt (`prompt_uncertain`, where it is unknown whether
+the order landed) and a fresh read showing a ready, empty input with the agent idle. Otherwise it waits, and a briefing that
+appears ends the wait.
+
+While an agent is still working, or has been quiet for less than the quiet period, the controller does nothing to it and
+writes a `handoff.waiting` event only when the reason or the number of live subagents changes, so the log shows why a full
+session was not drained. The reasons are `working` (the pane is busy, blocked on a dialog or has text in its input),
+`subagents` (the session has live subagents; the count is on the event) and, before the takeover, the same two from the
+ready check.
+
+### The per-session switch
+
+`herdr-eng handoff auto off` turns the controller off for one pane, and `herdr-eng handoff auto on` turns it back on
+(`--pane ID`; the default is `$HERDR_PANE_ID`). The switch is a marker file under
+`$HERDR_ENGINEERING_STATE/handoff-controller/off/` (default state root `~/.local/share/herdr-engineering/state`). Setting
+`HERDR_HANDOFF_AUTO=0` in the controller's environment turns it off for every session. A session whose switch is off gets one
+`handoff.skipped` event (`switch_off`). The controller reads the marker on every tick, so a toggle takes effect within
+5 seconds. A toggle off and on again wholly between two ticks is seen too: the marker file stays after `on` (its mtime is the
+time of the last toggle), and failures from before that time no longer count towards `gave_up`.
+
+### The event log and the colours
+
+Every step is one JSON line in `events.jsonl` in the shared handoff store (below). Each line has the event name, a UTC
+time, the chain id, the pane and session, the harness, the handoff id and the predecessor and successor ids, a colour on
+terminal events, a reason, the context percent, and (on events that name a successor) `successor_pane_id` and
+`successor_session_id`. `handoff.wip_committed` also carries the checkpoint `commit` (its `reason` is `committed`, or
+`push_not_allowed` or `push_failed` when the commit was not pushed; `nothing_stageable` and `session_working` carry no commit). The twelve events are `handoff.triggered`, `handoff.drain_started`, `handoff.drained`,
+`handoff.briefing_written`, `handoff.briefing_fallback`, `handoff.wip_committed`, `handoff.takeover_started`,
+`handoff.succeeded`, `handoff.failed_compacted`, `handoff.stuck`, `handoff.skipped` and `handoff.waiting`. A second
+`handoff.takeover_started` with reason `compacting` marks the start of the compaction fallback: a controller restarted after
+it does not try the takeover again. The last terminal event of a chain
+decides its colour:
+
+| Colour | Event | Meaning |
+|---|---|---|
+| green | `handoff.succeeded` | handed off: the successor is live and the source pane is closed |
+| orange | `handoff.failed_compacted` | the handoff could not be completed; the source session compacted and continues, pointed at the briefing; `reason` says why |
+| red | `handoff.stuck` | the controller stopped and left the session as it was; `reason` is one of the values below |
+
+`herdr-eng handoff controller status` prints whether a controller runs (it holds the lock) and the last event of every chain
+that has not ended.
+
+### Terminal outcomes and what to do
+
+The controller never closes a pane itself; only `herdr-handoff takeover` does, after the successor is proven live. On every
+red or orange outcome the source session keeps running.
+
+| `reason` of `handoff.stuck` | Meaning | What to do |
+|---|---|---|
+| `drain_timeout` | the session was never idle with an empty input for 30 minutes | finish or interrupt its work, then run `/handoff` yourself |
+| `blocked` | the session was waiting on a dialog when the 30 minutes ran out (the controller tries again every tick until then) | answer the dialog, then run `/handoff` or wait for the next chain |
+| `wrong_agent` | the pane runs another harness than the session's record | check the pane; no action is taken |
+| `drain_prompt_uncertain` | typing the order failed in a way that leaves it unknown whether it landed | look at the pane; run `/handoff` if it did not start |
+| `drain_order_too_long` | the order exceeds the typed-input limit | report it; use `/handoff` |
+| `no_record` | the session's record stayed unreadable for 30 minutes mid-chain | check that the harness still writes its session file |
+| `no_briefing` | no briefing, and the fallback writer could not write one (Codex or OpenCode, or the headless call failed) | run `/handoff` yourself |
+| `git_state_unknown` | a git command failed or timed out, so the state of the work is unknown | inspect the repository (for example a leftover `.git/index.lock`, which the controller never deletes) |
+| `record_unreadable` | `herdr-handoff inspect` could not read the record | check the record with `herdr-handoff inspect`; run `/handoff` yourself |
+| `pane_gone` | the pane of an open chain was not listed, or held another session, for 60 seconds of credited time (`pane_gone_after_s`) | look at what replaced it; start a handoff by hand if work remains. It does not count towards `gave_up` |
+| `no_longer_managed` | the pane is still listed but the switch went off, or it became a side pane, while the chain was open | none; turn the switch on to start over. It does not count towards `gave_up` |
+| `compaction_state_unknown` | a controller restarted while a compaction had begun and no end was recorded | look at the pane; the controller never types `/compact` a second time |
+| `merge_in_progress` | a merge, cherry-pick, revert or rebase is unfinished, so nothing was committed | finish or abort it. Where pushing is not allowed the controller goes on without committing (`--allow-dirty-source`); where it is allowed the chain stops |
+| `on_main_with_changes` | the session is on main, master or a detached head with uncommitted or unpushed work | move the work to a feature branch; the controller will not commit on main |
+| `launch_state_unknown` | a takeover died while placing the successor, a child may or may not exist | look for a pane below the source before doing anything; the controller will not retry |
+| `successor_without_takeover` | the record names a successor but no launched child | inspect the record with `herdr-handoff inspect`; do not launch another |
+| `source_not_closed_successor_live` | the successor is live; only closing the source failed | close the source pane yourself; the controller marks it handed off and never drains it again |
+| `no_compact_command`, `compaction_not_ready`, `compaction_not_started`, `compaction_timeout`, `pointer_too_long` | the handoff failed and compaction, the last resort, could not run either | compact or hand off by hand; the briefing is in the store |
+| `takeover_refused_and_compaction_failed` | takeover was refused three times and compaction failed | same; the `reason` text carries herdr-handoff's last refusal |
+| `internal_error:<Type>` | finishing the chain raised three times in a row | the controller has a bug; the session is untouched |
+
+`handoff.skipped` carries `switch_off`, `no_session` (the record could not be found), `no_record` (no usage yet) or
+`gave_up` (below), once per pane and reason in a row.
+
+### Retries and `gave_up`
+
+An orange or red chain may start again 30 minutes after it ended, then 60 minutes after the next one ended, and the
+third non-green end is final: `gave_up`. The controller writes one `handoff.skipped` with reason `gave_up`, only at a moment
+when it would otherwise have started a drain, and once per session. It then leaves the session alone until its session id
+changes or its switch is turned off and on. A session that would have succeeded on a fourth try is therefore left to the
+harness's own compaction. The waits count credited time (see below), so a laptop asleep for hours does not use them up.
+
+### Last resort: compaction
+
+Compaction is used only in the fallback path: over the ceiling once the 30-minute bound passed without the order typed (or
+a ready pane could not be typed), or after takeover failed 3 times without a confirmed successor, or when the 5-minute wait for a ready pane before the takeover ran out. The controller types the harness's compact command and then a pointer to the briefing file, each only
+into a ready pane (idle, empty input); it may do so with live subagents. This is the orange
+outcome. The controller makes no checkpoint commit while the session is still working (not idle or done, or with a live
+subagent): a commit then could capture half-written files and change what the session's own next commit holds. The
+worktree stays as it is, `handoff.wip_committed` has reason `session_working` and no `commit`, and the uncommitted and
+unpushed state is recorded only when the briefing is a fallback one (it was given `git status --short` and
+`git log -n 20`); a briefing the session wrote itself may not mention it. Check the worktree after the compaction. A last resort that finds the pane ready commits as usual.
+If the successor is confirmed live but the source would not close, the controller does not compact (two sessions on
+one task is worse than one stale pane): that is red `source_not_closed_successor_live`.
+
+A controller restarted after the compaction began, with no end recorded, does not type again: the chain ends red
+(`compaction_state_unknown`).
+
+The whole compaction path is bounded at 735 seconds: 60 s for the compact command to become ready, 15 s to see it start,
+600 s for it to finish, 60 s for the pointer to be accepted, plus the short delays between typed keys. Past that the chain
+ends red (`compaction_timeout` and its relatives).
+
+### Pushing
+
+The controller never pushes unless the session's repository is listed in `push_allowed_repos`, set with
+`HERDR_HANDOFF_PUSH_REPOS` (directories separated by `:`; a worktree counts when it, or the main checkout of its repository,
+is under one of them). `HERDR_HANDOFF_PUSH_DEFAULT=1` allows it for every other repository. Without it the briefing records
+the unpushed commits. Repositories whose own rules forbid pushing (herdr-engineering itself) must not be listed.
+
+### The fallback writer
+
+When the session does not write the briefing in time, the controller writes it with one headless model call to the same
+harness the session uses (the same provider; the transcript tail goes nowhere else). The call runs in a fresh empty
+directory under `<store>/fallback-work/`, with every `HERDR_*` and session-identity variable removed, and with every tool
+turned off: Claude (`--tools ""`, `--setting-sources ""`, `--safe-mode` when offered) and Pi (`--no-tools` and the other
+`--no-*` flags). Codex and OpenCode have no way to turn tools off from the command line, so they are not enabled. Codex has
+only `--sandbox read-only`, which stops writes but leaves its shell able to read any absolute path (`~/.ssh`, token files),
+and the transcript tail is untrusted text that could make it copy a secret into the stored briefing; an empty work
+directory does not stop that. For these two the fallback briefing is never written and the session compacts instead (red
+`no_briefing` when that fails). The record is created with `herdr-handoff create --fallback`,
+which stores `provenance.fallback = true`, so a briefing that the session did not write is always marked.
+
+### The one-controller lock
+
+One controller runs per host. It holds an exclusive `flock` on
+`<state root>/handoff-controller/controller.lock` for as long as it lives; the kernel drops the lock when it dies, so there
+is no stale pid. A second controller prints a message and exits 0.
+
+### Required programs and the shared store
+
+The controller needs `herdr`, `herdr-handoff` (0.5.0 or newer) and `git`, and uses `gh` when present (the fallback writer lists
+open pull requests). It resolves them to absolute paths once, at start, from `PATH` plus the directories in
+`HERDR_HANDOFF_BIN_DIRS` (`:`-separated; useful when a plugin's `PATH` is short); a missing required one is a one-line error
+and exit code 2. The same directories are used to find `claude`, `codex` and `pi`; the fallback writer runs only `claude` and `pi`.
+
+An error on the file system during a tick (for example a full disk or a permission problem on the state directory) is
+logged as one line naming the exception type only. The loop waits 5 seconds, doubling to 60 seconds, and tries again; with
+`--once` the exit code is 1.
+
+Timeouts inside the controller use the monotonic clock. Wall time is stored only to survive a restart. After a restart an
+event's age is its wall-clock age; a tick gap of more than 3 intervals in a running process (a sleeping machine) credits at
+most one interval. Any exception a tick raises is logged by its type and retried with the same back-off; a lock held by
+another controller is retried for about a second before this one gives up.
+
+All handoffs from all repositories go to one store: `$HERDR_HANDOFF_STORE`, default
+`~/.local/share/herdr-handoff/store`. Records from the old per-repo stores (`<repo>/.herdr/handoffs`) are copied in, once
+and without changing or deleting the originals, with `python3 scripts/handoff_import_legacy.py [REPO ...]` (the current
+repository by default); running it again imports nothing.
+
+### Installation
+
+The plugin manifest is `deploy/herdr-handoff-controller-plugin/herdr-plugin.toml` (a `[[startup]]` command that runs the
+controller, and a status action). Herdr 0.9.1 accepted it with `herdr plugin link` on an isolated test server. `scripts/install.sh`
+has no step for it yet: linking it is added to the installer in a later change. Until then start the controller yourself
+with `herdr-eng handoff controller run`.
+
+### Known limits
+
+* Verified only by a live run (`tests/e2e/test_handoff_controller_live.py`, not yet run): the headless flags of each harness
+  (they come from each CLI's `--help`, no real model call was made), that `herdr agent prompt` submits correctly on Codex
+  (Codex dropped an Enter sent together with text), and the names Herdr gives Codex and OpenCode agents (`codex` and
+  `opencode` are assumed; `claude` and `pi` were measured on Herdr 0.9.1). A wrong name means the controller does not manage
+  that harness at all.
+* `events.jsonl` is not rotated, and the `off/<pane>` markers of the switch accumulate. Both are small; clean them by hand
+  if they grow. A poller reads new events with `EventLog.read_since`, which also notices a replaced file.
+* An open chain whose pane is gone, or whose session changed, ends with one `handoff.stuck` reason `pane_gone`, after 60
+  seconds of credited absence.
+* Between the controller's last check and `herdr-handoff` typing the exit text (the successor split, launch and confirmation:
+  up to about 25 seconds) a session that starts a turn, or a user who starts typing, is not protected. `herdr-handoff`
+  types the exit text only when Herdr reports an agent, not when it is idle. The follow-up is a herdr-handoff 0.5.1 change.
+* The fallback writer runs inside the loop and can block every session's tick for up to 5 minutes, and so can the compaction
+  path (up to 735 seconds, see above): while one pane's chain is in either, no other pane is looked at.
+* A takeover killed after the child was launched but before it was confirmed counts as unconfirmed, so the last-resort
+  compaction can run while a slow child is still starting; the `successor_pane_id` on the orange event shows it.
+* An agent that turns `blocked` right after a failed prompt is reported as typed; the screen cannot say whether the text went in.
+* Tests that need Herdr (`herdr_server`, `herdr_live`) skip in CI, so CI does not cover those paths; the decision logic is
+  unit-tested without Herdr.

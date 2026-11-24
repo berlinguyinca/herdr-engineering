@@ -11,6 +11,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - Policy is the `handoff_reap` section of `~/.config/herdr-engineering/config.yaml`: `enabled` (default `false`), `interval_minutes` (default 15, must divide 60), `legacy_roots` (per-project `.herdr/handoffs` directories imported into the shared store first). The unit files are always installed but the timer is only started where `enabled: true`; a malformed section fails closed to disabled. No environment variables.
 - Covers the shared handoff store (`herdr-handoff` with no `--root`); `HERDR_HANDOFF_FILE`/`HERDR_HANDOFF_DIR` are removed from the job's environment so it cannot be redirected to one project's root. It never passes `--include-unrecorded` (tests pin this in the code, the units, the installer and the Ansible task).
 - Nothing is enabled by this change: each host opts in separately.
+### Fix: a dead Pi registration no longer blocks its host forever
+
+- `fleet rollout`: `_live` reported "no reachable registration" and "two live registrations claiming one conversation" with the same untyped error (`session identity missing or ambiguous`), and `retire_identityless` deliberately refuses that untyped text because it cannot tell a stale husk from a real disagreement. A session whose instance is therefore gone was un-settle-able by design: every pass repeated the refusal, every later plan re-read the same registrations and reproduced the block, and the host stayed `blocked` with no supported way past it. The two cases are now distinct -- zero reachable rows raise the typed `MissingInstanceIdentity` refusal ("has no live instance to act on", `blockReason=identity_missing`), which the operator can settle with `fleet rollout retire-identityless`, while more than one live row keeps the untyped ambiguity refusal and is still never retired. Observed on the live fleet: 80 of 143 blocked session entries across 17 rollout records carried that one error, 60 of them with no `pid` at all, and the same registrations recurred in up to 6 of 17 plans.
+
 ### Feat: `templates/ci-merge-defaults`, the "CI does the merging" defaults as a repo-agnostic template
 
 - `integrate-main.sh` (kept byte-identical to `scripts/ci/integrate-main.sh` by a test), Woodpecker `pr-gate.yml` and `main-gate.yml` snippets, and a README covering adoption plus the GitHub settings (`strict` off, required contexts, allow auto-merge, `gh pr merge --auto --squash`, `CHANGELOG.md merge=union`). Tested against real throwaway git repositories (`tests/test_ci_merge_defaults_template.py`).
@@ -177,6 +181,14 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 ### Fix: ui-gates reports on every pull request
 
 - `.woodpecker/ui-gates.yml` drops its `path:` filter for an `applicability` step (`scripts/ci/unit-gates-applicable.sh ui`), so the `ui-gates` context can be required without blocking PRs that touch no UI path. The decision reads `CI_PIPELINE_EVENT` (what Woodpecker exports) with `CI_EVENT` as fallback, and the `ui` case also covers `pyproject.toml`, `scripts/ci/journal.sh` and `scripts/ci/cache-trust.sh`, which `ui-gates.sh` depends on.
+
+### Automatic handoff controller
+
+- New `herdr_engineering/handoff_controller/` and `herdr-eng handoff controller run|status`: one process per host reads every Herdr-managed Claude, Codex, Pi and OpenCode session every 5 seconds. At 80 percent of the context window (hard ceiling 12 points higher) it types the drain order into an idle session, waits up to 5 minutes for the briefing (a headless fallback writer produces one when the session does not; marked `provenance.fallback`; not enabled for Codex or OpenCode, whose CLIs cannot turn every tool off), commits tracked changes to the feature branch, and runs `herdr-handoff takeover` to start a successor below and close the source pane. It never closes a pane itself, never commits on main or master, and never pushes unless the repository is in `HERDR_HANDOFF_PUSH_REPOS`. If a takeover fails three times it compacts the session with a pointer to the briefing (last resort).
+- Events go to `events.jsonl` in the shared store: twelve `handoff.*` events, colours green (handed off), orange (failed, compacted) and red (stuck, with a reason). Per-session switch `herdr-eng handoff auto off|on`; `HERDR_HANDOFF_AUTO=0` for all. After three non-green chains a session is left alone (`handoff.skipped`, `gave_up`). One controller per host (`flock`).
+- One shared handoff store (`HERDR_HANDOFF_STORE`, default `~/.local/share/herdr-handoff/store`); `scripts/handoff_import_legacy.py` copies the old per-repo stores into it. Requires herdr-handoff 0.5.0 (unreleased). Plugin manifest in `deploy/herdr-handoff-controller-plugin/`; `scripts/install.sh` does not link it yet.
+- The old per-harness auto-handoff policies are retired by plan 5 in the same release; they must not run alongside the controller.
+- Not yet verified by a live run (`tests/e2e/test_handoff_controller_live.py`, opt in with `HERDR_HANDOFF_LIVE_E2E=1`): the headless flags per harness and the Herdr agent names of Codex and OpenCode. See `docs/operations/handoff.md`.
 
 ### Fix: run-watched review nits from #824
 

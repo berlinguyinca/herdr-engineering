@@ -19,14 +19,58 @@ def _hold_gil(seconds):
         n += 1
 
 
+class _SteppingClock:
+    """A clock that moves by ``jump`` on every reading.
+
+    Whether the watchdog saw a pause is a computation over two clock readings, so the test supplies the clock:
+    the pause is created rather than raced against a scheduler. Asserting "no pause happened" against a real
+    monotonic clock is exactly what made this suite red on loaded CI hosts (#874) — a starved tick returns late
+    and the watchdog is right to say so.
+    """
+
+    def __init__(self, jump: float) -> None:
+        self.jump, self.readings = jump, 0
+
+    def __call__(self) -> float:
+        self.readings += 1
+        return self.readings * self.jump
+
+
+def _wait_until(fact, deadline_seconds: float = 5.0) -> bool:
+    """Wait for a fact the code records, instead of napping for a fixed wall-clock guess."""
+    deadline = time.monotonic() + deadline_seconds
+    while time.monotonic() < deadline:
+        if fact():
+            return True
+        time.sleep(0.01)
+    return False
+
+
 def test_watch_reports_a_paused_interpreter_and_names_other_threads(caplog):
+    caplog.set_level(logging.WARNING, logger=stall_watch.__name__)
+    # tick 0.02 s, and the clock says each tick took 0.7 s: the pause is asserted against bookkeeping
+    # (`watch.pauses`), not against how long a helper thread happened to be descheduled.
+    clock = _SteppingClock(jump=0.7)
+    watch = stall_watch.StallWatch(stall=0.2, tick=0.02, clock=clock)
+    watch.start()
+    try:
+        assert _wait_until(lambda: watch.pauses), "a late tick must be reported and recorded"
+    finally:
+        watch.stop()
+        watch.join(2)
+    assert any("process paused" in r.message and "MainThread" in r.message for r in caplog.records)
+    assert watch.pauses[0] >= 0.2
+
+
+def test_watch_reports_a_real_gil_hold(caplog):
+    """The clock-injected case above proves the arithmetic; this one proves the mechanism exists — a thread
+    that will not release the GIL really does stall the tick. Presence is waited for, never timed."""
     caplog.set_level(logging.WARNING, logger=stall_watch.__name__)
     watch = stall_watch.StallWatch(stall=0.2, tick=0.02)
     watch.start()
     try:
-        time.sleep(0.1)
         _hold_gil(0.6)
-        time.sleep(0.2)
+        assert _wait_until(lambda: watch.pauses), "holding the GIL longer than the stall window must register"
     finally:
         watch.stop()
         watch.join(2)
@@ -35,12 +79,18 @@ def test_watch_reports_a_paused_interpreter_and_names_other_threads(caplog):
 
 def test_watch_is_quiet_when_nothing_is_paused(caplog):
     caplog.set_level(logging.WARNING, logger=stall_watch.__name__)
-    watch = stall_watch.StallWatch(stall=0.5, tick=0.02)
+    # The clock advances exactly one tick per reading: lateness is zero by construction, so this says what it
+    # means to say — a watch that sees no lateness logs nothing — without depending on host load.
+    clock = _SteppingClock(jump=0.02)
+    watch = stall_watch.StallWatch(stall=0.5, tick=0.02, clock=clock)
     watch.start()
-    time.sleep(0.3)
-    watch.stop()
-    watch.join(2)
+    try:
+        assert _wait_until(lambda: clock.readings >= 6), "the watch really ran several ticks"
+    finally:
+        watch.stop()
+        watch.join(2)
     assert not caplog.records
+    assert watch.pauses == []
 
 
 def test_gc_timer_logs_only_long_collections(caplog):
