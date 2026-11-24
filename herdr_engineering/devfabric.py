@@ -357,7 +357,7 @@ class DevServiceRegistry:
                         return lease
             if lease_id and lease_id in self._leases:
                 lease = self._leases[lease_id]
-                self._reactivate(lease, now)
+                self._reactivate(lease, now, preferred_port)
                 # Route drift on a stable lease id: apply IN PLACE (same id,
                 # same port) so a re-enroll with changed routes takes effect
                 # on the gateway too instead of silently keeping the stale
@@ -388,7 +388,8 @@ class DevServiceRegistry:
             self._persist()
             return lease
 
-    def _reactivate(self, lease: DevServiceLease, now: str) -> None:
+    def _reactivate(self, lease: DevServiceLease, now: str,
+                    preferred_port: int | None = None) -> None:
         """Idempotent re-register of an existing lease (caller holds the lock).
 
         A lapsed lease gets a fresh TTL (otherwise the next reconcile expires it
@@ -397,7 +398,7 @@ class DevServiceRegistry:
         if (lease.state != "active"
                 and self._is_port_taken(lease.external_port, exclude_id=lease.id)):
             lease.external_port = self._allocate_port(
-                preferred=lease.target_port, exclude_id=lease.id)
+                preferred=preferred_port or lease.target_port, exclude_id=lease.id)
         lease.state = "active"
         lease.renewed_at = now
         lease.expires_at = _add_seconds(now, self._ttl)
@@ -533,13 +534,15 @@ class DevServiceRegistry:
             return [lease for lease in self._leases.values() if lease.state == "active"]
 
     def get(self, lease_id: str) -> DevServiceLease | None:
-        return self._leases.get(lease_id)
+        with self._lock:
+            return self._leases.get(lease_id)
 
     def resolve_port(self, external_port: int) -> DevServiceLease | None:
         self.reconcile()
-        for lease in self._leases.values():
-            if lease.external_port == external_port and lease.state == "active":
-                return lease
+        with self._lock:
+            for lease in self._leases.values():
+                if lease.external_port == external_port and lease.state == "active":
+                    return lease
         return None
 
 
@@ -670,12 +673,23 @@ def enable_keepalive(sock: socket.socket) -> None:
     """TCP keepalive so a peer that vanished without a FIN is reaped by the kernel."""
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        for name, value in (("TCP_KEEPIDLE", 60), ("TCP_KEEPINTVL", 15), ("TCP_KEEPCNT", 4)):
+        for name, value in (("TCP_KEEPIDLE", 15), ("TCP_KEEPINTVL", 15), ("TCP_KEEPCNT", 4)):
             opt = getattr(socket, name, None)
             if opt is not None:
                 sock.setsockopt(socket.IPPROTO_TCP, opt, value)
     except OSError:
         pass
+
+
+def _env_seconds(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
+# How long the TLS / header-rewrite path waits for the origin's response head.
+RESPONSE_HEAD_TIMEOUT = _env_seconds("HERDR_GATEWAY_RESPONSE_TIMEOUT", 300.0)
 
 
 def _poll_interval(idle: float) -> float:
@@ -708,7 +722,9 @@ def _pump(src: socket.socket, dst: socket.socket, act: _Activity, idle: float,
         while not act.stop.is_set():
             try:
                 data = src.recv(65536)
-            except TimeoutError:
+            except TimeoutError as exc:
+                if exc.errno is not None:
+                    raise  # ETIMEDOUT from TCP keepalive: the peer is gone
                 if act.expired(idle):
                     act.stop.set()
                     break
@@ -718,7 +734,9 @@ def _pump(src: socket.socket, dst: socket.socket, act: _Activity, idle: float,
             act.touch()
             _send_all(dst, data, act, idle)
     except (OSError, ValueError):
-        act.stop.set()
+        # This direction is dead; the other one keeps draining (an origin that
+        # answered early and closed must still get its response delivered).
+        pass
     finally:
         try:
             dst.shutdown(socket.SHUT_WR)
@@ -784,12 +802,13 @@ def _log_devfabric(component: str, level: str, msg: str, *args) -> None:
         pass
 
 
-def _send_http_502(client: socket.socket, reason: str = "backend unavailable") -> None:
+def _send_http_502(client: socket.socket, reason: str = "backend unavailable",
+                   status: str = "502 Bad Gateway") -> None:
     """Send a short HTTP 502 so HTTP clients fail cleanly instead of seeing a
     raw TCP reset. Best effort: non-HTTP clients just get a close."""
     body = f"{reason}\n".encode()
     head = (
-        b"HTTP/1.1 502 Bad Gateway\r\n"
+        b"HTTP/1.1 " + status.encode() + b"\r\n"
         b"Content-Type: text/plain\r\n"
         b"Connection: close\r\n"
         b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n"
@@ -920,11 +939,18 @@ def _read_head(sock: socket.socket, timeout: float | None = None) -> tuple[bytes
 
 def rewriting_pipe(client: socket.socket, target: socket.socket, port: int, external: str,
                    *, tls: bool = False, rewrite_head: bool = True, forwarded_for: str | None = None,
-                   inactivity_timeout: float = 30.0) -> None:
+                   inactivity_timeout: float = 30.0,
+                   response_timeout: float | None = None) -> None:
     """Byte-pipe that filters the headers of the origin's responses.
 
     Each exchange is forced to ``Connection: close`` so every response passes the
-    head filter. Upgrade requests (websockets) are passed through untouched."""
+    head filter. Upgrade requests (websockets) are passed through untouched.
+
+    The origin may take up to ``response_timeout`` (default ``RESPONSE_HEAD_TIMEOUT``,
+    env ``HERDR_GATEWAY_RESPONSE_TIMEOUT``) to send its response head, then the
+    client gets a 504; once streaming, ``inactivity_timeout`` applies."""
+    if response_timeout is None:
+        response_timeout = RESPONSE_HEAD_TIMEOUT
     from .urlrewrite import force_close, inject_request_headers, is_upgrade, rewrite_response_head
     for sock in (client, target):
         enable_keepalive(sock)
@@ -957,10 +983,16 @@ def rewriting_pipe(client: socket.socket, target: socket.socket, port: int, exte
         _send_all(target, req_head + rest, act, inactivity_timeout)
     except OSError:
         return
-    up = threading.Thread(target=_pump, args=(client, target, act, inactivity_timeout), daemon=True)
+    # The upload side must outlive the wait for a slow origin's response head.
+    up = threading.Thread(target=_pump, args=(client, target, act, max(inactivity_timeout, response_timeout)),
+                          daemon=True)
     up.start()
     try:
-        resp_head, body = _read_head_polled(target, act, inactivity_timeout)
+        try:
+            resp_head, body = _read_head_polled(target, act, response_timeout)
+        except TimeoutError:
+            _send_http_502(client, "origin did not answer in time", status="504 Gateway Timeout")
+            raise
         if rewrite_head and resp_head.endswith(b"\r\n\r\n"):
             resp_head = rewrite_response_head(resp_head[:-4], port, external,
                                               "https" if tls else None) + b"\r\n\r\n"

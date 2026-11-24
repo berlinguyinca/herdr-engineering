@@ -8,8 +8,10 @@ import pytest
 
 from herdr_engineering.devfabric import (
     DevServiceRegistry,
+    _Activity,
     _add_seconds,
     _now_iso,
+    _pump,
     prefixed_pipe,
     proxy_pair,
     rewriting_pipe,
@@ -223,8 +225,45 @@ def test_rewriting_pipe_returns_when_origin_goes_silent_after_the_request():
     t_proxy, t_backend = socket.socketpair()
     c_user.sendall(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
     started = time.monotonic()
-    rewriting_pipe(c_proxy, t_proxy, 80, "dev.test:80", inactivity_timeout=0.5)
+    rewriting_pipe(c_proxy, t_proxy, 80, "dev.test:80", inactivity_timeout=0.5, response_timeout=0.5)
     assert time.monotonic() - started < 5
+    c_user.close()
+    t_backend.close()
+
+
+def test_rewriting_pipe_waits_past_the_inactivity_timeout_for_a_slow_origin_head():
+    """A slow origin (first byte after > inactivity_timeout) is still served."""
+    c_user, c_proxy = socket.socketpair()
+    t_proxy, t_backend = socket.socketpair()
+    c_user.sendall(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+
+    def origin() -> None:
+        t_backend.recv(65536)
+        time.sleep(1.2)
+        t_backend.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+        t_backend.shutdown(socket.SHUT_WR)
+
+    threading.Thread(target=origin, daemon=True).start()
+    pt = threading.Thread(target=rewriting_pipe, args=(c_proxy, t_proxy, 80, "dev.test:80"),
+                          kwargs={"inactivity_timeout": 0.4, "response_timeout": 5.0}, daemon=True)
+    pt.start()
+    c_user.settimeout(10)
+    got = b""
+    while chunk := c_user.recv(4096):
+        got += chunk
+    pt.join(10)
+    assert got.startswith(b"HTTP/1.1 200") and got.endswith(b"ok")
+    c_user.close()
+    t_backend.close()
+
+
+def test_rewriting_pipe_answers_504_when_origin_never_sends_a_head():
+    c_user, c_proxy = socket.socketpair()
+    t_proxy, t_backend = socket.socketpair()
+    c_user.sendall(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+    rewriting_pipe(c_proxy, t_proxy, 80, "dev.test:80", inactivity_timeout=0.5, response_timeout=0.5)
+    c_user.settimeout(5)
+    assert c_user.recv(4096).startswith(b"HTTP/1.1 504")
     c_user.close()
     t_backend.close()
 
@@ -267,3 +306,102 @@ def test_gateway_enables_tcp_keepalive_on_accepted_clients(tmp_path):
         assert s.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE) == 1
     finally:
         s.close()
+
+
+# -- review: an early origin answer must not truncate on a failed upload ------------------------
+
+def test_rewriting_pipe_delivers_the_whole_early_response_when_the_upload_is_cut():
+    c_user, c_proxy = socket.socketpair()
+    t_proxy, t_backend = socket.socketpair()
+    for s in (c_user, c_proxy, t_proxy, t_backend):
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+    body = b"r" * 150000
+    c_user.sendall(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 10000000\r\n\r\n")
+
+    def uploader() -> None:
+        try:
+            while True:
+                c_user.sendall(b"u" * 8192)
+        except OSError:
+            pass
+
+    def origin() -> None:
+        t_backend.recv(65536)
+        t_backend.sendall(b"HTTP/1.1 413 Too Large\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
+        t_backend.close()  # origin answers early, then closes: further upload sends fail
+
+    threading.Thread(target=uploader, daemon=True).start()
+    threading.Thread(target=origin, daemon=True).start()
+    pt = threading.Thread(target=rewriting_pipe, args=(c_proxy, t_proxy, 80, "dev.test:80"),
+                          kwargs={"inactivity_timeout": 3.0}, daemon=True)
+    pt.start()
+    got = b""
+    c_user.settimeout(10)
+    time.sleep(0.5)  # the client reads late: the response pump is blocked mid-body when the upload send fails
+    while True:
+        try:
+            d = c_user.recv(65536)
+        except OSError:
+            break
+        if not d:
+            break
+        got += d
+        if len(got.split(b"\r\n\r\n", 1)[-1]) >= len(body):
+            break
+    pt.join(10)
+    assert len(got.split(b"\r\n\r\n", 1)[-1]) == len(body)
+    c_user.close()
+
+
+def test_pump_send_failure_does_not_stop_the_opposite_direction():
+    a, b = socket.socketpair()
+    dead_dst, dead_peer = socket.socketpair()
+    dead_peer.close()
+    act = _Activity()
+    a.settimeout(0.1)
+    b.sendall(b"x")
+    _pump(a, dead_dst, act, 5.0)
+    assert not act.stop.is_set()
+    a.close()
+    b.close()
+    dead_dst.close()
+
+
+# -- review: local (gateway-less) callers re-register a lease that lapsed onto a taken port ---
+
+def test_local_heartbeat_reregisters_lease_whose_port_was_reallocated(tmp_path):
+    from herdr_engineering.cli import heartbeat_local_leases
+    reg = _reg(tmp_path)
+    a = reg.register(target_machine_id="x", target_host="127.0.0.1", target_port=9001, preferred_port=26500)
+    reg.close(a.id)
+    b = reg.register(target_machine_id="y", target_host="127.0.0.1", target_port=9002, preferred_port=26500)
+    heartbeat_local_leases(reg, {"k": {"lease_id": a.id}})
+    again = reg.get(a.id)
+    assert again.state == "active"
+    assert again.external_port != b.external_port
+    assert {lease.id for lease in reg.active_leases()} == {a.id, b.id}
+
+
+# -- review: resolve_port/get hold the registry lock --------------------------------------------
+
+def test_registry_get_and_resolve_port_hold_the_lock(tmp_path):
+    reg = _reg(tmp_path)
+    lease = reg.register(target_machine_id="x", target_host="127.0.0.1", target_port=9001)
+    results = []
+    with reg._lock:
+        t = threading.Thread(target=lambda: results.append(reg.get(lease.id)), daemon=True)
+        t.start()
+        t.join(0.3)
+        blocked = t.is_alive()
+    t.join(5)
+    assert blocked and results == [lease]
+
+
+def test_reregister_lapsed_lease_honours_preferred_port_when_its_port_was_taken(tmp_path):
+    reg = _reg(tmp_path)
+    a = reg.register(target_machine_id="x", target_host="127.0.0.1", target_port=9001, preferred_port=26500)
+    reg.close(a.id)
+    reg.register(target_machine_id="y", target_host="127.0.0.1", target_port=9002, preferred_port=26500)
+    again = reg.register(target_machine_id="x", target_host="127.0.0.1", target_port=9001,
+                         lease_id=a.id, preferred_port=26777)
+    assert again.external_port == 26777

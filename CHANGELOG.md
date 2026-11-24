@@ -11,6 +11,9 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - `rewriting_pipe` (TLS / header-rewrite path) is bounded: the request head must arrive within the inactivity timeout, both sockets get TCP keepalive (also on accepted clients in `_proxy_one`), and the pumps end on whole-connection idleness.
 - `proxy_pair` / `prefixed_pipe` use one shared inactivity clock for both directions and no longer half-close the peer on a recv timeout, so healthy one-way streams (SSE, downloads) are not cut at 30 s / 70 s.
 - `DevServiceRegistry.heartbeat` refuses to revive an expired lease whose external port was re-allocated (the agent re-registers); idempotent `register` refreshes `expires_at`, moves a lapsed lease off a taken port, and runs under the registry lock.
+- A failed send on one pump direction no longer stops the opposite direction, so an origin that answers early and closes still has its response delivered; ETIMEDOUT from TCP keepalive is no longer mistaken for a poll timeout, and TCP keepalive idle is 15 s (was 60 s, longer than the idle timeout).
+- `rewriting_pipe` waits up to `HERDR_GATEWAY_RESPONSE_TIMEOUT` seconds (default 300) for the origin's response head and answers 504 on expiry; local (gateway-less) lease renewal re-registers a lease whose port was re-allocated.
+
 ### Fix: Slack approval of unseen text, calendar block-list alias, Rakazo first-bot cache
 
 - Slack ask: the Approve buttons are only offered when the command is shown in full; a long (truncated) command gets Deny only and a "cannot be approved from Slack" note, and an approve tap on such an ask is refused (`not_fully_shown`).

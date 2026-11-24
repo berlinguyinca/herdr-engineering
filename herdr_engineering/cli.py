@@ -2892,6 +2892,20 @@ def _spec_from_manifest(m: dict) -> dict:
     }
 
 
+def _renew_local(reg, lease_id: str):
+    """Heartbeat a local lease; if its port went to another lease while it
+    lapsed (heartbeat returns None) re-register it onto a fresh port. A lease
+    missing from the registry stays None (the next sync re-enrolls it)."""
+    renewed = reg.heartbeat(lease_id)
+    if renewed is None:
+        old = reg.get(lease_id)
+        if old is not None:
+            renewed = reg.register(
+                target_machine_id=old.target_machine_id, target_host=old.target_host,
+                target_port=old.target_port, lease_id=lease_id)
+    return renewed
+
+
 def heartbeat_local_leases(reg, state: dict) -> None:
     """Renew every locally-held lease (the --serve renewal loop, #89).
 
@@ -2907,7 +2921,7 @@ def heartbeat_local_leases(reg, state: dict) -> None:
         lid = st["lease_id"]
         lease = reg.get(lid)
         lapsed = lease is not None and _parse_time(lease.expires_at) < now
-        renewed = reg.heartbeat(lid)
+        renewed = _renew_local(reg, lid)
         if renewed is None:
             logging.getLogger("herdr.cli").warning(
                 "lease %s missing from the registry while the forwarder "
@@ -2995,7 +3009,7 @@ def _enroll_origin(spec: dict, client, reg, bind: str = "127.0.0.1"):
     elif existing is not None:
         lease = reg.update_routes(stable_id, routes)
         if lease.state != "active":
-            lease = reg.heartbeat(stable_id) or lease
+            lease = _renew_local(reg, stable_id) or lease
         changed = True
     else:
         lease = reg.register(
@@ -3327,7 +3341,7 @@ def _cmd_dev_enroll(args) -> int:
         # fabric member (visible in `devfabric list`, kept by a central gateway).
         if time.monotonic() >= next_hb:
             try:
-                reg.heartbeat(lease.id)
+                _renew_local(reg, lease.id)
             except Exception:
                 pass
             next_hb = time.monotonic() + 30
