@@ -287,3 +287,20 @@ def test_the_default_space_is_the_accounts_own_tenant():
     assert sp.space_tenant("default", sp.DEFAULT_SPACE_ID) == "default"
     assert sp.space_tenant("team-a", "spc0123") == "team-a~spc0123"
     assert sp.space_tenant("a", "spc1") != sp.space_tenant("a~spc1", "spc1")[:3]
+
+
+def test_the_first_bot_lookup_is_per_space_not_per_user(srv, alice):
+    """Two non-default spaces share the owner key (the phone's principal); a bot id cached for one must not leak to the other."""
+    server, api = srv
+    bridge = server.rakazo
+    space_a = ok(api, "spaces/create", {"name": "A"}, alice)["id"]
+    space_b = ok(api, "spaces/create", {"name": "B"}, alice)["id"]
+    bot_a = bot_in(api, alice, space_a, "Bot A")
+    bot_b = bot_in(api, alice, space_b, "Bot B")
+    account = bridge._by_id[next(iter(bridge._by_id))]
+    base = server.rakazo.svc.tenant_for(account.principal_id)
+    root = bridge._ctx(account, base, "", False, base=base)
+    ctx_a, ctx_b = bridge._in_space(root, space_a), bridge._in_space(root, space_b)
+    assert ctx_a.user == ctx_b.user and ctx_a.tenant != ctx_b.tenant
+    assert bridge._first_bot(ctx_a) == bot_a["id"]
+    assert bridge._first_bot(ctx_b) == bot_b["id"]
