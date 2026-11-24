@@ -1360,6 +1360,7 @@ class MemberService:
         token = secrets.token_urlsafe(32)
         share_id = "shr_" + secrets.token_hex(12)
         expires = now_dt(self.now) + timedelta(days=days)
+        checked = await self._precheck_create(member, artifact_id, version_id, entry_arg, agent)
         async with self.pool.acquire() as conn, conn.transaction():
             usage = await self._lock_usage(conn, member)
             if usage["sharing_disabled"]:
@@ -1383,7 +1384,8 @@ class MemberService:
                 entry = choose_entry(entry_arg, sorted(f["name"] for f in files))
             except ShareBundleError:
                 raise _bad("entry is not in the version") from None
-            await self._require_labelable(files)
+            if ver["manifest"] != checked:  # only the version can have moved since the check above
+                raise MemberError(409, "version_changed", "the version changed, retry")
             recent = await conn.fetchval(
                 "SELECT count(*) FROM shares WHERE created_by=$1 AND created_at > $2",
                 member,
@@ -1440,38 +1442,89 @@ class MemberService:
             "expires_at": iso(expires),
         }
 
-    async def _require_labelable(self, files: list[dict[str, Any]]) -> None:
-        """A member link labels every HTML page it serves ("shared by ... not reviewed") and fails closed with the uniform
-        404 when it cannot. Refuse such a version here, with the reason, rather than hand out a link that never opens."""
+    async def _precheck_create(
+        self, member: str, artifact_id: str, version_id: str, entry_arg: str | None, agent: bool
+    ) -> str | None:
+        """Before the locking transaction (blob reads and HTML parsing must not hold row locks while the pool is shared
+        with public serving): the label check of the entry page of the member's own ready version.  Returns the manifest
+        text it checked, or None when there is nothing to check (the transaction then gives the uniform error)."""
+        row = await self.pool.fetchrow(
+            "SELECT v.output_manifest::text AS manifest FROM artifact_versions v JOIN artifacts a "
+            "ON a.artifact_id=v.artifact_id WHERE v.version_id=$1 AND v.artifact_id=$2 AND v.state='ready' "
+            "AND a.owner=$3 AND a.intake='accepted' AND a.lifecycle='active'"
+            + (" AND a.created_via='agent'" if agent else ""),
+            version_id,
+            artifact_id,
+            member,
+        )
+        if row is None:
+            return None
+        files = json.loads(row["manifest"])
+        try:
+            entry = choose_entry(entry_arg, sorted(f["name"] for f in files))
+        except ShareBundleError:
+            return None
+        await self._require_labelable(files, entry)
+        return row["manifest"]
+
+    async def _precheck_approve(
+        self, member: str, artifact_id: str, share_id: str, agent: bool
+    ) -> str | None:
+        """The same check for a pending share, before its locking transaction; returns the manifest text checked."""
+        row = await self.pool.fetchrow(
+            "SELECT s.entry, s.state, v.output_manifest::text AS manifest FROM shares s JOIN artifacts a "
+            "ON a.artifact_id=s.artifact_id JOIN artifact_versions v ON v.version_id=s.version_id "
+            "WHERE s.share_id=$1 AND s.artifact_id=$2 AND a.owner=$3 "
+            "AND a.lifecycle NOT IN ('retracted','tombstoned')"
+            + (" AND s.created_via='agent' AND a.created_via='agent'" if agent else ""),
+            share_id,
+            artifact_id,
+            member,
+        )
+        if row is None or row["state"] != "pending":
+            return None
+        await self._require_labelable(json.loads(row["manifest"] or "[]"), row["entry"])
+        return row["manifest"]
+
+    async def _require_labelable(self, files: list[dict[str, Any]], entry: str) -> None:
+        """A member link labels every HTML page it serves ("shared by ... not reviewed") and the serve path fails closed
+        with the uniform 404 for a page it cannot label.  Refuse a share whose ENTRY page is such a page, with the reason,
+        rather than hand out a link that never opens; other pages of the version are checked (and 404) when served."""
+        item = next((f for f in files if f["name"] == entry), None)
+        if item is None:
+            return
+        ctype = content_type_for(entry)
+        if ctype.split(";")[0].strip() != "text/html":
+            return
+        if int(item["size_bytes"]) > MODE_SWITCH_MAX_BYTES:
+            raise MemberError(
+                400,
+                "html_too_large",
+                f"{entry} is over {MODE_SWITCH_MAX_BYTES} bytes, the most a member link can label",
+            )
         bar = shared_by_bar("a lab member")
-        for item in files:
-            name = item["name"]
-            ctype = content_type_for(name)
-            if ctype.split(";")[0].strip() != "text/html":
-                continue
-            if int(item["size_bytes"]) > MODE_SWITCH_MAX_BYTES:
-                raise MemberError(
-                    400,
-                    "html_too_large",
-                    f"{name} is over {MODE_SWITCH_MAX_BYTES} bytes, the most a member link can label",
-                )
 
-            def read(sha: str = item["sha256"]) -> bytes:
-                with self.blobs.open(sha) as handle:
-                    return handle.read()
+        def label() -> bool:
+            with self.blobs.open(item["sha256"]) as handle:
+                return labelled_html(handle.read(), ctype, bar) is not None
 
-            try:
-                data = await asyncio.to_thread(read)
-            except (BlobCorrupt, BlobMissing, OSError):
-                raise _not_found() from None
-            if labelled_html(data, ctype, bar) is None:
-                raise MemberError(
-                    400,
-                    "unsupported_html",
-                    f"{name} cannot carry the 'shared by' label (unsupported encoding such as UTF-16, or "
-                    "ambiguous markup: CDATA, <?...>, odd comments, an unclosed template/textarea/svg/script "
-                    "before <body>); save it as plain UTF-8 HTML",
-                )
+        try:
+            labelled = await asyncio.to_thread(label)
+        except (BlobCorrupt, BlobMissing):
+            raise _not_found() from None
+        except OSError:
+            log.exception("share label check: blob %s unreadable", item["sha256"])
+            raise MemberError(
+                503, "storage_unavailable", "storage is unavailable, retry shortly"
+            ) from None
+        if not labelled:
+            raise MemberError(
+                400,
+                "unsupported_html",
+                f"{entry} cannot carry the 'shared by' label (unsupported encoding such as UTF-16, or "
+                "ambiguous markup: CDATA, <?...>, odd comments, an unclosed template/textarea/svg/script "
+                "before <body>); save it as plain UTF-8 HTML",
+            )
 
     @staticmethod
     def _allow_list(value: object, pattern: re.Pattern[str], *, lower: bool = False) -> list[str]:
@@ -1535,6 +1588,7 @@ class MemberService:
         ):
             raise _bad("idempotency_key is invalid")
         self._throttle_write(member)
+        checked = await self._precheck_approve(member, artifact_id, share_id, self._agent(actor))
         async with self.pool.acquire() as conn, conn.transaction():
             usage = await self._lock_usage(conn, member)
             if usage["sharing_disabled"]:  # revoke and the event log stay open
@@ -1565,7 +1619,8 @@ class MemberService:
                 "ON v.version_id=s.version_id WHERE s.share_id=$1",
                 share_id,
             )
-            await self._require_labelable(json.loads(manifest or "[]"))
+            if manifest != checked:  # only the version can have moved since the check above
+                raise MemberError(409, "version_changed", "the version changed, retry")
             # an agent's link has no token yet: it is made here and shown to the owner once (only its digest is kept)
             token = secrets.token_urlsafe(32) if row["created_via"] == "agent" else None
             await conn.execute(
@@ -2418,6 +2473,7 @@ def build_member_settings(
         ),
     }
     assets = {url: (path.read_bytes(), ctype) for url, (path, ctype) in files.items()}
+
     # Exact files, never 'self': the same origin serves member-uploaded bundles (/s/<token>/f/x.js), which a bare
     # 'self' would let an HTML-injection bug load as a script and drive this API.
     def page_csp(origin: str) -> str:

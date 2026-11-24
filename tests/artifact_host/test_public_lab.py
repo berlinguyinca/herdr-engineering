@@ -7,6 +7,7 @@ import time
 
 import pytest
 
+from herdr_artifact_host.share_http import SESSION_GLOBAL_PER_MINUTE, SESSION_PER_CLIENT_PER_MINUTE
 from herdr_artifact_host.share_session import check_session
 from tests.artifact_host.seed import (
     FILES,
@@ -93,6 +94,34 @@ def test_a_link_holder_cannot_lock_other_viewers_out_of_sign_in(host: Host) -> N
     assert ok.status == 200
     # the attacker's own address stays throttled, even with good tokens
     assert sign_in(host, s, extra={"X-Forwarded-For": "203.0.113.9"}).status == 404
+
+
+def test_ipv6_clients_are_limited_by_their_64(host: Host) -> None:
+    """Rotating through the addresses of one /64 must not mint a fresh budget per address."""
+    s = lab(host)
+    for i in range(SESSION_PER_CLIENT_PER_MINUTE + 2):
+        junk = {"Content-Length": "0", "X-Forwarded-For": f"2001:db8:1:1::{i + 1:x}"}
+        assert host.request("POST", f"/s/{s.token}/session", junk).status == 404
+    same_64 = sign_in(host, s, extra={"X-Forwarded-For": "2001:db8:1:1::ffff"})
+    assert same_64.status == 404
+    assert sign_in(host, s, extra={"X-Forwarded-For": "2001:db8:2::1"}).status == 200
+
+
+def test_one_client_with_valid_tokens_cannot_use_up_the_share_budget(host: Host) -> None:
+    """The per-client budget is smaller than the per-share one, so one holder of valid tokens cannot lock out the rest."""
+    s = lab(host)
+    mine = {"X-Forwarded-For": "203.0.113.9"}
+    assert 404 in {sign_in(host, s, extra=mine).status for _ in range(40)}
+    assert sign_in(host, s, extra={"X-Forwarded-For": "198.51.100.7"}).status == 200
+
+
+def test_unverified_attempts_have_a_global_cap_too(host: Host) -> None:
+    """Addresses are cheap to rotate: before any token check the total is bounded as well (it bounds the JWT work)."""
+    s = lab(host)
+    for i in range(SESSION_GLOBAL_PER_MINUTE):
+        junk = {"Content-Length": "0", "X-Forwarded-For": f"198.51.{i // 250}.{i % 250 + 1}"}
+        assert host.request("POST", f"/s/{s.token}/session", junk).status == 404
+    assert sign_in(host, s, extra={"X-Forwarded-For": "192.0.2.77"}).status == 404
 
 
 def test_group_allow_list(host: Host) -> None:

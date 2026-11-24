@@ -39,6 +39,7 @@ from .fleet_config import (
     _parse,
     load_fleet_config,
 )
+from .cognito_values import cognito_problem
 from .https_origin import https_origin, origin_hostname
 
 DEFAULT_CONFIG_PATH = Path("~/.config/herdr-engineering/fleet/fleet-config.yaml")
@@ -628,6 +629,14 @@ def _check_member_host(
         )
 
 
+_COGNITO_COLLAB_KEY = {
+    "pool_id": "cognito_pool",
+    "client_ids": "cognito_clients",
+    "web_client_id": "cognito_web_client",
+    "domain": "cognito_domain",
+}
+
+
 def artifact_host_slices(cfg: FleetConfig) -> dict[str, dict] | None:
     """The host's per-role configuration slices (herdr_artifact_host.host_config schema), or None when it is disabled.
 
@@ -742,6 +751,18 @@ def artifact_host_slices(cfg: FleetConfig) -> dict[str, dict] | None:
             + ", ".join(missing)
         )
     del clients
+    if problem := cognito_problem(
+        {
+            "pool_id": cognito["pool_id"],
+            "client_ids": cognito["client_ids"],
+            "web_client_id": cognito["web_client_id"],
+            "domain": cognito["domain"],
+        }
+    ):
+        raise FleetConfigError(
+            f"control_plane.collab.{_COGNITO_COLLAB_KEY[problem[0]]} {problem[1]} "
+            "(control_plane.artifact_host: the host refuses to start on it)"
+        )
     library = cfg.section(CONTROL_PLANE_SECTION).get("artifact_library")
     key = library.get("host_key") if isinstance(library, dict) else None
     if not isinstance(key, str) or not key:

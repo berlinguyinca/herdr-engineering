@@ -2,10 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
+import os
 import re
+import threading
 import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any
 
+import asyncpg
 import pytest
 
 from herdr_artifact_host import member_session as ms
@@ -73,7 +82,10 @@ def test_member_host_serves_the_page_and_config_from_its_own_origin(migrated_dsn
         assert page.status == 200 and b"My artifacts" in page.body
         csp = page.header("Content-Security-Policy") or ""
         assert f"script-src {MEMBER_ORIGIN}/my/static/member.js" in csp
-        assert f"connect-src {MEMBER_ORIGIN}/api/member/" in csp and "https://share.example/" not in csp
+        assert (
+            f"connect-src {MEMBER_ORIGIN}/api/member/" in csp
+            and "https://share.example/" not in csp
+        )
         assert page.header("Cross-Origin-Opener-Policy") == "same-origin"
         assert h.get("/my/callback?code=x&state=y", _on(MEMBER_HOST)).status == 200
         cfg = h.get("/api/member/config", _on(MEMBER_HOST))
@@ -83,7 +95,9 @@ def test_member_host_serves_the_page_and_config_from_its_own_origin(migrated_dsn
         assert h.get("/my/static/member.js", _on(MEMBER_HOST + ":443")).status == 200
 
 
-def test_the_old_host_is_unchanged_while_a_member_host_is_configured(migrated_dsn, tmp_path) -> None:
+def test_the_old_host_is_unchanged_while_a_member_host_is_configured(
+    migrated_dsn, tmp_path
+) -> None:
     from tests.artifact_host.seed import running_host
 
     with running_host(migrated_dsn, tmp_path, OWN) as h:
@@ -100,10 +114,18 @@ def test_the_member_host_never_serves_shares_or_the_agent_endpoint(migrated_dsn,
     from tests.artifact_host.seed import running_host
 
     with running_host(migrated_dsn, tmp_path, OWN) as h:
-        for path in ("/s/" + "a" * 43 + "/", "/s/static/x.js", "/s/callback", "/mcp/artifacts", "/nope"):
+        for path in (
+            "/s/" + "a" * 43 + "/",
+            "/s/static/x.js",
+            "/s/callback",
+            "/mcp/artifacts",
+            "/nope",
+        ):
             r = h.get(path, _on(MEMBER_HOST))
             assert r.status == 404, path
-        assert h.get("/", _on("elsewhere.example")).status == 404  # an unknown host still reaches nothing
+        assert (
+            h.get("/", _on("elsewhere.example")).status == 404
+        )  # an unknown host still reaches nothing
 
 
 def test_each_host_accepts_only_its_own_origin_on_writes(migrated_dsn, tmp_path) -> None:
@@ -113,7 +135,9 @@ def test_each_host_accepts_only_its_own_origin_on_writes(migrated_dsn, tmp_path)
         mine = {"Origin": MEMBER_ORIGIN, "Host": MEMBER_HOST}
         wrong = {"Origin": "https://share.example", "Host": MEMBER_HOST}
         assert h.request("POST", "/api/member/session", wrong, b"").status == 403
-        assert h.request("POST", "/api/member/session", mine, b"").status == 401  # past the origin gate: no credentials
+        assert (
+            h.request("POST", "/api/member/session", mine, b"").status == 401
+        )  # past the origin gate: no credentials
         old = {"Origin": MEMBER_ORIGIN, "Host": "share.example"}
         assert h.request("POST", "/api/member/session", old, b"").status == 403
 
@@ -136,7 +160,9 @@ def test_a_member_session_works_on_the_member_host(migrated_dsn, tmp_path) -> No
         )
         assert r.status == 200 and r.header("Cross-Origin-Opener-Policy") == "same-origin"
         session = r.json()["session"]
-        me = h.request("GET", "/api/member/me", {"Host": MEMBER_HOST, "Authorization": f"Member {session}"})
+        me = h.request(
+            "GET", "/api/member/me", {"Host": MEMBER_HOST, "Authorization": f"Member {session}"}
+        )
         assert me.status == 200 and me.header("Set-Cookie") is None  # host-only: no cookie at all
 
 
@@ -167,7 +193,9 @@ def test_x_forwarded_host_never_moves_the_member_origin(migrated_dsn, tmp_path) 
         assert r.json()["redirect_uri"] == f"{MEMBER_ORIGIN}/my/callback"
 
 
-def test_a_member_host_equal_to_the_public_or_an_mcp_host_is_refused_at_start_up(migrated_dsn, tmp_path) -> None:
+def test_a_member_host_equal_to_the_public_or_an_mcp_host_is_refused_at_start_up(
+    migrated_dsn, tmp_path
+) -> None:
 
     from tests.artifact_host.seed import running_host
 
@@ -590,6 +618,11 @@ UNLABELABLE_PAGES = {
     "xml_prolog": b'<html><body><?xml version="1.0"?><svg></svg></body></html>',
     "script_comment": b"<html><head><script>var a='<!-- x -->'</script></head><body>hi</body></html>",
 }
+UNLABELABLE_CODE = {
+    "too_large": "html_too_large",
+    "xml_prolog": "unsupported_html",
+    "script_comment": "unsupported_html",
+}
 
 
 @pytest.mark.parametrize("kind", sorted(UNLABELABLE_PAGES))
@@ -599,7 +632,7 @@ def test_a_share_the_label_gate_would_404_is_refused_up_front(host: Host, kind: 
     aid, vid = published(host, s, {"index.html": UNLABELABLE_PAGES[kind]})
     r = make_share(host, s, aid, vid)
     assert r.status == 400, r.body
-    assert r.json()["error"] in ("html_too_large", "unsupported_html")
+    assert r.json()["error"] == UNLABELABLE_CODE[kind]
     assert host.rows("SELECT 1 FROM shares WHERE artifact_id=$1", aid) == []
 
 
@@ -617,6 +650,120 @@ def test_approve_refuses_a_pending_share_whose_page_cannot_be_labelled(host: Hos
     assert ap.status == 400 and ap.json()["error"] == "unsupported_html", ap.body
     [row] = host.rows("SELECT state FROM shares WHERE share_id=$1", share["share_id"])
     assert row["state"] == "pending"
+
+
+def test_only_the_entry_page_gates_a_share(host: Host) -> None:
+    """A page nothing links to that cannot be labelled 404s on its own at serve time; it must not block the share."""
+    s = sign_in(host)
+    ok = b"<html><body>hi</body></html>"
+    aid, vid = published(host, s, {"index.html": ok, "other.html": UNLABELABLE_PAGES["xml_prolog"]})
+    made = make_share(host, s, aid, vid)
+    assert made.status == 200, made.body
+    made = made.json()
+    ap = call(
+        host, s, "POST", f"/artifacts/{aid}/shares/{made['share_id']}/approve", {"confirm": True}
+    )
+    assert ap.status == 200, ap.body
+    assert host.get(f"/s/{made['token']}/f/index.html").status == 200
+    assert host.get(f"/s/{made['token']}/f/other.html").status == 404
+
+
+def blob_file(host: Host, data: bytes) -> Path:
+    digest = sha(data)
+    return host.blob_root / "sha256" / digest[:2] / digest[2:4] / digest
+
+
+@contextmanager
+def row_locked(host: Host, sql: str, *args: object) -> Iterator[None]:
+    """Hold ``SELECT ... FOR UPDATE`` on the rows ``sql`` selects, on its own connection, until the block ends."""
+    held, release = threading.Event(), threading.Event()
+
+    def hold() -> None:
+        async def go() -> None:
+            conn = await asyncpg.connect(host.dsn)
+            try:
+                async with conn.transaction():
+                    await conn.fetch(sql + " FOR UPDATE", *args)
+                    held.set()
+                    while not release.is_set():
+                        await asyncio.sleep(0.02)
+            finally:
+                await conn.close()
+
+        asyncio.run(go())
+
+    worker = threading.Thread(target=hold)
+    worker.start()
+    assert held.wait(15)
+    try:
+        yield
+    finally:
+        release.set()
+        worker.join(15)
+
+
+def answered_while_locked(request: Callable[[], Any]) -> Any:
+    """The response of ``request``, which must come back within seconds although a row it would lock is held."""
+    out: list[Any] = []
+    worker = threading.Thread(target=lambda: out.append(request()))
+    worker.start()
+    worker.join(8)
+    assert out, (
+        "the request waited for the row lock: it checks the page inside the locking transaction"
+    )
+    return out[0]
+
+
+def test_share_create_refuses_an_unlabelable_page_without_taking_the_row_locks(host: Host) -> None:
+    """The pool is shared with public serving: reading and parsing blobs must not happen inside the locking transaction."""
+    s = sign_in(host)
+    aid, vid = published(host, s, {"index.html": UNLABELABLE_PAGES["xml_prolog"]})
+    [usage] = host.rows("SELECT member_id FROM member_usage")
+    with row_locked(host, "SELECT 1 FROM member_usage WHERE member_id=$1", usage["member_id"]):
+        r = answered_while_locked(lambda: make_share(host, s, aid, vid))
+    assert r.status == 400 and r.json()["error"] == "unsupported_html", r.body
+
+
+def test_share_approve_refuses_an_unlabelable_page_without_taking_the_row_locks(
+    host: Host,
+) -> None:
+    s = sign_in(host)
+    aid, vid = published(host, s)
+    share = make_share(host, s, aid, vid).json()
+    v2 = publish_files(
+        host, s, aid, {"index.html": UNLABELABLE_PAGES["xml_prolog"]}, base=vid
+    ).json()["version_id"]
+    host.execute("UPDATE shares SET version_id=$2 WHERE share_id=$1", share["share_id"], v2)
+    with row_locked(host, "SELECT 1 FROM shares WHERE share_id=$1", share["share_id"]):
+        r = answered_while_locked(
+            lambda: call(
+                host,
+                s,
+                "POST",
+                f"/artifacts/{aid}/shares/{share['share_id']}/approve",
+                {"confirm": True},
+            )
+        )
+    assert r.status == 400 and r.json()["error"] == "unsupported_html", r.body
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads any file")
+def test_an_unreadable_blob_is_a_logged_5xx_not_a_404(
+    host: Host, caplog: pytest.LogCaptureFixture
+) -> None:
+    s = sign_in(host)
+    page = b"<html><body>unreadable</body></html>"
+    aid, vid = published(host, s, {"index.html": page})
+    path = blob_file(host, page)
+    path.chmod(0)
+    try:
+        with caplog.at_level(logging.ERROR, logger="herdr_artifact_host.member"):
+            r = make_share(host, s, aid, vid)
+    finally:
+        path.chmod(0o600)
+    assert r.status == 503, r.body
+    assert host.rows("SELECT 1 FROM shares WHERE artifact_id=$1", aid) == []
+    assert any("blob" in rec.getMessage() for rec in caplog.records)
 
 
 def test_ordinary_html_with_scripts_still_shares_and_serves(host: Host) -> None:

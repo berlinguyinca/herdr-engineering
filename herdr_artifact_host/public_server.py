@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import html
+import ipaddress
 import json
 import logging
 import os
@@ -96,7 +97,9 @@ from .share_http import (
     PDFJS_CONFIG,
     PREFLIGHT_HEADERS,
     RAW_PATH_OK,
+    SESSION_ATTEMPTS_GLOBAL_PER_MINUTE,
     SESSION_GLOBAL_PER_MINUTE,
+    SESSION_PER_CLIENT_PER_MINUTE,
     SESSION_PER_SHARE_PER_MINUTE,
     SHARED_BY_ETAG_SUFFIX,
     STATIC_FILES,
@@ -473,8 +476,11 @@ class PublicSurface:
         self.session_per_share = RateLimiter(SESSION_PER_SHARE_PER_MINUTE, now)
         self.session_global = RateLimiter(SESSION_GLOBAL_PER_MINUTE, now, max_keys=1)
         # Charged before any token check, so it is keyed by CLIENT: the per-share and global budgets above are charged
-        # only by exchanges that succeed, else a holder of a share link could burn them and lock every viewer out.
-        self.session_per_client = RateLimiter(SESSION_PER_SHARE_PER_MINUTE, now)
+        # only by exchanges that succeed, else a holder of a share link could burn them and lock every viewer out. The
+        # client budget is smaller than the per-share one, so one client with valid tokens cannot use the share up; the
+        # all-clients cap bounds the work an attacker rotating addresses can cause.
+        self.session_per_client = RateLimiter(SESSION_PER_CLIENT_PER_MINUTE, now)
+        self.session_attempts = RateLimiter(SESSION_ATTEMPTS_GLOBAL_PER_MINUTE, now, max_keys=1)
         limits = config.annotations
         self.annotations_enabled = bool(self.lab is not None and limits["enabled"])
         self.annotate_user = RateLimiter(int(limits["per_user_per_minute"]), now)
@@ -937,17 +943,33 @@ class PublicSurface:
             cors=False,
         )
 
+    @staticmethod
+    def _limiter_client(request: web.Request) -> str:
+        """The client key for the pre-verification limiter: the address, but an IPv6 client by its /64 (one subscriber
+        holds a whole /64 and can rotate through it for free)."""
+        client = MemberSurface._client(request)
+        try:
+            address = ipaddress.ip_address(client)
+        except ValueError:
+            return client
+        if isinstance(address, ipaddress.IPv6Address):
+            return str(ipaddress.ip_network(f"{address}/64", strict=False))
+        return client
+
     def session_open(self, request: web.Request, share_id: str) -> bool:
-        """Whether a session exchange may be tried: this client's own budget is charged, the share's and the global
-        budgets are only consulted (they are charged by ``session_charge`` once the tokens verified)."""
-        return (
-            self.session_per_client.allow(MemberSurface._client(request))
-            and not self.session_per_share.blocked(share_id)
-            and not self.session_global.blocked("*")
-        )
+        """Whether a session exchange may be tried: the share's and the global budgets are only consulted (they are
+        charged by ``session_charge`` once the tokens verified), then this client's and the all-clients attempt budgets
+        are charged."""
+        if self.session_per_share.blocked(share_id) or self.session_global.blocked("*"):
+            return False
+        return self.session_per_client.allow(
+            self._limiter_client(request)
+        ) and self.session_attempts.allow("*")
 
     def session_charge(self, share_id: str) -> bool:
-        """Charge the per-share and global budgets for one verified exchange."""
+        """Charge the per-share and global budgets for one verified exchange; neither is charged if the other refuses."""
+        if self.session_per_share.blocked(share_id) or self.session_global.blocked("*"):
+            return False
         return self.session_per_share.allow(share_id) and self.session_global.allow("*")
 
     async def claim_session(
