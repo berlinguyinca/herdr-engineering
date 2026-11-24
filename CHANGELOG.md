@@ -12,6 +12,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - The fabric image base (`python:3.12-slim`), `postgres:16-alpine`, `coredns:1.11.4` and the memory-client base are pinned by digest, and the runtime image installs under `deploy/fabric-stack/constraints.txt` exported from `uv.lock`. A test keeps the file equal to `uv export --locked` (so a pin bumped only in `pyproject.toml`, without `uv lock`, fails CI); `uv==0.13.7` is in a new test-only `ci-tools` extra (installed by `scripts/ci/unit-gates.sh`, not by `install.sh`; the test skips outside CI when uv is absent). Versions are unchanged. `minio/minio` stays pinned by exact tag only (its digest cannot be resolved from Docker Hub).
 - Operator-visible: the digest-form image strings differ from the old tags, so the first full `docker compose up -d` (`scripts/fabric-stack.sh up`) recreates `postgres` and `coredns` once, and `postgres` may come up on a newer 16.x patch release than the one it ran before.
 
+### Fix: web packages bug-hunt (collaboration sign-in/out, room polling, composer, member routes, nav badge)
+
+- Collaboration: blocked site storage (`window.sessionStorage` throwing) no longer stops `collab-view.js`, and so the whole dashboard, from loading; it falls back to memory. Sign out now also ends the Cognito Hosted-UI session (`/logout?client_id=...&logout_uri=...`, `logout_uri` defaulting to `public_url`, which the user pool must list as an allowed sign-out URL). Every `CollabApi` call now times out after 30 s, so a half-open connection no longer freezes a room silently; `showRoom` removes its `focusout` listener on teardown instead of adding one per visit.
+- Composer: a message delivered after the composer was disposed mid-send no longer survives as the stored draft.
+- Dashboard: mission titles are refreshed after 60 s and a failed load is no longer cached as an empty map (`mission-titles.js`). The nav badge announces "N open, M critical" instead of "true critical".
+- Member page: a slow library load no longer repaints over a newer route.
 ### Fix: required `unit-gates` no longer skips PRs that touch untested-by-list paths; Rust module gates fail in CI without cargo
 
 - `scripts/ci/unit-gates-applicable.sh unit` is now default-run with a short exempt list instead of an allow-list, so `herdr_artifact_host/`, `ansible/`, `skills/`, `scripts/*.sh`, `package.json`, `package-lock.json` and any new top-level path run the suite (they previously passed the required check with no tests; `main-moved-check.sh` shared the gap). A test checks every tracked file against the matcher.

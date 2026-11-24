@@ -313,3 +313,22 @@ test('a malformed address in the hash shows a not-found view without an error', 
     assert.deepEqual(errors, []);
   });
 });
+
+test('a slow library load does not repaint over a newer route', async () => {
+  await withApp({}, async ({ page, srv, errors }) => {
+    await signIn(page, srv);
+    let release;
+    const gate = new Promise((r) => { release = r; });
+    await page.route('**/api/member/library**', async (route) => { await gate; await route.continue(); });
+    const base = page.url().replace(/#.*$/, '');
+    await page.evaluate(() => { location.hash = '#/'; });          // starts route() for the library; its request is held
+    await page.evaluate(() => { location.hash = '#/new'; });       // the member opens the New form before it returns
+    await page.locator('[data-new-form] input[name="title"]').fill('half typed');
+    release();
+    await page.waitForTimeout(800);
+    assert.equal(page.url(), `${base}#/new`);
+    assert.equal(await page.locator('[data-new-form] input[name="title"]').inputValue(), 'half typed');
+    assert.equal(await page.locator('[data-feed-row], [data-chips-region]').count(), 0);
+    assert.deepEqual(errors, []);
+  });
+});
