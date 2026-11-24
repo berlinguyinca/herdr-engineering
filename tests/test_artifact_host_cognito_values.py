@@ -39,6 +39,7 @@ BAD = [
     ("cognito_web_client", "bad client!", "web_client_id"),
     ("cognito_clients", ["ok", "bad id!"], "client_ids"),
     ("cognito_clients", ["ok", 7], "client_ids"),
+    ("cognito_group", 2026, "group"),
 ]
 
 

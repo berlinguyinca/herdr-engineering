@@ -7,7 +7,11 @@ import time
 
 import pytest
 
-from herdr_artifact_host.share_http import SESSION_GLOBAL_PER_MINUTE, SESSION_PER_CLIENT_PER_MINUTE
+from herdr_artifact_host.share_http import (
+    SESSION_ATTEMPTS_GLOBAL_PER_MINUTE,
+    SESSION_FAILED_PER_SHARE_PER_MINUTE,
+    SESSION_PER_CLIENT_PER_MINUTE,
+)
 from herdr_artifact_host.share_session import check_session
 from tests.artifact_host.seed import (
     FILES,
@@ -107,21 +111,59 @@ def test_ipv6_clients_are_limited_by_their_64(host: Host) -> None:
     assert sign_in(host, s, extra={"X-Forwarded-For": "2001:db8:2::1"}).status == 200
 
 
-def test_one_client_with_valid_tokens_cannot_use_up_the_share_budget(host: Host) -> None:
-    """The per-client budget is smaller than the per-share one, so one holder of valid tokens cannot lock out the rest."""
-    s = lab(host)
-    mine = {"X-Forwarded-For": "203.0.113.9"}
-    assert 404 in {sign_in(host, s, extra=mine).status for _ in range(40)}
-    assert sign_in(host, s, extra={"X-Forwarded-For": "198.51.100.7"}).status == 200
+def test_one_user_with_valid_tokens_cannot_use_up_the_share_budget(host: Host) -> None:
+    """The per-user budget is smaller than the per-share one, so one signed-in user cannot lock out the rest."""
+    s = lab(host, emails=("alice@lab.example", "bob@lab.example"))
+    assert 404 in {sign_in(host, s).status for _ in range(40)}
+    bob = sign_in(host, s, access("bob"), ident("bob", email="bob@lab.example", nonce="n-0"))
+    assert bob.status == 200
 
 
 def test_unverified_attempts_have_a_global_cap_too(host: Host) -> None:
-    """Addresses are cheap to rotate: before any token check the total is bounded as well (it bounds the JWT work)."""
+    """Addresses are cheap to rotate: past the shape checks the total is bounded as well (it bounds the JWT work)."""
+    per_share = SESSION_FAILED_PER_SHARE_PER_MINUTE - 5
+    shares = [lab(host) for _ in range(SESSION_ATTEMPTS_GLOBAL_PER_MINUTE // per_share + 2)]
+    for i in range(SESSION_ATTEMPTS_GLOBAL_PER_MINUTE):
+        xff = {"X-Forwarded-For": f"198.51.{i // 250}.{i % 250 + 1}"}
+        assert sign_in(host, shares[i // per_share], acc="junk", extra=xff).status == 404
+    assert sign_in(host, shares[-1], extra={"X-Forwarded-For": "192.0.2.77"}).status == 404
+
+
+def test_ipv4_mapped_clients_are_limited_by_their_own_address(host: Host) -> None:
+    """``::ffff:a.b.c.d`` is an IPv4 client: one of them must not share a /64 budget with every other."""
     s = lab(host)
-    for i in range(SESSION_GLOBAL_PER_MINUTE):
-        junk = {"Content-Length": "0", "X-Forwarded-For": f"198.51.{i // 250}.{i % 250 + 1}"}
+    for _ in range(SESSION_PER_CLIENT_PER_MINUTE + 2):
+        junk = {"Content-Length": "0", "X-Forwarded-For": "::ffff:203.0.113.9"}
         assert host.request("POST", f"/s/{s.token}/session", junk).status == 404
-    assert sign_in(host, s, extra={"X-Forwarded-For": "192.0.2.77"}).status == 404
+    assert sign_in(host, s, extra={"X-Forwarded-For": "::ffff:203.0.113.9"}).status == 404
+    assert sign_in(host, s, extra={"X-Forwarded-For": "::ffff:198.51.100.7"}).status == 200
+
+
+def test_one_shares_abuse_does_not_shut_the_others_out(host: Host) -> None:
+    """Header-less POSTs from many /64s exhaust that share's failure budget only, not the all-clients cap."""
+    a, b = lab(host), lab(host)
+    junk = {"Content-Length": "0"}
+    for n in range(40):
+        for _ in range(SESSION_PER_CLIENT_PER_MINUTE):
+            xff = {**junk, "X-Forwarded-For": f"2001:db8:{n + 1:x}::1"}
+            assert host.request("POST", f"/s/{a.token}/session", xff).status == 404
+    assert sign_in(host, a, extra={"X-Forwarded-For": "198.51.100.7"}).status == 404
+    assert sign_in(host, b, extra={"X-Forwarded-For": "198.51.100.8"}).status == 200
+
+
+def test_successful_sign_ins_behind_one_address_are_not_throttled(host: Host) -> None:
+    """Twenty people behind one NAT opening links within a minute: only failures are charged to the address."""
+    s = lab(host, emails=(), groups=("Readers",))
+    nat = {"X-Forwarded-For": "203.0.113.50"}
+    codes = []
+    for i in range(2 * SESSION_PER_CLIENT_PER_MINUTE):
+        user = f"user{i}"
+        acc, idt = (
+            access(user, groups=("Readers",)),
+            ident(user, email=f"{user}@lab.example", nonce="n-0"),
+        )
+        codes.append(sign_in(host, s, acc, idt, extra=nat).status)
+    assert set(codes) == {200}
 
 
 def test_group_allow_list(host: Host) -> None:

@@ -1510,7 +1510,8 @@ class MemberService:
 
         try:
             labelled = await asyncio.to_thread(label)
-        except (BlobCorrupt, BlobMissing):
+        except (BlobCorrupt, BlobMissing) as err:
+            log.warning("share label check: blob %s is %s", item["sha256"], type(err).__name__)
             raise _not_found() from None
         except OSError:
             log.exception("share label check: blob %s unreadable", item["sha256"])

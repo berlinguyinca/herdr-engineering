@@ -98,9 +98,11 @@ from .share_http import (
     PREFLIGHT_HEADERS,
     RAW_PATH_OK,
     SESSION_ATTEMPTS_GLOBAL_PER_MINUTE,
+    SESSION_FAILED_PER_SHARE_PER_MINUTE,
     SESSION_GLOBAL_PER_MINUTE,
     SESSION_PER_CLIENT_PER_MINUTE,
     SESSION_PER_SHARE_PER_MINUTE,
+    SESSION_PER_USER_PER_MINUTE,
     SHARED_BY_ETAG_SUFFIX,
     STATIC_FILES,
     STATIC_MAX_BYTES,
@@ -475,12 +477,17 @@ class PublicSurface:
         )  # None: the sandbox CSP keeps 'self' only
         self.session_per_share = RateLimiter(SESSION_PER_SHARE_PER_MINUTE, now)
         self.session_global = RateLimiter(SESSION_GLOBAL_PER_MINUTE, now, max_keys=1)
-        # Charged before any token check, so it is keyed by CLIENT: the per-share and global budgets above are charged
-        # only by exchanges that succeed, else a holder of a share link could burn them and lock every viewer out. The
-        # client budget is smaller than the per-share one, so one client with valid tokens cannot use the share up; the
-        # all-clients cap bounds the work an attacker rotating addresses can cause.
+        # The per-share and global budgets above are charged only by exchanges that verified, else a holder of a share
+        # link could burn them and lock every viewer out. This client budget is charged by FAILED attempts only (as
+        # for member sign-in), so people behind one address are not throttled by each other; the all-clients cap is
+        # charged once the headers pass their shape check, and bounds the JWT work an address-rotating attacker causes.
         self.session_per_client = RateLimiter(SESSION_PER_CLIENT_PER_MINUTE, now)
         self.session_attempts = RateLimiter(SESSION_ATTEMPTS_GLOBAL_PER_MINUTE, now, max_keys=1)
+        # Failed attempts per share, charged before the shared caps can be reached: one link's abuse is stopped at
+        # that link (and the 404 stays uniform) instead of exhausting the all-clients cap for every share.
+        self.session_failed_per_share = RateLimiter(SESSION_FAILED_PER_SHARE_PER_MINUTE, now)
+        # Verified exchanges per (share, user): below the per-share budget, so one signed-in user cannot use it up.
+        self.session_per_user = RateLimiter(SESSION_PER_USER_PER_MINUTE, now)
         limits = config.annotations
         self.annotations_enabled = bool(self.lab is not None and limits["enabled"])
         self.annotate_user = RateLimiter(int(limits["per_user_per_minute"]), now)
@@ -953,24 +960,47 @@ class PublicSurface:
         except ValueError:
             return client
         if isinstance(address, ipaddress.IPv6Address):
+            if address.ipv4_mapped is not None:
+                return str(address.ipv4_mapped)
             return str(ipaddress.ip_network(f"{address}/64", strict=False))
         return client
 
     def session_open(self, request: web.Request, share_id: str) -> bool:
-        """Whether a session exchange may be tried: the share's and the global budgets are only consulted (they are
-        charged by ``session_charge`` once the tokens verified), then this client's and the all-clients attempt budgets
-        are charged."""
-        if self.session_per_share.blocked(share_id) or self.session_global.blocked("*"):
-            return False
-        return self.session_per_client.allow(
-            self._limiter_client(request)
-        ) and self.session_attempts.allow("*")
+        """Whether a session exchange may be tried. Only consults the budgets: failures are charged by
+        ``session_failed``, the JWT work by ``session_work`` and a verified exchange by ``session_charge``, so a
+        successful sign-in never uses up the client's or the share's failure budget."""
+        return not (
+            self.session_per_share.blocked(share_id)
+            or self.session_global.blocked("*")
+            or self.session_failed_per_share.blocked(share_id)
+            or self.session_per_client.blocked(self._limiter_client(request))
+            or self.session_attempts.blocked("*")
+        )
 
-    def session_charge(self, share_id: str) -> bool:
-        """Charge the per-share and global budgets for one verified exchange; neither is charged if the other refuses."""
-        if self.session_per_share.blocked(share_id) or self.session_global.blocked("*"):
+    def session_failed(self, request: web.Request, share_id: str) -> None:
+        """Charge one failed attempt to the sender and to the share."""
+        self.session_per_client.allow(self._limiter_client(request))
+        self.session_failed_per_share.allow(share_id)
+
+    def session_work(self) -> bool:
+        """Charge the all-clients cap, once the headers and nonce passed their shape checks (the JWT work follows)."""
+        return self.session_attempts.allow("*")
+
+    def session_charge(self, share_id: str, user: str) -> bool:
+        """Charge the user's, the per-share and the global budgets for one verified exchange; none is charged if
+        another refuses."""
+        key = f"{share_id}\0{user}"
+        if (
+            self.session_per_user.blocked(key)
+            or self.session_per_share.blocked(share_id)
+            or self.session_global.blocked("*")
+        ):
             return False
-        return self.session_per_share.allow(share_id) and self.session_global.allow("*")
+        return (
+            self.session_per_user.allow(key)
+            and self.session_per_share.allow(share_id)
+            and self.session_global.allow("*")
+        )
 
     async def claim_session(
         self, request: web.Request, state: ShareState, token: str
@@ -987,13 +1017,17 @@ class PublicSurface:
             return await self.deny("rate_limited", share_id)
         tokens = await self.verify_tokens(request, lab)
         if tokens is None:
+            self.session_failed(request, share_id)
             return await self.deny("bad_headers", share_id)
         access_token, id_token = tokens
         nonce = _single(request, "X-Nonce")
         if not nonce or len(nonce) > 256 or not nonce.isascii():
+            self.session_failed(request, share_id)
             return await self.deny(
                 "bad_nonce", share_id
             )  # the page's own sign-in attempt, as for member sessions
+        if not self.session_work():
+            return await self.deny("rate_limited", share_id)
 
         def verify() -> tuple[str | None, float | None, str | None]:
             try:
@@ -1020,10 +1054,11 @@ class PublicSurface:
             or not isinstance(email, str)
             or not email
         ):
+            self.session_failed(request, share_id)
             return await self.deny(
                 "bad_access_token" if not isinstance(user, str) else "bad_id_token", share_id
             )
-        if not self.session_charge(share_id):
+        if not self.session_charge(share_id, user):
             return await self.deny("rate_limited", share_id, user)
         now = self.now()
         until = min(now + lab.session_seconds, exp)
@@ -1055,17 +1090,22 @@ class PublicSurface:
             return await self.deny("rate_limited", share_id)
         tokens = await self.verify_tokens(request, lab)
         if tokens is None:
+            self.session_failed(request, share_id)
             return await self.deny("bad_headers", share_id)
         nonce = _single(request, "X-Nonce")
         if not nonce or len(nonce) > 256 or not nonce.isascii():
+            self.session_failed(request, share_id)
             return await self.deny("bad_nonce", share_id)  # the page's own sign-in attempt
+        if not self.session_work():
+            return await self.deny("rate_limited", share_id)
         grant, reason, identity = await asyncio.to_thread(
             authorise, state, tokens[0], tokens[1], lab.authenticator, nonce
         )
         if grant is None:
+            self.session_failed(request, share_id)
             return await self.deny(reason, share_id, identity or "public")
-        if not self.session_charge(share_id):
-            return await self.deny("rate_limited", share_id, identity or "public")
+        if not self.session_charge(share_id, grant["identity"]):
+            return await self.deny("rate_limited", share_id, grant["identity"])
         now = self.now()
         exp = min(now + lab.session_seconds, grant["exp"])
         if state["expires"] is not None:

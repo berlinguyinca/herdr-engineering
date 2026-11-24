@@ -31,6 +31,7 @@ from typing import Any
 
 import yaml
 
+from .cognito_values import cognito_problem
 from .fleet_config import (
     CONTROL_PLANE_SECTION,
     SCHEMA_VERSION,
@@ -39,7 +40,6 @@ from .fleet_config import (
     _parse,
     load_fleet_config,
 )
-from .cognito_values import cognito_problem
 from .https_origin import https_origin, origin_hostname
 
 DEFAULT_CONFIG_PATH = Path("~/.config/herdr-engineering/fleet/fleet-config.yaml")
@@ -634,6 +634,7 @@ _COGNITO_COLLAB_KEY = {
     "client_ids": "cognito_clients",
     "web_client_id": "cognito_web_client",
     "domain": "cognito_domain",
+    "group": "cognito_group",
 }
 
 
@@ -757,6 +758,7 @@ def artifact_host_slices(cfg: FleetConfig) -> dict[str, dict] | None:
             "client_ids": cognito["client_ids"],
             "web_client_id": cognito["web_client_id"],
             "domain": cognito["domain"],
+            "group": cognito["group"],
         }
     ):
         raise FleetConfigError(

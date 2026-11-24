@@ -19,7 +19,7 @@ POOL_ID = re.compile(r"[a-z]{2}-[a-z]+-\d_[A-Za-z0-9]+")
 
 def cognito_problem(cognito: Mapping[str, object]) -> tuple[str, str] | None:
     """``(key, rule)`` for the first value of ``cognito`` (keys ``pool_id``, ``web_client_id``, ``domain``,
-    ``client_ids``) that has the wrong shape, else None.  Presence is checked by the caller."""
+    ``client_ids``, and ``group`` when given) that has the wrong shape, else None.  Presence is checked by the caller."""
     if https_origin(cognito.get("domain")) is None:
         return "domain", "must be a bare https origin (https://host)"
     pool = cognito.get("pool_id")
@@ -33,4 +33,6 @@ def cognito_problem(cognito: Mapping[str, object]) -> tuple[str, str] | None:
         isinstance(c, str) and CLIENT_ID.fullmatch(c) for c in clients
     ):
         return "client_ids", "must each match [A-Za-z0-9_-]{1,128}"
+    if "group" in cognito and (not isinstance(cognito["group"], str) or not cognito["group"]):
+        return "group", "must be a non-empty string"
     return None

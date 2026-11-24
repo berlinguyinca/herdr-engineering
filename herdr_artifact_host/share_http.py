@@ -32,9 +32,15 @@ SESSION_PER_SHARE_PER_MINUTE = 30  # session attempts per share per minute (blun
 SESSION_GLOBAL_PER_MINUTE = (
     600  # verified session attempts across all lab shares per minute (bounds JWT work)
 )
-SESSION_PER_CLIENT_PER_MINUTE = 15  # session attempts per client per minute, before any token check (below the per-share budget)
-SESSION_ATTEMPTS_GLOBAL_PER_MINUTE = (
-    600  # session attempts per minute from all clients before any token check (bounds JWT work)
+SESSION_PER_CLIENT_PER_MINUTE = (
+    15  # FAILED session attempts per client per minute (checked before any token check)
+)
+SESSION_PER_USER_PER_MINUTE = (
+    10  # verified exchanges per (share, user) per minute (below the per-share budget)
+)
+SESSION_ATTEMPTS_GLOBAL_PER_MINUTE = 600  # session attempts per minute from all clients that passed the header shape check (bounds JWT work)
+SESSION_FAILED_PER_SHARE_PER_MINUTE = (
+    60  # failed session attempts per share per minute, all clients (checked first)
 )
 STATIC_MAX_BYTES = 1024 * 1024
 VENDOR_MAX_BYTES = 4 * 1024 * 1024  # the vendored pdf.js worker is ~1.4 MB
