@@ -1,8 +1,9 @@
 """One rule for the shape of the Cognito identifiers, shared by the deploy-time config check and the artifact host.
 
-Dependency free on purpose: ``herdr_engineering.fleet_config_cli`` runs on the deploy host and the host refuses to start
+Dependency free on purpose: the fleet config check runs on the deploy host and the host refuses to start
 on a value this rejects, so the two must agree exactly.  This file exists as two byte-identical copies
-(``herdr_artifact_host`` and ``herdr_engineering``; the host image ships only the former) and a test keeps them in step.
+(one in the artifact host package, one in the engineering package; the host image ships only the former, and the
+host's import-boundary test forbids naming the other package here) and a test keeps them in step.
 The shapes are the runtime's own (public_server's client id, cognito's pool id): a value they reject would silently turn
 the lab shares, the member surface and housekeeping off while the host reports healthy."""
 
