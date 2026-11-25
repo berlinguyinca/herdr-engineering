@@ -213,7 +213,10 @@ pinned). Pins are published so drift is judged against them. Enforced
 today: herdr-eng and the build-gate extension at
 `fleet_update_herdr_engineering_revision` (when set);
 pi-engineering only when a revision is passed. The herdr/pi/autospec pins are
-**report-only**: the existing install tasks only check presence, and the base
+**report-only**: the "Verify Herdr" and "Verify Pi" tasks in `herdr_linux` and
+`herdr_macos` only check the binary and print a `DRIFT:` line when herdr is
+missing or another version, or pi is missing; they never fail a host or stop
+the fleet update (nothing in the role installs either). The base
 role clones pi-engineering and autospec at `main` (pre-existing). herdr-eng is
 not updated by default (`fleet_update_herdr_engineering_revision` is empty).
 

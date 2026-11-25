@@ -112,22 +112,27 @@ ensure_local_dir() {   # the gateway bind-mounts it; if docker made it, it is ro
     mkdir -p "$d" || { echo "cannot create $d" >&2; exit 1; }
 }
 
+preflight() {
+    # compose.yaml requires variables only deploy.sh renders (HERDR_CP_IMAGE_TAG, GATEWAY_BIND ...). Without them
+    # every compose call fails at interpolation, so find out BEFORE anything is stopped or rebuilt.
+    local err
+    err="$("${COMPOSE[@]}" config -q 2>&1)" || {
+        echo "$err" >&2
+        echo "compose cannot render deploy/control-plane/compose.yaml with this env file: it needs the variables deploy.sh" >&2
+        echo "renders, so bring the stack up and recreate gateway services with deploy/control-plane/deploy.sh." >&2
+        exit 1
+    }
+}
+
 up() {
+    # Only this script's own services, never --remove-orphans: collab-public, collab-edge, share-public, fabric-whois
+    # and the Hindsight containers live in overlay files / profiles that deploy.sh manages, and would be removed.
     ensure_local_dir
     # The compose file bind-mounts the token directory read-only into fabric-gateway and herdr-web; docker would
     # create a missing source root-owned 0755, and nothing would fix it afterwards.
     check_fabric_token_dir || exit 1
-    write_env
-    gen_coredns
     "${COMPOSE[@]}" build fabric-gateway
-    # The optional Hindsight memory containers belong to compose profile `memory`, managed by deploy.sh --with-memory.
-    # While they exist, never ask compose to remove "orphans": this script's env file carries no memory variables.
-    local orphans=(--remove-orphans)
-    if docker inspect herdr-hindsight >/dev/null 2>&1 || docker inspect herdr-hindsight-db >/dev/null 2>&1; then
-        orphans=()
-        warn "Hindsight memory containers present: not using --remove-orphans (managed by deploy.sh --with-memory)"
-    fi
-    "${COMPOSE[@]}" up -d ${orphans[@]+"${orphans[@]}"}
+    "${COMPOSE[@]}" up -d coredns fabric-gateway herdr-web
     "${COMPOSE[@]}" ps
 }
 
@@ -175,7 +180,10 @@ memory_route() {
 }
 
 status() {
-    "${COMPOSE[@]}" ps 2>/dev/null || { echo "stack not running"; exit 0; }
+    # The exit status follows the gateway healthz and DNS checks. A compose problem is printed (it often only
+    # means this script's .env cannot render the file) but is not by itself a failure of the running stack.
+    local rc=0 answer
+    "${COMPOSE[@]}" ps || echo "docker compose could not list the stack (see the error above); judge it by the checks below" >&2
     say "hindsight memory (optional profile):"
     memory_status
     say "gateway healthz:"
@@ -183,28 +191,35 @@ status() {
     if [ -r "$tokfile" ] && [ -s "$tokfile" ]; then   # the full payload needs the bearer; without it only the minimal reply
         auth=(-H "Authorization: Bearer $(tr -d '[:space:]' <"$tokfile")")
     fi
-    curl -fsS "${auth[@]}" "http://127.0.0.1:29999/healthz" || echo "(unreachable)"
+    curl -fsS "${auth[@]}" "http://127.0.0.1:29999/healthz" || { echo "(unreachable)"; rc=1; }
     echo
     say "coredns dev.lan resolution (local):"
     if command -v dig >/dev/null; then
-        dig +short @127.0.0.1 dev.lan A
+        answer="$(dig +short @127.0.0.1 dev.lan A)"
+        if [ -n "$answer" ]; then echo "$answer"; else echo "(no answer)"; rc=1; fi
     else
-        getent hosts dev.lan || echo "(no getent result)"
+        getent hosts dev.lan || { echo "(no getent result)"; rc=1; }
     fi
+    return "$rc"
 }
+
 
 down() { "${COMPOSE[@]}" stop coredns fabric-gateway herdr-web; }  # not the control plane
 
 cmd="${1:-up}"
 case "$cmd" in
     up)
+        ensure_local_dir; check_fabric_token_dir || exit 1; write_env; gen_coredns; preflight
         up
         ;;
     up-replace)
+        ensure_local_dir; check_fabric_token_dir || exit 1; write_env; gen_coredns; preflight   # before anything is stopped: a failure here leaves the old services up
+        "${COMPOSE[@]}" build fabric-gateway   # build first: a failed build leaves the old services running
         stop_old_host_services   # must free ports 8787/29999/18000+ first
         up
         ;;
     down)
+        preflight
         down
         ;;
     status)
