@@ -29,8 +29,16 @@ LOG_PER_MINUTE = 20  # log lines per reason per minute
 MAX_CONNECTIONS = 128
 MAX_RAW_PATH = 8192
 SESSION_PER_SHARE_PER_MINUTE = 30  # session attempts per share per minute (blunts token guessing)
-SESSION_GLOBAL_PER_MINUTE = (
-    600  # verified session attempts across all lab shares per minute (bounds JWT work)
+SESSION_GLOBAL_PER_MINUTE = 300  # verified exchanges across all shares per minute (half the attempts cap below, so it can trip)
+SESSION_PER_CLIENT_PER_MINUTE = (
+    15  # FAILED session attempts per client per minute (checked before any token check)
+)
+SESSION_PER_USER_PER_MINUTE = (
+    10  # verified exchanges per (share, user) per minute (below the per-share budget)
+)
+SESSION_ATTEMPTS_GLOBAL_PER_MINUTE = 600  # session attempts per minute from all clients that passed the header shape check (bounds JWT work)
+SESSION_FAILED_PER_SHARE_PER_MINUTE = (
+    60  # failed session attempts per share per minute, all clients (checked first)
 )
 STATIC_MAX_BYTES = 1024 * 1024
 VENDOR_MAX_BYTES = 4 * 1024 * 1024  # the vendored pdf.js worker is ~1.4 MB
@@ -119,6 +127,11 @@ MODE_SWITCH_TEMPLATE = (
     "z-index:2147483647;display:block;margin:0;padding:6px 12px;font:600 14px/1.4 system-ui,sans-serif;color:#fff;"
     'background:#1f4fd1;border-radius:6px;text-decoration:none;box-shadow:0 1px 4px rgba(0,0,0,.4)">Annotate</a>'
 )
+# Limit (finding: the shared page's own script can remove or rewrite this bar): the bar is injected into the author's
+# own document, which must run the author's scripts ('unsafe-inline'), and no CSP stops a script from editing its own
+# DOM. It is a fixed, early, hard-to-hide label for an honest author and for passive content; it is NOT a defence
+# against a hostile author. A non-bypassable label needs a host-owned wrapper page showing the author's HTML in a
+# sandboxed iframe (a separate change, as it alters the page contract: viewport, relative URLs, annotate mode).
 SHARED_BY_BAR = (
     '<div data-herdr-shared-by role="note" style="position:fixed!important;top:0!important;left:0!important;'
     "right:0!important;z-index:2147483647!important;display:block!important;visibility:visible!important;"
@@ -231,6 +244,14 @@ class RateLimiter:
             self._windows[key] = (start, count + 1)
             self._windows.move_to_end(key)
             return True
+
+    def release(self, key: str) -> None:
+        """Give back one unit of ``key`` in its current window (a reservation that turned out not to be a charge)."""
+        now = self.now()
+        with self._lock:
+            start, count = self._windows.get(key, (now, 0))
+            if count > 0 and 0 <= now - start < self.window:
+                self._windows[key] = (start, count - 1)
 
     def _evict(self, now: float) -> None:
         """Make room: drop the least-recently-used keys that are not blocked; blocked ones are kept."""
@@ -541,7 +562,7 @@ def labelled_html(data: bytes, content_type: str, bar: bytes, link: bytes = b"")
 
 
 def shared_by_bar(name: str) -> bytes:
-    """The fixed, non-dismissable top bar for a member-created link; ``name`` is HTML-escaped."""
+    """The fixed top bar for a member-created link (hard to hide with CSS, but removable by the page's own script); ``name`` is HTML-escaped."""
     text = f"Shared by {html.escape(name)} \u2014 content was not reviewed by the operator"
     return SHARED_BY_BAR.format(text=text).encode("utf-8")
 
