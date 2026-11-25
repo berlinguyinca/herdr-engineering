@@ -5157,8 +5157,10 @@ def _make_handler(server, public=False, operator=False, fabric=False):
             from .assistant import AssistantNotFound, AssistantUnavailable
             from .assistant_hub.policy import (
                 ActivationRefused,
+                TruncatedDisplay,
                 activate_grant,
                 current_judge_version,
+                display_complete,
                 record_owner_decision,
                 revoke_action_grant,
             )
@@ -5174,11 +5176,17 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                 cfg = svc.config["grants"]
                 version = current_judge_version(server.assistant_judge)
 
-                def request_view(r):
-                    return {"request_id": r.request_id, "worker_id": r.worker_id, "session_id": r.session_id,
+                def request_view(r, full=False):
+                    view = {"request_id": r.request_id, "worker_id": r.worker_id, "session_id": r.session_id,
                             "task_id": r.task_id, "verb": r.verb, "risk_class": r.risk_class, "status": r.status,
-                            "reason": r.reason, "display": r.display, "created_at": iso(r.created_at),
+                            "reason": r.reason, "display": r.display,
+                            "display_complete": display_complete(r.display),
+                            "approvable": display_complete(r.display) or bool(r.display_full),
+                            "created_at": iso(r.created_at),
                             "decided_at": iso(r.decided_at), "decided_by": r.decided_by, "key_id": r.key_id}
+                    if full:                        # the whole text only on the single-request view, never in the list
+                        view["display_full"] = r.display_full or r.display
+                    return view
 
                 def grant_view(g):
                     return {"grant_id": g.grant_id, "worker_id": g.worker_id, "verb": g.verb,
@@ -5199,13 +5207,27 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                             return self._json({"error": "status must be pending, approved, denied or vetoed"}, 400)
                         rows = store.list_action_requests(tenant_id, user_id, status or None)
                         return self._json({"requests": [request_view(r) for r in rows]})
+                    if len(parts) == 5 and self.command == "GET":
+                        row = store.get_action_request(parts[4], tenant_id=tenant_id, user_id=user_id)
+                        if row is None:
+                            return self._json({"error": "not found"}, 404)
+                        return self._json(request_view(row, full=True))
                     if len(parts) == 6 and parts[5] == "decision" and self.command == "POST":
-                        if not exact({"approve"}) or not isinstance(body["approve"], bool):
-                            return self._json({"error": 'body must be exactly {"approve": true|false}'}, 400)
+                        if not (exact({"approve"}) or exact({"approve", "display_sha256"})) \
+                                or not isinstance(body["approve"], bool) \
+                                or not (("display_sha256" not in body)
+                                        or (isinstance(body["display_sha256"], str)
+                                            and re.fullmatch(r"[0-9a-fA-F]{64}", body["display_sha256"]))):
+                            return self._json({"error": 'body must be {"approve": true|false} (plus "display_sha256", '
+                                                        '64 hex characters, to approve a command whose display was '
+                                                        'cut)'}, 400)
                         try:
                             row = record_owner_decision(store, cfg, svc.now(), tenant_id, user_id, parts[4],
                                                         body["approve"], decided_by=user_id,
-                                                        judge_version=version)
+                                                        judge_version=version,
+                                                        display_sha256=body.get("display_sha256", "").lower())
+                        except TruncatedDisplay as exc:  # the owner saw only part of the command: deny only
+                            return self._json({"error": str(exc), "code": "truncated_display"}, 409)
                         except ValueError as exc:       # already decided, or vetoed (a veto is final)
                             return self._json({"error": str(exc), "code": "conflict"}, 409)
                         return self._json(request_view(row))

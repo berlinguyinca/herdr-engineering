@@ -8,9 +8,13 @@ rows and audit entries carry the canonical key and key id only, never the raw co
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import itertools
 import logging
 import re
 import secrets
+import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
@@ -73,7 +77,8 @@ class ActivationRefused(ValueError):
 
 
 _MAX_DISPLAY = 300
-_MAX_SCRUB_INPUT = 1000          # regexes only ever see this much text, so their cost is bounded
+_MAX_SCRUB_INPUT = 8192          # = the hub's command cap (mcp.MAX_COMMAND_BYTES); the regexes never see more than this
+_MAX_RENDERED = 16384
 _SECRET_WORDS = r"(?:token|secret|passw(?:or)?d|passwd|api[_-]?key|credential|auth\w{0,20}|cookie)"
 _USERINFO_RE = re.compile(r"(://)[^/\s@]*@")
 _OPTION_RE = re.compile(rf"(?i)(--?[\w-]{{0,40}}{_SECRET_WORDS}[\w-]{{0,40}})(=|\s+)([^\s\"']+)")
@@ -86,23 +91,46 @@ _LOGIN_RE = re.compile(r"(?i)\b((?:docker|podman)\s+login\b[^\n]*?\s(?:-p|--pass
 _DB_ATTACHED_RE = re.compile(r"(?i)\b((?:mysql|mysqldump|mysqladmin|psql|mariadb)\b[^\n]*?\s-p)[^\s\"']+")
 _MASK = "***"
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
+_TRUNCATED_RE = re.compile(r"\u2026\(\+\d+ chars\)$")
+_BLANK_EXTRA = frozenset("\u2800\u3164\u115f\u1160\u034f\uffa0\u27e8\u27e9")   # invisible letters/marks, token brackets
 
 
-def display_text(raw: RawAction) -> str:
-    if raw.command:
-        return raw.command
-    return " ".join(p for p in (raw.tool, raw.operation or "", ",".join(raw.recipients), raw.repo or "",
-                                raw.environment or "") if p)
+def _is_blank(ch: str) -> bool:
+    """A character that is invisible or looks like a space: it is shown as a token, never as itself (a plain space
+    between two other characters is the one exception)."""
+    return (ch.isspace() or ch in _BLANK_EXTRA or 0xFE00 <= ord(ch) <= 0xFE0F or 0xE0100 <= ord(ch) <= 0xE01EF
+            or unicodedata.category(ch) in ("Zs", "Zl", "Zp", "Cf", "Cc", "Cs", "Co", "Cn"))
 
 
-def scrub_display(text: str) -> str:
-    """A masked, truncated rendering for the OWNER-facing request row only (never audit, grants or events).
+def render_visible(text: str) -> str:
+    """The last step of the display: every blank-looking or invisible character becomes a closed, counted token, so two
+    different commands never read alike.  A run is a token per same-character stretch (``\u27e8\u2423\u00d72\u27e9`` two
+    spaces, ``\u27e8U+2800\u00d7260\u27e9`` Braille blanks); one plain space between other characters stays a space.  A
+    literal bracket is a token too (``\u27e8U+27E8\u27e9``), so the rendering reads back unambiguously."""
+    out: list[str] = []
+    for blank, group in itertools.groupby(text, _is_blank):
+        chunk = "".join(group)
+        if not blank or chunk == " ":
+            out.append(chunk)
+            continue
+        for ch, same in itertools.groupby(chunk):
+            n = len(list(same))
+            name = "\u2423" if ch == " " else f"U+{ord(ch):04X}"
+            out.append(f"\u27e8{name}\u00d7{n}\u27e9" if n > 1 else f"\u27e8{name}\u27e9")
+    return "".join(out)
 
-    Pattern based: URL userinfo, secret-named options and NAME=value pairs, Bearer headers, plus the hub's token-shape
-    scrubber. A secret that has no recognizable shape (a bare word like ``hunter2``) cannot be detected, which is why
-    this text lives only on the request row and key_canonical holds a digest instead of command text.
+
+def scrub_display_full(text: str) -> tuple[str, bool]:
+    """The masked, visible rendering of a command with no length cut, and whether the owner can approve what it shows.
+
+    Masking is exactly the origin/main pipeline: control characters (newline, tab, ESC...) become one space, then URL
+    userinfo, header, secret-named option and NAME=value rules and the hub's token-shape scrubber.  A secret that has
+    no recognizable shape (a bare word like ``hunter2``) cannot be detected, which is why this text lives only on the
+    request row and key_canonical holds a digest.  ``render_visible`` runs last.  Not approvable: input over the
+    8192-character cap, or a rendering over 16384 characters; both are returned cut and marked ``...(+N chars)``.
     """
-    out = _CONTROL_RE.sub(" ", text[:_MAX_SCRUB_INPUT])                    # no ESC/C0/C1 (or newline/tab) in anything a terminal may print
+    cut = max(0, len(text) - _MAX_SCRUB_INPUT)
+    out = _CONTROL_RE.sub(" ", text[:_MAX_SCRUB_INPUT])
     out = _USERINFO_RE.sub(r"\1" + _MASK + "@", out)
     out = _HEADER_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}{_MASK}", out)
     out = _SSHPASS_RE.sub(lambda m: m.group(1) + _MASK, out)
@@ -112,9 +140,43 @@ def scrub_display(text: str) -> str:
     out = _OPTION_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}{_MASK}", out)
     out = _ASSIGN_RE.sub(lambda m: f"{m.group(1)}={_MASK}", out)
     out = _BEARER_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}{_MASK}", out)
-    out = str(scrub_payload(out))
-    cut = max(0, len(out) - _MAX_DISPLAY) + max(0, len(text) - _MAX_SCRUB_INPUT)
-    return out[:_MAX_DISPLAY] + (f" \u2026(+{cut} chars)" if cut else "")
+    out = render_visible(str(scrub_payload(out)))
+    over = len(out) - _MAX_RENDERED
+    if cut or over > 0:
+        return out[:_MAX_RENDERED] + f" \u2026(+{cut + max(0, over)} chars)", False
+    return out, True
+
+
+def scrub_display(text: str) -> str:
+    """The OWNER-facing request row text: ``scrub_display_full`` cut to 300 characters and marked ``...(+N chars)``."""
+    return _cut(scrub_display_full(text)[0])
+
+
+def _cut(out: str) -> str:
+    if len(out) <= _MAX_DISPLAY:
+        return out
+    return out[:_MAX_DISPLAY] + f" \u2026(+{len(out) - _MAX_DISPLAY} chars)"
+
+
+def display_complete(display: str) -> bool:
+    """False when the owner saw only part of the command (the display ends in a ``...(+N chars)`` marker). A command
+    that merely ends like a marker is refused too."""
+    return not _TRUNCATED_RE.search(display)
+
+
+def full_text_sha256(full: str) -> str:
+    return hashlib.sha256(full.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+class TruncatedDisplay(ValueError):
+    """An approve decision for a request whose displayed text was cut and whose full text was not acknowledged."""
+
+
+def display_text(raw: RawAction) -> str:
+    if raw.command:
+        return raw.command
+    return " ".join(p for p in (raw.tool, raw.operation or "", ",".join(raw.recipients), raw.repo or "",
+                                raw.environment or "") if p)
 
 
 def in_shadow(store: AssistantStore, cfg: dict, now: datetime) -> bool:
@@ -129,12 +191,14 @@ def _extra_rules(cfg: dict) -> list[VetoRule]:
 def _new_row(worker: Worker, raw: RawAction, derived: Derived, session_id: str, task_id: str, status: str, reason: str,
              now: datetime) -> ActionRequestRow:
     key = derived.key
+    full, approvable = scrub_display_full(display_text(raw))
     return ActionRequestRow(
         request_id="ar_" + secrets.token_urlsafe(12), tenant_id=worker.tenant_id, user_id=worker.user_id,
         worker_id=worker.worker_id, session_id=session_id, task_id=task_id,
         key_canonical=key.canonical() if key else "", key_id=key.key_id() if key else "",
         verb=key.verb.value if key else Verb.UNKNOWN.value, risk_class=key.risk_class.value if key else "outward",
-        status=status, reason=reason, created_at=as_utc(now), display=scrub_display(display_text(raw)))
+        status=status, reason=reason, created_at=as_utc(now), display=_cut(full),
+        display_full=full if approvable and len(full) > _MAX_DISPLAY else "")
 
 
 def _audit(store: AssistantStore, worker: Worker, actor: str, action: str, subject: str, detail: str = "") -> None:
@@ -464,7 +528,7 @@ def _decide(store: AssistantStore, cfg: dict, worker: Worker, raw: RawAction, de
 
 def record_owner_decision(store: AssistantStore, cfg: dict, now: datetime, tenant_id: str, user_id: str,
                           request_id: str, approve: bool, decided_by: str, *, judge_version: str = "",
-                          provenance: str = "owner_api") -> ActionRequestRow:
+                          provenance: str = "owner_api", display_sha256: str = "") -> ActionRequestRow:
     if provenance not in OWNER_PROVENANCE:
         raise ValueError(f"unknown provenance {provenance!r}")
     if not decided_by.strip():
@@ -477,6 +541,12 @@ def record_owner_decision(store: AssistantStore, cfg: dict, now: datetime, tenan
             raise ValueError("a vetoed request cannot be decided")
         if row.status != "pending":
             raise ValueError("request already decided")
+        if approve and not display_complete(row.display):
+            if not row.display_full:
+                raise TruncatedDisplay("this command is too long to show in full; it can be denied, not approved")
+            if not hmac.compare_digest(display_sha256, full_text_sha256(row.display_full)):
+                raise TruncatedDisplay("this command was shown only in part; read display_full and send its SHA-256 "
+                                       "as display_sha256 to approve it")
         row = replace(row, status="approved" if approve else "denied", decided_at=as_utc(now), decided_by=decided_by)
         store.put_action_request(row)
         store.add_action_evidence(ActionEvidence(
