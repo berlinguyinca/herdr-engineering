@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import io
 import json
 import logging
@@ -4930,9 +4931,19 @@ def _cmd_cp_assistant_hub_owner(args) -> int:
                     display = _tty_safe(r["display"])
                     print(_tty_safe(f"{r['request_id']:<20} {r['status']:<9} {r['verb']:<14} {r['worker_id']:<22} ")
                           + display)
+                    if not r.get("display_complete", True):
+                        print("  (cut: `assistant-action approve` shows the whole command first)")
             else:
-                out = call("POST", f"/api/v1/assistant-action-requests/{quoted}/decision",
-                           {"approve": args.action == "approve"})
+                body = {"approve": args.action == "approve"}
+                if body["approve"]:
+                    pending = call("GET", "/api/v1/assistant-action-requests?status=pending")["requests"]
+                    row = next((r for r in pending if r["request_id"] == target), None)
+                    if row is not None and not row.get("display_complete", True):
+                        full = row.get("display_full") or row["display"]
+                        print("The command is too long to list; its whole masked text follows, then it is approved:")
+                        print(_tty_safe(full))
+                        body["display_sha256"] = hashlib.sha256(full.encode("utf-8")).hexdigest()
+                out = call("POST", f"/api/v1/assistant-action-requests/{quoted}/decision", body)
                 print(_tty_safe(f"{out['request_id']}: {out['status']}"))
         elif args.action == "list":
             rows = call("GET", "/api/v1/assistant-grants")["grants"]
@@ -4948,13 +4959,16 @@ def _cmd_cp_assistant_hub_owner(args) -> int:
             print(_tty_safe(f"{out['grant_id']}: {out['state']}"))
         return 0
     except urllib.error.HTTPError as exc:
-        code = ""
+        code = message = ""
         try:
-            code = str(json.loads(exc.read(65536)).get("code") or "")
+            payload = json.loads(exc.read(65536))
+            code = str(payload.get("code") or "")
+            message = payload.get("error") if kind == "assistant-action" else ""
         except (OSError, ValueError, AttributeError):
             pass
         suffix = f" ({code})" if code and code.replace("_", "").isalnum() else ""
-        print(f"{kind} {args.action} failed: HTTP {exc.code}{suffix}", file=sys.stderr)
+        detail = f": {_tty_safe(message)[:300]}" if isinstance(message, str) and message else ""
+        print(f"{kind} {args.action} failed: HTTP {exc.code}{suffix}{detail}", file=sys.stderr)
     except (OSError, ValueError, KeyError) as exc:
         print(f"{kind} {args.action} failed: {type(exc).__name__}", file=sys.stderr)
     return 1

@@ -8,9 +8,13 @@ rows and audit entries carry the canonical key and key id only, never the raw co
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import itertools
 import logging
 import re
 import secrets
+import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
@@ -73,31 +77,141 @@ class ActivationRefused(ValueError):
 
 
 _MAX_DISPLAY = 300
-_MAX_SCRUB_INPUT = 1000          # regexes only ever see this much text, so their cost is bounded
+_MAX_SCRUB_INPUT = 8192          # = the hub's command cap (mcp.MAX_COMMAND_BYTES); the regexes never see more than this
 _SECRET_WORDS = r"(?:token|secret|passw(?:or)?d|passwd|api[_-]?key|credential|auth\w{0,20}|cookie)"
-_USERINFO_RE = re.compile(r"(://)[^/\s@]*@")
-_OPTION_RE = re.compile(rf"(?i)(--?[\w-]{{0,40}}{_SECRET_WORDS}[\w-]{{0,40}})(=|\s+)([^\s\"']+)")
-_ASSIGN_RE = re.compile(rf"(?i)\b(\w{{0,40}}{_SECRET_WORDS}\w{{0,40}}|\w{{0,40}}(?:pwd|pass|key))=([^\s\"']+)")
-_BEARER_RE = re.compile(r"(?i)\b(bearer|basic)(\s+)[^\s\"']+")
-_USER_OPT_RE = re.compile(r"(?i)(\s(?:-u|--user|--proxy-user)(?:=|\s+))[^\s\"']+")
-_HEADER_RE = re.compile(r"(?i)\b(x-api-key|api-key|cookie|set-cookie|proxy-authorization|authorization)(\s*:\s*)[^\"'\n]*")
-_SSHPASS_RE = re.compile(r"(?i)\b(sshpass\s+-p\s*)[^\s\"']+")
-_LOGIN_RE = re.compile(r"(?i)\b((?:docker|podman)\s+login\b[^\n]*?\s(?:-p|--password)(?:=|\s+))[^\s\"']+")
-_DB_ATTACHED_RE = re.compile(r"(?i)\b((?:mysql|mysqldump|mysqladmin|psql|mariadb)\b[^\n]*?\s-p)[^\s\"']+")
+_V = r"[^\s\"']+"                                               # one shell word
+# (pattern, number of leading groups that stay visible); everything after them is replaced by the mask
+_MASK_RULES: tuple[tuple[re.Pattern[str], int], ...] = (
+    (re.compile(r"(://)[^/\s@]*(?=@)"), 1),
+    # stops at shell syntax, so a header value cannot swallow a command that follows it
+    (re.compile(r"(?i)\b(x-api-key|api-key|cookie|set-cookie|proxy-authorization|authorization)(\s*:\s*)[^\"';|&`<>()$]*"), 2),
+    (re.compile(rf"(?i)\b(sshpass\s+-p\s*){_V}"), 1),
+    (re.compile(rf"(?i)\b((?:docker|podman)\s+login\b[^\n]*?\s(?:-p|--password)(?:=|\s+)){_V}"), 1),
+    (re.compile(rf"(?i)\b((?:mysql|mysqldump|mysqladmin|psql|mariadb)\b[^\n]*?\s-p){_V}"), 1),
+    (re.compile(rf"(?i)(\s(?:-u|--user|--proxy-user)(?:=|\s+)){_V}"), 1),
+    (re.compile(rf"(?i)(--?[\w-]{{0,40}}{_SECRET_WORDS}[\w-]{{0,40}})(=|\s+){_V}"), 2),
+    (re.compile(rf"(?i)\b(\w{{0,40}}{_SECRET_WORDS}\w{{0,40}}=|\w{{0,40}}(?:pwd|pass|key)=){_V}"), 1),
+    (re.compile(rf"(?i)\b(bearer|basic)(\s+){_V}"), 2),
+)
 _MASK = "***"
-_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
-_SPACE_RUN_RE = re.compile(r"\s{2,}")
+_SHELL_ACTIVE = frozenset("$`;|&()<>")
 _TRUNCATED_RE = re.compile(r"\u2026\(\+\d+ chars\)$")
+_UNSEEN = " \u2026(masked shell syntax not shown)"
+
+# Blank-rendering characters become visible tokens (see _render_runs). While the masking regexes run, each such run is
+# one placeholder of four whitespace characters (so ``\s`` still sees whitespace there) that encodes the run's index.
+_POOL = "\x1c\x1d\x1e\x1f\x85\u1680" + "".join(chr(c) for c in range(0x2000, 0x200A))
+assert len(_POOL) == 16 and all(re.fullmatch(r"\s", c) for c in _POOL)
+_PLACEHOLDER_RE = re.compile(f"[{_POOL}]{{4}}")
+_BLANK_EXTRA = frozenset("\u2800\u3164\u115f\u1160\u180e\u034f\ufeff\u00ad")
+
+
+def _is_blank(ch: str) -> bool:
+    return ch.isspace() or ch in _BLANK_EXTRA or unicodedata.category(ch) in ("Zs", "Zl", "Zp", "Cf", "Cc")
+
+
+def _glyph(ch: str, count: int) -> str:
+    """One same-character stretch of a blank run, visibly: ``\\t``, ``\\u{2800}``, ``\u2423\u00d7260`` (spaces)."""
+    if ch == " ":
+        return f"\u2423\u00d7{count}"
+    esc = {"\t": "\\t", "\n": "\\n", "\r": "\\r"}.get(ch) or f"\\u{{{ord(ch):x}}}"
+    return esc if count == 1 else f"{esc}\u00d7{count}"
+
+
+def _render_run(run: str) -> str:
+    return "".join(_glyph(ch, len(list(g))) for ch, g in itertools.groupby(run))
+
+
+def _escape_literals(text: str) -> str:
+    """Make the visible tokens unambiguous: a literal backslash, ``\u2423`` or ``\u00d7`` in a command is escaped too."""
+    return text.replace("\\", "\\\\").replace("\u2423", "\\u{2423}").replace("\u00d7", "\\u{d7}")
+
+
+def _protect_blanks(text: str) -> tuple[str, list[str]]:
+    """Replace every blank run other than one plain space with a placeholder; return the text and each run's rendering."""
+    out: list[str] = []
+    rendered: list[str] = []
+    for blank, group in itertools.groupby(text, _is_blank):
+        chunk = "".join(group)
+        if not blank:
+            out.append(_escape_literals(chunk))
+        elif chunk == " ":
+            out.append(" ")
+        else:
+            i = len(rendered)
+            out.append("".join(_POOL[(i >> shift) & 15] for shift in (12, 8, 4, 0)))
+            rendered.append(_render_run(chunk))
+    return "".join(out), rendered
+
+
+def _restore_blanks(text: str, rendered: list[str]) -> str:
+    def one(m: re.Match[str]) -> str:
+        code = 0
+        for ch in m.group(0):
+            code = (code << 4) | _POOL.index(ch)
+        return rendered[code] if code < len(rendered) else ""
+    return _PLACEHOLDER_RE.sub(one, text)
+
+
+def _mask(text: str) -> tuple[str, bool]:
+    """Mask secret-shaped values; the flag says a masked value held shell syntax (it could hide a command)."""
+    hid = False
+
+    def rule(keep: int):
+        def sub(m: re.Match[str]) -> str:
+            nonlocal hid
+            kept = "".join(m.group(i) for i in range(1, keep + 1))
+            hid = hid or any(c in _SHELL_ACTIVE for c in m.group(0)[len(kept):])
+            return kept + _MASK
+        return sub
+
+    for rx, keep in _MASK_RULES:
+        text = rx.sub(rule(keep), text)
+    return text, hid
+
+
+def scrub_display_full(text: str) -> tuple[str, bool]:
+    """The masked, visible rendering of a command with no length cut, and whether the owner can approve what it shows.
+
+    Pattern based: URL userinfo, secret-named options and NAME=value pairs, Bearer headers, plus the hub's token-shape
+    scrubber. A secret that has no recognizable shape (a bare word like ``hunter2``) cannot be detected, which is why
+    this text lives only on the request row and key_canonical holds a digest instead of command text. Blank-looking
+    characters are never dropped or merged: a run becomes a token such as ``\u2423\u00d7260`` or ``\\u{2800}\u00d7260``, so two
+    different commands do not display alike.  Not approvable: input over the cap (cut), or a masked value that held
+    shell syntax (``$(...)``, ``;``, ``|``...), which would hide part of the command behind ``***``.
+    """
+    cut = max(0, len(text) - _MAX_SCRUB_INPUT)
+    out, runs = _protect_blanks(text[:_MAX_SCRUB_INPUT])
+    out, hidden = _mask(out)
+    out = _restore_blanks(str(scrub_payload(out)), runs)
+    if cut:
+        return out + f" \u2026(+{cut} chars)", False
+    return (out + _UNSEEN, False) if hidden else (out, True)
+
+
+def scrub_display(text: str) -> str:
+    """The OWNER-facing request row text: ``scrub_display_full`` cut to 300 characters and marked ``...(+N chars)``."""
+    return _cut(scrub_display_full(text)[0])
+
+
+def _cut(out: str) -> str:
+    if len(out) <= _MAX_DISPLAY:
+        return out
+    return out[:_MAX_DISPLAY] + f" \u2026(+{len(out) - _MAX_DISPLAY} chars)"
 
 
 def display_complete(display: str) -> bool:
-    """False when ``scrub_display`` cut the text (it ends in the ``...(+N chars)`` marker): the owner saw only part of
-    the command, so an approval of it must be refused. A command that merely ends like the marker is refused too."""
-    return not _TRUNCATED_RE.search(display)
+    """False when the owner saw only part of the command (the display ends in a ``...(+N chars)`` marker, or in the
+    masked-syntax marker). A command that merely ends like a marker is refused too."""
+    return not _TRUNCATED_RE.search(display) and not display.endswith(_UNSEEN)
+
+
+def full_text_sha256(full: str) -> str:
+    return hashlib.sha256(full.encode("utf-8")).hexdigest()
 
 
 class TruncatedDisplay(ValueError):
-    """An approve decision for a request whose displayed text was cut; only a denial is possible."""
+    """An approve decision for a request whose displayed text was cut and whose full text was not acknowledged."""
 
 
 def display_text(raw: RawAction) -> str:
@@ -105,29 +219,6 @@ def display_text(raw: RawAction) -> str:
         return raw.command
     return " ".join(p for p in (raw.tool, raw.operation or "", ",".join(raw.recipients), raw.repo or "",
                                 raw.environment or "") if p)
-
-
-def scrub_display(text: str) -> str:
-    """A masked, truncated rendering for the OWNER-facing request row only (never audit, grants or events).
-
-    Pattern based: URL userinfo, secret-named options and NAME=value pairs, Bearer headers, plus the hub's token-shape
-    scrubber. A secret that has no recognizable shape (a bare word like ``hunter2``) cannot be detected, which is why
-    this text lives only on the request row and key_canonical holds a digest instead of command text.
-    """
-    text = _SPACE_RUN_RE.sub(" ", _CONTROL_RE.sub(" ", text))              # no ESC/C0/C1 (or newline/tab) in anything a terminal
-    out = text[:_MAX_SCRUB_INPUT]                                           # may print; space runs cannot pad the tail out of view
-    out = _USERINFO_RE.sub(r"\1" + _MASK + "@", out)
-    out = _HEADER_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}{_MASK}", out)
-    out = _SSHPASS_RE.sub(lambda m: m.group(1) + _MASK, out)
-    out = _LOGIN_RE.sub(lambda m: m.group(1) + _MASK, out)
-    out = _DB_ATTACHED_RE.sub(lambda m: m.group(1) + _MASK, out)
-    out = _USER_OPT_RE.sub(lambda m: m.group(1) + _MASK, out)
-    out = _OPTION_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}{_MASK}", out)
-    out = _ASSIGN_RE.sub(lambda m: f"{m.group(1)}={_MASK}", out)
-    out = _BEARER_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}{_MASK}", out)
-    out = str(scrub_payload(out))
-    cut = max(0, len(out) - _MAX_DISPLAY) + max(0, len(text) - _MAX_SCRUB_INPUT)
-    return out[:_MAX_DISPLAY] + (f" \u2026(+{cut} chars)" if cut else "")
 
 
 def in_shadow(store: AssistantStore, cfg: dict, now: datetime) -> bool:
@@ -142,12 +233,14 @@ def _extra_rules(cfg: dict) -> list[VetoRule]:
 def _new_row(worker: Worker, raw: RawAction, derived: Derived, session_id: str, task_id: str, status: str, reason: str,
              now: datetime) -> ActionRequestRow:
     key = derived.key
+    full, approvable = scrub_display_full(display_text(raw))
     return ActionRequestRow(
         request_id="ar_" + secrets.token_urlsafe(12), tenant_id=worker.tenant_id, user_id=worker.user_id,
         worker_id=worker.worker_id, session_id=session_id, task_id=task_id,
         key_canonical=key.canonical() if key else "", key_id=key.key_id() if key else "",
         verb=key.verb.value if key else Verb.UNKNOWN.value, risk_class=key.risk_class.value if key else "outward",
-        status=status, reason=reason, created_at=as_utc(now), display=scrub_display(display_text(raw)))
+        status=status, reason=reason, created_at=as_utc(now), display=_cut(full),
+        display_full=full if approvable and len(full) > _MAX_DISPLAY else "")
 
 
 def _audit(store: AssistantStore, worker: Worker, actor: str, action: str, subject: str, detail: str = "") -> None:
@@ -477,7 +570,7 @@ def _decide(store: AssistantStore, cfg: dict, worker: Worker, raw: RawAction, de
 
 def record_owner_decision(store: AssistantStore, cfg: dict, now: datetime, tenant_id: str, user_id: str,
                           request_id: str, approve: bool, decided_by: str, *, judge_version: str = "",
-                          provenance: str = "owner_api") -> ActionRequestRow:
+                          provenance: str = "owner_api", display_sha256: str = "") -> ActionRequestRow:
     if provenance not in OWNER_PROVENANCE:
         raise ValueError(f"unknown provenance {provenance!r}")
     if not decided_by.strip():
@@ -491,7 +584,12 @@ def record_owner_decision(store: AssistantStore, cfg: dict, now: datetime, tenan
         if row.status != "pending":
             raise ValueError("request already decided")
         if approve and not display_complete(row.display):
-            raise TruncatedDisplay("the command was shown to the owner only in part; it can be denied, not approved")
+            if not row.display_full:
+                raise TruncatedDisplay("this command cannot be shown in full (too long, or a masked value holds shell "
+                                       "syntax); it can be denied, not approved")
+            if not hmac.compare_digest(display_sha256, full_text_sha256(row.display_full)):
+                raise TruncatedDisplay("this command was shown only in part; read display_full and send its SHA-256 "
+                                       "as display_sha256 to approve it")
         row = replace(row, status="approved" if approve else "denied", decided_at=as_utc(now), decided_by=decided_by)
         store.put_action_request(row)
         store.add_action_evidence(ActionEvidence(

@@ -5180,6 +5180,7 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                     return {"request_id": r.request_id, "worker_id": r.worker_id, "session_id": r.session_id,
                             "task_id": r.task_id, "verb": r.verb, "risk_class": r.risk_class, "status": r.status,
                             "reason": r.reason, "display": r.display,
+                            "display_full": r.display_full or r.display,
                             "display_complete": display_complete(r.display), "created_at": iso(r.created_at),
                             "decided_at": iso(r.decided_at), "decided_by": r.decided_by, "key_id": r.key_id}
 
@@ -5203,12 +5204,16 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                         rows = store.list_action_requests(tenant_id, user_id, status or None)
                         return self._json({"requests": [request_view(r) for r in rows]})
                     if len(parts) == 6 and parts[5] == "decision" and self.command == "POST":
-                        if not exact({"approve"}) or not isinstance(body["approve"], bool):
-                            return self._json({"error": 'body must be exactly {"approve": true|false}'}, 400)
+                        if not (exact({"approve"}) or exact({"approve", "display_sha256"})) \
+                                or not isinstance(body["approve"], bool) \
+                                or not isinstance(body.get("display_sha256", ""), str):
+                            return self._json({"error": 'body must be {"approve": true|false} (plus "display_sha256" '
+                                                        'to approve a command whose display was cut)'}, 400)
                         try:
                             row = record_owner_decision(store, cfg, svc.now(), tenant_id, user_id, parts[4],
                                                         body["approve"], decided_by=user_id,
-                                                        judge_version=version)
+                                                        judge_version=version,
+                                                        display_sha256=body.get("display_sha256", ""))
                         except TruncatedDisplay as exc:  # the owner saw only part of the command: deny only
                             return self._json({"error": str(exc), "code": "truncated_display"}, 409)
                         except ValueError as exc:       # already decided, or vetoed (a veto is final)

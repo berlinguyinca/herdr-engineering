@@ -5,11 +5,13 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
-### Fix: REST and CLI approval refuse a command the owner saw only in part
+### Fix: owner approval of a command the owner saw only in part
 
-- `POST /api/v1/assistant-action-requests/<id>/decision` with `approve: true` is refused (409, code `truncated_display`) when the stored display was cut (it ends in `...(+N chars)`); the request stays pending and can still be denied. The check is in `record_owner_decision`, so every approving path shares it. Request views carry `display_complete`.
-- Whitespace runs and control characters collapse to one space before the display is cut, so padding cannot push a command's tail out of view.
-- `herdr-eng control-plane assistant-action list` prints the whole stored display, not its first 120 characters.
+- A request whose display was cut (`...(+N chars)`) now stores the whole masked text, returned as `display_full` next to `display_complete` in the request view. `POST .../assistant-action-requests/<id>/decision` approves it only when the body carries `display_sha256`, the SHA-256 of `display_full`; a missing or wrong hash is 409 `truncated_display`, nothing is recorded (no evidence or label), and the request stays pending. Denying needs no hash.
+- A command over the 8192-byte cap, or one where a masked value held shell syntax, is deny-only (its display ends in `...(masked shell syntax not shown)`). The `Authorization:`-style header mask now stops at shell syntax instead of swallowing the rest of the command.
+- Blank-looking characters (runs of spaces, Unicode spaces, zero-width and Braille-blank characters, controls) are shown as counted tokens such as `␣×260`, and a single tab or newline as `\t`, `\n`, instead of being dropped or collapsed; two commands differing only in blanks display differently.
+- `assistant-action approve` prints the full text of a cut command and sends its hash, and shows the server's message on a refusal; `assistant-action list` marks cut entries and prints the whole display.
+- Slack stays refuse-only for a cut command; its message now says it is too long for Slack and can be approved from the CLI or REST. `fully_shown` shares `display_complete` with the REST check.
 
 ### Fix: artifact ACL expiry after restart, body-size and connection hygiene, retract revokes shares
 

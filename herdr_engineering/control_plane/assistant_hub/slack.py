@@ -42,6 +42,7 @@ from .policy import (
     activate_grant,
     create_standing_grant,
     current_judge_version,
+    display_complete,
     in_shadow,
     record_owner_decision,
 )
@@ -181,14 +182,11 @@ def slack_text(value: str, limit: int = _TEXT_MAX) -> str:
     return out
 
 
-_TRUNCATED = re.compile(r"\u2026\(\+\d+ chars\)$")
-
-
 def fully_shown(display: str) -> bool:
     """True when ``slack_text(display)`` prints every character of ``display``.  The request row keeps only a
     truncated rendering of a long command (marked ``...(+N chars)``), and Slack cuts at 300 characters again; a tap
     approves the WHOLE command, so an approval is only offered for text the owner can read in full."""
-    return not _TRUNCATED.search(display) and not slack_text(display, _TEXT_MAX + 1).endswith("\u2026") \
+    return display_complete(display) and not slack_text(display, _TEXT_MAX + 1).endswith("\u2026") \
         and len(slack_text(display, _TEXT_MAX + 1)) <= _TEXT_MAX
 
 
@@ -1006,8 +1004,8 @@ class SlackRuntime:
         shown = fully_shown(item.display)
         lines.append("```" + slack_text(item.display) + "```")
         if not shown:
-            lines.append("*Too long to show in full: it cannot be approved from Slack.* Deny it, or have the worker "
-                         "request a shorter command.")
+            lines.append("*Too long for Slack: it cannot be approved here.* Deny it, or read it in full and approve "
+                         "it with `herdr-eng control-plane assistant-action approve` (or the REST API).")
         lines.append(f"Why: {slack_text(item.why)}")
         value = button_value(ask)
 

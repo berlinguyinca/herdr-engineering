@@ -234,7 +234,7 @@ A worker credential gets 401/403 on all of these, a viewer key gets 403, and cro
 | Route | CLI (`herdr-eng control-plane ...`) | Purpose |
 |---|---|---|
 | `GET /api/v1/assistant-action-requests[?status=pending\|approved\|denied\|vetoed]` | `assistant-action list [--status S]` | Requests, including `display`. |
-| `POST /api/v1/assistant-action-requests/<id>/decision` `{"approve": true\|false}` | `assistant-action approve\|deny ID` | Record the owner decision (counts as evidence). 409 if already decided or vetoed. |
+| `POST /api/v1/assistant-action-requests/<id>/decision` `{"approve": true\|false}` | `assistant-action approve\|deny ID` | Record the owner decision (counts as evidence). 409 `conflict` if already decided or vetoed; 409 `truncated_display` if you approve a command whose `display` was cut and the body lacks the right `display_sha256` (see below). |
 | `GET /api/v1/assistant-grants` | `assistant-grant list` | Grants with their effective state. |
 | `POST /api/v1/assistant-grants/<id>/activate` `{"confirm": true}` | `assistant-grant activate ID` | 409 with the gate code until the judge gate passes (Phase 3). |
 | `DELETE /api/v1/assistant-grants/<id>` | `assistant-grant revoke ID` | Revoke; the next request is `pending`. Idempotent. |
@@ -245,7 +245,19 @@ A worker credential gets 401/403 on all of these, a viewer key gets 403, and cro
 `display` is what lets you recognise a request. It is returned **only** on these owner routes (and held in the owner's
 request row and store snapshot); it is never in the MCP response, the audit log, grants, evidence or events. It is
 **masked best effort** (URL userinfo, secret-named options and `NAME=value` pairs, Bearer headers, token shapes), then
-truncated to 300 characters with control characters removed. A scrubber cannot recognise an arbitrary secret word
+cut to 300 characters. Blank-looking characters are never dropped: a run of two or more (spaces, tabs, Unicode
+spaces, zero-width and Braille-blank characters, controls) shows as a counted token such as `␣×260` or `\u{2800}×260`,
+and a single tab, newline or odd space as `\t`, `\n`, `\u{a0}`, so two different commands do not look alike. A cut
+display ends in `…(+N chars)`.
+
+Each request view also has `display_complete` (false when the display was cut) and `display_full` (the whole masked
+text, no cut; equal to `display` when nothing was cut). To **approve** a request whose `display_complete` is false,
+send `{"approve": true, "display_sha256": "<SHA-256 hex of display_full>"}`; a missing or wrong hash is 409
+`truncated_display` and nothing is recorded. `assistant-action approve` does this for you after printing the full
+text. Denying never needs a hash. A request is deny-only (409 even with the hash) when it is over the 8192-byte
+command cap, or when a masked value held shell syntax (`$ \` ; | & ( ) < >`), because the `***` could hide a command;
+its display ends in `…(masked shell syntax not shown)`. **Slack never approves a cut command**: the message says it is
+too long for Slack and points here. A scrubber cannot recognise an arbitrary secret word
 (`mysql -pSomething`-style variants and bare passwords can slip through), so treat the owner request list as sensitive
 and keep it off shared screens.
 
