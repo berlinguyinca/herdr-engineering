@@ -278,6 +278,11 @@ class SyncedDirectory:
         age = self._now() - float(data["updated"])
         if age > self.max_age or age < -60:  # stale, or stamped in the future: both untrusted
             raise RuntimeError("group membership sync is stale")
+        off = data.get("disabled", [])
+        if not isinstance(off, list):
+            raise RuntimeError("disabled listing is malformed")  # fail closed, as snapshot() does
+        if user in off:  # the sync lists a disabled account under its group too: still out
+            return []
         return [self.group] if user in data["groups"].get(self.group, []) else []
 
     def members(self) -> frozenset[str]:

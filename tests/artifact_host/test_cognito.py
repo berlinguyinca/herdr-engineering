@@ -172,3 +172,28 @@ def test_id_token_gives_normalised_email():
         auth().verify_id_token(id_token(email="Alice@Example.ORG"), user="alice")
         == "alice@example.org"
     )
+
+
+def _write_members(folder, listed, *, disabled=None):
+    doc = {"updated": time.time(), "groups": {"dev": listed}}
+    if disabled is not None:
+        doc["disabled"] = disabled
+    (folder / "members.json").write_text(json.dumps(doc))
+
+
+def test_a_disabled_account_is_refused_even_while_still_listed_in_the_group(tmp_path):
+    """The sync script lists a disabled user under the group AND under ``disabled``: the per-request check must
+    refuse them on the next recheck, not only housekeeping's revocation pass."""
+    from herdr_artifact_host.cognito import SyncedDirectory
+
+    clock = [time.time()]
+    directory = SyncedDirectory(str(tmp_path), "dev", now=lambda: clock[0])
+    _write_members(tmp_path, ["alice", "bob"])
+    a = auth(group_lookup=directory.groups, now=lambda: clock[0])
+    tok = token("alice", exp=time.time() + 99999)
+    assert a.verify(tok) is not None and a.exists("alice")
+    _write_members(tmp_path, ["alice", "bob"], disabled=["alice"])
+    clock[0] += 61
+    assert a.verify(tok) is None and not a.exists("alice")
+    assert a.exists("bob")
+    assert directory.groups("alice") == [] and directory.groups("bob") == ["dev"]
