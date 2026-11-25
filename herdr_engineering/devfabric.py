@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 import os
 import socket
 import threading
+import time
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -197,19 +199,25 @@ class DevServiceRegistry:
         gateway restart never loses leases an overlapping process persisted
         (e.g. a register served by an old process that was mid-shutdown).
         """
-        try:
-            mtime = self._sig()
-        except OSError:
-            return False
-        if mtime == self._loaded_mtime:
-            return False
-        self._loaded_mtime = mtime
-        try:
-            data = json.loads(self._path.read_text())
-        except Exception:
-            return False
-        with self._lock:
-            self._leases = _parse_leases(data)
+        with self._lock:  # signature check, read and swap are one step: an older read never replaces newer state
+            try:
+                mtime = self._sig()
+            except OSError:
+                return False
+            if mtime == self._loaded_mtime:
+                return False
+            self._loaded_mtime = mtime
+            try:
+                data = json.loads(self._path.read_text())
+            except Exception:
+                return False
+            fresh = _parse_leases(data)
+            for lid, lease in fresh.items():  # health is in-memory only: keep it for leases that survive
+                old = self._leases.get(lid)
+                if old is not None:
+                    lease.health_last_ok_at = old.health_last_ok_at
+                    lease.health_last_error = old.health_last_error
+            self._leases = fresh
         self._prune_expired()
         return True
 
@@ -344,21 +352,21 @@ class DevServiceRegistry:
                  network_namespace: str | None = None) -> DevServiceLease:
         """Register (or idempotently renew) a lease. Allocates a collision-free port."""
         now = _now_iso()
-        # Idempotent registration for a stable owner/process identity.
-        if owner_herdr_session_id or owner_process_id:
-            for lease in self._leases.values():
-                if (lease.owner_herdr_session_id and lease.owner_herdr_session_id == owner_herdr_session_id
-                        and lease.owner_process_id and lease.owner_process_id == owner_process_id
-                        and lease.target_port == target_port):
-                    lease.renewed_at = now
-                    lease.state = "active"
-                    self._persist()
-                    return lease
+        if lease_id or owner_herdr_session_id or owner_process_id:
+            self.reload_if_changed()  # a re-register checks the port against other processes' leases
         with self._lock:
+            # Idempotent registration for a stable owner/process identity.
+            if owner_herdr_session_id or owner_process_id:
+                for lease in self._leases.values():
+                    if (lease.owner_herdr_session_id and lease.owner_herdr_session_id == owner_herdr_session_id
+                            and lease.owner_process_id and lease.owner_process_id == owner_process_id
+                            and lease.target_port == target_port):
+                        self._reactivate(lease, now)
+                        self._persist()
+                        return lease
             if lease_id and lease_id in self._leases:
                 lease = self._leases[lease_id]
-                lease.renewed_at = now
-                lease.state = "active"
+                self._reactivate(lease, now, preferred_port)
                 # Route drift on a stable lease id: apply IN PLACE (same id,
                 # same port) so a re-enroll with changed routes takes effect
                 # on the gateway too instead of silently keeping the stale
@@ -389,6 +397,21 @@ class DevServiceRegistry:
             self._persist()
             return lease
 
+    def _reactivate(self, lease: DevServiceLease, now: str,
+                    preferred_port: int | None = None) -> None:
+        """Idempotent re-register of an existing lease (caller holds the lock).
+
+        A lapsed lease gets a fresh TTL (otherwise the next reconcile expires it
+        again) and, if its external port was handed to another lease in the
+        meantime, a new port so two active leases never share one."""
+        if (lease.state != "active"
+                and self._is_port_taken(lease.external_port, exclude_id=lease.id)):
+            lease.external_port = self._allocate_port(
+                preferred=preferred_port or lease.target_port, exclude_id=lease.id)
+        lease.state = "active"
+        lease.renewed_at = now
+        lease.expires_at = _add_seconds(now, self._ttl)
+
     def heartbeat(self, lease_id: str,
                   expected_renewed_at: str | None = None) -> DevServiceLease | None:
         """Renew a lease. With ``expected_renewed_at``, the renewal is issued
@@ -396,6 +419,7 @@ class DevServiceRegistry:
         under the caller (another process renewed or re-registered it), the
         stale-base renewal is REFUSED — renewing from the old base would
         clobber the newer state; the caller retries from a fresh read (#89)."""
+        self.reload_if_changed()  # see leases other processes wrote before the port-taken check
         with self._lock:
             lease = self._leases.get(lease_id)
             if lease is None:
@@ -409,6 +433,10 @@ class DevServiceRegistry:
                                lease_id, expected_renewed_at, lease.renewed_at)
                 return lease
             if lease.state in ("expired", "failed"):
+                if self._is_port_taken(lease.external_port, exclude_id=lease.id):
+                    # The port went to another lease while this one lapsed: do
+                    # not revive onto it; the caller re-registers (new port).
+                    return None
                 lease.state = "active"
             lease.renewed_at = _now_iso()
             lease.expires_at = _add_seconds(lease.renewed_at, self._ttl)
@@ -516,13 +544,15 @@ class DevServiceRegistry:
             return [lease for lease in self._leases.values() if lease.state == "active"]
 
     def get(self, lease_id: str) -> DevServiceLease | None:
-        return self._leases.get(lease_id)
+        with self._lock:
+            return self._leases.get(lease_id)
 
     def resolve_port(self, external_port: int) -> DevServiceLease | None:
         self.reconcile()
-        for lease in self._leases.values():
-            if lease.external_port == external_port and lease.state == "active":
-                return lease
+        with self._lock:
+            for lease in self._leases.values():
+                if lease.external_port == external_port and lease.state == "active":
+                    return lease
         return None
 
 
@@ -635,48 +665,104 @@ class DevServiceForwarder:
         return self._listener is not None
 
 
-def proxy_pair(client: socket.socket, target: socket.socket,
-               inactivity_timeout: float = 30.0) -> None:
-    """Bidirectionally pump bytes between two sockets until either closes.
+class _Activity:
+    """Connection-wide activity clock shared by both pump directions."""
 
-    Protocol-transparent: HTTP/HTTPS/WebSocket/SSE/HMR/generic TCP all flow
-    through the same byte pipe. Used by both DevServiceForwarder (per-host
-    mode) and the fabric gateway router.
+    def __init__(self) -> None:
+        self.last = time.monotonic()
+        self.stop = threading.Event()
 
-    Issue #76: the pipe is BOUNDED. Each direction arms an ``inactivity_timeout``
-    on ``recv`` (re-armed after every op); a peer that accepts the TCP
-    handshake but never reads or responds ends the pipe in both directions
-    after the timeout instead of blocking the worker forever. Both directions
-    are joined with a bounded ``join`` so a leaked pump cannot hang the caller,
-    and both sockets are shut down and closed when the pipe ends.
-    """
-    def _pump(src: socket.socket, dst: socket.socket) -> None:
+    def touch(self) -> None:
+        self.last = time.monotonic()
+
+    def expired(self, idle: float) -> bool:
+        return time.monotonic() - self.last > idle
+
+
+def enable_keepalive(sock: socket.socket) -> None:
+    """TCP keepalive so a peer that vanished without a FIN is reaped by the kernel."""
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        for name, value in (("TCP_KEEPIDLE", 15), ("TCP_KEEPINTVL", 15), ("TCP_KEEPCNT", 4)):
+            opt = getattr(socket, name, None)
+            if opt is not None:
+                sock.setsockopt(socket.IPPROTO_TCP, opt, value)
+    except OSError:
+        pass
+
+
+def _env_seconds(name: str, default: float) -> float:
+    """A positive, finite number of seconds from the environment, else ``default``."""
+    try:
+        value = float(os.environ.get(name, default))
+    except ValueError:
+        return default
+    return value if math.isfinite(value) and value > 0 else default
+
+
+# How long the TLS / header-rewrite path waits for the origin's response head.
+RESPONSE_HEAD_TIMEOUT = _env_seconds("HERDR_GATEWAY_RESPONSE_TIMEOUT", 300.0)
+
+
+def _poll_interval(idle: float) -> float:
+    return min(1.0, max(idle / 4.0, 0.05))
+
+
+def _send_all(dst: socket.socket, data: bytes, act: _Activity, idle: float) -> None:
+    """``sendall`` that tolerates the short poll timeout and gives up only when
+    the whole connection has been idle (or was stopped)."""
+    view = memoryview(data)
+    while view:
         try:
-            src.settimeout(inactivity_timeout)
-            while True:
-                data = src.recv(65536)
-                if not data:
-                    break
-                dst.sendall(data)
-        except (OSError, TimeoutError, ValueError):
-            pass
-        finally:
-            try:
-                dst.shutdown(socket.SHUT_WR)
-            except OSError:
-                pass
+            sent = dst.send(view)
+        except TimeoutError as exc:
+            if exc.errno is not None:
+                raise  # ETIMEDOUT from TCP keepalive: the peer is gone
+            if act.stop.is_set() or act.expired(idle):
+                raise
+            continue
+        view = view[sent:]
+        act.touch()
 
-    t1 = threading.Thread(target=_pump, args=(client, target), daemon=True)
-    t2 = threading.Thread(target=_pump, args=(target, client), daemon=True)
-    t1.start()
-    t2.start()
-    # Bounded joins (issue #76c): once the activity deadline passes, give up
-    # waiting on any leaked pump — daemon threads cannot hold the accept/route
-    # path.
-    deadline = inactivity_timeout + 10.0
-    t1.join(timeout=deadline)
-    t2.join(timeout=deadline)
-    for s in (client, target):
+
+def _pump(src: socket.socket, dst: socket.socket, act: _Activity, idle: float,
+          prefix: bytes = b"") -> None:
+    """Copy ``src`` -> ``dst``. A recv timeout is NOT an end of stream: the pipe
+    ends only when the connection as a whole (either direction) has been idle
+    for ``idle`` seconds, so one-way streams (SSE, downloads, a long upload to a
+    backend that answers only at the end) keep flowing. A wedged backend (one
+    that stops accepting bytes) is caught by write progress: ``_send_all``
+    gives up once ``idle`` seconds pass without the socket taking a byte."""
+    try:
+        if prefix:
+            _send_all(dst, prefix, act, idle)
+        while not act.stop.is_set():
+            try:
+                data = src.recv(65536)
+            except TimeoutError as exc:
+                if exc.errno is not None:
+                    raise  # ETIMEDOUT from TCP keepalive: the peer is gone
+                if act.expired(idle):
+                    act.stop.set()
+                    break
+                continue
+            if not data:
+                break  # orderly half-close: the other direction may continue
+            act.touch()
+            _send_all(dst, data, act, idle)
+    except (OSError, ValueError):
+        # This direction is dead; the other one keeps draining (an origin that
+        # answered early and closed must still get its response delivered).
+        pass
+    finally:
+        try:
+            dst.shutdown(socket.SHUT_WR)
+        except (OSError, ValueError):
+            pass
+
+
+def _close_pair(*socks: socket.socket) -> None:
+    for s in socks:
         try:
             s.shutdown(socket.SHUT_RDWR)
         except OSError:
@@ -685,6 +771,43 @@ def proxy_pair(client: socket.socket, target: socket.socket,
             s.close()
         except OSError:
             pass
+
+
+def _run_pipe(client: socket.socket, target: socket.socket, inactivity_timeout: float,
+              client_prefix: bytes = b"") -> None:
+    act = _Activity()
+    poll = _poll_interval(inactivity_timeout)
+    for s in (client, target):
+        enable_keepalive(s)
+        s.settimeout(poll)
+    t1 = threading.Thread(target=_pump, args=(client, target, act, inactivity_timeout, client_prefix),
+                          daemon=True)
+    t2 = threading.Thread(target=_pump, args=(target, client, act, inactivity_timeout, b""),
+                          daemon=True)
+    t1.start()
+    t2.start()
+    # Both pumps end on their own: EOF/error, connection-wide idleness, or a wedged backend.
+    t1.join()
+    t2.join()
+    _close_pair(client, target)
+
+
+def proxy_pair(client: socket.socket, target: socket.socket,
+               inactivity_timeout: float = 30.0) -> None:
+    """Bidirectionally pump bytes between two sockets until either closes.
+
+    Protocol-transparent: HTTP/HTTPS/WebSocket/SSE/HMR/generic TCP all flow
+    through the same byte pipe. Used by both DevServiceForwarder (per-host
+    mode) and the fabric gateway router.
+
+    Issue #76: the pipe is BOUNDED, by whole-connection idleness: bytes moving
+    in EITHER direction re-arm one shared ``inactivity_timeout``, so a healthy
+    one-way stream is never cut, while a peer that accepts the TCP handshake
+    but never reads or responds ends the pipe after the timeout instead of
+    blocking the worker forever. A recv timeout alone never half-closes the
+    peer. Both sockets are shut down and closed when the pipe ends.
+    """
+    _run_pipe(client, target, inactivity_timeout)
 
 
 def _log_devfabric(component: str, level: str, msg: str, *args) -> None:
@@ -697,12 +820,15 @@ def _log_devfabric(component: str, level: str, msg: str, *args) -> None:
         pass
 
 
-def _send_http_502(client: socket.socket, reason: str = "backend unavailable") -> None:
+def _send_http_502(client: socket.socket, reason: str = "backend unavailable",
+                   status: str = "502 Bad Gateway", act: _Activity | None = None) -> None:
     """Send a short HTTP 502 so HTTP clients fail cleanly instead of seeing a
     raw TCP reset. Best effort: non-HTTP clients just get a close."""
+    if act is not None:
+        act.stop.set()  # stop the pump polling this socket before its timeout is switched
     body = f"{reason}\n".encode()
     head = (
-        b"HTTP/1.1 502 Bad Gateway\r\n"
+        b"HTTP/1.1 " + status.encode() + b"\r\n"
         b"Content-Type: text/plain\r\n"
         b"Connection: close\r\n"
         b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n"
@@ -800,57 +926,27 @@ def prefixed_pipe(client: socket.socket, target: socket.socket,
     TCP handshake but never reads or responds (e.g. a wedged or crashed
     backend) used to block the worker thread forever inside ``recv``/``sendall``
     — and because the forwarder's accept/route path is single-threaded, that
-    one stuck worker wedged the whole forwarder. Now:
-
-    * each pump direction has an ``inactivity_timeout`` on ``recv``; a peer that
-      sends nothing (or whose ``sendall`` cannot drain) for that long ends the
-      pipe in both directions. ``timeout`` is re-armed after every operation.
-    * ``connect_timeout`` bounds the initial ``target.connect_ex``.
-    * both directions are joined with a bounded ``join`` so a leaked pump can
-      never hang the caller (pumps are daemon threads).
+    one stuck worker wedged the whole forwarder. Now the pipe ends once the
+    whole connection (both directions together) has been idle for
+    ``inactivity_timeout``; a healthy one-way stream keeps flowing.
+    ``connect_timeout`` is kept for API compatibility.
     """
-    def _pump(src: socket.socket, dst: socket.socket, prefix: bytes = b"") -> None:
-        try:
-            src.settimeout(inactivity_timeout)
-            if prefix:
-                dst.sendall(prefix)
-            while True:
-                data = src.recv(65536)
-                if not data:
-                    break
-                dst.sendall(data)
-        except (OSError, TimeoutError, ValueError):
-            pass
-        finally:
-            try:
-                dst.shutdown(socket.SHUT_WR)
-            except OSError:
-                pass
-
-    t1 = threading.Thread(target=_pump, args=(client, target, client_prefix), daemon=True)
-    t2 = threading.Thread(target=_pump, args=(target, client), daemon=True)
-    t1.start()
-    t2.start()
-    # Bounded joins: once one direction is done, give the other a grace period,
-    # then move on. Pumps are daemon threads, so an unjoinable pump cannot
-    # hold the accept/route path (issue #76c).
-    t1.join(timeout=inactivity_timeout + connect_timeout + 10.0)
-    t2.join(timeout=inactivity_timeout + connect_timeout + 10.0)
-    for s in (client, target):
-        try:
-            s.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
-        try:
-            s.close()
-        except OSError:
-            pass
+    _run_pipe(client, target, inactivity_timeout, client_prefix)
 
 
-def _read_head(sock: socket.socket) -> tuple[bytes, bytes]:
-    """Read up to the end of an HTTP head; returns (head incl. blank line, remainder)."""
+def _read_head(sock: socket.socket, timeout: float | None = None) -> tuple[bytes, bytes]:
+    """Read up to the end of an HTTP head; returns (head incl. blank line, remainder).
+
+    With ``timeout`` the WHOLE head must arrive within that many seconds, else
+    ``TimeoutError`` (an ``OSError``) is raised."""
     buf = b""
+    deadline = None if timeout is None else time.monotonic() + timeout
     while b"\r\n\r\n" not in buf and len(buf) < 65536:
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("HTTP head not received in time")
+            sock.settimeout(remaining)
         chunk = sock.recv(65536)
         if not chunk:
             break
@@ -862,13 +958,28 @@ def _read_head(sock: socket.socket) -> tuple[bytes, bytes]:
 
 
 def rewriting_pipe(client: socket.socket, target: socket.socket, port: int, external: str,
-                   *, tls: bool = False, rewrite_head: bool = True, forwarded_for: str | None = None) -> None:
+                   *, tls: bool = False, rewrite_head: bool = True, forwarded_for: str | None = None,
+                   inactivity_timeout: float = 30.0,
+                   response_timeout: float | None = None) -> None:
     """Byte-pipe that filters the headers of the origin's responses.
 
     Each exchange is forced to ``Connection: close`` so every response passes the
-    head filter. Upgrade requests (websockets) are passed through untouched."""
+    head filter. Upgrade requests (websockets) are passed through untouched.
+
+    The origin may take up to ``response_timeout`` (default ``RESPONSE_HEAD_TIMEOUT``,
+    env ``HERDR_GATEWAY_RESPONSE_TIMEOUT``) to send its response head, then the
+    client gets a 504; once streaming, ``inactivity_timeout`` applies."""
+    if response_timeout is None:
+        response_timeout = RESPONSE_HEAD_TIMEOUT
     from .urlrewrite import force_close, inject_request_headers, is_upgrade, rewrite_response_head
-    req_head, rest = _read_head(client)
+    for sock in (client, target):
+        enable_keepalive(sock)
+    try:
+        req_head, rest = _read_head(client, inactivity_timeout)
+    except OSError:
+        return  # idle or vanished client: the caller closes both sockets
+    if not req_head:
+        return
     if tls and req_head.endswith(b"\r\n\r\n"):
         # TLS ends here: tell the origin the browser spoke https and which name it used.
         host = next((ln.split(b":", 1)[1].strip().decode("latin-1") for ln in req_head.split(b"\r\n")[1:]
@@ -881,49 +992,77 @@ def rewriting_pipe(client: socket.socket, target: socket.socket, port: int, exte
     if not upgrade and req_head.endswith(b"\r\n\r\n"):
         req_head = force_close(req_head[:-4]) + b"\r\n\r\n"
     if upgrade:
-        prefixed_pipe(client, target, client_prefix=req_head + rest)
+        prefixed_pipe(client, target, client_prefix=req_head + rest,
+                      inactivity_timeout=inactivity_timeout)
         return
+    act = _Activity()
+    poll = _poll_interval(inactivity_timeout)
     try:
-        target.sendall(req_head + rest)
+        target.settimeout(poll)
+        client.settimeout(poll)
+        _send_all(target, req_head + rest, act, inactivity_timeout)
     except OSError:
         return
-
-    def up() -> None:
-        try:
-            while True:
-                data = client.recv(65536)
-                if not data:
-                    break
-                target.sendall(data)
-        except OSError:
-            pass
-        finally:
-            try:
-                target.shutdown(socket.SHUT_WR)
-            except OSError:
-                pass
-
-    t = threading.Thread(target=up, daemon=True)
-    t.start()
+    # The upload side must outlive the wait for a slow origin's response head.
+    up = threading.Thread(target=_pump, args=(client, target, act, max(inactivity_timeout, response_timeout)),
+                          daemon=True)
+    up.start()
     try:
-        resp_head, body = _read_head(target)
+        try:
+            resp_head, body = _read_head_polled(target, act, response_timeout)
+        except TimeoutError as exc:
+            if exc.errno is None:
+                _send_http_502(client, "origin did not answer in time", status="504 Gateway Timeout", act=act)
+            else:  # TCP keepalive gave up on the origin
+                _send_http_502(client, "origin connection lost", act=act)
+            raise
+        except OSError:  # e.g. ECONNRESET before any head byte
+            _send_http_502(client, "origin connection lost", act=act)
+            raise
+        if not resp_head and not body:
+            if act.stop.is_set():
+                # The upload pump's idle clock expired together with the head deadline
+                # and half-closed the origin, which then closed: that is a timeout.
+                _send_http_502(client, "origin did not answer in time", status="504 Gateway Timeout", act=act)
+            else:  # the origin closed without sending a head byte
+                _send_http_502(client, "origin closed the connection without a response", act=act)
+            return
         if rewrite_head and resp_head.endswith(b"\r\n\r\n"):
             resp_head = rewrite_response_head(resp_head[:-4], port, external,
                                               "https" if tls else None) + b"\r\n\r\n"
-        client.sendall(resp_head + body)
-        while True:
-            data = target.recv(65536)
-            if not data:
-                break
-            client.sendall(data)
+        _pump(target, client, act, inactivity_timeout, prefix=resp_head + body)
     except OSError:
-        pass
+        act.stop.set()
     finally:
         try:
             client.shutdown(socket.SHUT_WR)
         except OSError:
             pass
-    t.join(timeout=5)
+        act.stop.set()
+    up.join(timeout=5)
+
+
+def _read_head_polled(sock: socket.socket, act: _Activity, idle: float) -> tuple[bytes, bytes]:
+    """Response-head read on a poll-timeout socket: gives up only when the whole
+    connection has been idle, and counts received bytes as activity."""
+    buf = b""
+    while b"\r\n\r\n" not in buf and len(buf) < 65536:
+        try:
+            chunk = sock.recv(65536)
+        except TimeoutError as exc:
+            if exc.errno is not None:
+                raise  # ETIMEDOUT from TCP keepalive: the origin is gone
+            if act.stop.is_set() or act.expired(idle):
+                raise
+            continue
+        if not chunk:
+            break
+        act.touch()
+        buf += chunk
+    idx = buf.find(b"\r\n\r\n")
+    if idx < 0:
+        return buf, b""
+    return buf[: idx + 4], buf[idx + 4:]
 
 
 def route_and_pipe(client: socket.socket, routes, fallback_host: str,
