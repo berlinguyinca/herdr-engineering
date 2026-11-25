@@ -33,6 +33,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Literal
 from urllib.parse import unquote, urlsplit
 
+from .browser_guard import browser_body_refusal
 from .host_literal import is_ip_or_localhost
 
 DEFAULT_UPSTREAM = "http://control-plane-web:8080"
@@ -266,7 +267,6 @@ class DashboardProxy:
         self._up_netloc = parts.netloc
         self._viewer, self._operator, self._allowlist = viewer_key, operator_key, tuple(allowlist)
         self._public_hosts = parse_host_entries(tuple(public_hosts))
-        self._hosts_configured = bool(public_hosts)   # never derived from the parsed tuple: fail closed
         self._public_scheme = public_scheme
         self._ready = threading.Event()
         proxy = self
@@ -304,16 +304,6 @@ class DashboardProxy:
                 return None, 403, "proxy: this write is not in the dashboard allowlist"
             return self._operator, None, ""
         return None, 405, "proxy: method not allowed"
-
-
-def host_refusal(host: str | None, entries: tuple[Authority, ...], configured: bool) -> str | None:
-    """With ``public_hosts`` configured, why this Host is not one the proxy answers to (None when it is).
-
-    A bare DNS name that is not listed is what a DNS-rebinding page uses. Behind a front that rewrites Host, the name
-    the front sends (``dashboard-proxy:8081``) must be listed too."""
-    if not configured or host_allowed(host, entries):
-        return None
-    return "proxy: host not allowed"
 
 
 def cross_origin_refusal(method: str, origin: str | None, host: str | None, fetch_site: str | None,
@@ -370,9 +360,10 @@ def _make_handler(proxy: DashboardProxy):
 
         def _forward(self) -> None:
             method = self.command
-            refusal = host_refusal(self.headers.get("Host"), proxy._public_hosts, proxy._hosts_configured)
-            if refusal:
-                return self._refuse_unread(403, refusal)
+            # The proxy attaches a credential, so a hostile web page must not be able to drive it: a Host that
+            # is not ours (DNS rebinding) is refused on every method, and a browser write must be same-origin.
+            if not host_allowed(self.headers.get("Host"), proxy._public_hosts):
+                return self._refuse_unread(403, "proxy: host not allowed (dashboard_proxy.public_hosts)")
             key, status, message = proxy.key_for(method, self.path)
             if key is None:
                 return self._refuse_unread(status or 403, message)
@@ -381,6 +372,10 @@ def _make_handler(proxy: DashboardProxy):
                                            proxy._public_scheme)
             if refusal:
                 return self._refuse_unread(403, refusal)
+            if method in _MUTATING:
+                refusal = browser_body_refusal(self.headers)
+                if refusal:
+                    return self._refuse_unread(refusal[0], "proxy: " + refusal[1])
             if self.headers.get("Transfer-Encoding"):
                 return self._refuse_unread(411, "proxy: chunked request bodies are not supported")
             try:
@@ -394,11 +389,9 @@ def _make_handler(proxy: DashboardProxy):
                        if k.lower() not in _HOP_BY_HOP and k.lower() not in _NEVER_FORWARD}
             headers["X-API-Key"] = key
             headers["Host"] = proxy._up_netloc
-            if (method in _MUTATING and self.headers.get("Origin") is not None
-                    and host_allowed(self.headers.get("Host"), proxy._public_hosts)):
-                # Proven same-origin with the proxy at an IP, localhost or listed name; the upstream compares Origin
-                # with the Host it sees. A by-name unlisted Host keeps its Origin: the upstream's guards refuse it
-                # there, exactly as before this check (a rebinding page gets no more than it did).
+            if method in _MUTATING and self.headers.get("Origin") is not None:
+                # Proven same-origin with the proxy at an IP, localhost or listed name (the Host gate above refuses
+                # any other); the upstream compares Origin with the Host it sees.
                 headers = {k: v for k, v in headers.items() if k.lower() != "origin"}
                 headers["Origin"] = f"{proxy._scheme}://{proxy._up_netloc}"
             headers["Connection"] = "close"

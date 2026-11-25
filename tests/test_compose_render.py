@@ -100,7 +100,10 @@ def test_rendered_env_validates_with_the_collab_overlay(tmp_path):
     cmd = model["services"]["control-plane-web"]["command"]
     assert cmd[cmd.index("--fleet-config") + 1] == "/etc/herdr/fleet/fleet-config.yaml"
     # #111: the dashboard proxies collab to the operator listener on the tailnet bind
-    assert [a for a in cmd if a.startswith("--collab")] == ["--collab-operator-url"]
+    assert [a for a in cmd if a.startswith("--collab") and a != "--collab-dashboard-host"] == ["--collab-operator-url"]
+    # the Host allowlist keeps the deployed names: the front door and the name the LLM/dashboard proxies call
+    hosts = [cmd[i + 1] for i, a in enumerate(cmd) if a == "--collab-dashboard-host"]
+    assert hosts == ["dev.lan", "control-plane-web"]
     assert cmd[cmd.index("--collab-operator-url") + 1] == "http://127.0.0.1:9555"
     pub = model["services"]["collab-public"]
     assert "--collab-operator-user" not in pub["command"]
