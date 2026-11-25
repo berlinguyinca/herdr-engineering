@@ -117,6 +117,10 @@ sections:
         operator_user: "REDACTED"                    # Cognito username the dashboard's no-sign-in
                                                      # collaboration acts as (required)
         # operator_email: "owner@example.test"       # optional, shown for the operator
+        # Extra DNS names the web API and dashboard answer to (DNS-rebinding guard; IP literals, localhost,
+        # dev.lan and control-plane-web already pass in the shipped compose). List every other name people or
+        # agents reach the control plane by, e.g. the public fabric name:
+        # dashboard_hosts: ["cp.example.test"]
         # Share links do NOT live here: they use control_plane.share.public_url (a different host); this URL stays
         # the MCP host (see COLLAB.md, "Share links").
         # T15 attention inbox, evidence-based progress, analytics (everything off unless enabled):
