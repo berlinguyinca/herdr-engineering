@@ -37,7 +37,9 @@ const MAX_HEIGHT = 10000;
 const selectNode = async (page) => { await page.locator('g[data-node="attempt:a1"]').focus(); await page.keyboard.press('Enter'); await page.locator('.wb-comment').first().waitFor(); await page.locator('.wb-steer').first().waitFor(); await page.evaluate(() => document.activeElement?.blur()); };
 
 /** The surfaces under test: slug, how to reach it, a selector that proves it rendered, optional steps, and components compared on their own. */
-export const SURFACES = [
+// Desktop only (2026-11-11): these tools are used on desktops, so phone and tablet pixel baselines are not kept.
+const DESKTOP_ONLY = ['tablet-light', 'tablet-dark', 'mobile-light', 'mobile-dark'];
+const COLLAB_SURFACES = [
   { slug: 'collab-rooms', hash: '/rooms', proof: '#hcn-rooms' },
   { slug: 'collab-chat', sub: 'chat', proof: '#hcn-log', regions: [{ name: 'logo', selector: '.cx-logo' }, { name: 'subtabs', selector: '.cx-stabs' }, { name: 'log', selector: '#hcn-log' }] },
   { slug: 'collab-tabs', sub: 'tabs', proof: '#hcn-tabs [role=tab]' },
@@ -60,6 +62,9 @@ export const SURFACES = [
   { slug: 'collab-links', sub: 'links', proof: '#hcn-links li' },
   { slug: 'collab-proposals', sub: 'proposals', proof: '[data-proposal]', steps: async (page) => { await page.locator('[data-proposal]').first().click(); await page.locator('#hcn-review [data-decide]').first().waitFor(); },
     regions: [{ name: 'review', selector: '#hcn-review' }] },
+];
+export const SURFACES = [
+  ...COLLAB_SURFACES.map((s) => ({ skip: DESKTOP_ONLY, ...s })),
   // The dashboard app (Missions, Personal Assistant tabs): served from packages/ over a stubbed API, no server process (visual-dashboard.mjs)
   ...DASHBOARD_SURFACES,
 ];
@@ -120,7 +125,7 @@ export function bundledFontCss() {
 }
 
 /** Ask Chromium which font file really painted EVERY element (and ::before / ::after) with text: each must be a bundled font. */
-export async function assertBundledFonts(page, ctx) {
+export async function assertBundledFonts(page, ctx, { strict = true } = {}) {
   const cdp = await ctx.newCDPSession(page);
   try {
     await cdp.send('DOM.enable'); await cdp.send('CSS.enable');
@@ -141,9 +146,10 @@ export async function assertBundledFonts(page, ctx) {
         else host.set(f.familyName, (host.get(f.familyName) || 0) + f.glyphCount);
       }
     }
-    if (host.size) throw new Error(`screenshots must use the bundled fonts only, but these host fonts painted glyphs: ${[...host].map(([f, n]) => `${f} (${n} glyphs)`).join(', ')}`);
+    const hostFonts = Object.fromEntries(host);
+    if (host.size && strict) throw new Error(`screenshots must use the bundled fonts only, but these host fonts painted glyphs: ${[...host].map(([f, n]) => `${f} (${n} glyphs)`).join(', ')}`);
     if (!used.size) throw new Error('could not read which fonts painted the page');
-    return { checked, used: Object.fromEntries(used) };
+    return { checked, used: Object.fromEntries(used), hostFonts };
   } finally { await cdp.detach().catch(() => {}); }
 }
 
@@ -167,10 +173,12 @@ async function settled(page, quietMs = 500, maxMs = 5000) {
  * Capture one surface at one viewport / colour scheme. Returns { page: Buffer, regions: {name: Buffer} }.
  * `extraCss` is only for the gate's own "teeth" tests: it lets a test inject a defect and prove the compare notices it.
  */
-export async function capture(browser, info, surface, viewport, scheme, { extraCss = '', regions = viewport === 'desktop' } = {}) {
-  const ctxOpts = { viewport: CFG.viewports[viewport], colorScheme: scheme, reducedMotion: 'reduce', deviceScaleFactor: 1, bypassCSP: true };
+export async function capture(browser, info, surface, viewport, scheme, { extraCss = '', regions = viewport === 'desktop', size = null, dpr = 1, strictFonts = true } = {}) {
+  // `size` ({width,height}) and `dpr` let capture-matrix.mjs take sizes outside ui-gates.yaml (the Screenwright matrix, the host's own screen)
+  const vp = size || CFG.viewports[viewport];
+  const ctxOpts = { viewport: vp, timezoneId: 'UTC', locale: 'en-US', colorScheme: scheme, reducedMotion: 'reduce', deviceScaleFactor: dpr, bypassCSP: true };
   const dashboard = surface.app === 'dashboard';
-  const { ctx, page } = dashboard ? await openDashboard(browser, surface.hash, ctxOpts) : await openReal(browser, info, 'alice', ctxOpts);
+  const { ctx, page } = dashboard ? await openDashboard(browser, surface.hash, ctxOpts, surface.apiLog) : await openReal(browser, info, 'alice', ctxOpts);
   try {
     if (!dashboard) await page.clock.setFixedTime(new Date(CFG.screenshots.fixed_clock));
     await page.addStyleTag({ content: bundledFontCss() });
@@ -189,11 +197,11 @@ export async function capture(browser, info, surface, viewport, scheme, { extraC
     // selecting a node scrolls the page by a run-dependent pixel; those surfaces are captured from the top (the chat, which scrolls to
     // its newest message on purpose, is not touched)
     if (surface.resetScroll) { await page.evaluate(() => { window.scrollTo(0, 0); document.scrollingElement.scrollTop = 0; }); await page.waitForTimeout(100); }
-    await assertBundledFonts(page, ctx);
+    const fontReport = await assertBundledFonts(page, ctx, { strict: strictFonts });
     const full = await page.evaluate(() => Math.max(document.documentElement.scrollHeight, innerHeight));
     if (full > MAX_HEIGHT) throw new Error(`${surface.slug} at ${viewport} is ${full}px tall, above the ${MAX_HEIGHT}px capture cap: the rest would never be compared`);
     const height = full;
-    const out = { page: await page.screenshot({ clip: { x: 0, y: 0, width: CFG.viewports[viewport].width, height }, fullPage: surface.fullPage === true, animations: 'disabled', caret: 'hide' }), regions: {} };
+    const out = { hostFonts: fontReport.hostFonts, page: await page.screenshot({ clip: { x: 0, y: 0, width: vp.width, height }, fullPage: surface.fullPage === true, animations: 'disabled', caret: 'hide' }), regions: {} };
     if (regions) {
       for (const r of surface.regions || []) {
         // by bounding box, not locator.screenshot(): that waits for the element to be visible, which would make a test that hides

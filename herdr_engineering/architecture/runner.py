@@ -117,6 +117,9 @@ def run_isolated(repo_path: str, rev: str, host_id: str, repository_id: str, *, 
             if cancel is not None and cancel.is_set():
                 _kill(proc)
                 raise AnalysisCancelled("analysis cancelled")
+            if any(len(out.get(k) or b"") > MAX_OUTPUT for k in ("out", "err")):  # the readers stopped draining: the worker would block on a full pipe
+                _kill(proc)
+                raise AnalysisError("analysis output exceeded the size limit")
             if time.monotonic() >= deadline:
                 _kill(proc)
                 raise AnalysisError(f"analysis exceeded the {limits.wall_seconds:g}s wall-clock limit")

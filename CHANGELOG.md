@@ -18,6 +18,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - `herdr_linux`/`herdr_macos` roles: the "Install Herdr" / "Install Pi" tasks installed nothing yet reported changed; they are now "Verify" tasks that only report: when the pinned herdr or pi is missing or another version they print a `DRIFT:` line (shown by a following "Report ... drift" task, since an ok task's stderr is hidden) and never fail the host or stop the fleet update (nothing in the role installs them, the operator does). Hosts no longer report changed for them.
 - `fleet-join.sh`: `--user` no longer overwrites the exported `USER` seen by ansible; the lease count prints once.
 - `collab-worker.sh`: task ids that are not plain tokens are skipped (they were written as file names), a JSON-RPC error reply no longer ends the worker loop, and one malformed task (for example null text) is logged to stderr and skipped instead of starving the good tasks in the same reply; skipped invalid ids are logged too. A task entry that is not an object, or has a non-integer `attempt`, is skipped the same way. The script is edited in its template (`packages/collab-scripts.js`) and regenerated into `deploy/control-plane/collab-worker.sh` and `packages/collab-scripts/worker.sh`.
+### Fix: bug-hunt wave 2 (handoff checkpoint, scratch reaper, cleanup target, architecture runner)
+
+- Auto-handoff checkpoint: a refused push (non-fast-forward, protected upstream, failing hook) now records `handoff.wip_committed` with reason `push_failed` (and git's reason line, not the `To <url>` header, in `error`) and the chain continues, taking over with the dirty source allowed so the old session still closes; if git cannot list the unpushed commits after the refusal, the chain ends red as `git_state_unknown`.
+- Scratch reaper and `cleanup --scope tmp`: session records older than the live window no longer count toward the 50,000-file inspection limit, and a record that vanishes mid-scan (it may have been renamed) makes the scan re-list once and then fail closed, like a directory removed mid-walk or a recent-record count over the limit.
+- `cleanup --scope target` (and `--scope tmp`) refuse when `git` fails for any reason other than "not a git repository" (both the "(or any of the parent directories)" and the "(or any parent up to mount point ...)" forms), so a worktree whose repository moved is no longer treated as untracked; the tracked-files check now asks about the target's own name, so managed `targets/<label>-<id>` directories are covered.
+- Architecture worker output over 64 MiB is reported as a size error at once, not after the 300 s wall-clock limit.
 ### Fix: inspector snapshot rebuild with archived rows, same-millisecond rows, and a missing snapshot table
 
 - The snapshot writer's full rebuild now also replays the rows the inspector archive moved into `fabric_events_archive`. Before, any archived row made the rebuilt count differ from the stored count, so the snapshot was never rewritten and boots fell back to the full replay.
@@ -103,6 +109,7 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - `PostgresStoreBackend.load()` no longer turns a failed read into "no snapshot": it raises `StoreLoadError`, so a control plane that boots while Postgres is unreachable fails startup instead of running with an empty store whose first mutation overwrote the stored snapshot.
 - Backend snapshot writes are numbered under the store lock and written one at a time; a slow older write can no longer land after a newer snapshot.
 - The store's list/search methods, `request_tool_action`'s idempotency scan and `list_approvals` read the shared dicts under the store lock (no more `dictionary changed size during iteration`), and `decide_approval` is atomic, so two concurrent decisions on one approval cannot both pass the pending check.
+
 ### Fix: Slack approval of unseen text, calendar block-list alias, Rakazo first-bot cache
 
 - Slack ask: the Approve buttons are only offered when the command is shown in full; a long (truncated) command gets Deny only and a "cannot be approved from Slack" note, and an approve tap on such an ask is refused (`not_fully_shown`).

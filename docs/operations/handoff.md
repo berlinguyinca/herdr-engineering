@@ -372,7 +372,7 @@ and nothing is created. `herdr-eng side-pane ensure --tab` is documented with pl
 5. A checkpoint commit of tracked changes on the feature branch (`wip: auto-handoff checkpoint`), `handoff.wip_committed`.
    The controller never commits on main or master, and never on a detached head, and an unknown git state ends the chain red
    rather than guessing. If the status shows tracked changes but `git add -u` stages none (a dirty submodule), nothing is
-   committed (`NOTHING_STAGEABLE`) and the takeover goes on with `--allow-dirty-source`. The last resort (below) makes no
+   committed (`NOTHING_STAGEABLE`) and the takeover goes on with `--allow-dirty-source`. So does a refused push (`push_failed`): the local checkpoint commit stays, and the event's `error` says why. The last resort (below) makes no
    checkpoint commit while the session is still working: that event has reason `session_working` and no commit.
 6. `handoff.takeover_started`: `herdr-handoff takeover` launches the same harness in a pane below the source, waits for proof
    that it is live, asks the source session to exit, and closes the source pane. It is tried up to 3 times per chain (each call is counted in the log as a `handoff.takeover_started` with reason `attempt`, so
@@ -427,7 +427,7 @@ Every step is one JSON line in `events.jsonl` in the shared handoff store (below
 time, the chain id, the pane and session, the harness, the handoff id and the predecessor and successor ids, a colour on
 terminal events, a reason, the context percent, and (on events that name a successor) `successor_pane_id` and
 `successor_session_id`. `handoff.wip_committed` also carries the checkpoint `commit` (its `reason` is `committed`, or
-`push_not_allowed` or `push_failed` when the commit was not pushed; `nothing_stageable` and `session_working` carry no commit). The twelve events are `handoff.triggered`, `handoff.drain_started`, `handoff.drained`,
+`push_not_allowed` or `push_failed` when the commit was not pushed; on `push_failed` the `error` key holds the line of git's output that gives the reason; `nothing_stageable` and `session_working` carry no commit). The twelve events are `handoff.triggered`, `handoff.drain_started`, `handoff.drained`,
 `handoff.briefing_written`, `handoff.briefing_fallback`, `handoff.wip_committed`, `handoff.takeover_started`,
 `handoff.succeeded`, `handoff.failed_compacted`, `handoff.stuck`, `handoff.skipped` and `handoff.waiting`. A second
 `handoff.takeover_started` with reason `compacting` marks the start of the compaction fallback: a controller restarted after
