@@ -190,3 +190,15 @@ def test_cognito_cache_is_bounded_and_garbage_ids_are_not_looked_up():
         a.exists(f"user-{i}")
     assert len(a._checked) <= 5000
     assert json.dumps(len(calls))
+
+
+def test_invite_by_email_of_a_known_user_respects_the_room_member_cap(svc):
+    pr, _, room = room_of(svc)
+    for uid in ("bob", "carol"):
+        svc.add_member(pr, room, {"user_id": uid, "role": "viewer"})       # alice + 2 = the cap of 3
+    svc._commit("identity_linked", {"actor_user_id": "mallory", "actor_agent_id": None,
+                                    "user_id": "mallory", "email": "mallory@example.org"})
+    reply = svc.invite_by_email(pr, room, {"email": "mallory@example.org", "role": "viewer"})
+    unknown = svc.invite_by_email(pr, room, {"email": "nobody@example.org", "role": "viewer"})
+    assert set(reply) == set(unknown)                                      # still no signed-in-or-not oracle
+    assert len(svc._rooms[room]["members"]) == 3

@@ -5,6 +5,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: collab task read and invite caps, scheduler lease ttl bound
+
+- `get_task` applies the same external-agent refusal (403) and hidden-task check as `list_tasks`.
+- `invite_by_email` of an already-signed-in user respects `max_members_per_room`: a full room records a pending invite instead (same reply, no sign-in oracle).
+- Scheduler lease heartbeat clamps `ttl` to 1..600 s and rejects non-numeric or non-finite values (`ValueError`) instead of storing an expiry decades away or overflowing.
+- `retention.py` docstring now says `apply_retention` is not applied in production; no deletion behaviour changed.
 ### Fix: artifact host share and sign-in bug-hunt findings
 
 - Member shares whose entry page the "shared by" label cannot be placed on (over 2 MiB, `<?xml`, CDATA, odd comments in head scripts, ...) were created and approved but 404 for every viewer. `share_create` and `share_approve` now refuse them with `html_too_large` / `unsupported_html` (same check as the serve path). Only the entry page gates the share; another unlabelable page of the version still 404s on its own when requested. The check runs before the locking transaction, off the event loop; an unreadable blob is a logged 503 `storage_unavailable` (it was a 404), and a version that changed in between is a 409 `version_changed`.
