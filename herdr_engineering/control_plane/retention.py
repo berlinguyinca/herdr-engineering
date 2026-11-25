@@ -5,6 +5,12 @@ Structured entity records (missions, sessions, services, hosts, artifacts
 metadata) and their event *streams* are durable and are never auto-deleted —
 only telemetry and old raw event frames are aged out. Artifact *bytes* (the
 in-memory RustFS stand-in) are pruned after a longer TTL.
+
+NOT APPLIED IN PRODUCTION: nothing calls ``apply_retention`` outside tests, no
+configuration key sets these TTLs, and it prunes in-memory state only (not the
+durable ``fabric_events`` log). Only ``sweep_token_usage`` (below) runs, from the
+server's sweep loop. Wiring this in would start deleting data and needs an owner
+decision on TTLs and durable pruning.
 """
 from __future__ import annotations
 

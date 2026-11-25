@@ -6,7 +6,7 @@ This repository controls developer machines, terminals, browser previews, test/C
 
 - Internal services are private/tailnet-only by default.
 - Secrets are injected through approved local/secret-management mechanisms, never Git.
-- Browser/CDP/debug endpoints must not be publicly reachable.
+- Browser/CDP/debug endpoints must not be publicly reachable. The fabric agent never adopts a Chrome DevTools, Node inspector or Jupyter endpoint (probed by identity on any port) or a port on its debugger/database/admin denylist, and does not rewrite `Host` for them; `fabric.agent_adopt_mode: allowlist` publishes only named ports or processes. See `docs/operations/fabric-agent-adoption.md`.
 - Dev-service routes may target only registered/policy-approved endpoints.
 - Terminal/process/control actions require authenticated authorization and audit.
 - Shared artifacts exclude credentials and active source worktrees by default.

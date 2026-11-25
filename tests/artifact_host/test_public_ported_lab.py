@@ -399,7 +399,7 @@ def test_csrf_is_delivered_only_in_our_markup(host: Host, viewed: tuple[Seeded, 
     assert "herdr-annotate-csrf" not in view(host, s, sess, "notes.txt", "v").body.decode()
     other = lab(host, files=VIEW_FILES, emails=("bob@lab.example",))
     bob = landing_session(
-        sign_in(host, other, access("bob"), ident("bob", email="bob@lab.example"))
+        sign_in(host, other, access("bob"), ident("bob", email="bob@lab.example", nonce="n-0"))
     )
     assert token not in view(host, other, bob, "notes.txt").body.decode()
 

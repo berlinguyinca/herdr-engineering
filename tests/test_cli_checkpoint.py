@@ -89,12 +89,12 @@ def test_worker_refresh_lifecycle_preserves_upstream_flows(
     main_thread = threading.get_ident()
 
     class Conn:
-        async def close(self):
+        async def close(self, timeout=None):
             events.append('close')
 
     conn = Conn()
 
-    async def connect(dsn):
+    async def connect(dsn, **kwargs):
         events.append('connect')
         return conn
 
@@ -147,13 +147,14 @@ def test_worker_refresh_lifecycle_preserves_upstream_flows(
     monkeypatch.setattr(worker, 'run_worker', run)
     monkeypatch.setattr(worker, 'run_one_pass', run)
     args = SimpleNamespace(fleet_config='/fleet', migrations='/migrations',
-                           once=once, interval=.01, host_id='host')
+                           once=once, interval=.01, host_id='host', heartbeat_file=None, max_failed_passes=10,
+                           connect_timeout=10.0, statement_timeout=120.0)
     if fail_worker:
         with pytest.raises(RuntimeError, match='worker failed'):
             cli._cmd_cp_worker(args)
     else:
         assert cli._cmd_cp_worker(args) == 0
-    expected = ['connect', 'migrate']
+    expected = ['connect', 'migrate', 'close', 'connect']       # migrations run on their own connection
     if configured and not once:
         expected += ['refresh-init', 'refresh-start']
     expected += ['worker']

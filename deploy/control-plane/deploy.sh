@@ -136,7 +136,7 @@ set -euo pipefail
 REF="origin/main"; DRY=0; FETCH=1; ALLOW_DIVERGENT=0; COLLAB_LOCK_WAIT=300; DEPLOY_LOCK_WAIT=600
 CHECKPOINT_LOCK_WAIT=420; PAUSE_WORKER=0; WORKER_PAUSED=0
 MEMORY_PRIVATE_EGRESS=auto; MEMORY_PRIVATE_EGRESS_RECOVER=""
-MEMORY_PRIVATE_EGRESS_CIDR="172.31.252.0/29"
+MEMORY_PRIVATE_EGRESS_CIDR="172.31.252.32/29"; MEMORY_PRIVATE_EGRESS_CIDR_SET=0
 MEMORY_PRIVATE_EGRESS_GATEWAY="${HERDR_CP_MEMORY_PRIVATE_EGRESS_GATEWAY:-}"
 MEMORY=0; MEMORY_CHECKOUT="${HERDR_MEMORY_CHECKOUT:-}"
 MEMORY_CLIENT_CONFIG="${HERDR_CP_MEMORY_CLIENT_CONFIG:-}"
@@ -155,7 +155,7 @@ while [ $# -gt 0 ]; do
     --memory-private-egress-recover) MEMORY_PRIVATE_EGRESS_RECOVER="${2:?needs the saved deploy attempt}"; shift 2 ;;
     --memory-private-egress) MEMORY_PRIVATE_EGRESS=1; shift ;;
     --no-memory-private-egress) MEMORY_PRIVATE_EGRESS=0; shift ;;
-    --memory-private-egress-cidr) MEMORY_PRIVATE_EGRESS_CIDR="${2:?needs a CIDR}"; shift 2 ;;
+    --memory-private-egress-cidr) MEMORY_PRIVATE_EGRESS_CIDR="${2:?needs a CIDR}"; MEMORY_PRIVATE_EGRESS_CIDR_SET=1; shift 2 ;;
     --memory-private-egress-gateway) MEMORY_PRIVATE_EGRESS_GATEWAY="${2:?needs an explicit IPv4/32}"; shift 2 ;;
     --with-memory) MEMORY=1; shift ;;
     --memory-checkout) MEMORY_CHECKOUT="${2:?--memory-checkout needs a value}"; shift 2 ;;
@@ -945,6 +945,41 @@ if [ ! -e "$PIPELINES_DIR" ]; then
   mkdir -p "$(dirname "$PIPELINES_DIR")" && mkdir -m 755 "$PIPELINES_DIR"
 fi
 check_pipelines_dir || exit 1
+# the fabric control-API token directory (mounted read-only into fabric-gateway and herdr-web): create it 0700 so
+# docker does not create it root-owned. It may stay empty during the --allow-open rollout.
+# (scripts/fabric-stack.sh up does the same before its compose run.)
+check_fabric_token_dir() {   # create it 0700 when missing, then verify it; never prints token content
+  local d="$HOME/.config/herdr-engineering/fabric-gateway" mode
+  if [ ! -e "$d" ] && [ ! -L "$d" ]; then
+    mkdir -p "$(dirname "$d")" && mkdir -m 700 "$d" || return 1
+  fi
+  if [ -L "$d" ] || [ ! -d "$d" ]; then
+    echo "$d (the fabric-gateway token mount) must be a real directory (not a symlink or a file)" >&2; return 1
+  fi
+  if [ "$(stat -c %u "$d")" != "$(id -u)" ]; then
+    echo "$d (the fabric-gateway token mount) must be owned by the deploying user (uid $(id -u)); docker creates it root-owned when it is missing at compose time" >&2; return 1
+  fi
+  mode="$(stat -c %a "$d")"
+  if [ "$mode" != 700 ]; then
+    echo "$d (the fabric-gateway token mount) must be mode 0700 (it is $mode): chmod 700 $d" >&2; return 1
+  fi
+}
+check_fabric_token_dir || exit 1
+
+# The fabric-gateway bind-mounts this at /fabric-local (host-local route files). Create it as the deploying user
+# first: otherwise docker creates it root-owned and `scripts/fabric-stack.sh memory-route enable` cannot write to it.
+FABRIC_LOCAL_DIR="$HOME/.config/herdr-engineering/fabric"
+check_fabric_local_dir() {
+  local d="$FABRIC_LOCAL_DIR"
+  if [ -L "$d" ] || { [ -e "$d" ] && [ ! -d "$d" ]; }; then
+    echo "$d must be a real directory (not a symlink or a file)" >&2; return 1
+  fi
+  if [ -d "$d" ] && [ "$(stat -c %u "$d")" != "$(id -u)" ]; then
+    echo "$d must be owned by the deploying user (uid $(id -u)); fix with: sudo chown $(id -un) $d" >&2; return 1
+  fi
+}
+check_fabric_local_dir || exit 1
+mkdir -p "$FABRIC_LOCAL_DIR" || { echo "cannot create $FABRIC_LOCAL_DIR" >&2; exit 1; }
 
 # ---- host files this deploy may change, backed up so every failure path restores them
 BACKUP_DIR="$ENV_DIR/backup"; mkdir -p "$BACKUP_DIR"

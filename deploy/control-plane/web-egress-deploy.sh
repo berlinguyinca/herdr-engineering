@@ -22,6 +22,7 @@ web_egress_preflight() {
       && [ ! -e "$STATE_DIR/web-egress/pending.json" ] && [ ! -L "$STATE_DIR/web-egress/pending.json" ]; then
     MEMORY_PRIVATE_EGRESS=0; return 0
   fi
+  local requested="$MEMORY_PRIVATE_EGRESS"
   if [ "$MEMORY_PRIVATE_EGRESS" = auto ]; then
     local approved="$ENV_DIR/web-egress-approved.json" values
     web_egress_cmd approved --current "$WEB_EGRESS_CURRENT" >"$approved" || return 1
@@ -32,6 +33,20 @@ print(int(v['enabled']),v.get('cidr','disabled'),v.get('destination','disabled')
 PYAPPROVED
 )" || return 1
     read -r MEMORY_PRIVATE_EGRESS MEMORY_PRIVATE_EGRESS_CIDR MEMORY_PRIVATE_EGRESS_GATEWAY WEB_EGRESS_GENERATION <<<"$values"
+  fi
+  # An explicit enable on a host that already has an approved network keeps that network's subnet unless
+  # --memory-private-egress-cidr names another (the built-in default only seeds hosts with no approved network).
+  # Auto mode already took the approved cidr above, so only an explicit enable needs this.
+  if [ "$requested" = 1 ] && [ "${MEMORY_PRIVATE_EGRESS_CIDR_SET:-0}" != 1 ] && [ -e "$WEB_EGRESS_CURRENT" ]; then
+    local kept
+    kept="$(web_egress_cmd approved --current "$WEB_EGRESS_CURRENT" | python3 -c '
+import json,sys
+v=json.load(sys.stdin)
+print(v["cidr"] if v.get("enabled") else "")')" || {
+      echo "web egress: could not read the approved network's subnet from $WEB_EGRESS_CURRENT (see the error above); using $MEMORY_PRIVATE_EGRESS_CIDR" >&2
+      kept=""
+    }
+    [ -z "$kept" ] || MEMORY_PRIVATE_EGRESS_CIDR="$kept"
   fi
   WEB_EGRESS_COMPOSE_ENABLED="$MEMORY_PRIVATE_EGRESS"
   [ "$PROJECT" = herdr-control-plane ] || {

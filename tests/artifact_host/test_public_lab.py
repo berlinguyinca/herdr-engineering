@@ -7,6 +7,11 @@ import time
 
 import pytest
 
+from herdr_artifact_host.share_http import (
+    SESSION_ATTEMPTS_GLOBAL_PER_MINUTE,
+    SESSION_FAILED_PER_SHARE_PER_MINUTE,
+    SESSION_PER_CLIENT_PER_MINUTE,
+)
 from herdr_artifact_host.share_session import check_session
 from tests.artifact_host.seed import (
     FILES,
@@ -29,7 +34,8 @@ def sign_in(
 ):
     headers = {
         "Authorization": f"Bearer {acc or access()}",
-        "X-Id-Token": idt or ident(),
+        "X-Id-Token": idt or ident(nonce="n-0"),
+        "X-Nonce": "n-0",
         "Content-Length": "0",
     }
     headers.update(extra or {})
@@ -68,6 +74,133 @@ def test_session_for_listed_email(host: Host) -> None:
     assert s.token not in r.body.decode().replace(body["landing"], "")
 
 
+def test_lab_session_binds_the_id_token_to_the_page_nonce(host: Host) -> None:
+    s = lab(host)
+    mine = ident(nonce="n-mine")
+    assert sign_in(host, s, idt=mine, extra={"X-Nonce": "n-mine"}).status == 200
+    assert sign_in(host, s, idt=mine, extra={"X-Nonce": "n-other"}).status == 404  # replayed token
+    bare = {"Authorization": f"Bearer {access()}", "X-Id-Token": mine, "Content-Length": "0"}
+    assert host.request("POST", f"/s/{s.token}/session", bare).status == 404  # no X-Nonce sent
+    assert (
+        sign_in(host, s, idt=ident(), extra={"X-Nonce": "n-mine"}).status == 404
+    )  # token has none
+    reasons = " ".join(e["detail"] for e in host.events(s.share_id, "denied"))
+    assert "bad_nonce" in reasons and "bad_id_token" in reasons
+
+
+def test_a_link_holder_cannot_lock_other_viewers_out_of_sign_in(host: Host) -> None:
+    """Unauthenticated session POSTs are charged to the sender, not to the share's or the global budget."""
+    s = lab(host)
+    junk = {"Content-Length": "0", "X-Forwarded-For": "203.0.113.9"}
+    codes = [host.request("POST", f"/s/{s.token}/session", junk).status for _ in range(60)]
+    assert set(codes) == {404}
+    ok = sign_in(host, s, extra={"X-Forwarded-For": "198.51.100.7"})
+    assert ok.status == 200
+    # the attacker's own address stays throttled, even with good tokens
+    assert sign_in(host, s, extra={"X-Forwarded-For": "203.0.113.9"}).status == 404
+
+
+def test_ipv6_clients_are_limited_by_their_64(host: Host) -> None:
+    """Rotating through the addresses of one /64 must not mint a fresh budget per address."""
+    s = lab(host)
+    for i in range(SESSION_PER_CLIENT_PER_MINUTE + 2):
+        junk = {"Content-Length": "0", "X-Forwarded-For": f"2001:db8:1:1::{i + 1:x}"}
+        assert host.request("POST", f"/s/{s.token}/session", junk).status == 404
+    same_64 = sign_in(host, s, extra={"X-Forwarded-For": "2001:db8:1:1::ffff"})
+    assert same_64.status == 404
+    assert sign_in(host, s, extra={"X-Forwarded-For": "2001:db8:2::1"}).status == 200
+
+
+def test_one_user_with_valid_tokens_cannot_use_up_the_share_budget(host: Host) -> None:
+    """The per-user budget is smaller than the per-share one, so one signed-in user cannot lock out the rest."""
+    s = lab(host, emails=("alice@lab.example", "bob@lab.example"))
+    alice = {"X-Forwarded-For": "203.0.113.5"}
+    assert 404 in {sign_in(host, s, extra=alice).status for _ in range(40)}
+    bob = sign_in(
+        host,
+        s,
+        access("bob"),
+        ident("bob", email="bob@lab.example", nonce="n-0"),
+        extra={"X-Forwarded-For": "198.51.100.5"},
+    )
+    assert bob.status == 200
+
+
+def test_unverified_attempts_have_a_global_cap_too(host: Host) -> None:
+    """Addresses are cheap to rotate: past the shape checks the total is bounded as well (it bounds the JWT work)."""
+    per_share = SESSION_FAILED_PER_SHARE_PER_MINUTE - 5
+    shares = [lab(host) for _ in range(SESSION_ATTEMPTS_GLOBAL_PER_MINUTE // per_share + 2)]
+    for i in range(SESSION_ATTEMPTS_GLOBAL_PER_MINUTE):
+        xff = {"X-Forwarded-For": f"198.51.{i // 250}.{i % 250 + 1}"}
+        assert sign_in(host, shares[i // per_share], acc="junk", extra=xff).status == 404
+    assert sign_in(host, shares[-1], extra={"X-Forwarded-For": "192.0.2.77"}).status == 404
+
+
+def test_ipv4_mapped_clients_are_limited_by_their_own_address(host: Host) -> None:
+    """``::ffff:a.b.c.d`` is an IPv4 client: one of them must not share a /64 budget with every other."""
+    s = lab(host)
+    for _ in range(SESSION_PER_CLIENT_PER_MINUTE + 2):
+        junk = {"Content-Length": "0", "X-Forwarded-For": "::ffff:203.0.113.9"}
+        assert host.request("POST", f"/s/{s.token}/session", junk).status == 404
+    assert sign_in(host, s, extra={"X-Forwarded-For": "::ffff:203.0.113.9"}).status == 404
+    assert sign_in(host, s, extra={"X-Forwarded-For": "::ffff:198.51.100.7"}).status == 200
+
+
+def test_one_shares_abuse_does_not_shut_the_others_out(host: Host) -> None:
+    """Header-less POSTs from many /64s exhaust that share's failure budget only, not the all-clients cap."""
+    a, b = lab(host), lab(host)
+    junk = {"Content-Length": "0"}
+    for n in range(40):
+        for _ in range(SESSION_PER_CLIENT_PER_MINUTE):
+            xff = {**junk, "X-Forwarded-For": f"2001:db8:{n + 1:x}::1"}
+            assert host.request("POST", f"/s/{a.token}/session", xff).status == 404
+    assert sign_in(host, a, extra={"X-Forwarded-For": "198.51.100.7"}).status == 404
+    assert sign_in(host, b, extra={"X-Forwarded-For": "198.51.100.8"}).status == 200
+
+
+def test_successful_sign_ins_behind_one_address_are_not_throttled(host: Host) -> None:
+    """Twenty people behind one NAT opening links within a minute: only failures are charged to the address."""
+    s = lab(host, emails=(), groups=("Readers",))
+    nat = {"X-Forwarded-For": "203.0.113.50"}
+    codes = []
+    for i in range(2 * SESSION_PER_CLIENT_PER_MINUTE):
+        user = f"user{i}"
+        acc, idt = (
+            access(user, groups=("Readers",)),
+            ident(user, email=f"{user}@lab.example", nonce="n-0"),
+        )
+        codes.append(sign_in(host, s, acc, idt, extra=nat).status)
+    assert set(codes) == {200}
+
+
+def test_replaying_a_valid_token_pair_cannot_spend_the_global_cap(host: Host) -> None:
+    """A replay refused by the per-user budget counts as a failure for that client and share, so it stops after 15."""
+    a = lab(host)
+    b = lab(host, emails=("bob@lab.example",))
+    replayer = {"X-Forwarded-For": "203.0.113.77"}
+    for _ in range(SESSION_ATTEMPTS_GLOBAL_PER_MINUTE + 100):
+        sign_in(host, a, extra=replayer)
+    other = sign_in(
+        host,
+        b,
+        access("bob"),
+        ident("bob", email="bob@lab.example", nonce="n-0"),
+        extra={"X-Forwarded-For": "198.51.100.9"},
+    )
+    assert other.status == 200
+
+
+def test_failures_on_one_link_do_not_block_the_same_address_on_other_links(host: Host) -> None:
+    """Colleagues behind one NAT lose only the link the junk was sent to."""
+    a, b = lab(host), lab(host)
+    nat = {"X-Forwarded-For": "203.0.113.50"}
+    for _ in range(SESSION_PER_CLIENT_PER_MINUTE + 2):
+        junk = {"Content-Length": "0", **nat}
+        assert host.request("POST", f"/s/{a.token}/session", junk).status == 404
+    assert sign_in(host, a, extra=nat).status == 404
+    assert sign_in(host, b, extra=nat).status == 200
+
+
 def test_group_allow_list(host: Host) -> None:
     s = lab(host, emails=(), groups=("Readers",))
     assert sign_in(host, s).status == 404
@@ -76,8 +209,8 @@ def test_group_allow_list(host: Host) -> None:
 
 def test_denials_and_events(host: Host) -> None:
     s = lab(host)
-    assert sign_in(host, s, idt=ident(email="mallory@evil.example")).status == 404
-    assert sign_in(host, s, idt=ident(verified=False)).status == 404
+    assert sign_in(host, s, idt=ident(email="mallory@evil.example", nonce="n-0")).status == 404
+    assert sign_in(host, s, idt=ident(verified=False, nonce="n-0")).status == 404
     assert sign_in(host, s, acc=access(key=OTHER_KEY)).status == 404
     assert sign_in(host, s, acc=access(exp=time.time() - 10)).status == 404
     assert sign_in(host, s, acc=access(client="stranger")).status == 404

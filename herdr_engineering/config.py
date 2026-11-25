@@ -165,6 +165,12 @@ DEFAULTS: dict[str, Any] = {
         # services on ports in [agent_web_port_min, agent_ephemeral_min) that
         # are not in agent_exclude_ports (well-known daemons are also skipped).
         "agent_exclude_ports": [],
+        # "denylist" adopts every web port not denied (default); "allowlist"
+        # adopts only agent_allow_ports and processes in agent_allow_processes.
+        # Debugger/notebook probes and the port denylist apply in both modes.
+        "agent_adopt_mode": "denylist",
+        "agent_allow_ports": [],
+        "agent_allow_processes": [],
         # Process-name fragments never auto-leased (null = built-in list of
         # test/dev servers: vitest, jest, playwright, vite, next-server, ...).
         "agent_deny_processes": None,
@@ -326,7 +332,8 @@ def _discover_config_sources() -> list[tuple[Path, bool]]:
     2. repository:     ``./config/herdr-engineering.yaml`` or ``./herdr-engineering.yaml``
        (untrusted: it is whatever checkout the command runs in)
     3. explicit env:   ``$HERDR_ENGINEERING_CONFIG`` (highest; the operator chose it, so it is machine config
-       even when it names a file inside the current directory)
+       even when it names a file inside the current directory). It may list several files separated by
+       ``os.pathsep`` (``:``); later ones override earlier ones and a missing one is skipped.
     """
     home = Path.home()
     candidates = [
@@ -336,7 +343,14 @@ def _discover_config_sources() -> list[tuple[Path, bool]]:
     ]
     env = os.environ.get("HERDR_ENGINEERING_CONFIG")
     if env:
-        candidates.append((Path(env), True))
+        if os.pathsep in env and Path(env).is_file():
+            parts = [env]   # one path that happens to contain the separator
+        else:
+            parts = [p for p in env.split(os.pathsep) if p]
+        for part in parts:
+            if not Path(part).exists() and len(parts) > 1:
+                logging.getLogger(__name__).warning("HERDR_ENGINEERING_CONFIG: %s does not exist; skipped", part)
+        candidates.extend((Path(part), True) for part in parts)
     return [(c, trusted) for c, trusted in candidates if c.exists()]
 
 

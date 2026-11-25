@@ -1557,3 +1557,9 @@ def test_slow_open_owner_log_names_the_phases(make_server, caplog, monkeypatch):
     assert api.raw("POST", "/api/auth/open", {}, {"X-Forwarded-For": "100.64.0.1"})[0] == 200
     line = next(r.getMessage() for r in caplog.records if "auth/open took" in r.getMessage())
     assert "mint " in line and "audit " in line
+
+
+def test_enabled_bridge_route_is_not_answered_404_by_the_disabled_check(make_server):
+    _, api = make_server(bridge_section())
+    status, _, _ = api.raw("POST", "/rpc/health", {"json": {}})
+    assert status != 404
