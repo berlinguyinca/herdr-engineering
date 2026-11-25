@@ -202,6 +202,14 @@ services:
       - "--web-root"
       - "/app/packages"
       - "--allow-open"
+      # Host names the API answers to (DNS-rebinding guard; IP literals and localhost always pass).
+      # dev.lan is the shipped front door, control-plane-web the compose-internal name the LLM proxy and
+      # dashboard proxy call. Add any other name (e.g. the public fabric name) under
+      # control_plane.collab.dashboard_hosts in the central fleet file: it is merged with these.
+      - "--collab-dashboard-host"
+      - "dev.lan"
+      - "--collab-dashboard-host"
+      - "control-plane-web"
       - "--fleet-config"
       - "/etc/herdr/fleet/fleet-config.yaml"
 

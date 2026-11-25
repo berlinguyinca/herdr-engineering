@@ -428,7 +428,7 @@ def test_guard_rejects_missing_registration_and_foreign_project_before_dispatch(
         with pytest.raises(urllib.error.HTTPError) as forbidden:
             _summary_post(proxy, foreign)
         assert forbidden.value.code == 403
-        assert gpu == cpu == calls == []
+        assert gpu == cpu == []     # the catalog is read first, to see whether the name shadows a gateway model
     finally:
         _teardown(proxy, srvs)
 
@@ -490,7 +490,7 @@ def test_registration_project_scope_applies_without_guard_header_too():
         with pytest.raises(urllib.error.HTTPError) as error:
             _post(proxy, foreign, {"model": "summary"})
         assert error.value.code == 403
-        assert gpu == cpu == calls == []
+        assert gpu == cpu == []     # the catalog is read to see whether the name shadows a gateway model
     finally:
         _teardown(proxy, srvs)
 
@@ -546,20 +546,22 @@ def test_truncated_fabric_response_fails_accounting_without_cpu_retry(chunked):
         _teardown(proxy, srvs)
 
 
-def test_legacy_static_model_project_is_metadata_unless_registration_guard_requested():
+def test_a_registered_models_project_is_enforced_with_or_without_the_guard_header():
+    # Was "metadata unless the guard header is sent": that let any project key read through another project's
+    # registered model, so a foreign key now gets 403 whichever way it asks.
     repo, _, proxy, upstream, custom, srvs = _setup()
     try:
+        repo.delete_custom_model("my-model")        # ownership never changes in place: the operator deletes first
         repo.upsert_custom_model("my-model", f"http://127.0.0.1:{srvs[1].server_address[1]}",
                                  "real-name", project="proj-a")
+        _serve_catalog(srvs[0], ["other"])          # a project-owned name routes once a catalog has been read
         foreign = repo.create_project_key("proj-b")["key"]
         proxy.RequestHandlerClass.state.refresh(force=True)
-        assert _post(proxy, foreign, {"model": "my-model"})[0] == 200
-        assert len(custom) == 1 and upstream == []
-        with pytest.raises(urllib.error.HTTPError) as forbidden:
-            _post_headers(proxy, foreign, {"model": "my-model"},
-                          {"X-Herdr-Require-Registered-Model": "true"})
-        assert forbidden.value.code == 403
-        assert len(custom) == 1 and upstream == []
+        for extra in ({}, {"X-Herdr-Require-Registered-Model": "true"}):
+            with pytest.raises(urllib.error.HTTPError) as forbidden:
+                _post_headers(proxy, foreign, {"model": "my-model"}, extra)
+            assert forbidden.value.code == 403
+        assert custom == [] and upstream == []
     finally:
         _teardown(proxy, srvs)
 
@@ -996,5 +998,140 @@ def test_connect_timeout_guards_only_the_fallback_attempt_not_the_body_read(monk
     try:
         status, _, body = _summary_post(proxy, key)
         assert status == 200 and body == b"{}"
+    finally:
+        _teardown(proxy, srvs)
+
+
+# ------------------------------------------- a custom model cannot capture traffic or reach metadata addresses
+
+
+def _serve_catalog(srv, ids, aliases=()):
+    """Make the fake upstream answer GET /v1/models like the gateway does."""
+    def get(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(json.dumps({"data": [{"id": i, "aliases": list(aliases)} for i in ids]}).encode())
+    srv.RequestHandlerClass.do_GET = get
+
+
+def test_a_plain_custom_model_cannot_shadow_a_model_the_upstream_serves():
+    repo, key, proxy, upstream, custom, srvs = _setup()
+    try:
+        _serve_catalog(srvs[0], ["qwen"], aliases=["qwen-alias"])
+        for name in ("qwen", "qwen-alias"):
+            repo.upsert_custom_model(name, f"http://127.0.0.1:{srvs[1].server_address[1]}", "stolen")
+        proxy.RequestHandlerClass.state.refresh(force=True)
+        for name in ("qwen", "qwen-alias"):
+            assert _post(proxy, key, {"model": name, "messages": []})[0] == 200
+        assert custom == [] and [s["body"]["model"] for s in upstream] == ["qwen", "qwen-alias"]
+        assert upstream[0]["auth"] == "Bearer UPSTREAM-SECRET"
+        # a name the upstream does not serve is still routed to its registered service
+        assert _post(proxy, key, {"model": "my-model", "messages": []})[0] == 200
+        assert len(custom) == 1 and custom[0]["body"]["model"] == "real-name"
+    finally:
+        _teardown(proxy, srvs)
+
+
+def test_a_policy_model_sharing_the_upstream_name_keeps_its_registration():
+    # Only a record whose route would leave the upstream is neutralised; a fabric_model registration stays on the
+    # gateway on purpose, so its fallback and egress policy keep applying.
+    _, key, proxy, gpu, cpu, srvs, _ = _policy_setup(catalog=[_gpu_model(aliases=["qwen-small", "summary"])])
+    try:
+        status, headers, _ = _summary_post(proxy, key)
+        assert status == 200 and headers["X-Herdr-LLM-Route"] == "fabric"
+        assert gpu[0]["body"]["model"] == "gpu/qwen-small" and cpu == []
+    finally:
+        _teardown(proxy, srvs)
+
+
+def test_a_shadowed_name_is_not_registered_for_a_guarded_request():
+    repo, key, proxy, upstream, custom, srvs = _setup()
+    try:
+        _serve_catalog(srvs[0], ["qwen"])
+        repo.upsert_custom_model("qwen", f"http://127.0.0.1:{srvs[1].server_address[1]}", "stolen", project="proj-a")
+        proxy.RequestHandlerClass.state.refresh(force=True)
+        with pytest.raises(urllib.error.HTTPError) as refused:
+            _post_headers(proxy, key, {"model": "qwen"}, {"X-Herdr-Require-Registered-Model": "true"})
+        assert refused.value.code == 503
+        assert custom == [] and upstream == []
+    finally:
+        _teardown(proxy, srvs)
+
+
+def test_the_last_known_catalog_still_protects_when_the_catalog_is_unavailable():
+    repo, key, proxy, upstream, custom, srvs = _setup()
+    try:
+        state = proxy.RequestHandlerClass.state
+        _serve_catalog(srvs[0], ["qwen"])
+        assert [i["id"] for i in state._fabric_catalog()] == ["qwen"]
+        srvs[0].RequestHandlerClass.do_GET = lambda self: (self.send_response(500), self.end_headers())
+        state._catalog_last = float("-inf")           # the next call re-reads the catalog, and it fails
+        repo.upsert_custom_model("qwen", f"http://127.0.0.1:{srvs[1].server_address[1]}", "stolen")
+        state.refresh(force=True)
+        assert _post(proxy, key, {"model": "qwen", "messages": []})[0] == 200
+        assert custom == [] and len(upstream) == 1
+    finally:
+        _teardown(proxy, srvs)
+
+
+@pytest.mark.parametrize("base_url", ["http://169.254.169.254", "http://[fe80::1]:9", "http://u:p@127.0.0.1:9",
+                                      "http://metadata.google.internal"])
+def test_a_stored_base_url_is_validated_again_when_used(base_url):
+    repo, key, proxy, upstream, custom, srvs = _setup()
+    try:
+        # Written straight into the event log, as an entry that predates the registration check would be.
+        repo.record_event("custom_model", "planted", "custom_model.upserted",
+                          {"name": "planted", "upstream_model": "planted", "project": None, "deleted": False,
+                           "base_url": base_url})
+        proxy.RequestHandlerClass.state.refresh(force=True)
+        with pytest.raises(urllib.error.HTTPError) as refused:
+            _post(proxy, key, {"model": "planted", "messages": []})
+        assert refused.value.code == 403
+        assert b"model_endpoint_refused" in refused.value.read()
+        assert custom == [] and upstream == []
+    finally:
+        _teardown(proxy, srvs)
+
+
+def test_a_shadowed_name_registered_by_another_project_still_routes_upstream_for_everyone_else():
+    repo, key, proxy, upstream, custom, srvs = _setup()
+    try:
+        _serve_catalog(srvs[0], ["qwen"])
+        repo.upsert_custom_model("qwen", f"http://127.0.0.1:{srvs[1].server_address[1]}", "stolen", project="proj-b")
+        proxy.RequestHandlerClass.state.refresh(force=True)
+        assert _post(proxy, key, {"model": "qwen", "messages": []})[0] == 200      # proj-a, not the owner: no 403
+        assert custom == [] and [s["body"]["model"] for s in upstream] == ["qwen"]
+    finally:
+        _teardown(proxy, srvs)
+
+
+def test_a_project_owned_registration_is_refused_until_a_catalog_has_been_read():
+    repo, key, proxy, upstream, custom, srvs = _setup()
+    try:
+        # The fake upstream serves no catalog (501), so whether the name shadows a gateway model is unknown.
+        repo.upsert_custom_model("owned", f"http://127.0.0.1:{srvs[1].server_address[1]}", "x", project="proj-a")
+        proxy.RequestHandlerClass.state.refresh(force=True)
+        with pytest.raises(urllib.error.HTTPError) as refused:
+            _post(proxy, key, {"model": "owned", "messages": []})
+        assert refused.value.code == 503 and custom == []
+        _serve_catalog(srvs[0], ["other"])
+        proxy.RequestHandlerClass.state._catalog_last = float("-inf")
+        assert _post(proxy, key, {"model": "owned", "messages": []})[0] == 200
+        assert len(custom) == 1
+    finally:
+        _teardown(proxy, srvs)
+
+
+def test_a_named_endpoint_is_connected_by_its_validated_address_with_the_original_host_header():
+    repo, key, proxy, upstream, custom, srvs = _setup()
+    try:
+        port = srvs[1].server_address[1]
+        repo.upsert_custom_model("named", f"http://localhost:{port}", "x")
+        proxy.RequestHandlerClass.state.refresh(force=True)
+        assert _post(proxy, key, {"model": "named", "messages": []})[0] == 200
+        assert custom[0]["headers"]["host"] == f"localhost:{port}"
+        state = proxy.RequestHandlerClass.state
+        assert set(state.pinned_addresses(f"http://localhost:{port}")) <= {"127.0.0.1", "::1"}
+        assert state.pinned_addresses(f"http://127.0.0.1:{port}") == ()
     finally:
         _teardown(proxy, srvs)

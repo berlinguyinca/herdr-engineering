@@ -10,6 +10,19 @@ from typing import Any
 from ..host_policy import default_policy, evaluate_eligibility
 from ..scheduler import HostCapacity, PlacementRequest, Scheduler
 
+MAX_LEASE_TTL_SECONDS = 600.0
+
+
+def _lease_ttl(ttl) -> float:
+    """A heartbeat's ttl, clamped to 1..MAX_LEASE_TTL_SECONDS; non-numeric or non-finite is refused."""
+    try:
+        value = float(ttl)
+    except (TypeError, ValueError):
+        raise ValueError("ttl must be a finite number of seconds") from None
+    if not math.isfinite(value):
+        raise ValueError("ttl must be a finite number of seconds")
+    return min(max(1.0, value), MAX_LEASE_TTL_SECONDS)
+
 
 class SchedulerService:
     def __init__(self, repo, *, reservation_ttl=90.0, owner_queue_limit=100,
@@ -479,6 +492,7 @@ class SchedulerService:
             raise PermissionError("lease generation is stale")
         if not isinstance(token, str) or not secrets.compare_digest(token, str(lease.get("token", ""))):
             raise PermissionError("lease token is invalid")
+        ttl = _lease_ttl(ttl)
         now = datetime.now(UTC)
         try:
             expiry = datetime.fromisoformat(lease["expires_at"])
@@ -488,7 +502,7 @@ class SchedulerService:
         if not live:
             raise PermissionError("lease expired; execution requires reconciliation")
         lease["heartbeat_at"] = now.isoformat()
-        lease["expires_at"] = (now + timedelta(seconds=max(1, float(ttl)))).isoformat()
+        lease["expires_at"] = (now + timedelta(seconds=ttl)).isoformat()
         return self.repo.save_scheduler_lease(lease)
 
     def reconcile_leases(self, now=None):

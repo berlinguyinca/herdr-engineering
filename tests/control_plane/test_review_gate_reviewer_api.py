@@ -539,7 +539,7 @@ def test_csrf_and_content_type_checks_apply(server):
     assert post(server, "review-gate/claim", good, headers={"Origin": origin})[0] == 200
 
 
-SMUGGLED = b"GET /api/v1/review-gate/prs HTTP/1.1\r\nHost: x\r\nX-API-Key: read\r\n\r\n"
+SMUGGLED = b"GET /api/v1/review-gate/prs HTTP/1.1\r\nHost: 127.0.0.1\r\nX-API-Key: read\r\n\r\n"
 
 
 def raw_exchange(srv, payload: bytes, wait=0.5):
@@ -557,7 +557,7 @@ def raw_exchange(srv, payload: bytes, wait=0.5):
 
 def _head(path, extra):
     return (
-        f"POST /api/v1/{path} HTTP/1.1\r\nHost: x\r\n"
+        f"POST /api/v1/{path} HTTP/1.1\r\nHost: 127.0.0.1\r\n"
         f"X-API-Key: {REV}\r\nContent-Type: application/json\r\n{extra}\r\n"
     ).encode()
 
