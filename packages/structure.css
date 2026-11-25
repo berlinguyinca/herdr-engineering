@@ -1,0 +1,20 @@
+/* Structure pass (desktop complexity). Loaded last, presentation only: no ids, data-attributes, routes or data change.
+   1. Target size: stand-alone links, summaries, fields and checkboxes reach the 24 px minimum (WCAG 2.5.8).
+   2. One primary action per view: filled accent buttons that are not the page's main action look like secondary buttons.
+   3. Two corner radii (controls 4 px, containers 10 px; status dots stay round). */
+#view .ov-heading a, #view .ov-row > div > a, #view .ov-history a, #view .as-story a, #view .rel dd a, #view .rel nav a,
+#view .sw-links a, #view a.cia-name, #view .ci-ob-worst button, #view a.mc-title, #view #session-mission a, #view .sw-llm-link, #view .hd-linkbtn, #view .sd-back, #view > a:first-child { display: inline-flex; align-items: center; min-height: 24px; }
+#view .ov-note a { display: inline-block; min-height: 24px; line-height: 24px; }
+#view details > summary { min-height: 24px; box-sizing: border-box; }
+#view input:not([type=checkbox]):not([type=radio]), #view select, #view textarea { min-height: 28px; box-sizing: border-box; }
+#view input[type=checkbox], #view input[type=radio] { width: 24px; height: 24px; }
+
+#view #session-terminal .hd-btn, #view #pa-panel .hd-btn, #view #pa-generic .hd-btn { color: var(--text); background: var(--surface); border-color: var(--border); }
+#view #session-terminal .hd-btn:not(:focus-visible), #view #pa-panel .hd-btn:not(:focus-visible), #view #pa-generic .hd-btn:not(:focus-visible) { box-shadow: none; }
+#view #session-terminal .hd-btn:hover:not(:disabled), #view #pa-panel .hd-btn:hover:not(:disabled), #view #pa-generic .hd-btn:hover:not(:disabled) { background: var(--surface-hover); }
+#view #pa-panel .hd-btn:disabled, #view #pa-panel .hd-btn[aria-disabled="true"] { opacity: .6; }
+
+#view .hd-btn, #view button, #view select, #view input[class], #view textarea[class], #view .hd-tabs > *, #view .pa-tabgroup, #view .pa-atab, #view .pa-tab,
+#view .pa-status, #view .pa-badge, #view .pa-graph-chip, #view .rel-state, #view .ov-metric, #view .ov-tag, #view details > summary, #view kbd, #view code { border-radius: 4px; }
+#view .hd-card, #view details.hd-card, #view .ov-panel, #view .pa-msg, #view .pa-app, #view .pa-setup, #view .pa-strip, #view .sw-message,
+#view .sw-summary-card, #view .sw-panes, #view .conversation-input { border-radius: 10px; }

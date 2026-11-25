@@ -91,3 +91,20 @@ def test_the_log_remembers_that_the_compaction_fallback_began_once(tmp_path: Pat
     assert attempts >= 1
     marks = [e for e in log.read() if e.event == "handoff.takeover_started" and e.reason == eventsmod.COMPACTING]
     assert len(marks) == 1  # the log says that the fallback began
+
+
+def test_a_refused_push_is_recorded_as_push_failed_and_the_chain_goes_on(tmp_path: Path) -> None:
+    w = World(tmp_path)
+    _repo_on("feature", w.repo, dirty=True)
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+    hook = remote / "hooks" / "pre-receive"
+    hook.write_text("#!/bin/sh\necho refused >&2\nexit 1\n")
+    hook.chmod(0o755)
+    _git(w.repo, "remote", "add", "origin", str(remote))
+    ref = SessionRef(Harness.CLAUDE, "p1", w.repo, "s-p1", None)
+    result = ctlrun._checkpoint(w.ctl, ref, "c1", w.repo, True, 85.0)
+    assert result is not None and result.committed  # not ended as git_state_unknown
+    (done,) = [e for e in w.events() if e.event == "handoff.wip_committed"]
+    assert done.reason == "push_failed" and done.commit
+    assert not [e for e in w.events() if e.event == "handoff.stuck"]

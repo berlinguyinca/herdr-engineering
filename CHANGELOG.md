@@ -17,6 +17,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - ACL grants refuse a non-finite or out-of-range `expires_at` (400) before touching the maps, and the registry write runs under the ACL lock so concurrent grant/revoke persist in the order they apply.
 - Report routes that answer before reading a POST body (build status, build, unknown path, report creation) close the connection; `too_large` is answered only for an artifact with a stored file (a report with no current file stays 404); a 10+ digit Content-Length is 413, not 400.
 - S3 client: 5 s connect timeout, botocore's own 60 s read timeout and default retries (a 30 s read timeout cut large uploads short).
+### Fix: bug-hunt wave 2 (handoff checkpoint, scratch reaper, cleanup target, architecture runner)
+
+- Auto-handoff checkpoint: a refused push (non-fast-forward, protected upstream, failing hook) now records `handoff.wip_committed` with reason `push_failed` (and git's reason line, not the `To <url>` header, in `error`) and the chain continues, taking over with the dirty source allowed so the old session still closes; if git cannot list the unpushed commits after the refusal, the chain ends red as `git_state_unknown`.
+- Scratch reaper and `cleanup --scope tmp`: session records older than the live window no longer count toward the 50,000-file inspection limit, and a record that vanishes mid-scan (it may have been renamed) makes the scan re-list once and then fail closed, like a directory removed mid-walk or a recent-record count over the limit.
+- `cleanup --scope target` (and `--scope tmp`) refuse when `git` fails for any reason other than "not a git repository" (both the "(or any of the parent directories)" and the "(or any parent up to mount point ...)" forms), so a worktree whose repository moved is no longer treated as untracked; the tracked-files check now asks about the target's own name, so managed `targets/<label>-<id>` directories are covered.
+- Architecture worker output over 64 MiB is reported as a size error at once, not after the 300 s wall-clock limit.
 ### Fix: inspector snapshot rebuild with archived rows, same-millisecond rows, and a missing snapshot table
 
 - The snapshot writer's full rebuild now also replays the rows the inspector archive moved into `fabric_events_archive`. Before, any archived row made the rebuilt count differ from the stored count, so the snapshot was never rewritten and boots fell back to the full replay.
@@ -102,6 +108,7 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 - `PostgresStoreBackend.load()` no longer turns a failed read into "no snapshot": it raises `StoreLoadError`, so a control plane that boots while Postgres is unreachable fails startup instead of running with an empty store whose first mutation overwrote the stored snapshot.
 - Backend snapshot writes are numbered under the store lock and written one at a time; a slow older write can no longer land after a newer snapshot.
 - The store's list/search methods, `request_tool_action`'s idempotency scan and `list_approvals` read the shared dicts under the store lock (no more `dictionary changed size during iteration`), and `decide_approval` is atomic, so two concurrent decisions on one approval cannot both pass the pending check.
+
 ### Fix: Slack approval of unseen text, calendar block-list alias, Rakazo first-bot cache
 
 - Slack ask: the Approve buttons are only offered when the command is shown in full; a long (truncated) command gets Deny only and a "cannot be approved from Slack" note, and an approve tap on such an ask is refused (`not_fully_shown`).
