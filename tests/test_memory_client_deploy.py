@@ -260,7 +260,7 @@ def test_ordinary_redeploy_preserves_approved_policy_without_remote_health_gate(
     before=current.read_bytes()
     body=f'''
 REPO="{ROOT}"; HERE="{ROOT}/deploy/control-plane"; PROJECT=herdr-control-plane
-MEMORY_PRIVATE_EGRESS=auto; MEMORY_PRIVATE_EGRESS_CIDR=172.31.252.0/29; MEMORY_PRIVATE_EGRESS_GATEWAY=""
+MEMORY_PRIVATE_EGRESS=auto; MEMORY_PRIVATE_EGRESS_CIDR=172.31.252.32/29; MEMORY_PRIVATE_EGRESS_GATEWAY=""
 . "{ROOT}/deploy/control-plane/web-egress-deploy.sh"
 web_egress_cmd() {{
   if [ "$1" = approved ]; then
@@ -288,7 +288,7 @@ memory_client_forward_connectivity "$WORK"
 def test_auto_without_any_owned_state_never_inspects_or_calls_root(harness):
     body=f'''
 REPO="{ROOT}"; HERE="{ROOT}/deploy/control-plane"; PROJECT=herdr-control-plane
-MEMORY_PRIVATE_EGRESS=auto; MEMORY_PRIVATE_EGRESS_CIDR=172.31.252.0/29; MEMORY_PRIVATE_EGRESS_GATEWAY=""
+MEMORY_PRIVATE_EGRESS=auto; MEMORY_PRIVATE_EGRESS_CIDR=172.31.252.32/29; MEMORY_PRIVATE_EGRESS_GATEWAY=""
 . "{ROOT}/deploy/control-plane/web-egress-deploy.sh"
 web_egress_cmd() {{ echo unexpected-egress-command >> "{harness['log']}"; return 99; }}
 web_egress_preflight
@@ -297,3 +297,23 @@ web_egress_preflight
     result=run(harness,body)
     assert result.returncode==0,result.stderr
     assert not harness['log'].exists()
+
+
+def test_explicit_enable_surfaces_why_the_approved_subnet_could_not_be_read(harness):
+    from herdr_engineering.web_egress_runtime import make_record, private_json
+    incomplete=make_record('172.31.252.0/29','100.71.1.7/32','e'*32)   # enabled, but no network_id / rule_may_exist
+    private_json(harness['root']/'state/web-egress/current.json',incomplete)
+    body=f'''
+REPO="{ROOT}"; HERE="{ROOT}/deploy/control-plane"; PROJECT=herdr-control-plane
+MEMORY_PRIVATE_EGRESS=1; MEMORY_PRIVATE_EGRESS_CIDR=172.31.252.32/29; MEMORY_PRIVATE_EGRESS_GATEWAY=100.71.1.7/32
+. "{ROOT}/deploy/control-plane/web-egress-deploy.sh"
+web_egress_cmd() {{
+  if [ "$1" = approved ]; then
+    (cd "$REPO" && PYTHONPATH="$REPO" python3 -m herdr_engineering.web_egress_runtime "$@")
+  else echo '{{"enabled":true,"managed":true}}'; fi
+}}
+web_egress_preflight
+'''
+    result=run(harness,body)
+    assert result.returncode==0,result.stderr
+    assert 'Private egress transaction failed' in result.stderr and 'could not read the approved network' in result.stderr
