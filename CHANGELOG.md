@@ -5,6 +5,12 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: REST and CLI approval refuse a command the owner saw only in part
+
+- `POST /api/v1/assistant-action-requests/<id>/decision` with `approve: true` is refused (409, code `truncated_display`) when the stored display was cut (it ends in `...(+N chars)`); the request stays pending and can still be denied. The check is in `record_owner_decision`, so every approving path shares it. Request views carry `display_complete`.
+- Whitespace runs and control characters collapse to one space before the display is cut, so padding cannot push a command's tail out of view.
+- `herdr-eng control-plane assistant-action list` prints the whole stored display, not its first 120 characters.
+
 ### Fix: artifact ACL expiry after restart, body-size and connection hygiene, retract revokes shares
 
 - Artifact ACL: expiring grants reloaded from the registry (ISO strings) no longer raise `TypeError` in `can`/`held`/`principals_with`; `expires_at` is normalised to epoch seconds and an invalid value is a 400. The ACL maps are now guarded by a lock.

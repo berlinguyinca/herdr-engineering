@@ -86,6 +86,18 @@ _LOGIN_RE = re.compile(r"(?i)\b((?:docker|podman)\s+login\b[^\n]*?\s(?:-p|--pass
 _DB_ATTACHED_RE = re.compile(r"(?i)\b((?:mysql|mysqldump|mysqladmin|psql|mariadb)\b[^\n]*?\s-p)[^\s\"']+")
 _MASK = "***"
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
+_SPACE_RUN_RE = re.compile(r"\s{2,}")
+_TRUNCATED_RE = re.compile(r"\u2026\(\+\d+ chars\)$")
+
+
+def display_complete(display: str) -> bool:
+    """False when ``scrub_display`` cut the text (it ends in the ``...(+N chars)`` marker): the owner saw only part of
+    the command, so an approval of it must be refused. A command that merely ends like the marker is refused too."""
+    return not _TRUNCATED_RE.search(display)
+
+
+class TruncatedDisplay(ValueError):
+    """An approve decision for a request whose displayed text was cut; only a denial is possible."""
 
 
 def display_text(raw: RawAction) -> str:
@@ -102,7 +114,8 @@ def scrub_display(text: str) -> str:
     scrubber. A secret that has no recognizable shape (a bare word like ``hunter2``) cannot be detected, which is why
     this text lives only on the request row and key_canonical holds a digest instead of command text.
     """
-    out = _CONTROL_RE.sub(" ", text[:_MAX_SCRUB_INPUT])                    # no ESC/C0/C1 (or newline/tab) in anything a terminal may print
+    text = _SPACE_RUN_RE.sub(" ", _CONTROL_RE.sub(" ", text))              # no ESC/C0/C1 (or newline/tab) in anything a terminal
+    out = text[:_MAX_SCRUB_INPUT]                                           # may print; space runs cannot pad the tail out of view
     out = _USERINFO_RE.sub(r"\1" + _MASK + "@", out)
     out = _HEADER_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}{_MASK}", out)
     out = _SSHPASS_RE.sub(lambda m: m.group(1) + _MASK, out)
@@ -477,6 +490,8 @@ def record_owner_decision(store: AssistantStore, cfg: dict, now: datetime, tenan
             raise ValueError("a vetoed request cannot be decided")
         if row.status != "pending":
             raise ValueError("request already decided")
+        if approve and not display_complete(row.display):
+            raise TruncatedDisplay("the command was shown to the owner only in part; it can be denied, not approved")
         row = replace(row, status="approved" if approve else "denied", decided_at=as_utc(now), decided_by=decided_by)
         store.put_action_request(row)
         store.add_action_evidence(ActionEvidence(

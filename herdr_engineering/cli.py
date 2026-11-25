@@ -4927,7 +4927,7 @@ def _cmd_cp_assistant_hub_owner(args) -> int:
                 rows = call("GET", f"/api/v1/assistant-action-requests{query}")["requests"]
                 print(f"{'REQUEST_ID':<20} {'STATUS':<9} {'VERB':<14} {'WORKER':<22} DISPLAY")
                 for r in rows:
-                    display = _tty_safe(r["display"])[:120]
+                    display = _tty_safe(r["display"])
                     print(_tty_safe(f"{r['request_id']:<20} {r['status']:<9} {r['verb']:<14} {r['worker_id']:<22} ")
                           + display)
             else:
