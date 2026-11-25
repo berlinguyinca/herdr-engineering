@@ -117,6 +117,17 @@ test('the baselines do not depend on the host: the whole suite passes under a ho
   assert.equal(r.status, 0, `baselines:check under the bundled-fonts-only fontconfig failed:\n${(r.stdout + r.stderr).split('\n').filter((l) => !l.startsWith('ok')).slice(0, 25).join('\n')}`);
 });
 
+test('the baselines do not depend on the host time zone: surfaces that print a date or a time check clean under a UTC-ahead and a UTC-behind zone', () => {
+  // the baselines were made in a UTC container; a CI host in America/Los_Angeles moved the clock text on collab-chat and the
+  // dashboard approvals page (the fixed clock is an instant, the page prints it in the browser's zone), so the capture pins its own zone
+  for (const TZ of ['America/Los_Angeles', 'Pacific/Kiritimati']) {
+    for (const slug of ['collab-chat', 'dashboard-assistant-approvals', 'dashboard-assistant-notifications']) {
+      const r = spawnSync(process.execPath, [path.join(FONT_DIR, '..', 'visual-baselines.mjs'), 'check', slug], { encoding: 'utf8', env: { ...process.env, TZ }, maxBuffer: 1 << 26, timeout: 300000 });
+      assert.equal(r.status, 0, `${slug} under TZ=${TZ}:\n${(r.stdout + r.stderr).split('\n').filter((l) => !l.startsWith('ok')).slice(0, 12).join('\n')}`);
+    }
+  }
+});
+
 // ---- the gate has teeth: each defect below is one a reviewer found slipping past an earlier, looser budget, or one a person would
 // not miss. A defect is injected with CSS after the page is ready and the compare must fail it on the page or on the component.
 const TEETH = [
