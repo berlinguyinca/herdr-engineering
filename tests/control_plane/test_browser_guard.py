@@ -218,6 +218,25 @@ def test_clearing_a_deployment_request_is_a_host_token_route_too(tmp_path):
         svr.shutdown()
 
 
+def test_an_api_key_client_answers_to_an_unlisted_name_but_only_with_a_valid_key(tmp_path):
+    # Agents (ingest, sessions) reach the control plane by whatever name their control_plane_url uses and
+    # authenticate with X-API-Key, which a rebinding page cannot present: the key, not the Host allowlist,
+    # is their credential. Without a valid key, or with an Origin (a browser), the unlisted name is refused.
+    svr = ControlPlaneServer(ControlPlaneRepo(), api_keys={"placeholder-agent-key": "operator"})
+    threading.Thread(target=svr.serve, daemon=True).start()
+    svr.wait_until_ready()
+    try:
+        name = {"Host": "cp.tail1234.ts.net"}
+        status, body = call(svr, "GET", "/api/v1/sessions", {**name, "X-API-Key": "placeholder-agent-key"})
+        assert status == 200, (status, body)
+        for headers in (name, {**name, "X-API-Key": "wrong"},
+                        {**name, "X-API-Key": "placeholder-agent-key", "Origin": "http://cp.tail1234.ts.net"}):
+            status, body = call(svr, "GET", "/api/v1/sessions", headers)
+            assert status == 403 and "host not allowed" in json.dumps(body), (headers, status, body)
+    finally:
+        svr.shutdown()
+
+
 def test_a_name_added_to_dashboard_hosts_works_without_a_restart(tmp_path):
     from herdr_engineering.fleet_config import FleetConfigStore
     path = tmp_path / "fleet.yaml"

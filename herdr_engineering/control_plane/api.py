@@ -2230,9 +2230,11 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                 return False
             host = self.headers.get("Host", "")
             if not host_ok(host, server._static_allowed_hosts) and not host_ok(host, server.allowed_hosts):
-                if (self._host_token_route(path) and self.headers.get("Origin") is None
-                        and self._valid_host_token()):
-                    return False   # not a browser: the per-host token is the credential, any name will do
+                if self.headers.get("Origin") is None and (
+                        (self._host_token_route(path) and self._valid_host_token()) or self._valid_api_key()):
+                    # Not a browser: a per-host token or a configured API key is the credential (a rebinding page
+                    # cannot present either), so the name the client reached us by does not matter.
+                    return False
                 return self._deny(403, "host not allowed: add it to control_plane.collab.dashboard_hosts")
             if writes:
                 refusal = browser_write_refusal(self.headers, server.allowed_hosts)
@@ -2245,6 +2247,16 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                     or path in _DEPLOYMENT_HOST_GET_PATHS or path in _DEPLOYMENT_EVENTS_PATHS
                     or _DEPLOYMENT_REQUEST_PATH.match(path) is not None   # DELETE: the host clears a picked-up request
                     or path.startswith("/api/v1/host/terminal/"))
+
+        def _valid_api_key(self):
+            """True when the request carries one of the configured API keys (never on an open listener)."""
+            supplied = self.headers.get_all("X-API-Key") or []
+            if len(supplied) != 1:
+                return False
+            if any(secrets.compare_digest(supplied[0], candidate) for candidate in server._keys):
+                return True
+            agent_key = (server.ci_fix_config or {}).get("agent_api_key") if server.ci_fix is not None else None
+            return bool(agent_key) and secrets.compare_digest(supplied[0], agent_key)
 
         def _valid_host_token(self):
             """True when the request carries a fleet host token the current fleet file knows."""
