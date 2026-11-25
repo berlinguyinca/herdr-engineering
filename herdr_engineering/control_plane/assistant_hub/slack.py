@@ -1008,7 +1008,7 @@ class SlackRuntime:
         lines.append("```" + slack_text(item.display) + "```")
         if not shown:
             if not item.approvable:
-                lines.append("*It cannot be approved at all: part of it is masked or too long.* Deny it, or have the worker "
+                lines.append("*It is too long to show in full and cannot be approved at all.* Deny it, or have the worker "
                              "request it differently.")
             else:
                 lines.append("*Too long for Slack: it cannot be approved here.* Deny it, or read it in full and "

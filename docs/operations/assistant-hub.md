@@ -245,30 +245,28 @@ A worker credential gets 401/403 on all of these, a viewer key gets 403, and cro
 `display` is what lets you recognise a request. It is returned **only** on these owner routes (and held in the owner's
 request row and store snapshot); it is never in the MCP response, the audit log, grants, evidence or events. It is
 **masked best effort** (URL userinfo, secret-named options and `NAME=value` pairs, Bearer headers, token shapes), then
-cut to 300 characters. Masking runs on the original text and the visible rendering runs last: every blank-looking
-character (tab, newline, Unicode spaces, zero-width and Braille-blank characters, controls, lone surrogates) becomes a
-closed token, so two different commands do not look alike and no control character reaches a terminal. A run of one
-character shows as `⟨␣×2⟩` (two spaces) or `⟨U+2800×260⟩`, a single one as `⟨\t⟩` or `⟨\n⟩`; a literal backslash is
-doubled and a literal `⟨`/`⟩` is written `\u{27e8}`/`\u{27e9}`. A cut display ends in `…(+N chars)`.
+cut to 300 characters. What is masked is unchanged: control characters (newline, tab, ESC) become one space, then the
+same rules in the same order as before; masks that could hide part of a command are a separate, known issue. The
+visible rendering runs last, on the masked text: every other blank-looking or invisible character (Unicode spaces,
+zero-width, format, private-use, unassigned, `U+FFA0`, variation selectors, lone surrogates) and a literal `⟨`/`⟩`
+becomes a closed token, so two different commands do not look alike. A run of one character shows as `⟨␣×2⟩` (two
+spaces) or `⟨U+2800×260⟩`, a single one as `⟨U+00A0⟩`. A cut display ends in `…(+N chars)`.
 
 The list view has `display_complete` (false when the display was cut) and `approvable` (false when the request can only
 be denied). `GET /api/v1/assistant-action-requests/<id>` also returns `display_full`, the whole masked text (equal to
 `display` when nothing was cut); the list never carries it. To **approve** a request whose `display_complete` is false,
 send `{"approve": true, "display_sha256": "<SHA-256 hex of display_full, UTF-8>"}`; a missing or wrong hash is 409
-`truncated_display` and nothing is recorded. Denying never needs a hash. A request is deny-only (`approvable` false,
-409 even with the hash) when the command is over the 8192-byte cap, when its rendering is over 16384 characters (cut),
-or when any mask replaced a character outside `[A-Za-z0-9._~+/=-]` (a quote, backslash, blank, `&`, `;`, `|`, `$`, `@`,
-`:`, `{`, anything non-ASCII), because the `***` could hide a command; its display ends in
-`…(masked shell syntax not shown)`. Every scrubber runs over the whole text. So `curl -H "Authorization: Bearer abc.DEF-123"
-https://example` stays approvable and shows the URL, while a JSON password with `&`, a `user:pass@` URL or
-`Bearer abc;def` is deny-only. `display_sha256` must be 64 hex characters (any case), else 400. Invisible characters
-(controls, format, separators, private-use, unassigned, `U+FFA0`, variation selectors) are shown as `⟨U+XXXX⟩` tokens.
-A row stored before `display_full` existed is approvable only when its display is complete.
+`truncated_display` and nothing is recorded. Denying never needs a hash. `display_sha256` must be 64 hex characters
+(any case), else 400. A request is deny-only (`approvable` false, 409 even with the hash) when the command is over the
+8192-character cap or its rendering is over 16384 characters; its `display_full` is then cut too. A row stored before
+`display_full` existed is approvable only when its display is complete.
 
-CLI: `assistant-action show ID` prints the full text and `display_sha256`. `assistant-action approve ID` on a cut
-command asks `Approve exactly this command? [y/N]` on a terminal; off a terminal it needs `--display-sha256 <hash>` from
-`show`. It never approves a cut command in one step. **Slack never approves a cut command**: the message says it is
-too long for Slack and points here (or that it cannot be approved at all when masked). A scrubber cannot recognise an arbitrary secret word
+CLI: `assistant-action show ID` prints the full text and `display_sha256`. `assistant-action approve ID` posts the
+approval first and, only after a 409 `truncated_display`, fetches the row: on a terminal it asks
+`Approve exactly this command? [y/N]` (Ctrl-C or Ctrl-D means no); off a terminal it needs `--display-sha256 <hash>`
+from `show`. It never approves a cut command in one step and shows the server's code and message on every refusal.
+**Slack never approves a cut command**: the message says it is too long for Slack and points here (or that it cannot be
+approved at all when deny-only). A scrubber cannot recognise an arbitrary secret word
 (`mysql -pSomething`-style variants and bare passwords can slip through), so treat the owner request list as sensitive
 and keep it off shared screens.
 

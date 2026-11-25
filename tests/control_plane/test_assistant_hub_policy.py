@@ -261,7 +261,7 @@ def test_persisted_state_holds_no_command_text_and_display_is_masked():
     rows = store.list_action_requests(T, U)
     assert any("https://***@example.com" in r.display and "--token=***" in r.display for r in rows)
     assert any("GITHUB_TOKEN=***" in r.display for r in rows)
-    assert any("Authorization: Bearer ***" in r.display for r in rows)
+    assert any("Authorization: ***" in r.display for r in rows)
     approvable = next(r for r in rows if r.status == "pending" and r.verb == "git.push")
     record_owner_decision(store, cfg, NOW, T, U, approvable.request_id, True, "owner")
     store.put_action_grant(ActionGrant(grant_id="ag_s", tenant_id=T, user_id=U, worker_id=W, key_id="k",
@@ -480,11 +480,11 @@ def test_wrapped_command_is_not_covered_by_the_plain_commands_grant(cmd):
     ('curl -H "X-Api-Key: key5" https://x', 'X-Api-Key: ***"', "key5"),
     ('curl -H "Cookie: sid=cook6" https://x', "Cookie: ***", "cook6"),
     ('curl -H "Set-Cookie: sid=cook7" https://x', "Set-Cookie: ***", "cook7"),
-    ('curl -H "Proxy-Authorization: Basic abc8" https://x', "Proxy-Authorization: Basic ***", "abc8"),
+    ('curl -H "Proxy-Authorization: Basic abc8" https://x', "Proxy-Authorization: ***", "abc8"),
     ("DB_PWD=pw9 AWS_SECRET=s10 MY_KEY=k11 X_PASS=p12 run", "DB_PWD=***", "pw9"),
     ("docker login -p pw13 reg", "-p ***", "pw13"),
     ("podman login --password pw14 reg", "--password ***", "pw14"),
-    ('curl -H "Authorization: Bearer tok15" https://x', 'Authorization: Bearer ***"', "tok15"),
+    ('curl -H "Authorization: Bearer tok15" https://x', 'Authorization: ***"', "tok15"),
 ])
 def test_display_masks_each_secret_shape(raw, masked, leaked):
     from herdr_engineering.control_plane.assistant_hub.policy import scrub_display
@@ -574,24 +574,17 @@ def test_active_grant_missing_activation_facts_is_not_live(missing):
 def _decode_visible(shown: str) -> str:
     """The inverse of render_visible; raises on anything it could not have produced."""
     import re
-    names = {"␣": " ", "\\t": "\t", "\\n": "\n", "\\r": "\r"}
     out, i = [], 0
     while i < len(shown):
         c = shown[i]
         if c == "⟨":
             j = shown.index("⟩", i)
-            body = shown[i + 1:j]
-            m = re.fullmatch(r"(.+?)(?:×(\d+))?", body)
-            name, n = m.group(1), int(m.group(2) or 1)
-            ch = names[name] if name in names else chr(int(name[2:], 16))
-            out.append(ch * n)
+            m = re.fullmatch(r"(␣|U\+[0-9A-F]{4,6})(?:×(\d+))?", shown[i + 1:j])
+            ch = " " if m.group(1) == "␣" else chr(int(m.group(1)[2:], 16))
+            out.append(ch * int(m.group(2) or 1))
             i = j + 1
-        elif c == "\\":
-            m = re.match(r"\\\\|\\u\{27e[89]\}", shown[i:])
-            out.append("\\" if m.group(0) == "\\\\" else chr(int(m.group(0)[3:-1], 16)))
-            i += len(m.group(0))
         else:
-            assert c not in "⟩" and not (c != " " and not c.isprintable()), repr(c)
+            assert c not in "⟩" and (c == " " or c.isprintable()), repr(c)
             out.append(c)
             i += 1
     return "".join(out)
@@ -629,6 +622,6 @@ def test_no_control_or_format_character_reaches_the_display():
 
 def test_invisible_characters_are_rendered_by_category_and_variation_selector():
     from herdr_engineering.control_plane.assistant_hub.policy import scrub_display_full
-    for ch in ("\uffa0", "\ufe0f", "\U000e0100", "\U000e01ef", "\x01", "\u3000", "\U000e0001", "\U0010ffff", "\ue000"):
+    for ch in ("\uffa0", "\ufe0f", "\U000e0100", "\U000e01ef", "\u3000", "\U000e0001", "\U0010ffff", "\ue000"):
         shown = scrub_display_full(f"a{ch}b")[0]
         assert ch not in shown and "\u27e8U+" in shown, (hex(ord(ch)), shown)

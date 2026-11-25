@@ -8,7 +8,6 @@ rows and audit entries carry the canonical key and key id only, never the raw co
 
 from __future__ import annotations
 
-import collections
 import hashlib
 import hmac
 import itertools
@@ -79,30 +78,21 @@ class ActivationRefused(ValueError):
 
 _MAX_DISPLAY = 300
 _MAX_SCRUB_INPUT = 8192          # = the hub's command cap (mcp.MAX_COMMAND_BYTES); the regexes never see more than this
-_SECRET_WORDS = r"(?:token|secret|passw(?:or)?d|passwd|api[_-]?key|credential|auth\w{0,20}|cookie)"
-_V = r"[^\s\"']+"
-# (pattern, number of leading groups that stay visible); everything after them is replaced by the mask
-_MASK_RULES: tuple[tuple[re.Pattern[str], int], ...] = (
-    (re.compile(r"(://)[^/\s@]*(?=@)"), 1),
-    # an auth header: the scheme word stays visible, only the credential token is masked
-    (re.compile(rf"(?i)\b(x-api-key|api-key|proxy-authorization|authorization)(\s*:\s*(?:(?:bearer|basic|token|digest|worker)\s+)?){_V}"), 2),
-    # a cookie value may hold blanks and ';': mask all of it up to a quote or newline
-    (re.compile(r"(?i)\b(cookie|set-cookie)(\s*:\s*)[^\"'\n\r]*"), 2),
-    (re.compile(rf"(?i)\b(sshpass\s+-p\s*){_V}"), 1),
-    (re.compile(rf"(?i)\b((?:docker|podman)\s+login\b[^\n]*?\s(?:-p|--password)(?:=|\s+)){_V}"), 1),
-    (re.compile(rf"(?i)\b((?:mysql|mysqldump|mysqladmin|psql|mariadb)\b[^\n]*?\s-p){_V}"), 1),
-    (re.compile(rf"(?i)(\s(?:-u|--user|--proxy-user)(?:=|\s+)){_V}"), 1),
-    (re.compile(rf"(?i)(--?[\w-]{{0,40}}{_SECRET_WORDS}[\w-]{{0,40}})(=|\s+){_V}"), 2),
-    (re.compile(rf"(?i)\b(\w{{0,40}}{_SECRET_WORDS}\w{{0,40}}=|\w{{0,40}}(?:pwd|pass|key)=){_V}"), 1),
-    (re.compile(rf"(?i)\b(bearer|basic|worker)(\s+){_V}"), 2),
-)
-_MASK = "***"
-_SAFE = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~+/=-")   # a mask may hide only these
 _MAX_RENDERED = 16384
+_SECRET_WORDS = r"(?:token|secret|passw(?:or)?d|passwd|api[_-]?key|credential|auth\w{0,20}|cookie)"
+_USERINFO_RE = re.compile(r"(://)[^/\s@]*@")
+_OPTION_RE = re.compile(rf"(?i)(--?[\w-]{{0,40}}{_SECRET_WORDS}[\w-]{{0,40}})(=|\s+)([^\s\"']+)")
+_ASSIGN_RE = re.compile(rf"(?i)\b(\w{{0,40}}{_SECRET_WORDS}\w{{0,40}}|\w{{0,40}}(?:pwd|pass|key))=([^\s\"']+)")
+_BEARER_RE = re.compile(r"(?i)\b(bearer|basic)(\s+)[^\s\"']+")
+_USER_OPT_RE = re.compile(r"(?i)(\s(?:-u|--user|--proxy-user)(?:=|\s+))[^\s\"']+")
+_HEADER_RE = re.compile(r"(?i)\b(x-api-key|api-key|cookie|set-cookie|proxy-authorization|authorization)(\s*:\s*)[^\"'\n]*")
+_SSHPASS_RE = re.compile(r"(?i)\b(sshpass\s+-p\s*)[^\s\"']+")
+_LOGIN_RE = re.compile(r"(?i)\b((?:docker|podman)\s+login\b[^\n]*?\s(?:-p|--password)(?:=|\s+))[^\s\"']+")
+_DB_ATTACHED_RE = re.compile(r"(?i)\b((?:mysql|mysqldump|mysqladmin|psql|mariadb)\b[^\n]*?\s-p)[^\s\"']+")
+_MASK = "***"
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
 _TRUNCATED_RE = re.compile(r"\u2026\(\+\d+ chars\)$")
-UNSEEN = " \u2026(masked shell syntax not shown)"
-_BLANK_EXTRA = frozenset("\u2800\u3164\u115f\u1160\u034f\uffa0")   # invisible letters, symbols and marks
-_NAMED = {"\t": "\\t", "\n": "\\n", "\r": "\\r", " ": "\u2423"}
+_BLANK_EXTRA = frozenset("\u2800\u3164\u115f\u1160\u034f\uffa0\u27e8\u27e9")   # invisible letters/marks, token brackets
 
 
 def _is_blank(ch: str) -> bool:
@@ -113,76 +103,48 @@ def _is_blank(ch: str) -> bool:
 
 
 def render_visible(text: str) -> str:
-    """The last step of the display: every blank-looking character becomes a closed, counted token, so two different
-    commands never read alike and no control character reaches a terminal.  A run is a token per same-character
-    stretch (``\u27e8\u2423\u00d72\u27e9`` two spaces, ``\u27e8\\t\u27e9`` a tab, ``\u27e8U+2800\u00d7260\u27e9`` Braille blanks); one plain space between
-    other characters stays a space.  A literal backslash is doubled and a literal bracket is written ``\\u{27e8}``
-    ``\\u{27e9}``, so the rendering can be read back unambiguously."""
+    """The last step of the display: every blank-looking or invisible character becomes a closed, counted token, so two
+    different commands never read alike.  A run is a token per same-character stretch (``\u27e8\u2423\u00d72\u27e9`` two
+    spaces, ``\u27e8U+2800\u00d7260\u27e9`` Braille blanks); one plain space between other characters stays a space.  A
+    literal bracket is a token too (``\u27e8U+27E8\u27e9``), so the rendering reads back unambiguously."""
     out: list[str] = []
     for blank, group in itertools.groupby(text, _is_blank):
         chunk = "".join(group)
-        if not blank:
-            out.append(chunk.replace("\\", "\\\\").replace("\u27e8", "\\u{27e8}").replace("\u27e9", "\\u{27e9}"))
-        elif chunk == " ":
-            out.append(" ")
-        else:
-            for ch, same in itertools.groupby(chunk):
-                n = len(list(same))
-                name = _NAMED.get(ch) or f"U+{ord(ch):04X}"
-                out.append(f"\u27e8{name}\u00d7{n}\u27e9" if n > 1 else f"\u27e8{name}\u27e9")
+        if not blank or chunk == " ":
+            out.append(chunk)
+            continue
+        for ch, same in itertools.groupby(chunk):
+            n = len(list(same))
+            name = "\u2423" if ch == " " else f"U+{ord(ch):04X}"
+            out.append(f"\u27e8{name}\u00d7{n}\u27e9" if n > 1 else f"\u27e8{name}\u27e9")
     return "".join(out)
-
-
-def _mask(text: str) -> tuple[str, bool]:
-    """The text with every secret masked, and whether every character a mask replaced was a plain one (``_SAFE``)."""
-    safe = True
-
-    def rule(keep: int):
-        def sub(m: re.Match[str]) -> str:
-            nonlocal safe
-            head = "".join(m.group(i) for i in range(1, keep + 1))
-            hidden = m.group(0)[len(head):]
-            if hidden != _MASK and not set(hidden) <= _SAFE:
-                safe = False
-            return head + _MASK
-        return sub
-
-    for rx, keep in _MASK_RULES:
-        text = rx.sub(rule(keep), text)
-    scrubbed = str(scrub_payload(text))               # the whole text: its token and JSON rules need the context
-    if scrubbed != text:
-        safe = safe and _only_safe_replaced(text, scrubbed)
-    return scrubbed, safe
-
-
-def _only_safe_replaced(before: str, after: str) -> bool:
-    """True when ``after`` differs from ``before`` only by markers that replaced ``_SAFE`` characters: the multiset of
-    every other character is unchanged (``*`` is counted separately, because the markers are made of it)."""
-    marker = "***REDACTED***"
-    added = after.count(marker) - before.count(marker)
-    other = lambda t: collections.Counter(c for c in t if c not in _SAFE and c != "*")   # noqa: E731
-    return (added >= 0 and other(before) == other(after)
-            and after.count("*") == before.count("*") + added * len(marker))
 
 
 def scrub_display_full(text: str) -> tuple[str, bool]:
     """The masked, visible rendering of a command with no length cut, and whether the owner can approve what it shows.
 
-    Pattern based: URL userinfo, secret-named options and NAME=value pairs, Bearer headers, plus the hub's token-shape
-    scrubber (run over the whole text).  A secret that has no recognizable shape (a bare word like ``hunter2``) cannot
-    be detected, which is why this text lives only on the request row and key_canonical holds a digest.  Masking runs
-    on the original text; ``render_visible`` runs last.  Not approvable: input over the cap (cut), a rendering over
-    16384 characters (cut), or any mask that replaced a character outside ``[A-Za-z0-9._~+/=-]``, because the mask
-    could hide part of a command.
+    Masking is exactly the origin/main pipeline: control characters (newline, tab, ESC...) become one space, then URL
+    userinfo, header, secret-named option and NAME=value rules and the hub's token-shape scrubber.  A secret that has
+    no recognizable shape (a bare word like ``hunter2``) cannot be detected, which is why this text lives only on the
+    request row and key_canonical holds a digest.  ``render_visible`` runs last.  Not approvable: input over the
+    8192-character cap, or a rendering over 16384 characters; both are returned cut and marked ``...(+N chars)``.
     """
     cut = max(0, len(text) - _MAX_SCRUB_INPUT)
-    masked, safe = _mask(text[:_MAX_SCRUB_INPUT])
-    out = render_visible(masked)
-    if cut:
-        return out[:_MAX_RENDERED] + f" \u2026(+{cut + max(0, len(out) - _MAX_RENDERED)} chars)", False
-    if len(out) > _MAX_RENDERED:
-        return out[:_MAX_RENDERED] + f" \u2026(+{len(out) - _MAX_RENDERED} chars)", False
-    return (out, True) if safe else (out + UNSEEN, False)
+    out = _CONTROL_RE.sub(" ", text[:_MAX_SCRUB_INPUT])
+    out = _USERINFO_RE.sub(r"\1" + _MASK + "@", out)
+    out = _HEADER_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}{_MASK}", out)
+    out = _SSHPASS_RE.sub(lambda m: m.group(1) + _MASK, out)
+    out = _LOGIN_RE.sub(lambda m: m.group(1) + _MASK, out)
+    out = _DB_ATTACHED_RE.sub(lambda m: m.group(1) + _MASK, out)
+    out = _USER_OPT_RE.sub(lambda m: m.group(1) + _MASK, out)
+    out = _OPTION_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}{_MASK}", out)
+    out = _ASSIGN_RE.sub(lambda m: f"{m.group(1)}={_MASK}", out)
+    out = _BEARER_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}{_MASK}", out)
+    out = render_visible(str(scrub_payload(out)))
+    over = len(out) - _MAX_RENDERED
+    if cut or over > 0:
+        return out[:_MAX_RENDERED] + f" \u2026(+{cut + max(0, over)} chars)", False
+    return out, True
 
 
 def scrub_display(text: str) -> str:
@@ -197,9 +159,9 @@ def _cut(out: str) -> str:
 
 
 def display_complete(display: str) -> bool:
-    """False when the owner saw only part of the command (the display ends in a ``...(+N chars)`` marker, or in the
-    masked-syntax marker). A command that merely ends like a marker is refused too."""
-    return not _TRUNCATED_RE.search(display) and not display.endswith(UNSEEN)
+    """False when the owner saw only part of the command (the display ends in a ``...(+N chars)`` marker). A command
+    that merely ends like a marker is refused too."""
+    return not _TRUNCATED_RE.search(display)
 
 
 def full_text_sha256(full: str) -> str:
@@ -581,8 +543,7 @@ def record_owner_decision(store: AssistantStore, cfg: dict, now: datetime, tenan
             raise ValueError("request already decided")
         if approve and not display_complete(row.display):
             if not row.display_full:
-                raise TruncatedDisplay("this command cannot be shown in full (too long, or a masked value holds shell "
-                                       "syntax); it can be denied, not approved")
+                raise TruncatedDisplay("this command is too long to show in full; it can be denied, not approved")
             if not hmac.compare_digest(display_sha256, full_text_sha256(row.display_full)):
                 raise TruncatedDisplay("this command was shown only in part; read display_full and send its SHA-256 "
                                        "as display_sha256 to approve it")

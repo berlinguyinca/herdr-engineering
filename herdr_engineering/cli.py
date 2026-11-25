@@ -4948,19 +4948,18 @@ def _cmd_cp_assistant_hub_owner(args) -> int:
                 elif row.get("approvable"):
                     print("display_sha256: " + _full_text_sha256(row["display_full"]))
                 else:
-                    print("deny only: part of this command is masked or too long to show")
+                    print("deny only: this command is too long to show in full")
             else:
                 body = {"approve": args.action == "approve"}
                 try:
                     out = call("POST", f"/api/v1/assistant-action-requests/{quoted}/decision", body)
                 except urllib.error.HTTPError as exc:
-                    raw = exc.read(65536)
-                    exc.fp = io.BytesIO(raw)             # the handler below reads the message again
-                    if not (body["approve"] and exc.code == 409 and b'"truncated_display"' in raw):
+                    if not (body["approve"] and exc.code == 409
+                            and _http_error_payload(exc).get("code") == "truncated_display"):
                         raise
                     row = call("GET", f"/api/v1/assistant-action-requests/{quoted}")
                     if not row.get("approvable"):
-                        print("this request can only be denied: part of it is masked or too long to show",
+                        print("this request can only be denied: it is too long to show in full",
                               file=sys.stderr)
                         return 1
                     full = row["display_full"]
@@ -4996,19 +4995,28 @@ def _cmd_cp_assistant_hub_owner(args) -> int:
             print(_tty_safe(f"{out['grant_id']}: {out['state']}"))
         return 0
     except urllib.error.HTTPError as exc:
-        code = message = ""
-        try:
-            payload = json.loads(exc.read(65536))
-            code = str(payload.get("code") or "")
-            message = payload.get("error") if kind == "assistant-action" else ""
-        except (OSError, ValueError, AttributeError):
-            pass
+        payload = _http_error_payload(exc)
+        code = str(payload.get("code") or "")
+        message = payload.get("error") if kind == "assistant-action" else ""
         suffix = f" ({code})" if code and code.replace("_", "").isalnum() else ""
         detail = f": {_tty_safe(message)[:300]}" if isinstance(message, str) and message else ""
         print(f"{kind} {args.action} failed: HTTP {exc.code}{suffix}{detail}", file=sys.stderr)
     except (OSError, ValueError, KeyError) as exc:
         print(f"{kind} {args.action} failed: {type(exc).__name__}", file=sys.stderr)
     return 1
+
+
+def _http_error_payload(exc) -> dict:
+    """The JSON object in an HTTP error body, read once (a second ``read`` returns nothing) and cached on ``exc``."""
+    cached = getattr(exc, "_herdr_payload", None)
+    if cached is None:
+        try:
+            parsed = json.loads(exc.read(65536))
+            cached = parsed if isinstance(parsed, dict) else {}
+        except (OSError, ValueError):
+            cached = {}
+        exc._herdr_payload = cached  # type: ignore[attr-defined]
+    return cached
 
 
 _REDEEM_SAFE = re.compile(r"[A-Za-z0-9._~:/\-]+")
