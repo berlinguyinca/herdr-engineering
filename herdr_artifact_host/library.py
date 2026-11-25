@@ -242,6 +242,42 @@ SELECT a.artifact_id, {_TITLE} AS title, a.owner AS sharer, a.created_at AS shar
 _PENDING_LIVE = "owner=$1 AND intake='pending' AND lifecycle NOT IN ('retracted','tombstoned')"
 
 
+def retained_bytes_sql(alias: str) -> str:
+    """SQL scalar: the bytes of the artifact's kept old versions (every non-purged version but the current one).  They
+    stay stored, so they count toward the owner's quota on top of ``size_bytes`` (the current version)."""
+    return (
+        "coalesce((SELECT sum((e->>'size_bytes')::bigint) FROM artifact_versions rv, "
+        f"jsonb_array_elements(rv.output_manifest) e WHERE rv.artifact_id = {alias}.artifact_id "
+        f"AND rv.state <> 'purged' AND rv.version_id IS DISTINCT FROM {alias}.current_version_id), 0)"
+    )
+
+
+async def held_bytes(conn: asyncpg.Connection, artifact_id: str) -> int:
+    """What an artifact counts against its owner's quota: the current version plus the kept old versions."""
+    return int(
+        await conn.fetchval(
+            "SELECT size_bytes + "
+            + retained_bytes_sql("a")
+            + " FROM artifacts a WHERE artifact_id=$1",
+            artifact_id,
+        )
+        or 0
+    )
+
+
+async def version_bytes(conn: asyncpg.Connection | asyncpg.Pool, version_id: str | None) -> int:
+    """The summed manifest size of one version (0 when there is none)."""
+    if version_id is None:
+        return 0
+    return int(
+        await conn.fetchval(
+            "SELECT coalesce(sum((e->>'size_bytes')::bigint), 0) FROM artifact_versions v, "
+            "jsonb_array_elements(v.output_manifest) e WHERE v.version_id=$1",
+            version_id,
+        )
+    )
+
+
 async def settle_quota(conn: asyncpg.Connection, owner: str, size: int) -> None:
     """A retracted or discarded artifact stops counting against its owner: its bytes move from ``bytes_used`` to
     ``bytes_retracted`` (clamped at zero).  Runs in the caller's transaction."""
@@ -348,7 +384,7 @@ class LibraryStore:
             await conn.execute("SELECT 1 FROM member_usage WHERE member_id=$1 FOR UPDATE", owner)
             size = await conn.fetchval(
                 "UPDATE artifacts SET intake='discarded', lifecycle='retracted', updated_at=now() "
-                f"WHERE artifact_id=$2 AND {_PENDING_LIVE} RETURNING size_bytes",
+                f"WHERE artifact_id=$2 AND {_PENDING_LIVE} RETURNING size_bytes + {retained_bytes_sql('artifacts')}",
                 owner,
                 item.artifact_id,
             )
