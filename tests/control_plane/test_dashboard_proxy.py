@@ -280,6 +280,53 @@ def test_settings_built_from_key_files_proxy_a_real_server(cp, tmp_path):
         thread.join(timeout=3)
 
 
+# ---- browser defences: the proxy attaches the operator key, so a hostile web page must not drive it ----
+
+SEND = "/api/v1/sessions/s1/messages"
+
+
+def test_a_cross_origin_write_never_gets_the_operator_key(cp, proxy):
+    status, body = call(proxy.port, "POST", SEND, headers={"Origin": "https://evil.example"}, body={})
+    assert status == 403 and b"cross-origin" in body
+
+
+def test_a_cross_site_write_without_origin_is_refused(proxy):
+    status, body = call(proxy.port, "POST", SEND, headers={"Sec-Fetch-Site": "cross-site"}, body={})
+    assert status == 403 and b"cross-site" in body
+
+
+def test_a_browser_write_that_is_not_json_is_refused(proxy):
+    origin = f"http://127.0.0.1:{proxy.port}"
+    conn = http.client.HTTPConnection("127.0.0.1", proxy.port, timeout=10)
+    conn.request("POST", SEND, body=b"{}", headers={"Origin": origin, "Content-Type": "text/plain"})
+    assert conn.getresponse().status == 415
+    conn.close()
+
+
+def test_a_rebound_host_is_refused_even_for_reads(proxy):
+    for method in ("GET", "POST"):
+        status, body = call(proxy.port, method, "/api/v1/sessions", headers={"Host": "evil.example"}, body=None)
+        assert status == 403 and b"host not allowed" in body
+
+
+def test_the_dashboard_itself_still_works_same_origin(cp, proxy):
+    origin = f"http://127.0.0.1:{proxy.port}"
+    status, _ = call(proxy.port, "POST", "/api/v1/attention/ack", body={},
+                     headers={"Origin": origin, "Sec-Fetch-Site": "same-origin"})
+    assert status not in (401, 403)       # the upstream saw an Origin equal to its own Host, with the key
+    assert call(proxy.port, "GET", "/api/v1/sessions", headers={"Origin": origin})[0] == 200
+
+
+def test_a_configured_proxy_name_is_accepted(cp):
+    px, thread = start_proxy(cp.port, public_hosts=("dash.lan",))
+    try:
+        assert call(px.port, "GET", "/api/v1/sessions", headers={"Host": "dash.lan"})[0] == 200
+        assert call(px.port, "GET", "/api/v1/sessions", headers={"Host": "dash.lan:81"})[0] == 200
+    finally:
+        px.shutdown()
+        thread.join(timeout=3)
+
+
 # --- browser Origin handling: the proxy is the same-origin gate, then presents an Origin the upstream accepts ---
 
 ACK_BODY = b'{"key": "k", "fingerprint": "f"}'   # valid: reaches the handler, which answers 200 not_current
@@ -306,14 +353,14 @@ def test_same_origin_browser_write_reaches_the_origin_guarded_upstream_route(cp,
     assert status == 200 and json.loads(body)["reason"] == "not_current", body
 
 
-def test_cross_origin_browser_write_is_refused_by_the_proxy(proxy):
-    status, body = _browser_post(proxy, "/api/v1/attention/ack", origin="http://evil.example")
+def test_cross_origin_browser_write_is_refused_by_the_proxy(public_proxy):
+    status, body = _browser_post(public_proxy, "/api/v1/attention/ack", origin="http://evil.example")
     assert status == 403 and b"cross-origin" in body
 
 
-def test_cross_origin_no_cors_write_to_an_upstream_unguarded_route_is_refused(proxy):
+def test_cross_origin_no_cors_write_to_an_upstream_unguarded_route_is_refused(public_proxy):
     # The CSRF case: a CORS-simple text/plain POST to a route the upstream does not Origin-guard.
-    status, body = _browser_post(proxy, "/api/v1/sessions/s1/messages", origin="http://evil.example",
+    status, body = _browser_post(public_proxy, "/api/v1/sessions/s1/messages", origin="http://evil.example",
                                  content_type="text/plain")
     assert status == 403 and b"cross-origin" in body
 
@@ -371,8 +418,8 @@ def test_origin_scheme_must_match_the_configured_public_scheme(public_proxy):
     assert status == 403 and b"cross-origin" in body
 
 
-def test_refusal_does_not_reset_the_connection_when_the_client_is_still_sending(proxy):
-    status, body = _browser_post(proxy, "/api/v1/attention/ack", origin="http://evil.example",
+def test_refusal_does_not_reset_the_connection_when_the_client_is_still_sending(public_proxy):
+    status, body = _browser_post(public_proxy, "/api/v1/attention/ack", origin="http://evil.example",
                                  body=b"x" * (4 * 1024 * 1024))
     assert status == 403 and b"cross-origin" in body
 
@@ -409,19 +456,18 @@ def _get(px, path, host):
 
 # --- review round 2 ---
 
-def test_by_name_host_without_public_hosts_is_no_more_permissive_than_main(proxy):
-    """Main forwarded the browser Origin unchanged, so Origin-guarded upstream routes were 403 for a by-name Host
-    and unguarded ones were served. A DNS-rebinding page (Host == Origin == its own name) must not gain more."""
+def test_by_name_host_without_public_hosts_is_refused_outright(proxy):
+    """Merged rule (stricter than main and than #949 alone): the Host gate is always on, so an unlisted DNS name is
+    403 on every route and method, with or without an Origin. A DNS-rebinding page reaches nothing, not even the
+    routes the control plane never Origin-guarded."""
     host = f"evil.example:{proxy.port}"
     origin = f"http://{host}"
     assert _browser_post(proxy, "/api/v1/attention/ack", origin=origin, host=host)[0] == 403
     assert _browser_post(proxy, "/api/v1/scheduler/plan", origin=origin, host=host, body=b"{}")[0] == 403
     assert _browser_post(proxy, "/api/v1/artifacts/x/approve", origin=origin, host=host, body=b"{}")[0] == 403
-    # main served an unguarded allowlisted route by name; so does this
     assert _browser_post(proxy, "/api/v1/sessions/s1/messages", origin=origin, host=host,
-                         body=b'{"text": "hi"}')[0] != 403
-    # a write with no Origin (not a browser) is unchanged from main
-    assert _browser_post(proxy, "/api/v1/attention/ack", origin=None, host=host)[0] == 200
+                         body=b'{"text": "hi"}')[0] == 403
+    assert _browser_post(proxy, "/api/v1/attention/ack", origin=None, host=host)[0] == 403
 
 
 def test_listed_name_gets_the_guarded_routes_by_name(cp):

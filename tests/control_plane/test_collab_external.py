@@ -706,3 +706,11 @@ def test_my_agents_reports_an_external_agent_online_only_while_its_heartbeat_is_
     assert mine()["online"] is True
     w.s.clock.t += ext.PRESENCE_STALE + 1
     assert mine()["online"] is False
+
+
+def test_external_cannot_fetch_a_single_task_by_id(w):
+    _, a = w.agent("alice", ("read", "post", "execute"))
+    tid = w.s.create_task(w.bob, w.room, {"target_agent_id": a["agent_id"], "text": "secret job"})["task_id"]
+    rw, _, _ = enroll(w, actions=["read"])
+    assert code(w.s.list_tasks, rw, w.room) == 403
+    assert code(w.s.get_task, rw, w.room, tid) == 403

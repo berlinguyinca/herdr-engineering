@@ -196,3 +196,23 @@ def test_expired_reservation_cannot_commit_before_sweep():
     with pytest.raises(RuntimeError, match="expired"):
         service.commit(row["reservation_id"])
 
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("nan"), -float("inf"), "abc"])
+def test_lease_heartbeat_rejects_non_finite_ttl(bad):
+    repo = configured_repo()
+    service = SchedulerService(repo)
+    service.commit(service.reserve(host_body("hb-bad-ttl"), "alice")["reservation_id"])
+    lease = repo.list_scheduler_leases()[0]
+    with pytest.raises(ValueError, match="ttl"):
+        service.heartbeat(lease["lease_id"], generation=lease["generation"], token=lease["token"], ttl=bad)
+
+
+def test_lease_heartbeat_clamps_ttl_to_ten_minutes():
+    repo = configured_repo()
+    service = SchedulerService(repo)
+    service.commit(service.reserve(host_body("hb-big-ttl"), "alice")["reservation_id"])
+    lease = repo.list_scheduler_leases()[0]
+    renewed = service.heartbeat(lease["lease_id"], generation=lease["generation"], token=lease["token"], ttl=1e9)
+    horizon = datetime.fromisoformat(renewed["expires_at"]) - datetime.fromisoformat(renewed["heartbeat_at"])
+    assert horizon == timedelta(seconds=600)

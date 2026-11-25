@@ -8,7 +8,7 @@ clears the request (that is the "once") and redeploys by itself.
 Operator side (``POST /api/deployments/force`` and ``/ack``, also under ``/api/v1``):
 KEYED MODE ONLY (an open tailnet server has no credential a DNS-rebound page lacks, so it
 refuses them), the operator role (X-API-Key), a Host an attacker cannot rebind
-(``_dashboard_host_ok``), no cross-site ``Sec-Fetch-Site``, a same-origin ``Origin``,
+(``host_ok``), no cross-site ``Sec-Fetch-Site``, a same-origin ``Origin``,
 application/json, a small body cap and the hot ``control_plane.deployment_actions: true``
 flag (fail closed). Auditing:
 

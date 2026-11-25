@@ -460,7 +460,11 @@ def test_collab_overlay_reads_only_the_collab_slice():
     wcmd = web["command"]
     i = wcmd.index("--collab-operator-url")
     assert wcmd[:i] + wcmd[i + 2:] == base["services"]["control-plane-web"]["command"]
-    assert not any(a.startswith("--collab-") for a in wcmd[:i] + wcmd[i + 2:])
+    # --collab-dashboard-host carries the shipped Host names (dev.lan, control-plane-web) the DNS-rebinding guard
+    # accepts; it is part of the BASE command, not a collab setting, so it is the one collab-prefixed flag allowed here
+    rest = wcmd[:i] + wcmd[i + 2:]
+    assert not any(a.startswith("--collab-") and a != "--collab-dashboard-host" for a in rest)
+    assert rest.count("--collab-dashboard-host") == base["services"]["control-plane-web"]["command"].count("--collab-dashboard-host")
     pub = doc["services"]["collab-public"]
     cmd = pub["command"]
     assert "--collab-only" in cmd
