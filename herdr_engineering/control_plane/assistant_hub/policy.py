@@ -81,35 +81,34 @@ _MAX_DISPLAY = 300
 _MAX_SCRUB_INPUT = 8192          # = the hub's command cap (mcp.MAX_COMMAND_BYTES); the regexes never see more than this
 _SECRET_WORDS = r"(?:token|secret|passw(?:or)?d|passwd|api[_-]?key|credential|auth\w{0,20}|cookie)"
 _V = r"[^\s\"']+"
-_C = r"[^\s\"';|&`<>()$]+"                                         # a credential: no blanks, no shell syntax
 # (pattern, number of leading groups that stay visible); everything after them is replaced by the mask
 _MASK_RULES: tuple[tuple[re.Pattern[str], int], ...] = (
     (re.compile(r"(://)[^/\s@]*(?=@)"), 1),
-    # an auth header: the scheme word stays visible, only the credential (one blank-free, syntax-free token) is masked
-    (re.compile(rf"(?i)\b(x-api-key|api-key|proxy-authorization|authorization)(\s*:\s*(?:(?:bearer|basic|token|digest|worker)\s+)?){_C}"), 2),
-    # a cookie value may hold blanks and ';': mask all of it up to a quote, newline or shell syntax (deny-only if it hid any)
-    (re.compile(r"(?i)\b(cookie|set-cookie)(\s*:\s*)[^\"'|&`<>()$\n\r]*"), 2),
+    # an auth header: the scheme word stays visible, only the credential token is masked
+    (re.compile(rf"(?i)\b(x-api-key|api-key|proxy-authorization|authorization)(\s*:\s*(?:(?:bearer|basic|token|digest|worker)\s+)?){_V}"), 2),
+    # a cookie value may hold blanks and ';': mask all of it up to a quote or newline
+    (re.compile(r"(?i)\b(cookie|set-cookie)(\s*:\s*)[^\"'\n\r]*"), 2),
     (re.compile(rf"(?i)\b(sshpass\s+-p\s*){_V}"), 1),
     (re.compile(rf"(?i)\b((?:docker|podman)\s+login\b[^\n]*?\s(?:-p|--password)(?:=|\s+)){_V}"), 1),
     (re.compile(rf"(?i)\b((?:mysql|mysqldump|mysqladmin|psql|mariadb)\b[^\n]*?\s-p){_V}"), 1),
     (re.compile(rf"(?i)(\s(?:-u|--user|--proxy-user)(?:=|\s+)){_V}"), 1),
     (re.compile(rf"(?i)(--?[\w-]{{0,40}}{_SECRET_WORDS}[\w-]{{0,40}})(=|\s+){_V}"), 2),
     (re.compile(rf"(?i)\b(\w{{0,40}}{_SECRET_WORDS}\w{{0,40}}=|\w{{0,40}}(?:pwd|pass|key)=){_V}"), 1),
-    (re.compile(rf"(?i)\b(bearer|basic|worker)(\s+){_C}"), 2),
+    (re.compile(rf"(?i)\b(bearer|basic|worker)(\s+){_V}"), 2),
 )
 _MASK = "***"
-_SHELL_ACTIVE = frozenset("$`;|&()<>")
-_SYNTAX_SPLIT = re.compile("([" + re.escape("".join(sorted(_SHELL_ACTIVE))) + "])")
+_SAFE = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~+/=-")   # a mask may hide only these
+_MAX_RENDERED = 16384
 _TRUNCATED_RE = re.compile(r"\u2026\(\+\d+ chars\)$")
 UNSEEN = " \u2026(masked shell syntax not shown)"
-_BLANK_EXTRA = frozenset("\u2800\u3164\u115f\u1160\u180e\u034f\ufeff\u00ad")
+_BLANK_EXTRA = frozenset("\u2800\u3164\u115f\u1160\u034f\uffa0")   # invisible letters, symbols and marks
 _NAMED = {"\t": "\\t", "\n": "\\n", "\r": "\\r", " ": "\u2423"}
 
 
 def _is_blank(ch: str) -> bool:
     """A character that is invisible or looks like a space: it is shown as a token, never as itself (a plain space
     between two other characters is the one exception)."""
-    return (ch.isspace() or ch in _BLANK_EXTRA
+    return (ch.isspace() or ch in _BLANK_EXTRA or 0xFE00 <= ord(ch) <= 0xFE0F or 0xE0100 <= ord(ch) <= 0xE01EF
             or unicodedata.category(ch) in ("Zs", "Zl", "Zp", "Cf", "Cc", "Cs", "Co", "Cn"))
 
 
@@ -134,44 +133,56 @@ def render_visible(text: str) -> str:
     return "".join(out)
 
 
-def _sensitive(text: str) -> collections.Counter[str]:
-    """The characters whose disappearance could hide a command: shell syntax, anything blank, and anything a
-    normalisation (NFKC) would rewrite."""
-    return collections.Counter(c for c in text
-                               if c in _SHELL_ACTIVE or _is_blank(c) or unicodedata.normalize("NFKC", c) != c)
+def _mask(text: str) -> tuple[str, bool]:
+    """The text with every secret masked, and whether every character a mask replaced was a plain one (``_SAFE``)."""
+    safe = True
 
-
-def _mask(text: str) -> str:
     def rule(keep: int):
         def sub(m: re.Match[str]) -> str:
-            return "".join(m.group(i) for i in range(1, keep + 1)) + _MASK
+            nonlocal safe
+            head = "".join(m.group(i) for i in range(1, keep + 1))
+            hidden = m.group(0)[len(head):]
+            if hidden != _MASK and not set(hidden) <= _SAFE:
+                safe = False
+            return head + _MASK
         return sub
 
     for rx, keep in _MASK_RULES:
         text = rx.sub(rule(keep), text)
-    # the token-shape scrubber sees one piece between shell-syntax characters at a time, so a masked credential cannot
-    # grow over the command that follows it
-    return "".join(str(scrub_payload(piece)) if piece and piece not in _SHELL_ACTIVE else piece
-                   for piece in _SYNTAX_SPLIT.split(text))
+    scrubbed = str(scrub_payload(text))               # the whole text: its token and JSON rules need the context
+    if scrubbed != text:
+        safe = safe and _only_safe_replaced(text, scrubbed)
+    return scrubbed, safe
+
+
+def _only_safe_replaced(before: str, after: str) -> bool:
+    """True when ``after`` differs from ``before`` only by markers that replaced ``_SAFE`` characters: the multiset of
+    every other character is unchanged (``*`` is counted separately, because the markers are made of it)."""
+    marker = "***REDACTED***"
+    added = after.count(marker) - before.count(marker)
+    other = lambda t: collections.Counter(c for c in t if c not in _SAFE and c != "*")   # noqa: E731
+    return (added >= 0 and other(before) == other(after)
+            and after.count("*") == before.count("*") + added * len(marker))
 
 
 def scrub_display_full(text: str) -> tuple[str, bool]:
     """The masked, visible rendering of a command with no length cut, and whether the owner can approve what it shows.
 
     Pattern based: URL userinfo, secret-named options and NAME=value pairs, Bearer headers, plus the hub's token-shape
-    scrubber. A secret that has no recognizable shape (a bare word like ``hunter2``) cannot be detected, which is why
-    this text lives only on the request row and key_canonical holds a digest instead of command text.  Masking runs
-    on the original text; ``render_visible`` runs last.  Not approvable: input over the cap (cut), or any masking
-    that removed or rewrote shell syntax, whitespace or a normalisable character (generic: the multiset of those
-    characters before and after masking must be equal), because the mask could hide part of a command.
+    scrubber (run over the whole text).  A secret that has no recognizable shape (a bare word like ``hunter2``) cannot
+    be detected, which is why this text lives only on the request row and key_canonical holds a digest.  Masking runs
+    on the original text; ``render_visible`` runs last.  Not approvable: input over the cap (cut), a rendering over
+    16384 characters (cut), or any mask that replaced a character outside ``[A-Za-z0-9._~+/=-]``, because the mask
+    could hide part of a command.
     """
     cut = max(0, len(text) - _MAX_SCRUB_INPUT)
-    kept = text[:_MAX_SCRUB_INPUT]
-    masked = _mask(kept)
+    masked, safe = _mask(text[:_MAX_SCRUB_INPUT])
     out = render_visible(masked)
     if cut:
-        return out + f" \u2026(+{cut} chars)", False
-    return (out, True) if _sensitive(kept) == _sensitive(masked) else (out + UNSEEN, False)
+        return out[:_MAX_RENDERED] + f" \u2026(+{cut + max(0, len(out) - _MAX_RENDERED)} chars)", False
+    if len(out) > _MAX_RENDERED:
+        return out[:_MAX_RENDERED] + f" \u2026(+{len(out) - _MAX_RENDERED} chars)", False
+    return (out, True) if safe else (out + UNSEEN, False)
 
 
 def scrub_display(text: str) -> str:

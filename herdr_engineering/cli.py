@@ -4951,28 +4951,36 @@ def _cmd_cp_assistant_hub_owner(args) -> int:
                     print("deny only: part of this command is masked or too long to show")
             else:
                 body = {"approve": args.action == "approve"}
-                if body["approve"]:
+                try:
+                    out = call("POST", f"/api/v1/assistant-action-requests/{quoted}/decision", body)
+                except urllib.error.HTTPError as exc:
+                    raw = exc.read(65536)
+                    exc.fp = io.BytesIO(raw)             # the handler below reads the message again
+                    if not (body["approve"] and exc.code == 409 and b'"truncated_display"' in raw):
+                        raise
                     row = call("GET", f"/api/v1/assistant-action-requests/{quoted}")
-                    if not row.get("display_complete", True):
-                        if not row.get("approvable"):
-                            print("this request can only be denied: part of it is masked or too long to show",
-                                  file=sys.stderr)
+                    if not row.get("approvable"):
+                        print("this request can only be denied: part of it is masked or too long to show",
+                              file=sys.stderr)
+                        return 1
+                    full = row["display_full"]
+                    if args.display_sha256:
+                        body["display_sha256"] = args.display_sha256
+                    elif sys.stdin.isatty():
+                        print(_tty_safe(full))
+                        try:
+                            answer = input("Approve exactly this command? [y/N] ").strip().lower()
+                        except (EOFError, KeyboardInterrupt):
+                            answer = ""
+                        if answer not in ("y", "yes"):
+                            print("not approved")
                             return 1
-                        full = row["display_full"]
-                        digest = _full_text_sha256(full)
-                        if args.display_sha256:
-                            body["display_sha256"] = args.display_sha256
-                        elif sys.stdin.isatty():
-                            print(_tty_safe(full))
-                            if input("Approve exactly this command? [y/N] ").strip().lower() not in ("y", "yes"):
-                                print("not approved")
-                                return 1
-                            body["display_sha256"] = digest
-                        else:
-                            print("this command is cut in the list; read it with `assistant-action show ID` and "
-                                  "pass the hash it prints as --display-sha256", file=sys.stderr)
-                            return 2
-                out = call("POST", f"/api/v1/assistant-action-requests/{quoted}/decision", body)
+                        body["display_sha256"] = _full_text_sha256(full)
+                    else:
+                        print("this command is cut in the list; read it with `assistant-action show ID` and "
+                              "pass the hash it prints as --display-sha256", file=sys.stderr)
+                        return 2
+                    out = call("POST", f"/api/v1/assistant-action-requests/{quoted}/decision", body)
                 print(_tty_safe(f"{out['request_id']}: {out['status']}"))
         elif args.action == "list":
             rows = call("GET", "/api/v1/assistant-grants")["grants"]

@@ -38,7 +38,6 @@ from .deploycheck import (
 )
 from .evidence import propose_if_ready
 from .policy import (
-    UNSEEN,
     ActivationRefused,
     activate_grant,
     create_standing_grant,
@@ -238,6 +237,7 @@ class _Queued:
     queued_at: datetime
     ask: SlackAsk | None = None
     urgent: bool = False             # goes to the head of the queue and is never the one dropped on overflow
+    approvable: bool = True          # False: the owner can only deny it (over the cap, or a mask hid part of it)
     kind: str = "action"             # action | question | summary (their asks are created up front) | outcome (a deploy
                                      # check id in ``request_id``)
 
@@ -437,7 +437,8 @@ class SlackRuntime:
             if not self._cfg().get("enabled"):
                 return
             self._enqueue(_Queued(row.tenant_id, row.user_id, row.request_id, row.worker_id, row.task_id, display,
-                                  why, project, as_utc(self._now())))
+                                  why, project, as_utc(self._now()),
+                                  approvable=display_complete(display) or bool(row.display_full)))
         except Exception as exc:
             _log.warning("slack notify failed: %s", type(exc).__name__)
 
@@ -609,7 +610,8 @@ class SlackRuntime:
                     self.store.put_slack_ask(orphan)
             with self._qcond:
                 self._queue.append(_Queued(row.tenant_id, row.user_id, rid, row.worker_id, row.task_id, row.display,
-                                           row.reason, "", now))
+                                           row.reason, "", now,
+                                           approvable=display_complete(row.display) or bool(row.display_full)))
                 self._qcond.notify()
             queued += 1
         return queued + self._sweep_questions(now) + self._sweep_outcomes(now)
@@ -1005,8 +1007,8 @@ class SlackRuntime:
         shown = fully_shown(item.display)
         lines.append("```" + slack_text(item.display) + "```")
         if not shown:
-            if item.display.endswith(UNSEEN):
-                lines.append("*It cannot be approved at all: part of it is masked.* Deny it, or have the worker "
+            if not item.approvable:
+                lines.append("*It cannot be approved at all: part of it is masked or too long.* Deny it, or have the worker "
                              "request it differently.")
             else:
                 lines.append("*Too long for Slack: it cannot be approved here.* Deny it, or read it in full and "

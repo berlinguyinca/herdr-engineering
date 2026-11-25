@@ -625,3 +625,10 @@ def test_no_control_or_format_character_reaches_the_display():
         for cmd in (f"a{ch}b", f"echo worker abcdefgh{ch}x{ch}y", f"{ch}" * 3):
             for shown in (scrub_display_full(cmd)[0], scrub_display(cmd)):
                 assert all(unicodedata.category(c) not in ("Cc", "Cf", "Zl", "Zp", "Cs") for c in shown), (hex(ord(ch)), shown)
+
+
+def test_invisible_characters_are_rendered_by_category_and_variation_selector():
+    from herdr_engineering.control_plane.assistant_hub.policy import scrub_display_full
+    for ch in ("\uffa0", "\ufe0f", "\U000e0100", "\U000e01ef", "\x01", "\u3000", "\U000e0001", "\U0010ffff", "\ue000"):
+        shown = scrub_display_full(f"a{ch}b")[0]
+        assert ch not in shown and "\u27e8U+" in shown, (hex(ord(ch)), shown)

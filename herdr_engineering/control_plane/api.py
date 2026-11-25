@@ -5215,14 +5215,17 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                     if len(parts) == 6 and parts[5] == "decision" and self.command == "POST":
                         if not (exact({"approve"}) or exact({"approve", "display_sha256"})) \
                                 or not isinstance(body["approve"], bool) \
-                                or not isinstance(body.get("display_sha256", ""), str):
-                            return self._json({"error": 'body must be {"approve": true|false} (plus "display_sha256" '
-                                                        'to approve a command whose display was cut)'}, 400)
+                                or not (("display_sha256" not in body)
+                                        or (isinstance(body["display_sha256"], str)
+                                            and re.fullmatch(r"[0-9a-fA-F]{64}", body["display_sha256"]))):
+                            return self._json({"error": 'body must be {"approve": true|false} (plus "display_sha256", '
+                                                        '64 hex characters, to approve a command whose display was '
+                                                        'cut)'}, 400)
                         try:
                             row = record_owner_decision(store, cfg, svc.now(), tenant_id, user_id, parts[4],
                                                         body["approve"], decided_by=user_id,
                                                         judge_version=version,
-                                                        display_sha256=body.get("display_sha256", ""))
+                                                        display_sha256=body.get("display_sha256", "").lower())
                         except TruncatedDisplay as exc:  # the owner saw only part of the command: deny only
                             return self._json({"error": str(exc), "code": "truncated_display"}, 409)
                         except ValueError as exc:       # already decided, or vetoed (a veto is final)
