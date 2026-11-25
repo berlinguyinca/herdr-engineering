@@ -215,3 +215,41 @@ def test_failed_forwarder_start_is_retried_on_next_sync(tmp_path):
     assert err2 is None and fwd.get("app") is not None
     assert fwd["app"].bound
     fwd["app"].stop()
+
+
+# -- route validation (#977) -------------------------------------------------
+
+_BAD_ROUTES = [
+    ["not-a-route"],
+    [None],
+    [{"prefix": "/a", "host": "127.0.0.1"}],
+    [{"prefix": "/a", "host": "127.0.0.1", "port": 0}],
+    [{"prefix": "/a", "host": "127.0.0.1", "port": 70000}],
+    [{"prefix": "/a", "host": "127.0.0.1", "port": "80"}],
+    [{"prefix": "", "host": "127.0.0.1", "port": 8000}],
+    [{"prefix": "/a", "host": "", "port": 8000}],
+    [{"prefix": "/a", "host": "127.0.0.1", "port": 8000, "extra": 1}],
+    "not-a-list",
+]
+
+
+@pytest.mark.parametrize("bad", _BAD_ROUTES)
+def test_update_routes_rejects_bad_routes_and_keeps_old_table(tmp_path, bad):
+    reg = _reg(tmp_path)
+    lease = reg.register(
+        target_machine_id="m", target_host="127.0.0.1", target_port=8401,
+        routes=[Route("/api", "127.0.0.1", 8402)], preferred_port=24510)
+    good = [{"prefix": "/ok", "host": "127.0.0.1", "port": 8000}]
+    with pytest.raises(ValueError):
+        reg.update_routes(lease.id, good + bad if isinstance(bad, list) else bad)
+    assert [r.prefix for r in reg.get(lease.id).routes] == ["/api"]
+    assert [r.prefix for r in _reg(tmp_path).get(lease.id).routes] == ["/api"], "nothing persisted"
+
+
+@pytest.mark.parametrize("bad", _BAD_ROUTES)
+def test_register_rejects_bad_routes(tmp_path, bad):
+    reg = _reg(tmp_path)
+    with pytest.raises(ValueError):
+        reg.register(target_machine_id="m", target_host="127.0.0.1",
+                     target_port=8401, routes=bad, preferred_port=24520)
+    assert reg.list() == [] if hasattr(reg, "list") else True

@@ -750,6 +750,7 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
     const onVisible = () => { if (!document.hidden) { since = -1; if (wake) { wake(); wake = null; } } };
     document.addEventListener('visibilitychange', onVisible);
     let teamRoom = null;
+    let unbindHelpers = () => {};          // replaced once the helper handlers are wired; a teardown before that must not throw
     const onFocusOut = () => setTimeout(() => { if (stale.size && alive) paint(); }, 0);
     teardown = () => { alive = false; root.removeEventListener('focusout', onFocusOut); composer?.dispose(); unbindHelpers(); teamRoom?.dispose(); ctl?.abort(); document.removeEventListener('visibilitychange', onVisible); if (wake) wake(); };
     const kick = () => { since = -1; ctl?.abort(); };       // an action just happened: refetch now
@@ -934,7 +935,7 @@ export function mountCollab(root, { fabricSessions = null, onFreshness = () => {
       }
       if (canInvite && S.profile) put('hcn-profile-box', renderProfileEditor(S.profile, { owner: canInvite }));
     };
-    const unbindHelpers = wireHelperHandlers(root, {
+    unbindHelpers = wireHelperHandlers(root, {
       api, roomId, operator, owner: canInvite, act, getProfile: () => S.profile, setProfile: (p) => { S.profile = p; $('hcn-profile-msg').textContent = 'Saved.'; },
       onError: (m) => { $('hcn-profile-msg').textContent = m; },
       refresh: async () => { await loadHelpers(); drawHelpers(); },

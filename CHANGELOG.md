@@ -5,6 +5,11 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: collab room teardown, assistant store scans, dev route validation
+
+- Collaboration page: leaving a room before its helper handlers were wired no longer throws a `ReferenceError` (`unbindHelpers` was a `const` declared after the teardown that calls it), which skipped the rest of the teardown and left the room's listeners and controller running (#974).
+- Personal assistant: the service-level scans of the store (`list_proposals` with its expiry write-back, `create_proposal`'s dedupe scan, `notify`, `list_notifications`, `digest`, `repair_pending_audits`, `open_tool_run`, `export_memory`, the diagnostics memory count and `_action_owner`) run under the store lock, so a concurrent insert can no longer fail them with `dictionary changed size during iteration` (#976).
+- Dev fabric: `DevServiceRegistry.register` and `update_routes` validate the route table in one place (each item a route object or dict, non-empty prefix, non-empty host, integer port 1-65535) and raise `ValueError` for the whole update instead of persisting a partial or malformed table (#977).
 ### Fix: artifact ACL expiry after restart, body-size and connection hygiene, retract revokes shares
 
 - Artifact ACL: expiring grants reloaded from the registry (ISO strings) no longer raise `TypeError` in `can`/`held`/`principals_with`; `expires_at` is normalised to epoch seconds and an invalid value is a 400. The ACL maps are now guarded by a lock.

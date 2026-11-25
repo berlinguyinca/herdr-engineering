@@ -3256,6 +3256,11 @@ class AssistantStore:
             self.proposals[x.proposal_id] = x
         self._after_mutation()
 
+    def count_memory(self, *, tenant_id: str, user_id: str, assistant_id: str) -> int:
+        with self._lock:
+            return sum(1 for m in self.memory.values()
+                       if m.tenant_id == tenant_id and m.user_id == user_id and m.assistant_id == assistant_id)
+
     def put_notification(self, x: AssistantNotification) -> None:
         with self._lock:
             x.updated_at = _now()
@@ -4154,10 +4159,11 @@ class AssistantService:
     def _action_owner(self, action: AssistantAction) -> tuple[str, str, str] | None:
         if action.tenant_id and action.user_id:
             return action.tenant_id, action.user_id, action.assistant_id
-        appr = self.store.approvals.get(action.approval_id) if action.approval_id else None
+        with self.store._lock:
+            appr = self.store.approvals.get(action.approval_id) if action.approval_id else None
+            run = self.store.runs.get(action.run_id)
         if appr is not None:
             return appr.tenant_id, appr.user_id, appr.assistant_id
-        run = self.store.runs.get(action.run_id)
         return (run.tenant_id, run.user_id, run.assistant_id) if run is not None else None
 
     @staticmethod
@@ -4313,11 +4319,14 @@ class AssistantService:
         """Write the audit entries that could not be written after an effect. Returns how many were repaired."""
         self._require_enabled()
         done = 0
-        for a in list(self.store.actions.values()):
+        with self.store._lock:
+            actions = list(self.store.actions.values())
+            proposals = list(self.store.proposals.values())
+        for a in actions:
             owner = self._action_owner(a)
             if owner and owner[0] == tenant_id and owner[1] == user_id and (a.result or {}).get("audit_pending"):
                 done += self._repair_action_audit(a, tenant_id, user_id, user_id)
-        for x in list(self.store.proposals.values()):
+        for x in proposals:
             if x.tenant_id == tenant_id and x.user_id == user_id and x.audit_pending:
                 done += self._repair_proposal_audit(x, user_id)
         return done
@@ -4456,10 +4465,11 @@ class AssistantService:
         self._require_enabled()
         self.store.get_assistant(assistant_id, tenant_id=tenant_id, user_id=user_id)
         initiator = f"dashboard:{purpose}"
-        for r in self.store.runs.values():
-            if (r.tenant_id == tenant_id and r.user_id == user_id and r.assistant_id == assistant_id
-                    and r.initiator == initiator):
-                return r
+        with self.store._lock:
+            for r in self.store.runs.values():
+                if (r.tenant_id == tenant_id and r.user_id == user_id and r.assistant_id == assistant_id
+                        and r.initiator == initiator):
+                    return r
         run = AssistantRun(run_id=_new_id("run"), thread_id="", assistant_id=assistant_id, tenant_id=tenant_id,
                            user_id=user_id, task_id=_new_id("task"), state="completed", initiator=initiator)
         self.store.put_run(run)
@@ -4498,9 +4508,10 @@ class AssistantService:
     def export_memory(self, *, tenant_id: str, user_id: str, assistant_id: str) -> dict[str, Any]:
         self._require_enabled()
         self.store.get_assistant(assistant_id, tenant_id=tenant_id, user_id=user_id)
-        rows = [m for m in self.store.memory.values()
-                if m.tenant_id == tenant_id and m.user_id == user_id
-                and m.assistant_id == assistant_id]
+        with self.store._lock:
+            rows = [m for m in self.store.memory.values()
+                    if m.tenant_id == tenant_id and m.user_id == user_id
+                    and m.assistant_id == assistant_id]
         return {"assistant_id": assistant_id,
                 "exported_at": self.now().isoformat(),
                 "count": len(rows),
@@ -5480,11 +5491,12 @@ class AssistantService:
         digest = hashlib.sha256(canonical_json([kind, payload]).encode()).hexdigest()
         key = dedupe_key or digest[:32]
         now = self.now()
-        for x in self.store.proposals.values():
-            if (x.tenant_id == tenant_id and x.user_id == user_id and x.dedupe_key == key
-                    and x.kind == kind and x.status in ("awaiting_approval", "approved")
-                    and x.expires_at is not None and x.expires_at > now):
-                return x, False
+        with self.store._lock:
+            for x in self.store.proposals.values():
+                if (x.tenant_id == tenant_id and x.user_id == user_id and x.dedupe_key == key
+                        and x.kind == kind and x.status in ("awaiting_approval", "approved")
+                        and x.expires_at is not None and x.expires_at > now):
+                    return x, False
         from .intel_assistant import navigate
         x = AssistantProposal(
             proposal_id=_new_id("prop"), tenant_id=tenant_id, user_id=user_id, assistant_id=assistant_id,
@@ -5501,14 +5513,18 @@ class AssistantService:
         self._require_enabled()
         now = self.now()
         out = []
-        for x in self.store.proposals.values():
-            if x.tenant_id != tenant_id or not (x.user_id == user_id or (self._is_approver(user_id) and x.kind not in EXTERNAL_KINDS)):
-                continue
-            if x.status == "awaiting_approval" and (x.expires_at is None or x.expires_at <= now):
-                x.status = "expired"
-                self.store.put_proposal(x)
-            if status is None or x.status == status:
-                out.append(x)
+        expired = []
+        with self.store._lock:       # scan and the expiry write-back are one step; persisting happens after
+            for x in self.store.proposals.values():
+                if x.tenant_id != tenant_id or not (x.user_id == user_id or (self._is_approver(user_id) and x.kind not in EXTERNAL_KINDS)):
+                    continue
+                if x.status == "awaiting_approval" and (x.expires_at is None or x.expires_at <= now):
+                    x.status = "expired"
+                    expired.append(x)
+                if status is None or x.status == status:
+                    out.append(x)
+        for x in expired:
+            self.store.put_proposal(x)
         return sorted(out, key=lambda x: x.created_at, reverse=True)
 
     def decide_proposal(self, proposal_id: str, *, tenant_id: str, user_id: str,
@@ -5821,9 +5837,10 @@ class AssistantService:
             raise AssistantError("priority must be urgent or normal")
         if link and not link.startswith("#/"):
             raise AssistantError("notification links must be dashboard links")
-        for x in self.store.notifications.values():
-            if x.tenant_id == tenant_id and x.user_id == user_id and x.key == key:
-                return x, "duplicate"
+        with self.store._lock:
+            for x in self.store.notifications.values():
+                if x.tenant_id == tenant_id and x.user_id == user_id and x.key == key:
+                    return x, "duplicate"
         planner = self._quiet_planner()
         notice = Notice(key=key, priority=priority, text=(redact_secrets(text) or "")[:500], link=link)
         verdict = planner.plan(notice, self._local(self.now()))
@@ -5840,17 +5857,19 @@ class AssistantService:
     def list_notifications(self, *, tenant_id: str, user_id: str,
                            state: str | None = None) -> list[AssistantNotification]:
         self._require_enabled()
-        return sorted([x for x in self.store.notifications.values()
-                       if x.tenant_id == tenant_id and x.user_id == user_id
-                       and (state is None or x.state == state)],
-                      key=lambda x: x.created_at, reverse=True)
+        with self.store._lock:
+            rows = [x for x in self.store.notifications.values()
+                    if x.tenant_id == tenant_id and x.user_id == user_id
+                    and (state is None or x.state == state)]
+        return sorted(rows, key=lambda x: x.created_at, reverse=True)
 
     def digest(self, *, tenant_id: str, user_id: str) -> dict[str, Any]:
         """Collect what quiet hours held back (once: they become ``digested``)."""
         self._require_enabled()
-        held = sorted([x for x in self.store.notifications.values()
-                       if x.tenant_id == tenant_id and x.user_id == user_id and x.state == "held_for_digest"],
-                      key=lambda x: x.created_at)
+        with self.store._lock:
+            held = sorted([x for x in self.store.notifications.values()
+                           if x.tenant_id == tenant_id and x.user_id == user_id and x.state == "held_for_digest"],
+                          key=lambda x: x.created_at)
         if held and self._quiet_planner()._quiet(self._local(self.now())):
             return {"items": [], "quiet_hours": True, "held": len(held)}
         for x in held:
@@ -6187,7 +6206,6 @@ class AssistantService:
                                                         assistant_id=assistant_id)),
             "run_count": len(self.store.list_runs(tenant_id=tenant_id, user_id=user_id,
                                                   assistant_id=assistant_id)),
-            "memory_count": len([m for m in self.store.memory.values()
-                                 if m.tenant_id == tenant_id and m.user_id == user_id
-                                 and m.assistant_id == assistant_id]),
+            "memory_count": self.store.count_memory(tenant_id=tenant_id, user_id=user_id,
+                                                    assistant_id=assistant_id),
         }

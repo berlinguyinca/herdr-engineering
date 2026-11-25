@@ -80,9 +80,34 @@ def _routes_equal(a, b) -> bool:
         sorted(_route_key(r) for r in (b or []))
 
 
+def _validate_route(r) -> Route:
+    """One Route object or raw dict -> a checked Route, else ValueError."""
+    if isinstance(r, dict):
+        try:
+            r = Route(**r)
+        except TypeError as exc:
+            raise ValueError(f"invalid route {r!r}: {exc}") from exc
+    elif not isinstance(r, Route):
+        raise ValueError(f"route must be a Route or a dict, got {type(r).__name__}")
+    if not isinstance(r.prefix, str) or not r.prefix.strip("/ "):
+        raise ValueError(f"route prefix must be a non-empty path: {r.prefix!r}")
+    if not isinstance(r.host, str) or not r.host.strip():
+        raise ValueError(f"route host must be a non-empty string: {r.host!r}")
+    if not isinstance(r.port, int) or isinstance(r.port, bool) or not 0 < r.port < 65536:
+        raise ValueError(f"route port out of range: {r.port!r}")
+    return r
+
+
 def _normalize_routes(routes):
-    """Route objects or raw dicts (gateway registers pass dicts) -> [Route]."""
-    return [Route(**r) if isinstance(r, dict) else r for r in (routes or [])]
+    """Route objects or raw dicts (gateway registers pass dicts) -> [Route].
+
+    Validates every item and raises ValueError for the first bad one, so a
+    caller never persists a partial or malformed table."""
+    if routes is None:
+        return []
+    if not isinstance(routes, (list, tuple)):
+        raise ValueError(f"routes must be a list, got {type(routes).__name__}")
+    return [_validate_route(r) for r in routes]
 
 
 _LEASE_FIELDS = frozenset(f.name for f in dataclasses.fields(DevServiceLease))
@@ -352,6 +377,8 @@ class DevServiceRegistry:
                  network_namespace: str | None = None) -> DevServiceLease:
         """Register (or idempotently renew) a lease. Allocates a collision-free port."""
         now = _now_iso()
+        if routes is not None:
+            routes = _normalize_routes(routes)  # reject a bad table before any state changes
         if lease_id or owner_herdr_session_id or owner_process_id:
             self.reload_if_changed()  # a re-register checks the port against other processes' leases
         with self._lock:
