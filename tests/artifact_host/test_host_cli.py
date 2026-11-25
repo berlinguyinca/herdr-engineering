@@ -29,7 +29,7 @@ def good() -> dict:
             "pool_id": "us-west-2_POOL",
             "client_ids": ["client-a"],
             "web_client_id": "client-a",
-            "domain": "auth.example.test",
+            "domain": "https://auth.example.test",
             "group": "team",
         },
         "session_secret": SECRET,
@@ -61,6 +61,25 @@ def write(tmp_path: Path, data: dict) -> Path:
     path = tmp_path / "cfg.json"
     path.write_text(json.dumps(data))
     return path
+
+
+@pytest.mark.parametrize(
+    ("mutate", "key"),
+    [
+        (lambda d: d["cognito"].update(domain="auth.example.test"), "cognito.domain"),
+        (lambda d: d["cognito"].update(domain="https://auth.example.test/path"), "cognito.domain"),
+        (lambda d: d["cognito"].update(web_client_id="bad client!"), "cognito.web_client_id"),
+        (lambda d: d["cognito"].update(client_ids=["ok", "bad id!"]), "cognito.client_ids"),
+        (lambda d: d["cognito"].update(pool_id="nopool"), "cognito.pool_id"),
+    ],
+)
+def test_parse_refuses_a_cognito_value_the_runtime_would_silently_drop(mutate, key: str) -> None:
+    """A value the lab/member surfaces reject at runtime must stop the host at start, not 404 every share."""
+    data = copy.deepcopy(good())
+    mutate(data)
+    with pytest.raises(ValueError) as err:
+        host_config.parse(data)
+    assert key in str(err.value)
 
 
 def test_load_maps_the_file_to_a_config(tmp_path: Path) -> None:
