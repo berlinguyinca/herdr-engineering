@@ -61,7 +61,7 @@ def test_logs_never_carry_tokens_sessions_or_csrf(
     sess = landing_session(r)
     host.get(f"/s/{s.token}/k/{sess}/f/missing.txt")
     host.get(f"/s/{s.token}/k/{sess}x/f/notes.txt")
-    sign_in(host, s, idt=ident(email="mallory@evil.example"))
+    sign_in(host, s, idt=ident(email="mallory@evil.example", nonce="n-0"))
     pub = host.seed_share()
     host.get(f"/s/{pub.token}/f/nope")
     text = "\n".join(rec.getMessage() for rec in caplog.records)
