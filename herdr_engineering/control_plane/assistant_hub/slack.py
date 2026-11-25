@@ -42,6 +42,7 @@ from .policy import (
     activate_grant,
     create_standing_grant,
     current_judge_version,
+    display_complete,
     in_shadow,
     record_owner_decision,
 )
@@ -181,14 +182,11 @@ def slack_text(value: str, limit: int = _TEXT_MAX) -> str:
     return out
 
 
-_TRUNCATED = re.compile(r"\u2026\(\+\d+ chars\)$")
-
-
 def fully_shown(display: str) -> bool:
     """True when ``slack_text(display)`` prints every character of ``display``.  The request row keeps only a
     truncated rendering of a long command (marked ``...(+N chars)``), and Slack cuts at 300 characters again; a tap
     approves the WHOLE command, so an approval is only offered for text the owner can read in full."""
-    return not _TRUNCATED.search(display) and not slack_text(display, _TEXT_MAX + 1).endswith("\u2026") \
+    return display_complete(display) and not slack_text(display, _TEXT_MAX + 1).endswith("\u2026") \
         and len(slack_text(display, _TEXT_MAX + 1)) <= _TEXT_MAX
 
 
@@ -239,6 +237,7 @@ class _Queued:
     queued_at: datetime
     ask: SlackAsk | None = None
     urgent: bool = False             # goes to the head of the queue and is never the one dropped on overflow
+    approvable: bool = True          # False: the owner can only deny it (over the cap, or a mask hid part of it)
     kind: str = "action"             # action | question | summary (their asks are created up front) | outcome (a deploy
                                      # check id in ``request_id``)
 
@@ -438,7 +437,8 @@ class SlackRuntime:
             if not self._cfg().get("enabled"):
                 return
             self._enqueue(_Queued(row.tenant_id, row.user_id, row.request_id, row.worker_id, row.task_id, display,
-                                  why, project, as_utc(self._now())))
+                                  why, project, as_utc(self._now()),
+                                  approvable=display_complete(display) or bool(row.display_full)))
         except Exception as exc:
             _log.warning("slack notify failed: %s", type(exc).__name__)
 
@@ -610,7 +610,8 @@ class SlackRuntime:
                     self.store.put_slack_ask(orphan)
             with self._qcond:
                 self._queue.append(_Queued(row.tenant_id, row.user_id, rid, row.worker_id, row.task_id, row.display,
-                                           row.reason, "", now))
+                                           row.reason, "", now,
+                                           approvable=display_complete(row.display) or bool(row.display_full)))
                 self._qcond.notify()
             queued += 1
         return queued + self._sweep_questions(now) + self._sweep_outcomes(now)
@@ -1006,8 +1007,12 @@ class SlackRuntime:
         shown = fully_shown(item.display)
         lines.append("```" + slack_text(item.display) + "```")
         if not shown:
-            lines.append("*Too long to show in full: it cannot be approved from Slack.* Deny it, or have the worker "
-                         "request a shorter command.")
+            if not item.approvable:
+                lines.append("*It is too long to show in full and cannot be approved at all.* Deny it, or have the worker "
+                             "request it differently.")
+            else:
+                lines.append("*Too long for Slack: it cannot be approved here.* Deny it, or read it in full and "
+                             "approve it with `herdr-eng control-plane assistant-action approve` (or the REST API).")
         lines.append(f"Why: {slack_text(item.why)}")
         value = button_value(ask)
 

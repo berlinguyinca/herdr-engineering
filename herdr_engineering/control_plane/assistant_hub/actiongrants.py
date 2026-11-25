@@ -93,6 +93,7 @@ class ActionRequestRow:
     decided_by: str = ""
     display: str = ""                # scrubbed, truncated command for the owner API only; never audit/grants/events
     consumed_at: datetime | None = None   # set once when an approved row authorized one re-ask (older snapshots: None)
+    display_full: str = ""           # the whole masked command when ``display`` was cut and can be read in full; else ""
 
 
 @dataclass

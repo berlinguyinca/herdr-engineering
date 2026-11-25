@@ -1130,8 +1130,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--yes", action="store_true", help="install-hooks: apply without the confirmation prompt")
     p2.set_defaults(func=_cmd_cp_assistant_worker)
     p2 = csub.add_parser("assistant-action", help="list, approve or deny hub workers' action requests (owner API)")
-    p2.add_argument("action", choices=["list", "approve", "deny"])
-    p2.add_argument("request_id", nargs="?", default=None, help="the request to decide (approve|deny)")
+    p2.add_argument("action", choices=["list", "show", "approve", "deny"])
+    p2.add_argument("request_id", nargs="?", default=None, help="the request to show or decide (show|approve|deny)")
+    p2.add_argument("--display-sha256", default=None,
+                    help="approve: the hash `show` printed, to approve a cut command without a prompt (not on a terminal)")
     p2.add_argument("--status", default=None, choices=["pending", "approved", "denied", "vetoed"], help="list filter")
     p2.add_argument("--control-plane", default=None, help="control-plane base URL (default: host.json)")
     p2.add_argument("--api-key-file", default=None, help="PATH to a file holding an operator API key (never the key itself)")
@@ -4726,6 +4728,11 @@ def _cmd_cp_assistant_worker(args) -> int:
     return 1
 
 
+def _full_text_sha256(full: str) -> str:
+    from .control_plane.assistant_hub.policy import full_text_sha256
+    return full_text_sha256(full)
+
+
 def _tty_safe(value) -> str:
     """Server-provided text with every ESC/C0/C1 control character removed (space kept), safe to print to a terminal."""
     return "".join(c for c in str(value) if c == " " or not (ord(c) < 32 or 0x7F <= ord(c) <= 0x9F))
@@ -4944,12 +4951,52 @@ def _cmd_cp_assistant_hub_owner(args) -> int:
                 rows = call("GET", f"/api/v1/assistant-action-requests{query}")["requests"]
                 print(f"{'REQUEST_ID':<20} {'STATUS':<9} {'VERB':<14} {'WORKER':<22} DISPLAY")
                 for r in rows:
-                    display = _tty_safe(r["display"])[:120]
+                    display = _tty_safe(r["display"])
                     print(_tty_safe(f"{r['request_id']:<20} {r['status']:<9} {r['verb']:<14} {r['worker_id']:<22} ")
                           + display)
+                    if not r.get("display_complete", True):
+                        print("  (cut: read it with `assistant-action show ID`)")
+            elif args.action == "show":
+                row = call("GET", f"/api/v1/assistant-action-requests/{quoted}")
+                print(_tty_safe(f"{row['request_id']}: {row['status']}"))
+                print(_tty_safe(row.get("display_full") or row["display"]))
+                if row.get("display_complete", True):
+                    print("shown in full: approve needs no hash")
+                elif row.get("approvable"):
+                    print("display_sha256: " + _full_text_sha256(row["display_full"]))
+                else:
+                    print("deny only: this command is too long to show in full")
             else:
-                out = call("POST", f"/api/v1/assistant-action-requests/{quoted}/decision",
-                           {"approve": args.action == "approve"})
+                body = {"approve": args.action == "approve"}
+                try:
+                    out = call("POST", f"/api/v1/assistant-action-requests/{quoted}/decision", body)
+                except urllib.error.HTTPError as exc:
+                    if not (body["approve"] and exc.code == 409
+                            and _http_error_payload(exc).get("code") == "truncated_display"):
+                        raise
+                    row = call("GET", f"/api/v1/assistant-action-requests/{quoted}")
+                    if not row.get("approvable"):
+                        print("this request can only be denied: it is too long to show in full",
+                              file=sys.stderr)
+                        return 1
+                    full = row["display_full"]
+                    if args.display_sha256:
+                        body["display_sha256"] = args.display_sha256
+                    elif sys.stdin.isatty():
+                        print(_tty_safe(full))
+                        try:
+                            answer = input("Approve exactly this command? [y/N] ").strip().lower()
+                        except (EOFError, KeyboardInterrupt):
+                            answer = ""
+                        if answer not in ("y", "yes"):
+                            print("not approved")
+                            return 1
+                        body["display_sha256"] = _full_text_sha256(full)
+                    else:
+                        print("this command is cut in the list; read it with `assistant-action show ID` and "
+                              "pass the hash it prints as --display-sha256", file=sys.stderr)
+                        return 2
+                    out = call("POST", f"/api/v1/assistant-action-requests/{quoted}/decision", body)
                 print(_tty_safe(f"{out['request_id']}: {out['status']}"))
         elif args.action == "list":
             rows = call("GET", "/api/v1/assistant-grants")["grants"]
@@ -4965,16 +5012,28 @@ def _cmd_cp_assistant_hub_owner(args) -> int:
             print(_tty_safe(f"{out['grant_id']}: {out['state']}"))
         return 0
     except urllib.error.HTTPError as exc:
-        code = ""
-        try:
-            code = str(json.loads(exc.read(65536)).get("code") or "")
-        except (OSError, ValueError, AttributeError):
-            pass
+        payload = _http_error_payload(exc)
+        code = str(payload.get("code") or "")
+        message = payload.get("error") if kind == "assistant-action" else ""
         suffix = f" ({code})" if code and code.replace("_", "").isalnum() else ""
-        print(f"{kind} {args.action} failed: HTTP {exc.code}{suffix}", file=sys.stderr)
+        detail = f": {_tty_safe(message)[:300]}" if isinstance(message, str) and message else ""
+        print(f"{kind} {args.action} failed: HTTP {exc.code}{suffix}{detail}", file=sys.stderr)
     except (OSError, ValueError, KeyError) as exc:
         print(f"{kind} {args.action} failed: {type(exc).__name__}", file=sys.stderr)
     return 1
+
+
+def _http_error_payload(exc) -> dict:
+    """The JSON object in an HTTP error body, read once (a second ``read`` returns nothing) and cached on ``exc``."""
+    cached = getattr(exc, "_herdr_payload", None)
+    if cached is None:
+        try:
+            parsed = json.loads(exc.read(65536))
+            cached = parsed if isinstance(parsed, dict) else {}
+        except (OSError, ValueError):
+            cached = {}
+        exc._herdr_payload = cached  # type: ignore[attr-defined]
+    return cached
 
 
 _REDEEM_SAFE = re.compile(r"[A-Za-z0-9._~:/\-]+")
