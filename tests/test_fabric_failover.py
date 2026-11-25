@@ -14,7 +14,7 @@ from tests.test_fabric import _port_range
 def _node(tmp_path, name, peer, node_id, port_range, promote_after=2):
     registry = DevServiceRegistry(store_path=tmp_path / name / "leases.json", port_range=port_range, lease_ttl_seconds=60)
     gw = FabricGateway(registry, GatewayRouter(["127.0.0.1"]), control_host="127.0.0.1", control_port=0,
-                       url_base="dev.test", probe_interval=3600, token=None, peer_url=peer, node_id=node_id,
+                       url_base="dev.test", probe_interval=3600, token="", peer_url=peer, node_id=node_id,
                        promote_after=promote_after, auto_ha=False)
     return gw
 
@@ -165,7 +165,7 @@ def test_background_loop_mirrors_and_promotes_without_any_manual_step(tmp_path, 
     a.start()
     registry = DevServiceRegistry(store_path=tmp_path / "b" / "leases.json", port_range=rng, lease_ttl_seconds=60)
     b = FabricGateway(registry, GatewayRouter(["127.0.0.1"]), control_host="127.0.0.1", control_port=0, url_base="dev.test",
-                      probe_interval=0.2, token=None, peer_url=f"http://127.0.0.1:{a.control_port}", node_id="node-b",
+                      probe_interval=0.2, token="", peer_url=f"http://127.0.0.1:{a.control_port}", node_id="node-b",
                       promote_after=2)
     b.start()
     try:

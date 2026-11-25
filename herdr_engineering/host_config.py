@@ -225,15 +225,22 @@ def host_config() -> HostConfig:
     is memoised too, so a hot path does not retry the network on every call."""
     if _SOURCE:
         return _SOURCE[0]()
-    if "v" not in _MEMO:
+    value = _MEMO.get("v")      # one read: the memo may be cleared by another thread (forget_memoised_host_config)
+    if value is None:
         try:
-            _MEMO["v"] = load_host_config()
+            value = load_host_config()
         except HostConfigUnavailable as exc:
-            _MEMO["v"] = exc
-    value = _MEMO["v"]
+            value = exc
+        _MEMO["v"] = value
     if isinstance(value, HostConfigUnavailable):
-        raise HostConfigUnavailable(str(value), revoked=value.revoked)
+        raise HostConfigUnavailable(str(value), revoked=value.revoked, permanent=value.permanent)
     return value
+
+
+def forget_memoised_host_config() -> None:
+    """Drop the memoised value (or memoised failure) so the next ``host_config()`` fetches again; an installed
+    source stays."""
+    _MEMO.clear()
 
 
 def reset_host_config() -> None:
@@ -365,9 +372,10 @@ def exit_unavailable(exc: HostConfigUnavailable) -> int:
 # optional X-API-Key for control-plane callers (absent key = no header = open posture)
 # --------------------------------------------------------------------------
 
-def read_key_file(path: str | Path) -> str:
+def read_key_file(path: str | Path, *, allow_empty: bool = False) -> str:
     """The key in ``path``. Refuses a symlink, a non-regular file or any mode wider than 0600
-    (``ValueError``; the message names the path, never the key). An empty file is an error too."""
+    (``ValueError``; the message names the path, never the key). An empty file is an error too, unless
+    ``allow_empty`` (then ``""`` is returned)."""
     import stat as _stat
     p = Path(path).expanduser()
     try:
@@ -382,7 +390,7 @@ def read_key_file(path: str | Path) -> str:
         key = p.read_text(encoding="utf-8").strip()
     except (OSError, ValueError):
         raise ValueError(f"api key file {p}: unreadable") from None
-    if not key:
+    if not key and not allow_empty:
         raise ValueError(f"api key file {p}: empty")
     return key
 

@@ -624,12 +624,22 @@ services:
       - ${HOME}/.config/herdr-engineering/acme:/acme:ro
       - ${HOME}/.config/herdr-engineering/ca:/ca:ro
       - ${HOME}/.config/herdr-engineering/tailnet-cert:/tailnet-cert:ro
+      # Control-API bearer token: a DIRECTORY mount (a rename-replace is followed; a missing file bind would be
+      # created as a directory by docker). Put the token in ~/.config/herdr-engineering/fabric-gateway/token (0600).
+      # The gateway re-reads it on every request, so rotating needs no restart: replace the file ATOMICALLY
+      # (write a temp file in the same directory, then rename it over token).
+      - ${HOME}/.config/herdr-engineering/fabric-gateway:/run/fabric:ro
     environment:
       HERDR_ENGINEERING_STATE: /state
       HERDR_ENGINEERING_CONFIG: /app/config.yaml
+      HERDR_ENGINEERING_FABRIC_TOKEN_FILE: /run/fabric/token
     command:
       - "devfabric"
       - "gateway"
+      # ROLLOUT: the gateway refuses to start with no token unless --allow-open is given. It is kept here so
+      # deploying the code does not take the gateway down; a token in /run/fabric/token is enforced the moment it
+      # exists even with this flag. Remove the flag (follow-up PR) once the token is provisioned everywhere.
+      - "--allow-open"
       - "--control-port"
       - "29999"
       - "--bind"
@@ -667,8 +677,11 @@ services:
       # Bind the controller's fleet store read-only so the dashboard can serve the
       # per-site summaries written by playbooks/agent-mine.yml.
       - ~/.cache/agent-mine:/root/.cache/agent-mine:ro
+      # The web UI calls the gateway control API (leases, /healthz): same read-only token directory as fabric-gateway.
+      - ${HOME}/.config/herdr-engineering/fabric-gateway:/run/fabric:ro
     environment:
       HERDR_ENGINEERING_CONFIG: /app/config.yaml
+      HERDR_ENGINEERING_FABRIC_TOKEN_FILE: /run/fabric/token
     command: ["web", "--host", "127.0.0.1", "--port", "8787"]
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8787/"]

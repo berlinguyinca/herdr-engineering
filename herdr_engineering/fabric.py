@@ -15,14 +15,17 @@ space. It owns:
 
 Security: control API and router bind to loopback and/or the tailnet only
 (private by default); the control API requires a bearer token (secret read
-from the environment or a machine-local file, never from the repo).
+from the environment, a machine-local file or host config, never from the repo).
 """
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import socket
 import ssl
+import stat
+import sys
 import threading
 import time
 import urllib.request
@@ -32,23 +35,133 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from .devfabric import DevServiceRegistry, proxy_pair, route_and_pipe
+from .devfabric import DevServiceRegistry, enable_keepalive, proxy_pair, route_and_pipe
 from .errors import ConflictError, UnreachableError
 from .fabric_named import AcceptBackoff
+
+
+class TokenNotAccepted(UnreachableError):
+    """The gateway is up and answered, but did not accept our bearer token (HTTP 401, or the minimal /healthz).
+    Different from "down": a caller that infers a dead peer from ``UnreachableError`` must check for this first.
+    ``info`` is what the gateway said without a token (``role``, ``epoch``, ``node_id``), possibly empty."""
+
+    def __init__(self, message: str, *, target: str | None = None, info: dict[str, Any] | None = None) -> None:
+        super().__init__(message, target=target)
+        self.info: dict[str, Any] = info or {}
+
+
+class TokenUnreadable(UnreachableError):
+    """This machine cannot read ITS OWN token (bad file, failed host-config fetch). Says nothing about the
+    gateway being down, so it must never be counted as a dead peer."""
+
+
+class TokenFileMode(OSError):
+    """The token file's mode is wider than 0600."""
+
+
+_warned_token_files: set[str] = set()
+
 
 _FABRIC_TOKEN_FILE = os.path.join("~", ".config", "herdr-engineering", "fabric-token")
 
 
-def read_fabric_token() -> str | None:
-    from .host_config import host_value
-    tok = host_value("fabric.token")
-    if tok:
-        return tok
+# Unauthenticated callers (session tools using /rewrite) may post at most this much text.
+_OPEN_BODY_LIMIT = 64 * 1024
+_FABRIC_TOKEN_ENV = "HERDR_ENGINEERING_FABRIC_TOKEN"
+_FABRIC_TOKEN_FILE_ENV = "HERDR_ENGINEERING_FABRIC_TOKEN_FILE"
+# A superseded token stays valid this long. Well above the agents' host-config refresh (300 s,
+# ``host_config.REFRESH_INTERVAL``) so a client that only learns the new token on its next refresh is not locked out.
+_TOKEN_ROTATION_GRACE_SECONDS = 3600.0
+
+
+_HOST_TOKEN_TTL = 300.0       # the agents' host-config refresh (``host_config.REFRESH_INTERVAL``)
+_HOST_TOKEN_RETRY = 30.0      # how soon a failed host-config fetch is tried again
+_host_token_lock = threading.Lock()
+_host_token_state: dict[str, Any] = {}      # {"at": monotonic time of the last forced re-fetch, "failed": bool}
+
+
+def reset_fabric_token_cache() -> None:
+    """Forget when the host config was last re-fetched (tests; the next read re-fetches)."""
+    with _host_token_lock:
+        _host_token_state.clear()
+
+
+def _host_config_token() -> str | None:
+    """``fabric.token`` of the host config. The host config is memoised per process, so it is dropped every
+    ``_HOST_TOKEN_TTL`` seconds and re-fetched: a long-lived gateway or client follows a rotation. Not
+    configured (no host.json, a revoked host) is "no token"; a fetch that failed (control plane unreachable,
+    no cache) raises ``OSError`` and is tried again after ``_HOST_TOKEN_RETRY`` seconds: an outage, which
+    ``host_config()`` memoises, must never read as "no token" (an open gateway)."""
+    from . import host_config as hc
+    now = time.monotonic()
+    with _host_token_lock:
+        limit = _HOST_TOKEN_RETRY if _host_token_state.get("failed") else _HOST_TOKEN_TTL
+        if now - _host_token_state.get("at", -limit - 1.0) > limit:
+            hc.forget_memoised_host_config()
+            _host_token_state["at"] = now
+            _host_token_state["failed"] = False
     try:
-        with open(os.path.expanduser(_FABRIC_TOKEN_FILE)) as f:
-            return f.read().strip() or None
-    except OSError:
+        cfg = hc.host_config()
+    except hc.HostConfigUnavailable as exc:
+        if exc.permanent:
+            return None
+        with _host_token_lock:
+            _host_token_state["failed"] = True
+        raise OSError(f"host configuration unavailable ({exc}); fabric.token cannot be read") from None
+    raw = cfg.get("fabric.token")
+    return (str(raw).strip() or None) if raw is not None else None   # YAML may hand over an int for digits
+
+
+def _read_token_file(path: str) -> str | None:
+    """The token in ``path``, or None when the file is missing, empty or only whitespace. Same checks as
+    ``host_config.read_key_file`` (regular file, no symlink, mode 0600); anything wrong with it raises
+    ``OSError`` (``TokenFileMode`` for a wide mode) so callers fail closed."""
+    from .host_config import read_key_file
+    p = os.path.expanduser(path)
+    try:
+        st = os.lstat(p)
+    except FileNotFoundError:
         return None
+    if stat.S_ISREG(st.st_mode) and stat.S_IMODE(st.st_mode) & 0o077:
+        raise TokenFileMode(f"fabric token file {p}: unsafe mode {stat.S_IMODE(st.st_mode):04o}; run: chmod 600 {p}")
+    try:
+        return read_key_file(p, allow_empty=True) or None
+    except ValueError as exc:                      # names the path, never the content
+        raise OSError(str(exc)) from None
+
+
+def read_fabric_token(*, strict: bool = True) -> str | None:
+    """The fabric bearer token: env var, then the token file (``HERDR_ENGINEERING_FABRIC_TOKEN_FILE`` or
+    ``~/.config/herdr-engineering/fabric-token``), then host config ``fabric.token``.
+
+    The file is read on every call (a rotation is followed); the host config is re-fetched every 300 s.
+    A missing or empty file with no host-config token means "no token" (None); any other problem (a
+    directory where the file should be, a symlink, a mode wider than 0600, non-UTF-8 content, a failed
+    host-config fetch) raises ``OSError`` so callers fail closed instead of treating it as "no token".
+    ``strict=False`` (clients) warns once about a token file with a wide mode and falls through to host config
+    instead of raising, and a failed host-config fetch means "no token" (no bearer is sent); the gateway stays
+    strict."""
+    env = os.environ.get(_FABRIC_TOKEN_ENV, "").strip()
+    if env:
+        return env
+    path = os.environ.get(_FABRIC_TOKEN_FILE_ENV) or _FABRIC_TOKEN_FILE
+    try:
+        from_file = _read_token_file(path)
+    except TokenFileMode as exc:
+        if strict:
+            raise
+        if path not in _warned_token_files:
+            _warned_token_files.add(path)
+            print(f"herdr-eng: ignoring {exc}", file=sys.stderr, flush=True)
+        from_file = None
+    if from_file:
+        return from_file
+    try:
+        return _host_config_token()
+    except OSError:
+        if strict:
+            raise
+        return None      # a client with no token sends no bearer and lets the gateway decide
 
 
 def _is_ip_literal(host: str) -> bool:
@@ -259,6 +372,7 @@ class GatewayRouter:
                 except OSError:
                     pass
                 return
+        enable_keepalive(client)
         client, tls = self._terminate_tls(client)
         if client is None:
             return
@@ -371,7 +485,8 @@ class FabricGateway:
                  auto_ha: bool = True, url_aliases: tuple[str, ...] = (),
                  named_domain: str | None = None, named_port: int = 443,
                  apex_upstream: tuple[str, int] | None = None,
-                 host_routes: dict[str, tuple[str, int]] | None = None) -> None:
+                 host_routes: dict[str, tuple[str, int]] | None = None,
+                 allow_open: bool = False, rotation_grace: float | None = None) -> None:
         self.registry = registry
         registry.port_free = router.can_bind
         # Stable service-name URLs (https://<service>.<named_domain>[:named_port]); off unless a domain is given
@@ -416,11 +531,74 @@ class FabricGateway:
         # falling back to the tailnet IP or the control host).
         self.url_base = url_base or magicdns_name() or tailnet_ipv4() or control_host
         self.probe_interval = probe_interval
-        self.token = token if token is not None else read_fabric_token()
+        # token="" is an explicit "no auth" (tests, loopback tools); allow_open lets a gateway with no token
+        # configured serve open. Otherwise a missing token rejects every control request (fail closed).
+        self._fixed_token = token
+        self.allow_open = allow_open or token == ""
+        self.rotation_grace = float(_TOKEN_ROTATION_GRACE_SECONDS if rotation_grace is None else rotation_grace)
+        self._token_lock = threading.Lock()
+        self._last_token: str | None = None
+        self._prev_tokens: dict[str, float] = {}     # superseded token -> accepted until (monotonic)
+        self._token_unreadable = False
+        self.peer_unauthorised = False
+        self.peer_info: dict[str, Any] = {}          # what an unauthorised peer told us without a token
+        self._warned_unauthorised = False
+        self._unauth_cycles = 0
+        self._standby_cycles = 0
         self._httpd: ThreadingHTTPServer | None = None
         self._probe_thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._sync_router()
+
+    @property
+    def token(self) -> str | None:
+        """The current bearer token. Re-read on every use so a rotated token file is followed without a
+        restart (the file must be replaced atomically: write a temp file, then rename). A token seen once is
+        never forgotten (a vanished file must not reopen the API), and every superseded token stays valid for
+        ``rotation_grace`` so a mistyped or torn value cannot evict the real previous one. An unreadable file
+        keeps the last known token; with none known the gateway fails closed (see ``accepts``)."""
+        if self._fixed_token is not None:
+            return self._fixed_token or None
+        try:
+            fresh = read_fabric_token()
+            unreadable = False
+        except OSError:
+            fresh, unreadable = None, True
+        now = time.monotonic()
+        with self._token_lock:
+            self._token_unreadable = unreadable
+            if fresh and fresh != self._last_token:
+                if self._last_token:
+                    self._prev_tokens[self._last_token] = now + self.rotation_grace
+                self._last_token = fresh
+            self._prev_tokens = {t: until for t, until in self._prev_tokens.items() if until > now}
+            return self._last_token
+
+    @property
+    def control_auth(self) -> str:
+        """"token" (enforced), "unreadable" (the token cannot be read: every control request is rejected),
+        "closed" (no token and not ``allow_open``: every control request is rejected) or "open"."""
+        if self.token:
+            return "token"
+        if self._token_unreadable:
+            return "unreadable"
+        return "open" if self.allow_open else "closed"
+
+    def accepts(self, presented: str | None) -> bool:
+        """True when ``presented`` matches the current token (or a previous one inside its rotation grace)."""
+        current = self.token
+        if not current:
+            return self.allow_open and not self._token_unreadable
+        presented = presented or ""
+        if hmac.compare_digest(presented.encode(), current.encode()):
+            return True
+        now = time.monotonic()
+        with self._token_lock:
+            prev = list(self._prev_tokens.items())
+        ok = False
+        for tok, until in prev:                      # no early exit: keep the work independent of which matched
+            ok |= now < until and hmac.compare_digest(presented.encode(), tok.encode())
+        return ok
 
     # -- router sync -------------------------------------------------------
     def _sync_router(self) -> None:
@@ -446,8 +624,20 @@ class FabricGateway:
         return client
 
     def _peer_health(self) -> dict[str, Any] | None:
+        """The peer's full health, or None when it is down OR did not accept our token. ``peer_unauthorised``
+        tells the two apart: a reachable peer that answers a minimal /healthz is alive, so it must never count
+        toward a promotion (a token written on one node of the pair only would otherwise make the open node
+        promote itself over the tokened one)."""
+        self.peer_unauthorised = False
+        self.peer_info = {}
         try:
             health = self._peer().healthz()
+        except TokenNotAccepted as exc:
+            self.peer_unauthorised, self.peer_info = True, exc.info
+            return None
+        except TokenUnreadable:
+            self.peer_unauthorised = True            # our own token cannot be read: says nothing about the peer
+            return None
         except Exception:
             return None
         return health if isinstance(health, dict) and health.get("ok") else None
@@ -455,7 +645,14 @@ class FabricGateway:
     def _choose_initial_role(self) -> None:
         """Start as standby when the peer is already serving; otherwise take over (epoch above anything seen)."""
         peer = self._peer_health()
-        if peer and peer.get("role") == "active":
+        if self.peer_unauthorised:
+            # Alive but we cannot read its state: serving beside it could mean two actives, so start as
+            # standby; _ha_step decides deterministically (see _ha_step_unauthorised).
+            self.role = "standby"
+            self.epoch = int(self.peer_info.get("epoch") or 0)
+            print("fabric gateway: the peer is reachable but this node cannot use its token with it; starting as "
+                  "standby (give both nodes the same token)", file=sys.stderr, flush=True)
+        elif peer and peer.get("role") == "active":
             self.role, self.epoch = "standby", int(peer.get("epoch", 0))
         else:
             self.role = "active"
@@ -472,16 +669,23 @@ class FabricGateway:
         self.epoch += 1
         self.role = "active"
         self._peer_failures = 0
+        self._unauth_cycles = self._standby_cycles = 0
         self.registry.renew_all()
         self._sync_router()
 
     def demote(self) -> None:
         self.role = "standby"
+        self._unauth_cycles = self._standby_cycles = 0
         self._sync_router()
 
     def _ha_step(self) -> None:
         """One peer check: mirror while standby, promote after ``promote_after`` misses, resolve a double-active."""
         peer = self._peer_health()
+        if peer is None and self.peer_unauthorised:
+            self._ha_step_unauthorised()
+            return
+        self._warned_unauthorised = False
+        self._unauth_cycles = 0
         if self.role == "standby":
             if peer is None:
                 self._peer_failures += 1
@@ -497,9 +701,49 @@ class FabricGateway:
                     pass
             elif self.node_id <= str(peer.get("node_id", "")):
                 self.promote()   # both standby (e.g. both restarted): the smaller node id takes over
+            else:
+                # the smaller node id is not promoting (for instance it cannot use its token): do not wait forever
+                self._standby_cycles += 1
+                if self._standby_cycles >= 2 * self.promote_after:
+                    self.promote()
             return
         if peer and peer.get("role") == "active" and not self._wins_against(peer):
             self.demote()
+
+    def _ha_step_unauthorised(self) -> None:
+        """The peer answers but this node cannot read it (token mismatch, or our own token unreadable). The peer
+        is alive, so it never counts as a miss. Role and epoch come from its tokenless /healthz when it gave
+        them, which keeps exactly one node active: a node without a token never promotes over (and yields to) a
+        tokened peer; two tokened nodes with different tokens settle by node id; an unreadable peer that may
+        be active is never promoted over."""
+        self._peer_failures = 0
+        if not self._warned_unauthorised:
+            self._warned_unauthorised = True
+            print("fabric gateway: HA PEER NOT READABLE: it is reachable but this node's token does not work with "
+                  "it (or cannot be read); give both nodes the same token. Deterministic fallback in use",
+                  file=sys.stderr, flush=True)
+        info = self.peer_info
+        peer_role = info.get("role")
+        if self.role == "active":
+            if peer_role == "active":
+                peer_tokened = info.get("auth") == "token"
+                if self.token and not peer_tokened:
+                    return                           # a tokened node never yields to a tokenless one
+                if peer_tokened and not self.token or not self._wins_against(info):
+                    self.demote()                    # tokenless yields to tokened; otherwise epoch, then node id
+            return
+        if peer_role == "active" and info.get("auth") == "token":
+            self._unauth_cycles = 0                  # a tokened active peer keeps serving: wait
+            return
+        if peer_role not in ("standby", "active"):
+            self._unauth_cycles = 0                  # unknown (our own token unreadable): wait
+            return
+        self._unauth_cycles += 1
+        if not self.token:
+            return                                   # tokenless never promotes over a tokened peer
+        if self._unauth_cycles >= self.promote_after and (
+                self.node_id <= str(info.get("node_id", "")) or self._unauth_cycles >= 2 * self.promote_after):
+            self.promote()
 
     def _rewrite_target(self, lease) -> str | None:
         if self.rewrite_headers and lease.protocol == "http":
@@ -646,6 +890,11 @@ class FabricGateway:
     def op_register(self, body: dict[str, Any]) -> dict[str, Any]:
         from .fabric_urls import validate_target_host
         validate_target_host(str(body.get("target_host", "")), self.allowed_target_networks)
+        # Route hosts are connect targets too: same SSRF rules as the lease target.
+        routes = body.get("routes")
+        for route in routes if isinstance(routes, list) else ():
+            host = route.get("host") if isinstance(route, dict) else getattr(route, "host", None)
+            validate_target_host(str(host or ""), self.allowed_target_networks)
         lease = self.registry.register(
             target_machine_id=body["target_machine_id"],
             target_host=body["target_host"],
@@ -796,13 +1045,23 @@ def _make_handler(gateway: FabricGateway):
             self.wfile.write(body)
 
         def _authorized(self) -> bool:
-            if not gateway.token:
-                return True  # token-less mode (loopback-only deployments)
             header = self.headers.get("Authorization", "")
-            return header == f"Bearer {gateway.token}"
+            presented = header[7:] if header.startswith("Bearer ") else None
+            return gateway.accepts(presented)
 
         def do_GET(self) -> None:  # noqa: N802 (http.server API)
-            if not self._authorized():
+            authorized = self._authorized()
+            if self.path == "/healthz" and not authorized:
+                # Container healthchecks carry no token: say only whether the gateway is alive.
+                front = gateway.named_front
+                ok = front is None or front.healthy()
+                # role/epoch/node_id are not secret: an HA peer with a different token still needs them to keep
+                # exactly one node active.
+                self._send(200 if ok else 503, {"ok": ok, "role": gateway.role, "epoch": gateway.epoch,
+                                                "node_id": gateway.node_id,
+                                                "auth": gateway.control_auth})
+                return
+            if not authorized and not self.path.startswith("/resolve-loopback/"):
                 self._send(401, {"error": "unauthorized"})
                 return
             if self.path == "/list":
@@ -827,6 +1086,12 @@ def _make_handler(gateway: FabricGateway):
                     return
                 res = gateway.op_resolve_loopback(port, (q.get("from") or [None])[0],
                                                   (q.get("service") or [None])[0])
+                if not authorized:
+                    # Session tools carry no token: they get only the fabric address (what /rewrite also hands
+                    # out), not the lease record (owner, target host/machine) nor the machines named in a 409.
+                    res.pop("lease", None)
+                    if "error" in res:
+                        res["error"] = f"port {port} is served by more than one machine"
                 self._send(res.pop("status"), res)
                 return
             if self.path == "/names":
@@ -845,12 +1110,20 @@ def _make_handler(gateway: FabricGateway):
             self._send(404, {"error": "not found"})
 
         def do_POST(self) -> None:  # noqa: N802 (http.server API)
-            if not self._authorized():
+            authorized = self._authorized()
+            if not authorized and self.path != "/rewrite":
                 self._send(401, {"error": "unauthorized"})
                 return
             try:
                 length = int(self.headers.get("Content-Length", "0"))
+                if length < 0:
+                    raise ValueError("negative length")
+                if not authorized and length > _OPEN_BODY_LIMIT:
+                    self._send(413, {"error": "body too large"})
+                    return
                 body = json.loads(self.rfile.read(length) or b"{}")
+                if not isinstance(body, dict):
+                    raise ValueError("not an object")
             except (ValueError, json.JSONDecodeError):
                 self._send(400, {"error": "invalid json"})
                 return
@@ -885,7 +1158,10 @@ def _make_handler(gateway: FabricGateway):
                 self._send(200, gateway.op_close(lease_id))
                 return
             if self.path == "/rewrite":
-                self._send(200, gateway.op_rewrite(str(body.get("text", "")), body.get("from")))
+                res = gateway.op_rewrite(str(body.get("text", "")), body.get("from"))
+                if not authorized:               # the notes name the machines of an ambiguous port
+                    res["ambiguous"] = ["ambiguous loopback port left unchanged" for _ in res["ambiguous"]]
+                self._send(200, res)
                 return
             self._send(404, {"error": "not found"})
 
@@ -897,8 +1173,12 @@ class FabricClient:
 
     def __init__(self, gateway_url: str, token: str | None = None) -> None:
         self.gateway_url = gateway_url.rstrip("/")
-        self.token = token if token is not None else read_fabric_token()
+        self._token = token                              # None: resolve per request (a rotated file is followed)
         self._resolved: tuple[str, float] | None = None  # (url-with-IP, monotonic ts)
+
+    @property
+    def token(self) -> str | None:
+        return self._token if self._token is not None else read_fabric_token(strict=False)
 
     def _control_url(self) -> str:
         """The gateway URL with its hostname replaced by a resolved IPv4.
@@ -946,15 +1226,21 @@ class FabricClient:
     def _req(self, method: str, path: str, payload: dict | None = None) -> dict:
         url = self._control_url() + path
         data = json.dumps(payload or {}).encode()
+        try:
+            token = self.token
+        except OSError as exc:
+            raise TokenUnreadable(f"fabric token unavailable: {exc}", target=url) from exc
         req = urllib.request.Request(url, data=data, method=method, headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.token or ''}",
+            "Authorization": f"Bearer {token or ''}",
             "Host": self._host_header(),
         })
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 return json.loads(resp.read())
         except urllib.error.HTTPError as exc:
+            if exc.code == 401:
+                raise TokenNotAccepted(f"fabric gateway rejected the token (401) for {url}", target=url) from exc
             raise UnreachableError(f"fabric gateway error {exc.code} for {url}",
                                    target=url) from exc
         except Exception as exc:
@@ -989,7 +1275,14 @@ class FabricClient:
         return self._req("GET", "/names")
 
     def healthz(self) -> dict[str, Any]:
-        return self._req("GET", "/healthz")
+        """The gateway's full health payload. A gateway answers a missing or wrong token with only
+        ``ok``, ``role``, ``epoch``, ``node_id`` and ``auth`` (so the container healthcheck needs no token); that is "reachable, but not
+        authorised", not healthy, so it raises."""
+        health = self._req("GET", "/healthz")
+        if "auth" in health or set(health) <= {"ok"}:      # only the tokenless reply has "auth" (or is a bare ok)
+            raise TokenNotAccepted("fabric gateway reachable but the token was not accepted (minimal /healthz)",
+                                   target=self.gateway_url, info=health)
+        return health
 
 
 def gateway_url_from_config(config: dict[str, Any], *, fabric_url: str | None = None) -> str | None:

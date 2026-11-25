@@ -96,9 +96,10 @@ def test_gateway_accepts_the_fields_and_resolves_through_them(tmp_path):
 
 
 def test_agent_reports_origin_port_when_the_forwarder_could_not_reuse_it(tmp_path):
-    # app on 127.0.0.1:P only; agent's tailnet ip is 127.0.0.2, whose port P is already taken => ephemeral forwarder
-    app = socket.socket(); app.bind(("127.0.0.1", 0)); app.listen(5)
-    port = app.getsockname()[1]
+    # a real HTTP app on 127.0.0.1:P only (the agent's probe must get an answer: a silent
+    # socket is inconclusive and is not adopted); the agent's tailnet ip is 127.0.0.2,
+    # whose port P is already taken => ephemeral forwarder
+    app, port = _http_target(tmp_path)
     squatter = socket.socket(); squatter.bind(("127.0.0.2", port)); squatter.listen(5)
     # tcp_open(127.0.0.2, port) must be False for the forwarder path: close the squatter's accept side by not listening
     squatter.close()
@@ -119,12 +120,11 @@ def test_agent_reports_origin_port_when_the_forwarder_could_not_reuse_it(tmp_pat
     finally:
         for f in list(agent._forwards.values()):
             f.stop()
-        gw.stop(); app.close(); block.close()
+        gw.stop(); app.shutdown(); block.close()
 
 
 def test_agent_omits_origin_port_when_ports_match(tmp_path):
-    app = socket.socket(); app.bind(("127.0.0.1", 0)); app.listen(5)
-    port = app.getsockname()[1]
+    app, port = _http_target(tmp_path)               # a real HTTP app: the probe needs an answer
     gw = _FakeGateway()
     agent = _agent(tmp_path, gw)                     # tailnet ip 127.0.0.1: reachable directly, no forwarder
     seen = {}
@@ -134,7 +134,7 @@ def test_agent_omits_origin_port_when_ports_match(tmp_path):
         assert agent._adopt(port, {"process": "node"})
         assert seen["origin_port"] is None and seen["target_port"] == port
     finally:
-        gw.stop(); app.close()
+        gw.stop(); app.shutdown()
 
 
 def test_own_net_namespace_is_a_valid_identifier():

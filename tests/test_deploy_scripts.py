@@ -2397,3 +2397,21 @@ def test_explicit_no_egress_removes_selector_and_accepts_inactive_cleanup(env):
     assert 'root-read-status' in calls
     assert 'ROOT-EXECUTOR-FORBIDDEN' not in calls
     assert current.read_bytes()==before  # dry-run never revokes or rewrites policy
+
+
+def test_deploy_creates_the_fabric_token_dir_0700_before_compose_and_dry_run_does_not(env):
+    d = env["home"] / ".config/herdr-engineering/fabric-gateway"
+    assert deploy(env, "--dry-run").returncode == 0
+    assert not d.exists()
+    env["env"]["FAIL_COMPOSE"] = "1"
+    deploy(env)
+    assert d.is_dir() and (d.stat().st_mode & 0o777) == 0o700 and not list(d.iterdir())
+
+
+def test_deploy_refuses_a_fabric_token_dir_that_is_not_private(env):
+    d = env["home"] / ".config/herdr-engineering/fabric-gateway"
+    d.mkdir(parents=True)
+    d.chmod(0o755)
+    r = deploy(env)
+    assert r.returncode != 0 and "fabric-gateway token mount" in r.stderr and "0700" in r.stderr
+    assert " up " not in env["log"].read_text()
