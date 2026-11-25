@@ -70,7 +70,9 @@ from .library import (
     LibraryStore,
     Source,
     Viewer,
+    held_bytes,
     settle_quota,
+    version_bytes,
 )
 from .media_type import safe_media_type
 from .member_session import check_session, mint_session
@@ -666,7 +668,7 @@ class MemberService:
         self._throttle_write(member)
         async with self.pool.acquire() as conn, conn.transaction():
             await self._lock_usage(conn, member)
-            row = await self._owned(conn, member, artifact_id, lock=True, agent=self._agent(actor))
+            await self._owned(conn, member, artifact_id, lock=True, agent=self._agent(actor))
             await conn.execute(
                 "UPDATE artifacts SET lifecycle='retracted', updated_at=now() WHERE artifact_id=$1",
                 artifact_id,
@@ -678,7 +680,7 @@ class MemberService:
                 artifact_id,
                 self._who(actor, member),
             )
-            await settle_quota(conn, member, int(row["size_bytes"]))
+            await settle_quota(conn, member, await held_bytes(conn, artifact_id))
         await self._drop_staging(member, artifact_id)
         await self._audit(member, "delete", "ok")
         return {"artifact_id": artifact_id, "deleted": True}
@@ -1011,15 +1013,18 @@ class MemberService:
 
     # -- publish
 
-    def _check_quota(self, usage: asyncpg.Record | None, current_size: int, total: int) -> int:
-        """The member's projected bytes if this artifact became ``total`` bytes; raises 413 ``quota`` when over."""
+    def _check_quota(
+        self, usage: asyncpg.Record | None, current_size: int, total: int, keep: int = 0
+    ) -> int:
+        """The member's projected bytes if this artifact became ``total`` bytes; raises 413 ``quota`` when over.
+        ``keep`` is what the superseded version still holds: old versions stay stored, so they stay counted."""
 
         def limit(column: str, default: int) -> int:
             return int((usage and usage[column]) or default)
 
         if total > limit("max_artifact_bytes", self.limits.max_artifact_bytes):
             raise MemberError(413, "quota", "artifact is over its size limit")
-        projected = int(usage["bytes_used"] if usage else 0) - current_size + total
+        projected = int(usage["bytes_used"] if usage else 0) - current_size + total + keep
         if projected > limit("max_member_bytes", self.limits.max_member_bytes):
             raise MemberError(413, "quota", "storage quota exceeded")
         return projected
@@ -1173,7 +1178,12 @@ class MemberService:
             member,
         )
         current_row = await self._owned(self.pool, member, artifact_id, agent=self._agent(actor))
-        self._check_quota(early, int(current_row["size_bytes"]), total)
+        self._check_quota(
+            early,
+            int(current_row["size_bytes"]),
+            total,
+            await version_bytes(self.pool, current_row["current_version_id"]),
+        )
         # Each publish holds one pooled connection from its first blob lock until the commit (the session-level locks
         # must outlive the blob write), so a global cap keeps publishes from draining the pool.
         if self._publishing >= self.limits.concurrent_publishes:
@@ -1245,7 +1255,12 @@ class MemberService:
                     current = row["current_version_id"]
                     if (base_version_id or None) != current:
                         raise MemberError(409, "stale_base", "the artifact has a newer version")
-                    projected = self._check_quota(usage, int(row["size_bytes"]), total)
+                    projected = self._check_quota(
+                        usage,
+                        int(row["size_bytes"]),
+                        total,
+                        await version_bytes(conn, current),
+                    )
                     for item in manifest:
                         await conn.execute(
                             "INSERT INTO artifact_blobs (sha256, size_bytes, media_type) VALUES ($1,$2,$3) "
