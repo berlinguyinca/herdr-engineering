@@ -3276,8 +3276,9 @@ class AssistantStore:
         self._after_mutation()
 
     def delete_memory(self, memory_id: str, *, tenant_id: str, user_id: str) -> None:
-        self.get_memory(memory_id, tenant_id=tenant_id, user_id=user_id)
-        del self.memory[memory_id]
+        with self._lock:
+            self.get_memory(memory_id, tenant_id=tenant_id, user_id=user_id)
+            del self.memory[memory_id]
         self.audit_record(tenant_id=tenant_id, user_id=user_id, actor=user_id,
                           action="memory.deleted", subject_id=memory_id)
         self._after_mutation()

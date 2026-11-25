@@ -252,4 +252,64 @@ def test_register_rejects_bad_routes(tmp_path, bad):
     with pytest.raises(ValueError):
         reg.register(target_machine_id="m", target_host="127.0.0.1",
                      target_port=8401, routes=bad, preferred_port=24520)
-    assert reg.list() == [] if hasattr(reg, "list") else True
+    assert reg.active_leases() == []
+    assert _reg(tmp_path).active_leases() == [], "nothing persisted"
+
+
+def test_root_prefix_catchall_route_is_valid_and_reregisters(tmp_path):
+    reg = _reg(tmp_path)
+    kw = dict(target_machine_id="m", target_host="127.0.0.1", target_port=8401, lease_id="lease_root1",
+              routes=[{"prefix": "/", "host": "127.0.0.1", "port": 3000}], preferred_port=24530)
+    first = reg.register(**kw)
+    assert [r.prefix for r in first.routes] == ["/"]
+    again = reg.register(**kw)
+    assert again.id == first.id
+    assert [r.prefix for r in reg.update_routes(first.id, [Route("/", "127.0.0.1", 3001)]).routes] == ["/"]
+
+
+@pytest.mark.parametrize("prefix", [5, None, "", "   "])
+def test_non_string_or_blank_prefix_is_a_value_error(tmp_path, prefix):
+    reg = _reg(tmp_path)
+    with pytest.raises(ValueError):
+        reg.register(target_machine_id="m", target_host="127.0.0.1", target_port=8401, preferred_port=24540,
+                     routes=[{"prefix": prefix, "host": "127.0.0.1", "port": 8000}])
+
+
+# -- CLI: a rejected route table is reported, not a traceback --------------------
+
+def _cli(tmp_path, *argv):
+    import os
+    import subprocess
+    import sys
+    env = {**os.environ, "HOME": str(tmp_path), "HERDR_ENGINEERING_STATE": str(tmp_path / "state"),
+           "XDG_CONFIG_HOME": str(tmp_path / "cfg")}
+    done = subprocess.run(
+        [sys.executable, "-c", "import sys; from herdr_engineering.cli import main; raise SystemExit(main(sys.argv[1:]))",
+         "devfabric", *argv], env=env, capture_output=True, text=True, timeout=60)
+    return done, done.stdout
+
+
+def test_cli_register_accepts_root_route_and_rejects_bad_port_without_traceback(tmp_path):
+    ok, _ = _cli(tmp_path, "register", "--machine", "m", "--host", "127.0.0.1", "--port", "8401",
+                 "--route", "/=127.0.0.1:3000", "--preferred-port", "24550")
+    assert ok.returncode == 0, ok.stderr
+    bad, out = _cli(tmp_path, "register", "--machine", "m2", "--host", "127.0.0.1", "--port", "8402",
+                    "--route", "/api=127.0.0.1:0")
+    assert bad.returncode != 0
+    assert "Traceback" not in bad.stderr, bad.stderr
+    assert '"ok": false' in out.lower() or '"ok":false' in out.lower()
+
+
+def test_cli_enroll_with_bad_route_keeps_the_existing_lease(tmp_path):
+    import json
+    common = ["enroll", "--origin-port", "24560", "--machine", "m", "--repo", "r", "--catchall", "127.0.0.1:9"]
+    ok, _ = _cli(tmp_path, *common, "--route", "/api=127.0.0.1:8502")
+    assert ok.returncode == 0, ok.stderr
+    leases = DevServiceRegistry(store_path=tmp_path / "state" / "leases.json").active_leases()
+    assert len(leases) == 1
+    bad, out = _cli(tmp_path, *common, "--route", "/api=127.0.0.1:0")
+    assert bad.returncode != 0
+    assert "Traceback" not in bad.stderr, bad.stderr
+    assert json.loads(out)["ok"] is False
+    after = DevServiceRegistry(store_path=tmp_path / "state" / "leases.json").active_leases()
+    assert [x.id for x in after] == [x.id for x in leases], "the stale lease must survive a rejected table"

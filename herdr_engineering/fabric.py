@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any
 
 from .devfabric import DevServiceRegistry, enable_keepalive, proxy_pair, route_and_pipe
-from .errors import ConflictError, UnreachableError
+from .errors import ConflictError, InvalidError, UnreachableError
 from .fabric_named import AcceptBackoff
 
 
@@ -1241,6 +1241,13 @@ class FabricClient:
         except urllib.error.HTTPError as exc:
             if exc.code == 401:
                 raise TokenNotAccepted(f"fabric gateway rejected the token (401) for {url}", target=url) from exc
+            if exc.code == 400:   # the gateway refused the request itself (e.g. a bad route table): not an outage
+                try:
+                    reason = str(json.loads(exc.read()).get("error", ""))
+                except Exception:  # noqa: BLE001 - an unreadable body still means "rejected"
+                    reason = ""
+                raise InvalidError(f"fabric gateway rejected the request (400): {reason}".rstrip(": "),
+                                   target=url) from exc
             raise UnreachableError(f"fabric gateway error {exc.code} for {url}",
                                    target=url) from exc
         except Exception as exc:

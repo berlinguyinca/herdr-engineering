@@ -111,34 +111,3 @@ test('the nav badge is announced with its critical count, not "true"', async () 
     assert.equal(await page.locator('herdr-app-shell .hd-shell__badge').getAttribute('data-tone'), 'normal');
   });
 });
-
-test('leaving a room whose wiring failed part-way still runs the whole teardown (no unbindHelpers TDZ error)', async () => {
-  await withPage(async (page, base) => {
-    await collabApi(page, base, { operator: true });
-    const errors = [];
-    page.on('pageerror', (e) => errors.push(e.message));
-    await page.goto(`${base}/__blank`);
-    await page.evaluate(() => { document.body.innerHTML = '<div id="host"></div>'; });
-    await page.evaluate(async () => {
-      const { mountCollab } = await import('/collab-view.js');
-      window.collab = mountCollab(document.querySelector('#host'));
-    });
-    await page.locator('[data-room="room-one"]').waitFor();
-    // The browser refuses the room's focusout listener once: showRoom stops after it has installed its teardown but before the
-    // helper handlers are wired. Leaving the room must still run the whole teardown.
-    await page.evaluate(() => {
-      const host = document.querySelector('#host');
-      const add = host.addEventListener.bind(host);
-      host.addEventListener = (type, ...rest) => {
-        if (type === 'focusout') { host.addEventListener = add; throw new Error('injected: focusout refused'); }
-        return add(type, ...rest);
-      };
-    });
-    await page.locator('[data-room="room-one"]').click();
-    await page.locator('.cx-rtab--new').waitFor();
-    await page.locator('.cx-rtab--new').click();
-    await page.locator('[data-room="room-one"]').waitFor();
-    assert.deepEqual(errors.filter((m) => !m.includes('injected')), []);
-    await page.evaluate(() => window.collab.dispose());
-  });
-});

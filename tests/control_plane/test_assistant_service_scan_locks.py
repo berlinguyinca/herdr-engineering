@@ -125,3 +125,17 @@ def test_list_proposals_survives_concurrent_inserts(svc):
         stop.set()
         t.join(5)
     assert not errors, errors
+
+
+def test_delete_memory_does_not_remove_while_the_store_lock_is_held(svc):
+    """The removal itself is under the lock, so it cannot change the dict under a scan that holds it."""
+    s, a = svc
+    m = s.store_memory(tenant_id=T, user_id=U, assistant_id=a.assistant_id, content="x")
+    done = threading.Event()
+    with s.store._lock:
+        threading.Thread(target=lambda: (s.store.delete_memory(m.memory_id, tenant_id=T, user_id=U), done.set()),
+                         daemon=True).start()
+        time.sleep(0.4)
+        assert m.memory_id in s.store.memory
+    assert done.wait(5)
+    assert m.memory_id not in s.store.memory

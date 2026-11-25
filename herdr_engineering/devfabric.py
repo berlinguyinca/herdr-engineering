@@ -83,13 +83,16 @@ def _routes_equal(a, b) -> bool:
 def _validate_route(r) -> Route:
     """One Route object or raw dict -> a checked Route, else ValueError."""
     if isinstance(r, dict):
+        prefix = r.get("prefix")        # checked raw: Route() would turn a blank prefix into the "/" catch-all
+        if not isinstance(prefix, str) or not prefix.strip():
+            raise ValueError(f"route prefix must be a non-empty path: {prefix!r}")
         try:
             r = Route(**r)
-        except TypeError as exc:
+        except (TypeError, AttributeError) as exc:
             raise ValueError(f"invalid route {r!r}: {exc}") from exc
     elif not isinstance(r, Route):
         raise ValueError(f"route must be a Route or a dict, got {type(r).__name__}")
-    if not isinstance(r.prefix, str) or not r.prefix.strip("/ "):
+    if not isinstance(r.prefix, str) or not r.prefix.strip():
         raise ValueError(f"route prefix must be a non-empty path: {r.prefix!r}")
     if not isinstance(r.host, str) or not r.host.strip():
         raise ValueError(f"route host must be a non-empty string: {r.host!r}")
