@@ -41,14 +41,14 @@ warn() { printf '\033[1;33m  ! %s\033[0m\n' "$*"; }
 HOST=""
 OS="linux"
 ANSIBLE_HOST=""
-USER=""
+REMOTE_USER=""
 GATEWAY="http://dev.lan:29999"
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --os) OS="${2:?--os needs linux|macos}"; shift 2 ;;
     --ansible-host) ANSIBLE_HOST="${2:?--ansible-host needs a value}"; shift 2 ;;
-    --user) USER="${2:?--user needs a value}"; shift 2 ;;
+    --user) REMOTE_USER="${2:?--user needs a value}"; shift 2 ;;
     --gateway) GATEWAY="${2:?--gateway needs a URL}"; shift 2
       echo "WARNING: --gateway is IGNORED for the fabric agent; set fabric.url in fleet-config.yaml (or fabric.gateway_url in config.yaml)." >&2 ;;
     -*) echo "unknown option: $1" >&2; exit 2 ;;
@@ -62,9 +62,9 @@ done
 step "1/4 adding '$HOST' to the private fleet inventory (os=$OS)"
 python3 "$INV_HELPER" add --inventory "$INVENTORY" --host "$HOST" --os "$OS"
 
-if [ -n "$ANSIBLE_HOST" ] && [ -n "$USER" ]; then
+if [ -n "$ANSIBLE_HOST" ] && [ -n "$REMOTE_USER" ]; then
   python3 "$INV_HELPER" host-var --dir "$HOST_VARS_DIR" --host "$HOST" \
-    --ansible-host "$ANSIBLE_HOST" --user "$USER"
+    --ansible-host "$ANSIBLE_HOST" --user "$REMOTE_USER"
 else
   warn "no --ansible-host/--user given; you must add connection vars to"
   warn "  $HOST_VARS_DIR/$HOST.yml manually before the playbook can reach $HOST."
@@ -85,7 +85,7 @@ fi
 step "3/4 verifying '$HOST' is registered with the fabric gateway"
 if command -v herdr-eng >/dev/null 2>&1; then
   LEASES="$(herdr-eng devfabric list --json 2>/dev/null || true)"
-  COUNT="$(printf '%s' "$LEASES" | grep -c "\"machine_id\": *\"$HOST\"" 2>/dev/null || echo 0)"
+  COUNT="$(printf '%s' "$LEASES" | grep -c "\"machine_id\": *\"$HOST\"" 2>/dev/null || true)"; COUNT="${COUNT:-0}"
   echo "  $HOST leases visible to the gateway: $COUNT"
   if [ "$COUNT" -ge 0 ]; then
     echo "  (0 is fine if the host has no web services running yet; the agent"

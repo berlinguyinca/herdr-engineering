@@ -332,6 +332,49 @@ roll_relay() {
   return 0
 }
 
+# Snapshot plugin for the current host ($name, $target, $manager are set by the host loop). 0 = rolled and active.
+roll_plugin() {
+  local base='$HOME/.local/share/herdr-cp-feed-plugin-releases' prev dest unit f
+  prev="$(run "$target" "readlink \$HOME/.local/share/herdr-cp-feed-plugin-current || true")" || { echo "   plugin: FAILED on $name (could not read the current release)" >&2; return 1; }
+  run "$target" "mkdir -p -m 700 $base/$REL" || { echo "   plugin: FAILED on $name (could not create the release dir)" >&2; return 1; }
+  dest="$(run "$target" "echo $base/$REL")" || { echo "   plugin: FAILED on $name (could not resolve the release dir)" >&2; return 1; }
+  for f in $PLUGIN_FILES; do
+    put "$target" "$WORK/src/deploy/herdr-cp-feed-plugin/$f" "$dest" || { echo "   plugin: FAILED on $name (copy of $f)" >&2; return 1; }
+  done
+  run "$target" "ln -sfn $base/$REL \$HOME/.local/share/herdr-cp-feed-plugin-current" || { echo "   plugin: FAILED on $name (could not switch the current link)" >&2; return 1; }
+  if [ "$manager" = launchd ]; then unit=com.herdr.cp-sessions; else unit=herdr-cp-sessions; fi
+  if run "$target" "$(restart_cmd "$manager" "$unit")" && run "$target" "$(active_cmd "$manager" "$unit")"; then
+    echo "   plugin: ok"
+  else
+    echo "   plugin: NOT active, restoring ${prev:-previous release}" >&2
+    [ -n "$prev" ] && run "$target" "ln -sfn $prev \$HOME/.local/share/herdr-cp-feed-plugin-current; $(restart_cmd "$manager" "$unit")" || true
+    return 1
+  fi
+}
+
+# Service-ownership feed for the current host (only where it is installed). 0 = rolled, active or not installed.
+roll_feed() {
+  local fb fprev fdest
+  if [ "$manager" = systemd ] && run "$target" "test -d \$HOME/.local/share/herdr-service-metadata/releases"; then
+    fb='$HOME/.local/share/herdr-service-metadata'
+    fprev="$(run "$target" "readlink $fb/current || true")" || { echo "   ownership feed: FAILED on $name (could not read the current release)" >&2; return 1; }
+    run "$target" "mkdir -p -m 700 $fb/releases/$REL && python3 -m venv $fb/releases/$REL/venv" || { echo "   ownership feed: FAILED on $name (venv)" >&2; return 1; }
+    fdest="$(run "$target" "echo $fb/releases/$REL")" || { echo "   ownership feed: FAILED on $name (could not resolve the release dir)" >&2; return 1; }
+    put "$target" "$WHEEL" "$fdest" || { echo "   ownership feed: FAILED on $name (copy of the wheel)" >&2; return 1; }
+    run "$target" "$fb/releases/$REL/venv/bin/pip install -q $fb/releases/$REL/*.whl" || { echo "   ownership feed: FAILED on $name (pip install)" >&2; return 1; }
+    run "$target" "ln -sfn $fb/releases/$REL $fb/current" || { echo "   ownership feed: FAILED on $name (could not switch the current link)" >&2; return 1; }
+    if run "$target" "$(restart_cmd systemd herdr-service-metadata)" && run "$target" "$(active_cmd systemd herdr-service-metadata)"; then
+      echo "   ownership feed: ok"
+    else
+      echo "   ownership feed: NOT active, restoring ${fprev:-previous release}" >&2
+      [ -n "$fprev" ] && run "$target" "ln -sfn $fprev $fb/current; $(restart_cmd systemd herdr-service-metadata)" || true
+      return 1
+    fi
+  else
+    echo "   ownership feed: not installed here, skipped"
+  fi
+}
+
 failed=0
 while IFS='|' read -r name target manager; do
   name="$(echo "$name" | xargs)"; target="$(echo "$target" | xargs)"; manager="$(echo "$manager" | xargs)"
@@ -370,40 +413,10 @@ while IFS='|' read -r name target manager; do
   hook_script="${hook_script//\'/\'\\\'\'}"
   if ! run "$target" "bash -c '$hook_script'"; then failed=1; fi
 
-  # ---- snapshot plugin ----
-  base='$HOME/.local/share/herdr-cp-feed-plugin-releases'
-  prev="$(run "$target" "readlink \$HOME/.local/share/herdr-cp-feed-plugin-current || true")"
-  run "$target" "mkdir -p -m 700 $base/$REL"
-  for f in $PLUGIN_FILES; do
-    put "$target" "$WORK/src/deploy/herdr-cp-feed-plugin/$f" "$(run "$target" "echo $base/$REL")"
-  done
-  run "$target" "ln -sfn $base/$REL \$HOME/.local/share/herdr-cp-feed-plugin-current"
-  if [ "$manager" = launchd ]; then unit=com.herdr.cp-sessions; else unit=herdr-cp-sessions; fi
-  run "$target" "$(restart_cmd "$manager" "$unit")"
-  if run "$target" "$(active_cmd "$manager" "$unit")"; then
-    echo "   plugin: ok"
-  else
-    echo "   plugin: NOT active, restoring ${prev:-previous release}" >&2; failed=1
-    [ -n "$prev" ] && run "$target" "ln -sfn $prev \$HOME/.local/share/herdr-cp-feed-plugin-current; $(restart_cmd "$manager" "$unit")" || true
-  fi
-
-  # ---- service-ownership feed (only where it is installed) ----
-  if [ "$manager" = systemd ] && run "$target" "test -d \$HOME/.local/share/herdr-service-metadata/releases"; then
-    fb='$HOME/.local/share/herdr-service-metadata'
-    fprev="$(run "$target" "readlink $fb/current || true")"
-    run "$target" "mkdir -p -m 700 $fb/releases/$REL && python3 -m venv $fb/releases/$REL/venv"
-    put "$target" "$WHEEL" "$(run "$target" "echo $fb/releases/$REL")"
-    run "$target" "$fb/releases/$REL/venv/bin/pip install -q $fb/releases/$REL/*.whl"
-    run "$target" "ln -sfn $fb/releases/$REL $fb/current; $(restart_cmd systemd herdr-service-metadata)"
-    if run "$target" "$(active_cmd systemd herdr-service-metadata)"; then
-      echo "   ownership feed: ok"
-    else
-      echo "   ownership feed: NOT active, restoring ${fprev:-previous release}" >&2; failed=1
-      [ -n "$fprev" ] && run "$target" "ln -sfn $fprev $fb/current; $(restart_cmd systemd herdr-service-metadata)" || true
-    fi
-  else
-    echo "   ownership feed: not installed here, skipped"
-  fi
+  # Each step reports its own failure (set -e is off inside a function called from `if`): a host that fails
+  # is marked failed, put back where it was, and the roll goes on to the next host.
+  if ! roll_plugin; then failed=1; fi
+  if ! roll_feed; then failed=1; fi
 
   if [ "$RELAY" = 1 ]; then roll_relay; fi
 done < "$HOSTS_FILE"

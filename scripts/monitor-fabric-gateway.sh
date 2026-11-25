@@ -34,7 +34,7 @@ GATEWAY_CPU="n/a"; LOADCORE="n/a"; GATE_SLOTS="n/a"; GATE_USED=0
 
 if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER}$"; then
   CONTAINER_STATUS=$(docker inspect -f '{{.State.Status}} ({{.State.Health.Status}})' "$CONTAINER" 2>/dev/null)
-  case "$CONTAINER_STATUS" in *healthy*) HEALTHY=1;; esac
+  case "$CONTAINER_STATUS" in *'(healthy)'*) HEALTHY=1;; esac   # not *healthy*: that also matches '(unhealthy)'
   # CPU% = average over 1s of the container's cpu.usage deltas / host cores.
   GATEWAY_CPU=$(docker stats --no-stream --format '{{.CPUPerc}}' "$CONTAINER" 2>/dev/null)
   if docker exec "$CONTAINER" sh -c "test -f $STORE_IN_CONTAINER" >/dev/null 2>&1; then
@@ -71,10 +71,18 @@ GATE_USED=$(find "$STATE_DIR/build-gates" -name 'gate.*' -mmin -5 2>/dev/null | 
 TELE="$STATE_DIR/build-gates/telemetry.jsonl"
 GATE_CONT_1H=0; GATE_CONT_24H=0
 if [ -f "$TELE" ]; then
-  GATE_CONT_24H=$(grep -c '"event": *"contention"' "$TELE" 2>/dev/null || echo 0)
-  CUTOFF=$(date -u -d '-1 hour' +%FT%T 2>/dev/null)
-  if [ -n "$CUTOFF" ]; then
-    GATE_CONT_1H=$(awk -v c="$CUTOFF" '$0>c' "$TELE" 2>/dev/null | wc -l)
+  # count only contention events whose "ts" (UTC ISO, to the second) falls inside each window
+  CUTOFF_1H=$(date -u -d '-1 hour' +%FT%T 2>/dev/null)
+  CUTOFF_24H=$(date -u -d '-24 hours' +%FT%T 2>/dev/null)
+  if [ -n "$CUTOFF_1H" ] && [ -n "$CUTOFF_24H" ]; then
+    read -r GATE_CONT_1H GATE_CONT_24H <<< "$(awk -v c1="$CUTOFF_1H" -v c24="$CUTOFF_24H" '
+      /"event": *"contention"/ && match($0, /"ts": *"[^"]+"/) {
+        ts = substr($0, RSTART, RLENGTH); sub(/^"ts": *"/, "", ts); ts = substr(ts, 1, 19)
+        if (ts > c24) n24++
+        if (ts > c1) n1++
+      }
+      END { print n1 + 0, n24 + 0 }' "$TELE" 2>/dev/null)"
+    GATE_CONT_1H=${GATE_CONT_1H:-0}; GATE_CONT_24H=${GATE_CONT_24H:-0}
   fi
 fi
 

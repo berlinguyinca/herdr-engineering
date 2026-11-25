@@ -50,25 +50,35 @@
     state: present
   when: brew_present | bool
 
-- name: "Install Herdr (pinned compatible version) if not present"
+- name: "Verify Herdr (pinned compatible version) is present"
   ansible.builtin.shell: |
     set -e
     if ! command -v herdr >/dev/null 2>&1 || ! herdr --version 2>/dev/null | grep -q "{{ herdr_pinned_version }}"; then
-      echo "herdr install required: {{ herdr_pinned_version }}" >&2
-      exit 0
-    fi
-  register: herdr_install
-  changed_when: "'herdr install required' in (herdr_install.stderr | default(''))"
+      echo "DRIFT: herdr {{ herdr_pinned_version }} is not installed (missing or another version)" >&2
+    fi   # report only, never fail: nothing in this role installs herdr (the operator does); a missing or other version must not stop the fleet update
+  changed_when: false
+  failed_when: false
+  register: herdr_check
 
-- name: "Install Pi if not present"
+- name: "Report Herdr drift"
+  ansible.builtin.debug:
+    msg: "{{ herdr_check.stderr }}"   # an ok task's stderr is hidden by default, so the drift line is printed here
+  when: "'DRIFT' in (herdr_check.stderr | default(''))"
+
+- name: "Verify Pi is present"
   ansible.builtin.shell: |
     set -e
     if ! command -v pi >/dev/null 2>&1; then
-      echo "pi install required" >&2
-      exit 0
-    fi
-  register: pi_install
-  changed_when: "'pi install required' in (pi_install.stderr | default(''))"
+      echo "DRIFT: pi is not on this play's PATH" >&2
+    fi   # report only, never fail: nothing in this role installs pi (the operator does)
+  changed_when: false
+  failed_when: false
+  register: pi_check
+
+- name: "Report Pi drift"
+  ansible.builtin.debug:
+    msg: "{{ pi_check.stderr }}"   # an ok task's stderr is hidden by default, so the drift line is printed here
+  when: "'DRIFT' in (pi_check.stderr | default(''))"
 
 - name: "Clone berlinguyinca/pi-engineering"
   ansible.builtin.git:
