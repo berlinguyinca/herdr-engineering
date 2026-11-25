@@ -121,5 +121,5 @@ h3 { font-size: 1.0625rem; letter-spacing: -0.008em; }
 .hd-tabs > button, .hd-tabs > label { border-radius: 8px; }
 .hd-tabs > [aria-selected="true"], .hd-tabs > [aria-pressed="true"], .hd-tabs > .hd-tab--on { background: var(--accent-weak); box-shadow: none; font-weight: 600; }
 input, select, textarea { transition: border-color var(--motion-fast) var(--ease-ui), box-shadow var(--motion-fast) var(--ease-ui); }
-input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
 ::selection { background: var(--accent-weak); }
