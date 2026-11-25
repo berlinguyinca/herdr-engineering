@@ -76,7 +76,7 @@ MEMORY_CLIENT_PREVIOUS="{old}"; MEMORY_CLIENT_CANDIDATE="{new}"; MEMORY_CLIENT_C
 web_egress_cmd() {{
   local action="$1"; shift
   if [ "$action" = selector ]; then
-    printf '%s\\n' '{{"enabled":true,"cidr":"172.31.252.0/29","generation":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","activation_changed":{str(health_result != "outage-unchanged").lower()}}}'
+    printf '%s\\n' '{{"enabled":true,"cidr":"172.31.252.32/29","generation":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","activation_changed":{str(health_result != "outage-unchanged").lower()}}}'
   else
     echo "egress:$action $*" >> "{log}"
     if [ "$action" = before ] && [ "{int(delete_fails)}" = 1 ]; then return 1; fi
@@ -152,6 +152,6 @@ status=0
     else:
         assert connectivity == []
     assert str(old if direction == "rollback" else new) in events[profile]
-    assert "selector=1 cidr=172.31.252.0/29" in events[compose]
+    assert "selector=1 cidr=172.31.252.32/29" in events[compose]
     commit = next(i for i, line in enumerate(events) if line.startswith("egress:commit"))
     assert grant < commit

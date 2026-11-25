@@ -17,7 +17,7 @@ PROJECT = "herdr-control-plane"
 NETWORK = PROJECT + "_web-egress"
 DEFAULT = PROJECT + "_default"
 BRIDGE = "br-herdr-cp-eg"
-CIDR = "172.31.252.0/29"
+CIDR = "172.31.252.32/29"
 COMMENT = "herdr-cp-web-egress-v1"
 LABELS = {
     "com.docker.compose.project": PROJECT,

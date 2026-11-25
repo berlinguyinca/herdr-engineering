@@ -71,15 +71,15 @@ def runtime(tmp_path):
                 "EnableIPv6": False,
                 "Options": {"com.docker.network.bridge.name": policy.BRIDGE},
                 "Labels": {**policy.LABELS, "io.herdr.web-egress.generation": record["generation"]},
-                "IPAM": {"Config": [{"Subnet": policy.CIDR, "Gateway": "172.31.252.1"}]},
-                "Containers": {web["Id"]: {"IPv4Address": "172.31.252.2/29"}},
+                "IPAM": {"Config": [{"Subnet": policy.CIDR, "Gateway": "172.31.252.33"}]},
+                "Containers": {web["Id"]: {"IPv4Address": "172.31.252.34/29"}},
             }
         ]
         web["NetworkSettings"]["Networks"][policy.NETWORK] = {
             "NetworkID": "c" * 64,
-            "IPAddress": "172.31.252.2",
+            "IPAddress": "172.31.252.34",
             "IPPrefixLen": 29,
-            "Gateway": "172.31.252.1",
+            "Gateway": "172.31.252.33",
             "GwPriority": 100,
         }
         events.append(["compose", "candidate-with-egress"])
@@ -235,12 +235,12 @@ def test_prior_enabled_selector_and_profile_restore_as_one_transition(runtime):
     later.before("rollback")
     web["NetworkSettings"]["Networks"][policy.NETWORK] = {
         "NetworkID": "c" * 64,
-        "IPAddress": "172.31.252.2",
+        "IPAddress": "172.31.252.34",
         "IPPrefixLen": 29,
-        "Gateway": "172.31.252.1",
+        "Gateway": "172.31.252.33",
         "GwPriority": 100,
     }
-    networks[0]["Containers"] = {web["Id"]: {"IPv4Address": "172.31.252.2/29"}}
+    networks[0]["Containers"] = {web["Id"]: {"IPv4Address": "172.31.252.34/29"}}
     events.append(["compose", "previous-enabled"])
     events.append(["profile", "previous"])
     later.after("rollback")
@@ -259,7 +259,7 @@ def test_foreign_existing_rule_is_not_adopted_or_deleted(runtime):
     tx.before("forward")
     attach()
     rules.append(
-        "ufw allow in on br-herdr-cp-eg proto tcp from 172.31.252.0/29 to 100.64.8.6 port 443 comment foreign"
+        "ufw allow in on br-herdr-cp-eg proto tcp from 172.31.252.32/29 to 100.64.8.6 port 443 comment foreign"
     )
     with pytest.raises(ValueError):
         tx.after("forward")
@@ -469,7 +469,7 @@ def test_prune_rechecks_bridge_and_cidr_before_removing_empty_owned_network(runt
 def test_preexisting_unowned_rule_refuses_before_snapshot_or_compose(runtime):
     tx, events, rules, *_ = runtime
     rules.append(
-        "ufw allow in on br-herdr-cp-eg proto tcp from 172.31.252.0/29 to 100.64.8.6 port 443 comment foreign"
+        "ufw allow in on br-herdr-cp-eg proto tcp from 172.31.252.32/29 to 100.64.8.6 port 443 comment foreign"
     )
     with pytest.raises(ValueError):
         tx.snapshot(enabled=True, cidr=policy.CIDR, destination="100.64.8.6/32")
@@ -512,14 +512,14 @@ def test_activation_change_compares_policy_not_container_or_network_ids():
 
     from herdr_engineering.web_egress_runtime import activation_changed, make_record
 
-    record = make_record("172.31.252.0/29", "100.64.8.6/32", "a" * 32)
+    record = make_record("172.31.252.32/29", "100.64.8.6/32", "a" * 32)
     record.update(network_id="c" * 64, rule_may_exist=True)
     recreated = deepcopy(record)
     recreated.update(network_id="d" * 64, rule_may_exist=False)
     assert activation_changed(record, recreated) is False
     assert activation_changed({"enabled": False}, record) is True
     assert activation_changed(record, {"enabled": False}) is False
-    changed = make_record("172.31.252.0/29", "100.71.1.7/32", "a" * 32)
+    changed = make_record("172.31.252.32/29", "100.71.1.7/32", "a" * 32)
     assert activation_changed(record, changed) is True
     changed = make_record("172.30.254.0/29", "100.64.8.6/32", "a" * 32)
     assert activation_changed(record, changed) is True
@@ -530,7 +530,7 @@ def test_auto_policy_refuses_partial_or_interrupted_approval(runtime, fault):
     from herdr_engineering.web_egress_runtime import approved_policy, make_record
 
     tx, *_ = runtime
-    record = make_record("172.31.252.0/29", "100.64.8.6/32", "a" * 32)
+    record = make_record("172.31.252.32/29", "100.64.8.6/32", "a" * 32)
     record.update(network_id="c" * 64, rule_may_exist=True)
     if fault == "missing-id":
         record["network_id"] = None
