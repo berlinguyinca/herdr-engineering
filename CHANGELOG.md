@@ -7,11 +7,11 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ### Fix: owner approval of a command the owner saw only in part
 
-- A request whose display was cut (`...(+N chars)`) now stores the whole masked text, returned as `display_full` next to `display_complete` in the request view. `POST .../assistant-action-requests/<id>/decision` approves it only when the body carries `display_sha256`, the SHA-256 of `display_full`; a missing or wrong hash is 409 `truncated_display`, nothing is recorded (no evidence or label), and the request stays pending. Denying needs no hash.
-- A command over the 8192-byte cap, or one where a masked value held shell syntax, is deny-only (its display ends in `...(masked shell syntax not shown)`). The `Authorization:`-style header mask now stops at shell syntax instead of swallowing the rest of the command.
-- Blank-looking characters (runs of spaces, Unicode spaces, zero-width and Braille-blank characters, controls) are shown as counted tokens such as `␣×260`, and a single tab or newline as `\t`, `\n`, instead of being dropped or collapsed; two commands differing only in blanks display differently.
-- `assistant-action approve` prints the full text of a cut command and sends its hash, and shows the server's message on a refusal; `assistant-action list` marks cut entries and prints the whole display.
-- Slack stays refuse-only for a cut command; its message now says it is too long for Slack and can be approved from the CLI or REST. `fully_shown` shares `display_complete` with the REST check.
+- A request whose display was cut (`...(+N chars)`) keeps the whole masked text, served as `display_full` by `GET /api/v1/assistant-action-requests/<id>` (the list has `display_complete` and `approvable` only, so it stays small). `POST .../decision` approves a cut command only when the body carries `display_sha256`, the SHA-256 of `display_full`; a missing or wrong hash is 409 `truncated_display`, nothing is recorded, and the request stays pending. Denying needs no hash. Rows stored before this change have no `display_full` and are approvable only when their display is complete.
+- Deny-only (`approvable` false): a command over the 8192-byte cap, or one where any mask (the option/header/Bearer rules or the token-shape scrubber) removed or rewrote shell syntax, whitespace or a normalisable character. The `Authorization:`-style header mask also stops at a newline and at shell syntax.
+- The display is rendered last: blank-looking characters, controls and lone surrogates become closed, counted tokens such as `⟨␣×2⟩`, `⟨U+2800×260⟩`, `⟨\t⟩` (backslash and the brackets are escaped), so two different commands never display alike and no control character reaches `display`.
+- CLI: `assistant-action show ID` prints the full text and its hash; `approve` of a cut command asks for confirmation on a terminal, or needs `--display-sha256` from `show`; it shows the server's message on a refusal and never offers approval for a deny-only request; `list` marks cut entries.
+- Slack stays refuse-only for a cut command; its message says it is too long for Slack and can be approved from the CLI or REST (or cannot be approved when masked). `fully_shown` shares `display_complete` with REST.
 
 ### Fix: artifact ACL expiry after restart, body-size and connection hygiene, retract revokes shares
 

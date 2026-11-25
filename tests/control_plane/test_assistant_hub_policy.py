@@ -567,3 +567,61 @@ def test_active_grant_missing_activation_facts_is_not_live(missing):
     fields[missing] = "" if missing == "confirmed_by" else None
     store.put_action_grant(ActionGrant(**fields))
     assert _decide(store, cfg, _push(), session="s3").outcome == "pending"
+
+
+# --------------------------------------------------------------------- visible, injective display (PR #980)
+
+def _decode_visible(shown: str) -> str:
+    """The inverse of render_visible; raises on anything it could not have produced."""
+    import re
+    names = {"␣": " ", "\\t": "\t", "\\n": "\n", "\\r": "\r"}
+    out, i = [], 0
+    while i < len(shown):
+        c = shown[i]
+        if c == "⟨":
+            j = shown.index("⟩", i)
+            body = shown[i + 1:j]
+            m = re.fullmatch(r"(.+?)(?:×(\d+))?", body)
+            name, n = m.group(1), int(m.group(2) or 1)
+            ch = names[name] if name in names else chr(int(name[2:], 16))
+            out.append(ch * n)
+            i = j + 1
+        elif c == "\\":
+            m = re.match(r"\\\\|\\u\{27e[89]\}", shown[i:])
+            out.append("\\" if m.group(0) == "\\\\" else chr(int(m.group(0)[3:-1], 16)))
+            i += len(m.group(0))
+        else:
+            assert c not in "⟩" and not (c != " " and not c.isprintable()), repr(c)
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def test_render_visible_is_injective_and_tokens_are_closed():
+    import random
+
+    from herdr_engineering.control_plane.assistant_hub.policy import render_visible
+    assert render_visible("kill -9  1") != render_visible("kill -9" + " " * 21)
+    alphabet = ["a", "1", " ", "\t", "\n", "⠀", " ", "​", "\\", "⟨", "⟩", "×", "␣",
+                "t", "n", "\ud800", "\x1b", "\x85", "U", "+"]
+    rng = random.Random(7)
+    seen: dict[str, str] = {}
+    for _ in range(4000):
+        text = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 9)))
+        shown = render_visible(text)
+        assert _decode_visible(shown) == text
+        assert seen.setdefault(shown, text) == text
+
+
+def test_no_control_or_format_character_reaches_the_display():
+    import unicodedata
+
+    from herdr_engineering.control_plane.assistant_hub.policy import (
+        scrub_display,
+        scrub_display_full,
+    )
+    bad = [chr(c) for c in range(0x110000) if unicodedata.category(chr(c)) in ("Cc", "Cf", "Zl", "Zp") or 0xD800 <= c <= 0xDFFF]
+    for ch in bad:
+        for cmd in (f"a{ch}b", f"echo worker abcdefgh{ch}x{ch}y", f"{ch}" * 3):
+            for shown in (scrub_display_full(cmd)[0], scrub_display(cmd)):
+                assert all(unicodedata.category(c) not in ("Cc", "Cf", "Zl", "Zp", "Cs") for c in shown), (hex(ord(ch)), shown)

@@ -8,6 +8,7 @@ rows and audit entries carry the canonical key and key id only, never the raw co
 
 from __future__ import annotations
 
+import collections
 import hashlib
 import hmac
 import itertools
@@ -84,7 +85,7 @@ _V = r"[^\s\"']+"                                               # one shell word
 _MASK_RULES: tuple[tuple[re.Pattern[str], int], ...] = (
     (re.compile(r"(://)[^/\s@]*(?=@)"), 1),
     # stops at shell syntax, so a header value cannot swallow a command that follows it
-    (re.compile(r"(?i)\b(x-api-key|api-key|cookie|set-cookie|proxy-authorization|authorization)(\s*:\s*)[^\"';|&`<>()$]*"), 2),
+    (re.compile(r"(?i)\b(x-api-key|api-key|cookie|set-cookie|proxy-authorization|authorization)(\s*:\s*)[^\"';|&`<>()$\n\r]*"), 2),
     (re.compile(rf"(?i)\b(sshpass\s+-p\s*){_V}"), 1),
     (re.compile(rf"(?i)\b((?:docker|podman)\s+login\b[^\n]*?\s(?:-p|--password)(?:=|\s+)){_V}"), 1),
     (re.compile(rf"(?i)\b((?:mysql|mysqldump|mysqladmin|psql|mariadb)\b[^\n]*?\s-p){_V}"), 1),
@@ -96,78 +97,55 @@ _MASK_RULES: tuple[tuple[re.Pattern[str], int], ...] = (
 _MASK = "***"
 _SHELL_ACTIVE = frozenset("$`;|&()<>")
 _TRUNCATED_RE = re.compile(r"\u2026\(\+\d+ chars\)$")
-_UNSEEN = " \u2026(masked shell syntax not shown)"
-
-# Blank-rendering characters become visible tokens (see _render_runs). While the masking regexes run, each such run is
-# one placeholder of four whitespace characters (so ``\s`` still sees whitespace there) that encodes the run's index.
-_POOL = "\x1c\x1d\x1e\x1f\x85\u1680" + "".join(chr(c) for c in range(0x2000, 0x200A))
-assert len(_POOL) == 16 and all(re.fullmatch(r"\s", c) for c in _POOL)
-_PLACEHOLDER_RE = re.compile(f"[{_POOL}]{{4}}")
+UNSEEN = " \u2026(masked shell syntax not shown)"
 _BLANK_EXTRA = frozenset("\u2800\u3164\u115f\u1160\u180e\u034f\ufeff\u00ad")
+_NAMED = {"\t": "\\t", "\n": "\\n", "\r": "\\r", " ": "\u2423"}
 
 
 def _is_blank(ch: str) -> bool:
-    return ch.isspace() or ch in _BLANK_EXTRA or unicodedata.category(ch) in ("Zs", "Zl", "Zp", "Cf", "Cc")
+    """A character that is invisible or looks like a space: it is shown as a token, never as itself (a plain space
+    between two other characters is the one exception)."""
+    return (ch.isspace() or ch in _BLANK_EXTRA
+            or unicodedata.category(ch) in ("Zs", "Zl", "Zp", "Cf", "Cc", "Cs", "Co", "Cn"))
 
 
-def _glyph(ch: str, count: int) -> str:
-    """One same-character stretch of a blank run, visibly: ``\\t``, ``\\u{2800}``, ``\u2423\u00d7260`` (spaces)."""
-    if ch == " ":
-        return f"\u2423\u00d7{count}"
-    esc = {"\t": "\\t", "\n": "\\n", "\r": "\\r"}.get(ch) or f"\\u{{{ord(ch):x}}}"
-    return esc if count == 1 else f"{esc}\u00d7{count}"
-
-
-def _render_run(run: str) -> str:
-    return "".join(_glyph(ch, len(list(g))) for ch, g in itertools.groupby(run))
-
-
-def _escape_literals(text: str) -> str:
-    """Make the visible tokens unambiguous: a literal backslash, ``\u2423`` or ``\u00d7`` in a command is escaped too."""
-    return text.replace("\\", "\\\\").replace("\u2423", "\\u{2423}").replace("\u00d7", "\\u{d7}")
-
-
-def _protect_blanks(text: str) -> tuple[str, list[str]]:
-    """Replace every blank run other than one plain space with a placeholder; return the text and each run's rendering."""
+def render_visible(text: str) -> str:
+    """The last step of the display: every blank-looking character becomes a closed, counted token, so two different
+    commands never read alike and no control character reaches a terminal.  A run is a token per same-character
+    stretch (``\u27e8\u2423\u00d72\u27e9`` two spaces, ``\u27e8\\t\u27e9`` a tab, ``\u27e8U+2800\u00d7260\u27e9`` Braille blanks); one plain space between
+    other characters stays a space.  A literal backslash is doubled and a literal bracket is written ``\\u{27e8}``
+    ``\\u{27e9}``, so the rendering can be read back unambiguously."""
     out: list[str] = []
-    rendered: list[str] = []
     for blank, group in itertools.groupby(text, _is_blank):
         chunk = "".join(group)
         if not blank:
-            out.append(_escape_literals(chunk))
+            out.append(chunk.replace("\\", "\\\\").replace("\u27e8", "\\u{27e8}").replace("\u27e9", "\\u{27e9}"))
         elif chunk == " ":
             out.append(" ")
         else:
-            i = len(rendered)
-            out.append("".join(_POOL[(i >> shift) & 15] for shift in (12, 8, 4, 0)))
-            rendered.append(_render_run(chunk))
-    return "".join(out), rendered
+            for ch, same in itertools.groupby(chunk):
+                n = len(list(same))
+                name = _NAMED.get(ch) or f"U+{ord(ch):04X}"
+                out.append(f"\u27e8{name}\u00d7{n}\u27e9" if n > 1 else f"\u27e8{name}\u27e9")
+    return "".join(out)
 
 
-def _restore_blanks(text: str, rendered: list[str]) -> str:
-    def one(m: re.Match[str]) -> str:
-        code = 0
-        for ch in m.group(0):
-            code = (code << 4) | _POOL.index(ch)
-        return rendered[code] if code < len(rendered) else ""
-    return _PLACEHOLDER_RE.sub(one, text)
+def _sensitive(text: str) -> collections.Counter[str]:
+    """The characters whose disappearance could hide a command: shell syntax, anything blank, and anything a
+    normalisation (NFKC) would rewrite."""
+    return collections.Counter(c for c in text
+                               if c in _SHELL_ACTIVE or _is_blank(c) or unicodedata.normalize("NFKC", c) != c)
 
 
-def _mask(text: str) -> tuple[str, bool]:
-    """Mask secret-shaped values; the flag says a masked value held shell syntax (it could hide a command)."""
-    hid = False
-
+def _mask(text: str) -> str:
     def rule(keep: int):
         def sub(m: re.Match[str]) -> str:
-            nonlocal hid
-            kept = "".join(m.group(i) for i in range(1, keep + 1))
-            hid = hid or any(c in _SHELL_ACTIVE for c in m.group(0)[len(kept):])
-            return kept + _MASK
+            return "".join(m.group(i) for i in range(1, keep + 1)) + _MASK
         return sub
 
     for rx, keep in _MASK_RULES:
         text = rx.sub(rule(keep), text)
-    return text, hid
+    return str(scrub_payload(text))
 
 
 def scrub_display_full(text: str) -> tuple[str, bool]:
@@ -175,18 +153,18 @@ def scrub_display_full(text: str) -> tuple[str, bool]:
 
     Pattern based: URL userinfo, secret-named options and NAME=value pairs, Bearer headers, plus the hub's token-shape
     scrubber. A secret that has no recognizable shape (a bare word like ``hunter2``) cannot be detected, which is why
-    this text lives only on the request row and key_canonical holds a digest instead of command text. Blank-looking
-    characters are never dropped or merged: a run becomes a token such as ``\u2423\u00d7260`` or ``\\u{2800}\u00d7260``, so two
-    different commands do not display alike.  Not approvable: input over the cap (cut), or a masked value that held
-    shell syntax (``$(...)``, ``;``, ``|``...), which would hide part of the command behind ``***``.
+    this text lives only on the request row and key_canonical holds a digest instead of command text.  Masking runs
+    on the original text; ``render_visible`` runs last.  Not approvable: input over the cap (cut), or any masking
+    that removed or rewrote shell syntax, whitespace or a normalisable character (generic: the multiset of those
+    characters before and after masking must be equal), because the mask could hide part of a command.
     """
     cut = max(0, len(text) - _MAX_SCRUB_INPUT)
-    out, runs = _protect_blanks(text[:_MAX_SCRUB_INPUT])
-    out, hidden = _mask(out)
-    out = _restore_blanks(str(scrub_payload(out)), runs)
+    kept = text[:_MAX_SCRUB_INPUT]
+    masked = _mask(kept)
+    out = render_visible(masked)
     if cut:
         return out + f" \u2026(+{cut} chars)", False
-    return (out + _UNSEEN, False) if hidden else (out, True)
+    return (out, True) if _sensitive(kept) == _sensitive(masked) else (out + UNSEEN, False)
 
 
 def scrub_display(text: str) -> str:
@@ -203,11 +181,11 @@ def _cut(out: str) -> str:
 def display_complete(display: str) -> bool:
     """False when the owner saw only part of the command (the display ends in a ``...(+N chars)`` marker, or in the
     masked-syntax marker). A command that merely ends like a marker is refused too."""
-    return not _TRUNCATED_RE.search(display) and not display.endswith(_UNSEEN)
+    return not _TRUNCATED_RE.search(display) and not display.endswith(UNSEEN)
 
 
 def full_text_sha256(full: str) -> str:
-    return hashlib.sha256(full.encode("utf-8")).hexdigest()
+    return hashlib.sha256(full.encode("utf-8", "surrogatepass")).hexdigest()
 
 
 class TruncatedDisplay(ValueError):

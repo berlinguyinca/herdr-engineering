@@ -38,6 +38,7 @@ from .deploycheck import (
 )
 from .evidence import propose_if_ready
 from .policy import (
+    UNSEEN,
     ActivationRefused,
     activate_grant,
     create_standing_grant,
@@ -1004,8 +1005,12 @@ class SlackRuntime:
         shown = fully_shown(item.display)
         lines.append("```" + slack_text(item.display) + "```")
         if not shown:
-            lines.append("*Too long for Slack: it cannot be approved here.* Deny it, or read it in full and approve "
-                         "it with `herdr-eng control-plane assistant-action approve` (or the REST API).")
+            if item.display.endswith(UNSEEN):
+                lines.append("*It cannot be approved at all: part of it is masked.* Deny it, or have the worker "
+                             "request it differently.")
+            else:
+                lines.append("*Too long for Slack: it cannot be approved here.* Deny it, or read it in full and "
+                             "approve it with `herdr-eng control-plane assistant-action approve` (or the REST API).")
         lines.append(f"Why: {slack_text(item.why)}")
         value = button_value(ask)
 

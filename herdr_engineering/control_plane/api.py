@@ -5176,13 +5176,17 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                 cfg = svc.config["grants"]
                 version = current_judge_version(server.assistant_judge)
 
-                def request_view(r):
-                    return {"request_id": r.request_id, "worker_id": r.worker_id, "session_id": r.session_id,
+                def request_view(r, full=False):
+                    view = {"request_id": r.request_id, "worker_id": r.worker_id, "session_id": r.session_id,
                             "task_id": r.task_id, "verb": r.verb, "risk_class": r.risk_class, "status": r.status,
                             "reason": r.reason, "display": r.display,
-                            "display_full": r.display_full or r.display,
-                            "display_complete": display_complete(r.display), "created_at": iso(r.created_at),
+                            "display_complete": display_complete(r.display),
+                            "approvable": display_complete(r.display) or bool(r.display_full),
+                            "created_at": iso(r.created_at),
                             "decided_at": iso(r.decided_at), "decided_by": r.decided_by, "key_id": r.key_id}
+                    if full:                        # the whole text only on the single-request view, never in the list
+                        view["display_full"] = r.display_full or r.display
+                    return view
 
                 def grant_view(g):
                     return {"grant_id": g.grant_id, "worker_id": g.worker_id, "verb": g.verb,
@@ -5203,6 +5207,11 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                             return self._json({"error": "status must be pending, approved, denied or vetoed"}, 400)
                         rows = store.list_action_requests(tenant_id, user_id, status or None)
                         return self._json({"requests": [request_view(r) for r in rows]})
+                    if len(parts) == 5 and self.command == "GET":
+                        row = store.get_action_request(parts[4], tenant_id=tenant_id, user_id=user_id)
+                        if row is None:
+                            return self._json({"error": "not found"}, 404)
+                        return self._json(request_view(row, full=True))
                     if len(parts) == 6 and parts[5] == "decision" and self.command == "POST":
                         if not (exact({"approve"}) or exact({"approve", "display_sha256"})) \
                                 or not isinstance(body["approve"], bool) \

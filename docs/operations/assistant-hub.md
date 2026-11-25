@@ -245,19 +245,27 @@ A worker credential gets 401/403 on all of these, a viewer key gets 403, and cro
 `display` is what lets you recognise a request. It is returned **only** on these owner routes (and held in the owner's
 request row and store snapshot); it is never in the MCP response, the audit log, grants, evidence or events. It is
 **masked best effort** (URL userinfo, secret-named options and `NAME=value` pairs, Bearer headers, token shapes), then
-cut to 300 characters. Blank-looking characters are never dropped: a run of two or more (spaces, tabs, Unicode
-spaces, zero-width and Braille-blank characters, controls) shows as a counted token such as `␣×260` or `\u{2800}×260`,
-and a single tab, newline or odd space as `\t`, `\n`, `\u{a0}`, so two different commands do not look alike. A cut
-display ends in `…(+N chars)`.
+cut to 300 characters. Masking runs on the original text and the visible rendering runs last: every blank-looking
+character (tab, newline, Unicode spaces, zero-width and Braille-blank characters, controls, lone surrogates) becomes a
+closed token, so two different commands do not look alike and no control character reaches a terminal. A run of one
+character shows as `⟨␣×2⟩` (two spaces) or `⟨U+2800×260⟩`, a single one as `⟨\t⟩` or `⟨\n⟩`; a literal backslash is
+doubled and a literal `⟨`/`⟩` is written `\u{27e8}`/`\u{27e9}`. A cut display ends in `…(+N chars)`.
 
-Each request view also has `display_complete` (false when the display was cut) and `display_full` (the whole masked
-text, no cut; equal to `display` when nothing was cut). To **approve** a request whose `display_complete` is false,
-send `{"approve": true, "display_sha256": "<SHA-256 hex of display_full>"}`; a missing or wrong hash is 409
-`truncated_display` and nothing is recorded. `assistant-action approve` does this for you after printing the full
-text. Denying never needs a hash. A request is deny-only (409 even with the hash) when it is over the 8192-byte
-command cap, or when a masked value held shell syntax (`$ \` ; | & ( ) < >`), because the `***` could hide a command;
-its display ends in `…(masked shell syntax not shown)`. **Slack never approves a cut command**: the message says it is
-too long for Slack and points here. A scrubber cannot recognise an arbitrary secret word
+The list view has `display_complete` (false when the display was cut) and `approvable` (false when the request can only
+be denied). `GET /api/v1/assistant-action-requests/<id>` also returns `display_full`, the whole masked text (equal to
+`display` when nothing was cut); the list never carries it. To **approve** a request whose `display_complete` is false,
+send `{"approve": true, "display_sha256": "<SHA-256 hex of display_full, UTF-8>"}`; a missing or wrong hash is 409
+`truncated_display` and nothing is recorded. Denying never needs a hash. A request is deny-only (`approvable` false,
+409 even with the hash) when the command is over the 8192-byte cap, or when masking removed or rewrote any shell syntax
+(`$ \` ; | & ( ) < >`), whitespace or normalisable character (checked generically over every mask, including the
+token-shape scrubber), because the `***` could hide a command; its display ends in `…(masked shell syntax not shown)`.
+A secret that sits next to a space or shell character, such as `Authorization: Bearer x`, therefore makes the request
+deny-only. A row stored before `display_full` existed is approvable only when its display is complete.
+
+CLI: `assistant-action show ID` prints the full text and `display_sha256`. `assistant-action approve ID` on a cut
+command asks `Approve exactly this command? [y/N]` on a terminal; off a terminal it needs `--display-sha256 <hash>` from
+`show`. It never approves a cut command in one step. **Slack never approves a cut command**: the message says it is
+too long for Slack and points here (or that it cannot be approved at all when masked). A scrubber cannot recognise an arbitrary secret word
 (`mysql -pSomething`-style variants and bare passwords can slip through), so treat the owner request list as sensitive
 and keep it off shared screens.
 
