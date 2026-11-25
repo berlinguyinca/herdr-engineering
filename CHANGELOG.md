@@ -5,6 +5,11 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: collab room teardown, assistant store scans, dev route validation
+
+- Collaboration page: leaving a room before its helper handlers were wired no longer throws a `ReferenceError` (`unbindHelpers` was a `const` declared after the teardown that calls it), which skipped the rest of the teardown and left the room's listeners and controller running (#974).
+- Personal assistant: the service-level scans of the store (`list_proposals` with its expiry write-back, `create_proposal`'s dedupe scan, `notify`, `list_notifications`, `digest`, `repair_pending_audits`, `open_tool_run`, `export_memory`, the diagnostics memory count and `_action_owner`) run under the store lock, so a concurrent insert can no longer fail them with `dictionary changed size during iteration` (#976).
+- Dev fabric: `DevServiceRegistry.register` and `update_routes` validate the route table in one place (each item a route object or dict, non-empty prefix, non-empty host, integer port 1-65535) and raise `ValueError` for the whole update (the `/` catch-all prefix stays valid; `dev register` and `dev enroll` report it and exit 1, and a gateway 400 is reported as a rejection, not as an outage) instead of persisting a partial or malformed table (#977).
 ### Fix: owner approval of a command the owner saw only in part
 
 - A request whose display was cut (`...(+N chars)`) keeps the whole masked text, served as `display_full` by `GET /api/v1/assistant-action-requests/<id>` (the list has `display_complete` and `approvable` only, so it stays small). `POST .../decision` approves a cut command only when the body carries `display_sha256` (64 hex characters, any case; else 400), the SHA-256 of `display_full`; a missing or wrong hash is 409 `truncated_display`, nothing is recorded, and the request stays pending. Denying needs no hash. Rows stored before this change have no `display_full` and are approvable only when their display is complete.

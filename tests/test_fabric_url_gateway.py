@@ -65,3 +65,30 @@ def test_resolve_urls_rejects_bad_body(tmp_path):
         assert "400" in str(exc.value)
     finally:
         gw.stop()
+
+
+def test_dev_register_reports_a_gateway_route_rejection_without_falling_back(tmp_path, monkeypatch, capsys):
+    """A real gateway answers 400 for a bad route table: `dev register` says so and exits 1; it must not claim the
+    gateway is unreachable or register the lease in the local registry."""
+    import herdr_engineering.cli as cli
+    from herdr_engineering.fabric import GatewayRejected
+
+    gw, registry, _ = _gateway(tmp_path)
+    state = tmp_path / "local-state"
+    monkeypatch.setenv("HERDR_ENGINEERING_STATE", str(state))
+    monkeypatch.setattr(cli, "_local_fabric_client", lambda: _client(gw))
+    try:
+        with pytest.raises(GatewayRejected) as exc:
+            _client(gw).register(target_machine_id="m", target_host="127.0.0.1", target_port=80,
+                                 routes=[{"prefix": "/a", "host": "127.0.0.1", "port": 0}])
+        assert isinstance(exc.value, UnreachableError) and "400" in str(exc.value)
+        args = type("A", (), {"machine": "m", "host": "127.0.0.1", "port": 80, "protocol": "http", "session": None,
+                              "repo": None, "worktree": None, "process": None, "label": None,
+                              "route": ["/a=127.0.0.1:0"], "preferred_port": 80})()
+        assert cli._cmd_dev_register(args) == 1
+        out = capsys.readouterr().out
+        assert "rejected" in out and "fell back" not in out and "unreachable" not in out
+        assert registry.active_leases() == []
+        assert not (state / "leases.json").exists() or not json.loads((state / "leases.json").read_text()).get("leases")
+    finally:
+        gw.stop()

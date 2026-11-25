@@ -2839,6 +2839,7 @@ def _parse_routes(specs):
 
 def _cmd_dev_register(args) -> int:
     from .devfabric import DevServiceRegistry
+    from .fabric import GatewayRejected
     host = _resolve_target_host(args.host, args.port)
     try:
         routes = _parse_routes(args.route)
@@ -2857,16 +2858,23 @@ def _cmd_dev_register(args) -> int:
                 preferred_port=args.preferred_port)
             _print_json(result)
             return 0
+        except GatewayRejected as exc:
+            _print_json({"ok": False, "error": f"gateway rejected the registration: {exc.reason or exc.message}"})
+            return 1
         except Exception as exc:
             _print_json({"ok": False, "gateway": str(exc),
                          "note": "gateway unreachable — fell back to local registry",
                          "warning": "lease is NOT reachable via dev:<port> until the gateway is up"})
-    lease = DevServiceRegistry().register(
-        target_machine_id=args.machine, target_host=host, target_port=args.port,
-        protocol=args.protocol, owner_herdr_session_id=args.session,
-        owner_repository=args.repo, owner_worktree_id=args.worktree,
-        owner_process_id=args.process, label=args.label, routes=routes,
-        preferred_port=args.preferred_port)
+    try:
+        lease = DevServiceRegistry().register(
+            target_machine_id=args.machine, target_host=host, target_port=args.port,
+            protocol=args.protocol, owner_herdr_session_id=args.session,
+            owner_repository=args.repo, owner_worktree_id=args.worktree,
+            owner_process_id=args.process, label=args.label, routes=routes,
+            preferred_port=args.preferred_port)
+    except ValueError as exc:
+        _print_json({"ok": False, "error": str(exc)})
+        return 1
     _print_json(lease.to_dict())
     return 0
 
@@ -3313,7 +3321,7 @@ def _cmd_dev_enroll(args) -> int:
     --serve runs the forwarder locally.
     """
     from .contracts import Route
-    from .devfabric import DevServiceRegistry, forwarder_for
+    from .devfabric import DevServiceRegistry, _normalize_routes, forwarder_for
     from .errors import ConflictError
 
     m = {}
@@ -3344,8 +3352,13 @@ def _cmd_dev_enroll(args) -> int:
         _print_json({"ok": False, "error": "missing catch-all backend (--catchall HOST:PORT or manifest.catchall)"})
         return 1
     c_host, c_port = catchall["host"], int(catchall["port"])
-    routes = [Route(r.get("prefix", "/"), r.get("host"), int(r.get("port")))
-              if isinstance(r, dict) else r for r in routes_in]
+    try:
+        routes = [Route(r.get("prefix", "/"), r.get("host"), int(r.get("port")))
+                  if isinstance(r, dict) else r for r in routes_in]
+        _normalize_routes(routes)
+    except (ValueError, TypeError) as exc:
+        _print_json({"ok": False, "error": f"bad route table: {exc}"})
+        return 1
     routes_wire = [{"prefix": r.prefix, "host": r.host, "port": r.port} for r in routes] or None
 
     client = _local_fabric_client()
@@ -3398,10 +3411,14 @@ def _cmd_dev_enroll(args) -> int:
                   and cand.target_port == c_port), None)
     if stale is not None:
         reg.close(stale.id)
-    lease = reg.register(
-        target_machine_id=machine, target_host=c_host, target_port=c_port,
-        protocol=protocol, owner_repository=repo, label=label,
-        routes=routes, preferred_port=origin_port)
+    try:
+        lease = reg.register(
+            target_machine_id=machine, target_host=c_host, target_port=c_port,
+            protocol=protocol, owner_repository=repo, label=label,
+            routes=routes, preferred_port=origin_port)
+    except ValueError as exc:
+        _print_json({"ok": False, "error": f"bad route table: {exc}"})
+        return 1
     origin = f"http://dev:{lease.external_port}"
     out = {
         "ok": True, "via": "local", "lease_id": lease.id, "origin": origin,
@@ -4087,7 +4104,7 @@ def _cmd_dev_serve(args) -> int:
     import signal
     import time
 
-    from .devfabric import DevServiceRegistry, forwarder_for
+    from .devfabric import DevServiceRegistry, _normalize_routes, forwarder_for
     from .errors import ConflictError
     lease = DevServiceRegistry().get(args.lease_id)
     if lease is None:

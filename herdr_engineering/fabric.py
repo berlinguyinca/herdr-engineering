@@ -40,6 +40,14 @@ from .errors import ConflictError, UnreachableError
 from .fabric_named import AcceptBackoff
 
 
+class GatewayRejected(UnreachableError):
+    """The gateway answered 400: it is up and refused this request. Still an UnreachableError for existing callers."""
+
+    def __init__(self, message: str, *, reason: str = "", **kw: Any) -> None:
+        super().__init__(message, **kw)
+        self.reason = reason
+
+
 class TokenNotAccepted(UnreachableError):
     """The gateway is up and answered, but did not accept our bearer token (HTTP 401, or the minimal /healthz).
     Different from "down": a caller that infers a dead peer from ``UnreachableError`` must check for this first.
@@ -1241,6 +1249,13 @@ class FabricClient:
         except urllib.error.HTTPError as exc:
             if exc.code == 401:
                 raise TokenNotAccepted(f"fabric gateway rejected the token (401) for {url}", target=url) from exc
+            if exc.code == 400:   # the gateway refused the request itself (e.g. a bad route table): not an outage
+                try:
+                    reason = str(json.loads(exc.read()).get("error", ""))
+                except Exception:  # noqa: BLE001 - an unreadable body still means "rejected"
+                    reason = ""
+                raise GatewayRejected(f"fabric gateway error 400 for {url}" + (f": {reason}" if reason else ""),
+                                      target=url, reason=reason) from exc
             raise UnreachableError(f"fabric gateway error {exc.code} for {url}",
                                    target=url) from exc
         except Exception as exc:
