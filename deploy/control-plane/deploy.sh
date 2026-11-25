@@ -136,7 +136,7 @@ set -euo pipefail
 REF="origin/main"; DRY=0; FETCH=1; ALLOW_DIVERGENT=0; COLLAB_LOCK_WAIT=300; DEPLOY_LOCK_WAIT=600
 CHECKPOINT_LOCK_WAIT=420; PAUSE_WORKER=0; WORKER_PAUSED=0
 MEMORY_PRIVATE_EGRESS=auto; MEMORY_PRIVATE_EGRESS_RECOVER=""
-MEMORY_PRIVATE_EGRESS_CIDR="172.31.252.0/29"
+MEMORY_PRIVATE_EGRESS_CIDR="172.31.252.32/29"; MEMORY_PRIVATE_EGRESS_CIDR_SET=0
 MEMORY_PRIVATE_EGRESS_GATEWAY="${HERDR_CP_MEMORY_PRIVATE_EGRESS_GATEWAY:-}"
 MEMORY=0; MEMORY_CHECKOUT="${HERDR_MEMORY_CHECKOUT:-}"
 MEMORY_CLIENT_CONFIG="${HERDR_CP_MEMORY_CLIENT_CONFIG:-}"
@@ -155,7 +155,7 @@ while [ $# -gt 0 ]; do
     --memory-private-egress-recover) MEMORY_PRIVATE_EGRESS_RECOVER="${2:?needs the saved deploy attempt}"; shift 2 ;;
     --memory-private-egress) MEMORY_PRIVATE_EGRESS=1; shift ;;
     --no-memory-private-egress) MEMORY_PRIVATE_EGRESS=0; shift ;;
-    --memory-private-egress-cidr) MEMORY_PRIVATE_EGRESS_CIDR="${2:?needs a CIDR}"; shift 2 ;;
+    --memory-private-egress-cidr) MEMORY_PRIVATE_EGRESS_CIDR="${2:?needs a CIDR}"; MEMORY_PRIVATE_EGRESS_CIDR_SET=1; shift 2 ;;
     --memory-private-egress-gateway) MEMORY_PRIVATE_EGRESS_GATEWAY="${2:?needs an explicit IPv4/32}"; shift 2 ;;
     --with-memory) MEMORY=1; shift ;;
     --memory-checkout) MEMORY_CHECKOUT="${2:?--memory-checkout needs a value}"; shift 2 ;;
@@ -965,6 +965,21 @@ check_fabric_token_dir() {   # create it 0700 when missing, then verify it; neve
   fi
 }
 check_fabric_token_dir || exit 1
+
+# The fabric-gateway bind-mounts this at /fabric-local (host-local route files). Create it as the deploying user
+# first: otherwise docker creates it root-owned and `scripts/fabric-stack.sh memory-route enable` cannot write to it.
+FABRIC_LOCAL_DIR="$HOME/.config/herdr-engineering/fabric"
+check_fabric_local_dir() {
+  local d="$FABRIC_LOCAL_DIR"
+  if [ -L "$d" ] || { [ -e "$d" ] && [ ! -d "$d" ]; }; then
+    echo "$d must be a real directory (not a symlink or a file)" >&2; return 1
+  fi
+  if [ -d "$d" ] && [ "$(stat -c %u "$d")" != "$(id -u)" ]; then
+    echo "$d must be owned by the deploying user (uid $(id -u)); fix with: sudo chown $(id -un) $d" >&2; return 1
+  fi
+}
+check_fabric_local_dir || exit 1
+mkdir -p "$FABRIC_LOCAL_DIR" || { echo "cannot create $FABRIC_LOCAL_DIR" >&2; exit 1; }
 
 # ---- host files this deploy may change, backed up so every failure path restores them
 BACKUP_DIR="$ENV_DIR/backup"; mkdir -p "$BACKUP_DIR"
