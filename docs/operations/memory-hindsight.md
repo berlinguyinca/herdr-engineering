@@ -92,13 +92,14 @@ routed names:
 * DNS: CoreDNS already answers `*.dev.lan` with the gateway's tailnet IP, and `*.local.metabolomics.us` is published by
   `devfabric dns publish`. No record is added.
 * Certificates: both names are covered by the certificates the gateway already serves (SNI picks the certificate).
-* Route: `scripts/fabric-stack.sh memory-route enable` uncomments the two marked `routes` lines in
-  `deploy/fabric-stack/config.yaml` (`memory.<domain>=127.0.0.1:8888`, `memory.dev.lan=127.0.0.1:8888`); change the
-  port there if you changed `control_plane.memory.port`. Then recreate the `fabric-gateway` container the way you do for
-  any gateway change (`deploy/fabric-stack/README.md`, "HTTPS on 443"; it needs the variables deploy.sh renders, e.g.
-  `GATEWAY_BIND`, so use the same invocation).
-  Recreating the gateway drops its in-memory lease state until agents re-register (as noted in compose.yaml); do it in a
-  quiet window. `memory-route disable` reverses it.
+* Route: `scripts/fabric-stack.sh memory-route enable [PORT]` (default 8888; pass `control_plane.memory.port`, e.g. 8897 on
+  bender) writes `~/.config/herdr-engineering/fabric/memory-route.yaml` (only `fabric.local_routes`:
+  `memory.<domain>` and `memory.dev.lan` -> `127.0.0.1:PORT`). The gateway container mounts that directory read-only and
+  appends the routes to the baked `fabric.routes` of `/app/config.yaml`, so the setting survives deploys, later changes
+  to the shipped routes still reach the host, it is not in git, and no other file in that directory is touched. Apply
+  with `docker restart herdr-fabric-gateway`; `memory-route disable` removes only `memory-route.yaml`. The restart drops
+  the gateway's in-memory lease state until agents re-register; do it in a quiet window. `deploy.sh` and
+  `fabric-stack.sh up` create the directory as the deploying user (refusing if it belongs to someone else).
 * The herdr-memory client **refuses `http://` off loopback**; do not configure it otherwise. Be aware of existing
   gateway behaviour: every named route on 443 also answers plain HTTP (the listener sniffs the first byte). Nothing
   here advertises that, the tailnet is WireGuard-encrypted, and the client will not use it, but it is a property of
@@ -246,7 +247,7 @@ never reported as ok. Also `scripts/fabric-stack.sh status` prints the two conta
 * **Not rolled back:** the database service definition (it is recreated only if its compose definition changed) and the
   volume, which is never removed by any path. Data is recovered from backups, not by rollback.
 * **Turn it off:** `docker compose -p herdr-control-plane --profile memory stop hindsight-api hindsight-db` (data kept),
-  `memory-route disable` + gateway recreate, `systemctl --user disable --now herdr-hindsight-backup.timer`, and set
+  `memory-route disable` + `docker restart herdr-fabric-gateway`, `systemctl --user disable --now herdr-hindsight-backup.timer`, and set
   `control_plane.memory.enabled: false`. Removing the volume is a separate, deliberate `docker volume rm` after a
   verified off-host backup.
 
@@ -275,19 +276,19 @@ other tenant name is not visible until the tenant mapping is decided (spec quest
 ## Operational notes from the first production deployment (bender)
 
 * **Port.** The first deployment used `control_plane.memory.port: 8897` because 8888 was already taken by an earlier,
-  unmanaged candidate. If you use a non-default port, set it in **three** places: the fleet config, the two
-  `herdr-memory-route` lines in `deploy/fabric-stack/config.yaml`, and `fabric.agent_exclude_ports` (next item).
+  unmanaged candidate. If you use a non-default port, set it in **three** places: the fleet config, the
+  `memory-route enable <port>` argument, and `fabric.agent_exclude_ports` (next item).
 * **Keep the fabric agent off the API port.** The agent (`herdr-eng devfabric agent`) mirrors every loopback listener
   onto the tailnet IP as plain HTTP. Add the port to `fabric.agent_exclude_ports` in
   `~/.config/herdr-engineering/config.yaml` and restart `herdr-eng-fabric-agent.service`. A forwarder that already
   exists is **restored from the agent state on restart**, so also remove that port's entry from
   `~/.local/share/herdr-engineering/state/fabric-agent.json` while the agent is stopped. Verify with
   `curl http://<tailnet-ip>:<port>/health` (must fail) and `ss -ltn | grep <port>` (loopback only).
-* **Routes on a running gateway.** The gateway bind-mounts `config.yaml` as a single file, so edit it **in place** (same
-  inode; `sed -i` replaces the file and the container keeps the old one), then `docker restart herdr-fabric-gateway`.
-  Check which checkout the running gateway uses: `docker inspect herdr-fabric-gateway` label
-  `com.docker.compose.project.working_dir` (on bender it is `~/.local/share/herdr-engineering/gateway-deploy`, not
-  `deploy-src`). The restart drops fabric leases until agents re-register (about a minute).
+* **Routes on a running gateway.** The shipped `deploy/fabric-stack/config.yaml` is baked into the `herdr-engineering`
+  image (`/app/config.yaml`); host-specific routes live in `~/.config/herdr-engineering/fabric/memory-route.yaml`, mounted at
+  `/fabric-local` and appended to the baked routes (`memory-route enable [PORT]` writes it). After a change, `docker restart
+  herdr-fabric-gateway` (drops fabric leases until agents re-register, about a minute). A host that had routes enabled
+  in a checkout copy before this change must run `memory-route enable <port>` once before its first deploy of it.
 * **Clients.** `memory.local.metabolomics.us` carries a public certificate and works from any host; `memory.dev.lan`
   needs the private CA trusted. Keys are exported per tenant (`fleet config memory export-key`); never `personal` to an
   engineering harness.
