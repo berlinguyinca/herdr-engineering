@@ -10,10 +10,11 @@
 #   ./scripts/fabric-stack.sh --replace  # also stop the OLD host-run services
 #   ./scripts/fabric-stack.sh down       # stop the stack
 #   ./scripts/fabric-stack.sh status     # show container + healthz state (+ Hindsight memory, when deployed)
-#   ./scripts/fabric-stack.sh memory-route enable|disable|status
+#   ./scripts/fabric-stack.sh memory-route enable [PORT]|disable|status
 #                                        # route https://memory.<domain> and https://memory.dev.lan to the loopback
-#                                        # Hindsight API through the gateway (deploy/fabric-stack/config.yaml `routes`);
-#                                        # edits the file only, then prints the gateway recreate command to run
+#                                        # Hindsight API (default port 8888) through the gateway. Writes the host-local
+#                                        # ~/.config/herdr-engineering/fabric/config.yaml (survives deploys; the shipped
+#                                        # config stays routes-off), then prints the gateway restart to run
 set -euo pipefail
 
 STACK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../deploy/fabric-stack" && pwd)"
@@ -100,6 +101,17 @@ stop_old_host_services() {
     fi
 }
 
+ensure_local_dir() {   # the gateway bind-mounts it; if docker made it, it is root-owned and memory-route cannot write
+    local d="$HOME/.config/herdr-engineering/fabric"
+    if [ -L "$d" ] || { [ -e "$d" ] && [ ! -d "$d" ]; }; then
+        echo "$d must be a real directory (not a symlink or a file)" >&2; exit 1
+    fi
+    if [ -d "$d" ] && [ "$(stat -c %u "$d")" != "$(id -u)" ]; then
+        echo "$d must be owned by $(id -un); fix with: sudo chown $(id -un) $d" >&2; exit 1
+    fi
+    mkdir -p "$d" || { echo "cannot create $d" >&2; exit 1; }
+}
+
 preflight() {
     # compose.yaml requires variables only deploy.sh renders (HERDR_CP_IMAGE_TAG, GATEWAY_BIND ...). Without them
     # every compose call fails at interpolation, so find out BEFORE anything is stopped or rebuilt.
@@ -115,6 +127,7 @@ preflight() {
 up() {
     # Only this script's own services, never --remove-orphans: collab-public, collab-edge, share-public, fabric-whois
     # and the Hindsight containers live in overlay files / profiles that deploy.sh manages, and would be removed.
+    ensure_local_dir
     # The compose file bind-mounts the token directory read-only into fabric-gateway and herdr-web; docker would
     # create a missing source root-owned 0755, and nothing would fix it afterwards.
     check_fabric_token_dir || exit 1
@@ -134,22 +147,35 @@ memory_status() {
 }
 
 memory_route() {
-    local cfg="$STACK_DIR/config.yaml" mark='# herdr-memory-route'
+    # The shipped deploy/fabric-stack/config.yaml (baked into the image) keeps the memory routes OFF. They live in
+    # their own host-local file, the gateway's third HERDR_ENGINEERING_CONFIG entry, under fabric.local_routes (the
+    # gateway appends them to the baked fabric.routes), so a deploy never loses them, a changed shipped route still
+    # reaches this host, and no other host-local file is touched.
+    local shipped="$STACK_DIR/config.yaml" mark='# herdr-memory-route'
+    local dir="$HOME/.config/herdr-engineering/fabric" port="${2:-}"; [ -n "$port" ] || port=8888
+    local route_file="$dir/memory-route.yaml"
     case "${1:-status}" in
         enable)
-            sed -i.bak -E "/$mark\$/ s/^( *)# - /\1- /" "$cfg" && rm -f "$cfg.bak"
-            say "memory routes enabled in $cfg (https://memory.<domain> and https://memory.dev.lan -> 127.0.0.1:<memory port>)"
-            say "apply: recreate the fabric-gateway container the way you normally do (deploy/fabric-stack/README.md, 'HTTPS on 443');"
-            say "       it needs the compose variables deploy.sh renders (GATEWAY_BIND ...), so use the same invocation as for any gateway change"
+            case "$port" in ''|*[!0-9]*) echo "usage: $0 memory-route enable [PORT]  (control_plane.memory.port, default 8888)" >&2; exit 2 ;; esac
+            ensure_local_dir
+            local lines
+            lines="$(sed -n '/^  routes:/,/^  [a-z_]*:/p' "$shipped" | grep "$mark\$" | sed -E "s/^( *)# - /\1- /; s/:[0-9]+\"/:$port\"/")" \
+                && [ -n "$lines" ] || { echo "no '$mark' lines in $shipped" >&2; rm -f "$route_file.new"; exit 1; }
+            { printf '%s\n' "# Written by scripts/fabric-stack.sh memory-route; appended to fabric.routes by the gateway." \
+                  "fabric:" "  local_routes:"; printf '%s\n' "$lines"; } >"$route_file.new" \
+                && mv "$route_file.new" "$route_file" \
+                || { echo "could not write $route_file" >&2; rm -f "$route_file.new"; exit 1; }
+            say "memory routes enabled in $route_file (https://memory.<domain> and https://memory.dev.lan -> 127.0.0.1:$port)"
+            say "apply: docker restart herdr-fabric-gateway   (it re-reads the file; leases return when agents re-register)"
             ;;
         disable)
-            sed -i.bak -E "/$mark\$/ s/^( *)- /\1# - /" "$cfg" && rm -f "$cfg.bak"
-            say "memory routes disabled in $cfg; apply by recreating fabric-gateway (deploy/fabric-stack/README.md)"
+            rm -f "$route_file" || { echo "could not remove $route_file" >&2; exit 1; }
+            say "memory routes disabled (removed $route_file); apply: docker restart herdr-fabric-gateway"
             ;;
         status)
-            grep "$mark" "$cfg" || echo "(no memory route lines in $cfg)"
+            if [ -f "$route_file" ]; then grep -E '^ *- "' "$route_file"; else echo "(memory routes off: no $route_file)"; fi
             ;;
-        *) echo "usage: $0 memory-route enable|disable|status" >&2; exit 2 ;;
+        *) echo "usage: $0 memory-route enable [PORT]|disable|status" >&2; exit 2 ;;
     esac
 }
 
@@ -183,11 +209,11 @@ down() { "${COMPOSE[@]}" stop coredns fabric-gateway herdr-web; }  # not the con
 cmd="${1:-up}"
 case "$cmd" in
     up)
-        check_fabric_token_dir || exit 1; write_env; gen_coredns; preflight
+        ensure_local_dir; check_fabric_token_dir || exit 1; write_env; gen_coredns; preflight
         up
         ;;
     up-replace)
-        check_fabric_token_dir || exit 1; write_env; gen_coredns; preflight   # before anything is stopped: a failure here leaves the old services up
+        ensure_local_dir; check_fabric_token_dir || exit 1; write_env; gen_coredns; preflight   # before anything is stopped: a failure here leaves the old services up
         "${COMPOSE[@]}" build fabric-gateway   # build first: a failed build leaves the old services running
         stop_old_host_services   # must free ports 8787/29999/18000+ first
         up
@@ -203,11 +229,11 @@ case "$cmd" in
         stop_old_host_services
         ;;
     memory-route)
-        memory_route "${2:-status}"
+        memory_route "${2:-status}" "${3:-}"
         exit 0
         ;;
     *)
-        echo "usage: $0 [up|up-replace|down|status|stop-old|memory-route enable|disable|status]" >&2
+        echo "usage: $0 [up|up-replace|down|status|stop-old|memory-route enable [PORT]|disable|status]" >&2
         exit 2
         ;;
 esac

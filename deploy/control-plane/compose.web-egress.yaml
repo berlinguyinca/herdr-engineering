@@ -21,4 +21,4 @@ networks:
       io.herdr.web-egress.generation: ${HERDR_CP_WEB_EGRESS_GENERATION:?private egress transaction required}
     ipam:
       config:
-        - subnet: ${HERDR_CP_WEB_EGRESS_CIDR:-172.31.252.0/29}
+        - subnet: ${HERDR_CP_WEB_EGRESS_CIDR:-172.31.252.32/29}

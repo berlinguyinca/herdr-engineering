@@ -48,7 +48,7 @@ def policy(facts, **kwargs):
     networks, routes, web = facts
     return egress.policy(
         enabled=True,
-        cidr="172.31.252.0/29",
+        cidr="172.31.252.32/29",
         networks=networks,
         routes=routes,
         web=web,
@@ -72,22 +72,22 @@ def attach(facts):
             "io.herdr.web-egress.policy": "v1",
         },
         "Options": {"com.docker.network.bridge.name": "br-herdr-cp-eg"},
-        "IPAM": {"Config": [{"Subnet": "172.31.252.0/29", "Gateway": "172.31.252.1"}]},
-        "Containers": {web["Id"]: {"Name": "herdr-cp-web", "IPv4Address": "172.31.252.2/29"}},
+        "IPAM": {"Config": [{"Subnet": "172.31.252.32/29", "Gateway": "172.31.252.33"}]},
+        "Containers": {web["Id"]: {"Name": "herdr-cp-web", "IPv4Address": "172.31.252.34/29"}},
     }
     networks.append(network)
     routes.extend(
         [
-            {"dst": "172.31.252.0/29", "dev": "br-herdr-cp-eg", "protocol": "kernel"},
-            {"dst": "172.31.252.1", "dev": "br-herdr-cp-eg", "protocol": "kernel", "type": "local"},
+            {"dst": "172.31.252.32/29", "dev": "br-herdr-cp-eg", "protocol": "kernel"},
+            {"dst": "172.31.252.33", "dev": "br-herdr-cp-eg", "protocol": "kernel", "type": "local"},
         ]
     )
     web["NetworkSettings"]["Networks"]["herdr-control-plane_web-egress"] = {
         "GwPriority": 100,
         "NetworkID": "c" * 64,
-        "IPAddress": "172.31.252.2",
+        "IPAddress": "172.31.252.34",
         "IPPrefixLen": 29,
-        "Gateway": "172.31.252.1",
+        "Gateway": "172.31.252.33",
     }
     return network
 
@@ -109,7 +109,7 @@ def test_exact_host_input_rule_and_owned_removal(facts):
         "proto",
         "tcp",
         "from",
-        "172.31.252.0/29",
+        "172.31.252.32/29",
         "to",
         "100.64.8.6/32",
         "port",
@@ -131,8 +131,8 @@ def test_exact_host_input_rule_and_owned_removal(facts):
     "route",
     [
         {"dst": "172.31.0.0/16", "dev": "tailscale0", "table": 52},
-        {"dst": "172.31.252.4/32", "dev": "vpn0", "table": 100},
-        {"dst": "172.31.252.0/29", "dev": "other-bridge"},
+        {"dst": "172.31.252.36/32", "dev": "vpn0", "table": 100},
+        {"dst": "172.31.252.32/29", "dev": "other-bridge"},
         {"dst": "128.0.0.0/1", "dev": "vpn0"},
         {"dst": "malformed"},
     ],
@@ -145,7 +145,7 @@ def test_host_vpn_route_conflicts_refuse(facts, route):
 
 def test_docker_subnet_conflict_refuses_even_without_host_route(facts):
     facts[0].append(
-        {"Name": "foreign", "Id": "d" * 64, "IPAM": {"Config": [{"Subnet": "172.31.252.0/28"}]}}
+        {"Name": "foreign", "Id": "d" * 64, "IPAM": {"Config": [{"Subnet": "172.31.252.32/28"}]}}
     )
     with pytest.raises(ValueError):
         policy(facts)
@@ -153,7 +153,7 @@ def test_docker_subnet_conflict_refuses_even_without_host_route(facts):
 
 @pytest.mark.parametrize(
     "cidr",
-    ["0.0.0.0/0", "100.64.0.0/29", "127.0.0.0/29", "172.31.252.1/29", "172.31.0.0/16", "::/0"],
+    ["0.0.0.0/0", "100.64.0.0/29", "127.0.0.0/29", "172.31.252.33/29", "172.31.0.0/16", "::/0"],
 )
 def test_noncanonical_or_broad_cidr_refused(facts, cidr):
     with pytest.raises(ValueError):
@@ -271,7 +271,7 @@ def test_disabled_policy_does_not_grant_other_host_ports_or_sibling_access(facts
     rule = result["ufw_allow"]
     assert rule[rule.index("port") + 1] == "443"
     assert rule[rule.index("to") + 1] == "100.64.8.6/32"
-    assert rule[rule.index("from") + 1] == "172.31.252.0/29"
+    assert rule[rule.index("from") + 1] == "172.31.252.32/29"
     assert rule[rule.index("on") + 1] == "br-herdr-cp-eg"
 
 
