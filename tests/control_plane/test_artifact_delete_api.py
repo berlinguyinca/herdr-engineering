@@ -382,3 +382,70 @@ def test_the_reviews_list_of_a_registry_artifact_is_as_private_as_its_versions(r
             assert request(env.base, f"{path}/versions", key=caller) == missing, caller   # the sibling route agrees
         assert request(env.base, f"{path}/reviews", key=None)[0] in (401, 404)
         assert request(env.base, f"{path}/reviews", key="wrong-key")[0] in (401, 404)
+
+
+def _shared_html(env, tmp_path):
+    aid, _ = env.seed(b"<html><body>secret " + uid("h").encode() + b"</body></html>", name="index.html",
+                      media="text/html")
+    version = env.adapter("get_record", aid, principal_id=CREATOR)["current_version_id"]
+    got, made = request(env.base, f"/api/v1/artifacts/{aid}/shares", key="creator-key",
+                        body={"version_id": version, "audience": "lab", "allow_emails": ["a@example.org"]})
+    assert got == 201, made
+    sid = made["share"]["share_id"]
+    got, approved = request(env.base, f"/api/v1/artifacts/{aid}/shares/{sid}/approve", key="creator-key",
+                            body={"confirm": True})
+    assert got == 200, approved
+    assert (tmp_path / sid).exists() and any((tmp_path / "by-token").iterdir())
+    return aid, version, sid
+
+
+def test_retracting_an_artifact_or_version_revokes_its_live_shares(registry_pg, tmp_path):
+    from herdr_engineering.control_plane.artifact_acl import ArtifactAcl
+    from herdr_engineering.control_plane.artifact_shares import ShareStore
+
+    async def make_shares():
+        return ShareStore(await asyncpg.connect(registry_pg["dsn"]))
+
+    shares = SyncArtifactAdapter(make_shares)
+    settings = {"public_url": "http://127.0.0.1", "max_share_bytes": 1 << 28, "max_files": 100,
+                "max_total_bytes": 1 << 30, "default_public_days": 30}
+    acl = ArtifactAcl()
+    try:
+        with api(registry_pg, extra={"share_store": shares, "shares_root": tmp_path, "share_settings": settings,
+                                     "artifact_acl": acl}) as env:
+            whole, _, whole_share = _shared_html(env, tmp_path)
+            one, version, version_share = _shared_html(env, tmp_path)
+            for aid in (whole, one):
+                acl.grant(aid, CREATOR, {"read", "edit", "review", "share", "admin"})
+            got, out = request(env.base, f"/api/v1/artifacts/{one}/retract", key="creator-key",
+                               body={"version_id": version, "reason": "wrong"})
+            assert got == 200, out
+            assert shares("get", version_share)["state"] == "revoked"
+            assert not (tmp_path / version_share).exists()
+            assert shares("get", whole_share)["state"] != "revoked"            # another artifact is untouched
+            got, out = request(env.base, f"/api/v1/artifacts/{whole}/retract", key="creator-key", body={"reason": "leak"})
+            assert got == 200, out
+            assert shares("get", whole_share)["state"] == "revoked"
+            assert not (tmp_path / whole_share).exists() and not any((tmp_path / "by-token").iterdir())
+    finally:
+        shares.close()
+
+
+def test_retract_is_a_failure_when_its_share_links_could_not_be_revoked(registry_pg, tmp_path):
+    from herdr_engineering.control_plane.artifact_acl import ArtifactAcl
+    from herdr_engineering.control_plane.artifact_shares import ShareStore
+
+    async def make_shares():
+        return ShareStore(await asyncpg.connect(registry_pg["dsn"]))
+
+    shares = SyncArtifactAdapter(make_shares)
+    settings = {"public_url": "http://127.0.0.1", "max_share_bytes": 1 << 28, "max_files": 100,
+                "max_total_bytes": 1 << 30, "default_public_days": 30}
+    acl = ArtifactAcl()
+    with api(registry_pg, extra={"share_store": shares, "shares_root": tmp_path, "share_settings": settings,
+                                 "artifact_acl": acl}) as env:
+        aid, _, _ = _shared_html(env, tmp_path)
+        acl.grant(aid, CREATOR, {"read", "edit", "review", "share", "admin"})
+        shares.close()                              # the share store is now unreachable: revocation cannot complete
+        got, out = request(env.base, f"/api/v1/artifacts/{aid}/retract", key="creator-key", body={"reason": "leak"})
+        assert got == 500 and out["shares_revoked"] is None and "share links" in out["share_revocation_error"], out

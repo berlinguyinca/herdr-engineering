@@ -244,6 +244,10 @@ def _plan(server, artifact_id: str, version_id: str, entry: str | None,
     version = _call(registry, "get_version", version_id, artifact_id)
     if version is None:
         raise ShareHTTPError(404, "not found")
+    gate = getattr(server, "artifact_graph_gate", None)
+    if gate is not None and gate.version_retracted(artifact_id, version_id):
+        # the in-memory retraction also holds when persisting it failed and the registry still says "ready"
+        raise ShareHTTPError(409, "version is retracted; a retracted version cannot be shared")
     if version.get("state") != "ready":
         raise ShareHTTPError(400, f"version is {version.get('state')}, not ready; only a ready version can be shared")
     warnings: list[str] = []

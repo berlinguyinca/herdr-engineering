@@ -266,7 +266,7 @@ class Shares:
 
 
 @contextmanager
-def share_server(tmp_path, *, enabled=True, collab=None, **settings):
+def share_server(tmp_path, *, enabled=True, collab=None, servers=None, **settings):
     blobs = Bytes()
     registry, shares = Registry(blobs), Shares()
     config = {"public_url": "https://share.example/", "max_share_bytes": 512 * MIB, "max_files": 20000,
@@ -279,6 +279,8 @@ def share_server(tmp_path, *, enabled=True, collab=None, **settings):
     thread = threading.Thread(target=server.serve, daemon=True)
     thread.start()
     server.wait_until_ready()
+    if servers is not None:
+        servers.append(server)                      # for tests that reach the gate the server really holds
     if collab is not None:
         server.collab = collab                      # a room-membership stand-in (set after start: serve() drives a real one)
     try:
@@ -904,3 +906,29 @@ def test_share_settings_public_host_derives_the_link_base():
         with pytest.raises(ValueError, match="public_host"):
             share_settings_config({}, public_url=None, public_host=bad)
     assert share_settings_config({}, public_url="https://x.example/")["public_url"] == "https://x.example/"
+
+
+def test_a_retracted_version_is_neither_shared_nor_approved_even_when_the_registry_still_says_ready(tmp_path):
+    servers = []
+    with share_server(tmp_path, servers=servers) as (base, registry, shares, blobs, root):
+        status, body = create(base)
+        assert status == 201
+        share_id = body["share"]["share_id"]
+        # the in-memory retraction is what hides a version when persisting it failed: the registry still says "ready"
+        servers[0].artifact_graph_gate.retract(AID, "v_html")
+        assert registry.versions["v_html"]["state"] == "ready"
+        status, body = create(base)
+        assert status == 409 and "retracted" in body["error"]
+        status, body = approve(base, share_id)
+        assert status == 409 and "retracted" in body["error"]
+        assert shares.rows[share_id]["state"] == "pending" and tree(root) == []
+        assert create(base, version="v_pdf")[0] == 201          # only the retracted version is refused
+
+
+def test_a_version_the_registry_marks_retracted_is_a_409_not_a_400(tmp_path):
+    servers = []
+    with share_server(tmp_path, servers=servers) as (base, registry, shares, blobs, root):
+        servers[0].artifact_graph_gate.retract(AID, "v_html")
+        registry.versions["v_html"]["state"] = "retracted"
+        status, body = create(base)
+        assert status == 409 and "retracted" in body["error"]

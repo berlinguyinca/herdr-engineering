@@ -63,6 +63,7 @@ def pinned_output(output, *, require_size=True):
 
 def _body(handler, allowed):
     if handler.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
+        handler.close_connection = True         # the body is never read; it must not be parsed as the next request
         raise ValueError("report mutations require application/json")
     value = handler._read_json()
     if not isinstance(value, dict) or set(value) - set(allowed):
@@ -142,6 +143,7 @@ def route_report(handler, server, parts, resource):
     if not any((creating, building, build_status, uploading, versioned)):
         return False
     if server.artifact_store is None:
+        handler.close_connection = True         # a POST body may be unread: never parse it as the next request
         handler._json({"error": "versioned report registry is unavailable"}, 503)
         return True
     method = handler.command
@@ -152,6 +154,7 @@ def route_report(handler, server, parts, resource):
         return True
     if creating:
         if method != "POST":
+            handler.close_connection = True  # a POST body may be unread: never parse it as the next request
             handler._json({"error": "not found"}, 404)
             return True
         body = _body(handler, {"title"})
@@ -174,6 +177,7 @@ def route_report(handler, server, parts, resource):
         return True
     if build_status:
         if method != "GET":
+            handler.close_connection = True  # a POST body may be unread: never parse it as the next request
             handler._json({"error": "not found"}, 404)
             return True
         job = handler._artifact_call("get_report_job", artifact_id, parts[6])
@@ -184,6 +188,8 @@ def route_report(handler, server, parts, resource):
         return True
     query = parse_qs(urlsplit(handler.path).query)
     if uploading:
+        client_closes = handler.close_connection
+        handler.close_connection = True         # every answer below that precedes the body read leaves it unread
         if method != "POST" or server.rustfs is None or not hasattr(server.rustfs, "put_stream"):
             handler._json({"error": "streaming report upload is unavailable"}, 503)
             return True
@@ -207,12 +213,14 @@ def route_report(handler, server, parts, resource):
             raise ValueError("invalid report asset media type")
         uploaded = server.rustfs.put_stream(LimitedInput(handler.rfile, length), expected_size=length,
                                             media_type=mime, chunk_size=CHUNK_BYTES)
+        handler.close_connection = client_closes    # the body was consumed in full: keep-alive is safe again
         registered = handler._artifact_call("register_report_blob", artifact_id,
             storage_key=uploaded["key"], sha256=uploaded["sha256"], size_bytes=uploaded["size"], media_type=mime)
         handler._json({"name": name, **registered}, 201)
         return True
     if building:
         if method != "POST" or server.artifact_job_manager is None:
+            handler.close_connection = True  # a POST body may be unread: never parse it as the next request
             handler._json({"error": "report build worker is unavailable"}, 503)
             return True
         body = _body(handler, {"base_version_id", "request"})
@@ -252,6 +260,7 @@ def route_report(handler, server, parts, resource):
         _download(handler, server, asset)
         return True
     if len(parts) != 8:
+        handler.close_connection = True  # a POST body may be unread: never parse it as the next request
         handler._json({"error": "not found"}, 404)
         return True
     if method == "GET":
@@ -294,5 +303,7 @@ def route_report(handler, server, parts, resource):
         handler._json(handler._artifact_call(function, artifact_id, version_id,
                                              **body, actor=handler._resource_principal()), 201)
         return True
+    if method == "POST":
+        handler.close_connection = True         # an unmatched POST leaves its body unread
     handler._json({"error": "not found"}, 404)
     return True

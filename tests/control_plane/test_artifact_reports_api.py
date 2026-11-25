@@ -402,3 +402,51 @@ def test_output_download_rejects_digest_substitution_before_blob_read(reports_se
     assert status == 409
     assert blobs.downloads == 0
     assert b"evidence" not in body
+
+
+def _raw_exchange(base, request_bytes, *, send_body=b""):
+    import socket
+    host, port = base.removeprefix("http://").split(":")
+    with socket.create_connection((host, int(port)), timeout=5) as sock:
+        sock.sendall(request_bytes + send_body)
+        sock.shutdown(socket.SHUT_WR)
+        chunks = []
+        while chunk := sock.recv(65536):
+            chunks.append(chunk)
+    return b"".join(chunks).decode("latin-1")
+
+
+@pytest.mark.parametrize("query,mime", [("filename=../x", "application/octet-stream"),
+                                        ("filename=ok.bin", "text/plain; charset=utf-8")])
+def test_a_refused_blob_upload_closes_the_connection(reports_server, query, mime):
+    base, _, blobs = reports_server
+    body = b"B" * 64
+    head = (f"POST /api/v1/artifacts/artifact_report/blobs?{query} HTTP/1.1\r\nHost: x\r\nX-API-Key: owner-key\r\n"
+            f"Content-Type: {mime}\r\nContent-Length: {len(body)}\r\n\r\n").encode()
+    reply = _raw_exchange(base, head, send_body=body)
+    assert reply.startswith("HTTP/1.0 400") or reply.startswith("HTTP/1.1 400")
+    assert "connection: close" in reply.lower()
+    assert blobs.uploads == 0
+
+
+@pytest.mark.parametrize("path,status", [
+    ("/api/v1/artifact-reports/artifact_report/jobs/job1", "404"),       # build status is GET only
+    ("/api/v1/artifacts/artifact_report/versions/v1/diff/extra", "404"),  # a path no report route serves
+])
+def test_early_report_answers_to_a_post_close_the_connection(reports_server, path, status):
+    base, _, _ = reports_server
+    body = b'{"x": 1}'
+    head = (f"POST {path} HTTP/1.1\r\nHost: x\r\nX-API-Key: owner-key\r\nContent-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n\r\n").encode()
+    reply = _raw_exchange(base, head, send_body=body)
+    assert f" {status} " in reply.split("\r\n", 1)[0]
+    assert "connection: close" in reply.lower()
+
+
+def test_a_post_with_a_non_json_content_type_closes_the_connection(reports_server):
+    base, _, _ = reports_server
+    body = b"x=1"
+    head = (f"POST /api/v1/artifacts/artifact_report/versions/v1/feedback HTTP/1.1\r\nHost: x\r\nX-API-Key: owner-key\r\n"
+            f"Content-Type: text/plain\r\nContent-Length: {len(body)}\r\n\r\n").encode()
+    reply = _raw_exchange(base, head, send_body=body)
+    assert " 400 " in reply.split("\r\n", 1)[0] and "connection: close" in reply.lower()

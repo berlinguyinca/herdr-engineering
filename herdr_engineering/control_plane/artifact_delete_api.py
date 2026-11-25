@@ -118,9 +118,10 @@ def _actor(handler, server) -> str:
     return handler._resource_principal() if server._keys else _KEYLESS_ACTOR
 
 
-def revoke_shares(handler, server, artifact_id: str, actor: str) -> int | None:
-    """Revoke every pending or live share of the artifact and remove its bundle. Returns how many were revoked, or
-    ``None`` when sharing could not be fully revoked (the delete stands; repeat it to retry)."""
+def revoke_shares(handler, server, artifact_id: str, actor: str, version_id: str | None = None) -> int | None:
+    """Revoke every pending or live share of the artifact (only those pinned to ``version_id`` when given) and remove
+    its bundle. Returns how many were revoked, or ``None`` when sharing could not be fully revoked (the delete stands;
+    repeat it to retry)."""
     store, root = getattr(server, "share_store", None), getattr(server, "shares_root", None)
     if store is None or root is None:
         return 0
@@ -129,7 +130,7 @@ def revoke_shares(handler, server, artifact_id: str, actor: str) -> int | None:
     revoked = 0
     try:
         for share in _call(store, "list_for_artifact", artifact_id):
-            if share.get("state") == "revoked":
+            if share.get("state") == "revoked" or (version_id is not None and share.get("version_id") != version_id):
                 continue
             full = _call(store, "get", share["share_id"]) or share
             if full.get("token_hash"):

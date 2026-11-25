@@ -35,6 +35,7 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from ..version import __version__
 from .artifact_acl import is_agent_collaborator
+from .artifact_uploads import MAX_UPLOAD_BYTES
 from .artifacts import ArtifactConflict, ArtifactError
 from .browser_guard import browser_write_refusal, host_ok
 from .rakazo_bridge import RakazoBridge
@@ -153,6 +154,10 @@ _PDFJS_VENDOR_DIR = Path(__file__).resolve().parent / "share_static" / "vendor" 
 _VENDORED_PDFJS = frozenset({"vendor/pdfjs/pdf.min.mjs", "vendor/pdfjs/pdf.worker.min.mjs"})
 _INDEX = "index.html"
 _MAX_JSON_BODY = 4 * 1024 * 1024
+# POST /api/v1/artifacts buffers the whole body in memory. ``herdr-eng artifact upload`` posts the whole file here, and main
+# had no cap, so the cap is the registry's own ceiling (the resumable path's MAX_UPLOAD_BYTES): nothing the registry could
+# store is refused here.
+_MAX_LEGACY_UPLOAD_BYTES = MAX_UPLOAD_BYTES
 _MAX_ATTACHMENT_JSON = 36 * 1024 * 1024        # a 25 MiB attachment is ~33.4 MiB of base64 plus its mail envelope
 
 
@@ -244,9 +249,12 @@ def _is_wildcard_bind(host):
 
 def _content_length(raw):
     """Non-negative int, or None when the header is malformed (never raises)."""
+    raw = raw.strip(" \t") if raw is not None else raw       # RFC 9110 allows optional whitespace around the value
     if raw is None or raw == "":
         return 0
-    return int(raw) if raw.isascii() and raw.isdigit() and len(raw) <= 9 else None
+    if not (raw.isascii() and raw.isdigit()):
+        return None
+    return int(raw) if len(raw) <= 18 else 10 ** 18       # absurdly long: a size no cap admits, not a malformed header
 
 
 class _RateLimiter:
@@ -6440,7 +6448,11 @@ def _make_handler(server, public=False, operator=False, fabric=False):
             return None
 
         def _upload_artifact(self, r, parts):
-            length = int(self.headers.get("Content-Length") or 0)
+            length = _content_length(self.headers.get("Content-Length"))
+            if length is None:
+                return self._deny(400, "invalid Content-Length")
+            if length > _MAX_LEGACY_UPLOAD_BYTES:       # the whole body is buffered below: refuse before reading it
+                return self._deny(413, "upload exceeds the size limit")
             if length <= 0:
                 return self._json({"error": "empty body"}, 400)
             data = self.rfile.read(length)
@@ -6673,7 +6685,9 @@ def _make_handler(server, public=False, operator=False, fabric=False):
 
         def _read_json(self, limit=_MAX_JSON_BODY):
             try:
-                length = int(self.headers.get("Content-Length") or 0)
+                length = _content_length(self.headers.get("Content-Length"))
+                if length is None:
+                    raise ValueError("invalid Content-Length")
                 if not length:
                     return None
                 if length > limit:
@@ -6748,6 +6762,15 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                              artifact_id=artifact_id, version_id=version_id, reason=body.get("reason"),
                              persist=persist, on_unpersisted=on_unpersisted)
             result["restrict_all_applied"] = False
+            from .artifact_delete_api import _actor, revoke_shares
+            # a retracted artifact (or version) must stop being served through its share links too
+            result["shares_revoked"] = revoke_shares(self, server, artifact_id, _actor(self, server), version_id)
+            shares_failed = result["shares_revoked"] is None
+            if shares_failed:
+                # the retraction stands (hidden from graph readers; repeat the call to retry) but a public share link may
+                # still serve the content, so the caller must not be told it worked
+                result["share_revocation_error"] = ("the artifact is retracted but its share links could not all be "
+                                                    "revoked; repeat the retract to retry")
             if result["error"]:
                 result["restrict_all_offered"] = True
                 if "write" in pending:
@@ -6761,7 +6784,7 @@ def _make_handler(server, public=False, operator=False, fabric=False):
                         result["restrict_all_applied"] = True
                     except Exception as exc:                  # noqa: BLE001 - type name only; the 500 stands
                         result["collab_restrict_error"] = type(exc).__name__
-            return self._json(result, 500 if result["error"] else 200)
+            return self._json(result, 500 if result["error"] or shares_failed else 200)
 
         def _artifact_backfill(self, artifact_id):
             """POST /api/v1/artifacts/<id>/lineage/backfill: re-emit stored versions so nodes created before artifact

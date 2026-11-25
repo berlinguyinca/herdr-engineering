@@ -196,3 +196,73 @@ def test_health_reports_memory_backend_without_rustfs(server):
     base, _ = server
     with urllib.request.urlopen(f"{base}/api/v1/health") as r:
         assert json.loads(r.read())["rustfs"] == "memory"
+
+
+def _raw(base, head: bytes, body: bytes = b"", *, host_header: bytes | None = None) -> str:
+    import socket
+    host, port = base.removeprefix("http://").split(":")
+    # the Host allowlist runs before any body check, so send the name the server is reached by (not a placeholder)
+    head = head.replace(b"Host: x\r\n", b"Host: " + (host_header or f"{host}:{port}".encode()) + b"\r\n", 1)
+    with socket.create_connection((host, int(port)), timeout=5) as sock:
+        sock.sendall(head + body)
+        sock.shutdown(socket.SHUT_WR)
+        chunks = []
+        while chunk := sock.recv(65536):
+            chunks.append(chunk)
+    return b"".join(chunks).decode("latin-1")
+
+
+def test_upload_over_the_cap_is_refused_before_the_body_is_read(server):
+    base, _ = server
+    head = (f"POST /api/v1/artifacts?filename=big.bin HTTP/1.1\r\nHost: x\r\n"
+            f"Content-Length: {2 * 1024**3}\r\n\r\n").encode()
+    reply = _raw(base, head)                       # no body follows: the server must answer without waiting for one
+    assert " 413 " in reply.split("\r\n", 1)[0] and "connection: close" in reply.lower()
+
+
+def test_upload_with_a_ten_digit_content_length_is_too_large_not_malformed(server):
+    base, _ = server
+    head = (f"POST /api/v1/artifacts?filename=big.bin HTTP/1.1\r\nHost: x\r\n"
+            f"Content-Length: {99_999_999_999}\r\n\r\n").encode()
+    reply = _raw(base, head)
+    assert " 413 " in reply.split("\r\n", 1)[0] and "connection: close" in reply.lower()
+
+
+def test_upload_with_a_malformed_content_length_is_refused(server):
+    base, _ = server
+    reply = _raw(base, b"POST /api/v1/artifacts?filename=a.bin HTTP/1.1\r\nHost: x\r\nContent-Length: -5\r\n\r\n", b"abc")
+    assert " 400 " in reply.split("\r\n", 1)[0] and "connection: close" in reply.lower()
+
+
+def test_json_routes_refuse_a_negative_content_length(server):
+    base, repo = server
+    reply = _raw(base, b"POST /api/v1/sessions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                       b"Content-Length: -1\r\n\r\n", b'{"title": "x"}')
+    assert " 400 " in reply.split("\r\n", 1)[0] and "connection: close" in reply.lower()
+
+
+def test_upload_cap_admits_what_the_registry_can_store_and_no_more(server):
+    from herdr_engineering.control_plane.artifact_uploads import MAX_UPLOAD_BYTES
+    base, _ = server
+    over = (f"POST /api/v1/artifacts?filename=big.bin HTTP/1.1\r\nHost: x\r\n"
+            f"Content-Length: {MAX_UPLOAD_BYTES + 1}\r\n\r\n").encode()
+    assert " 413 " in _raw(base, over).split("\r\n", 1)[0]
+    # 400 MiB worked on main: it must get past the size gate (the empty remainder then ends the read, not a 413)
+    ok = (f"POST /api/v1/artifacts?filename=big.bin HTTP/1.1\r\nHost: x\r\n"
+          f"Content-Length: {400 * 1024 * 1024}\r\n\r\n").encode()
+    assert " 413 " not in _raw(base, ok).split("\r\n", 1)[0]
+
+
+def test_content_length_with_legal_surrounding_whitespace_is_parsed():
+    from herdr_engineering.control_plane.api import _content_length
+    assert _content_length("12 ") == 12 and _content_length(" \t7") == 7
+    assert _content_length("1 2") is None and _content_length("-5") is None
+
+
+def test_a_host_the_guard_refuses_gets_403_and_the_connection_closes_over_an_unread_body(server):
+    base, _ = server
+    body = b"GET /api/v1/health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"          # a smuggled second request in the body
+    head = (f"POST /api/v1/artifacts?filename=a.bin HTTP/1.1\r\nHost: x\r\nContent-Length: {len(body)}\r\n\r\n").encode()
+    reply = _raw(base, head, body, host_header=b"evil.example")
+    assert " 403 " in reply.split("\r\n", 1)[0] and "connection: close" in reply.lower()
+    assert reply.count("HTTP/1.") == 1                     # the body was not parsed as a second request

@@ -37,6 +37,7 @@ class Blobs:
     def __init__(self):
         self.objects = {}
         self.objects_by_sha = {}
+        self.reads = []
 
     def add(self, data):
         key, digest = key_of(data)
@@ -45,6 +46,7 @@ class Blobs:
         return {"storage_key": key, "sha256": digest, "size_bytes": len(data)}
 
     def get(self, key, digest):
+        self.reads.append(key)
         return self.objects[key]
 
     def iter_get(self, key, digest, chunk_size=1024 * 1024):
@@ -511,3 +513,41 @@ def test_drop_style_elements_still_cuts_balanced_elements_and_defangs_leftovers(
     from herdr_engineering.control_plane.artifact_render_api import drop_style_elements
     assert drop_style_elements("a<style>b{}</style>c<STYLE x>d</style >e") == "ace"
     assert drop_style_elements("a<style>b") == "a&lt;style>b"
+
+
+def test_a_pinned_size_over_the_cap_is_too_large_without_reading_the_blob(world):
+    base, store = world
+    entry = store.blobs.add(b"<p>small</p>")
+    entry["size_bytes"] = share_render.MAX_RENDER_INPUT + 1      # the registry's pinned size is what the cap judges
+    store.outputs[("h1", "vbig")] = [{"name": "index.html", "media_type": "text/html", **entry}]
+    store.blobs.reads.clear()
+    status, body, _ = envelope(base, "/api/v1/artifacts/h1/versions/vbig/outputs/0/render")
+    assert (status, body) == (200, {"kind": "html", "html": None, "too_large": True})
+    assert store.blobs.reads == []
+
+
+def test_an_inflated_record_size_does_not_make_a_small_file_too_large(world):
+    base, store = world
+    store.records["h1"]["size_bytes"] = share_render.MAX_RENDER_INPUT + 1      # a report version rewrites it to a sum
+    status, body, _ = envelope(base, "/api/v1/artifacts/h1/render")
+    assert status == 200 and body["too_large"] is False and body["html"]
+
+
+def test_a_stored_file_over_the_cap_is_too_large_by_a_bounded_read(world):
+    base, store = world
+    big = b"<p>" + b"x" * (share_render.MAX_RENDER_INPUT + 10) + b"</p>"
+    store.records["h1"].update(store.blobs.add(big))
+    store.blobs.reads.clear()
+    status, body, _ = envelope(base, "/api/v1/artifacts/h1/render")
+    assert (status, body) == (200, {"kind": "html", "html": None, "too_large": True})
+    assert store.blobs.reads == []                  # never buffered whole through get()
+
+
+def test_a_report_artifact_without_a_current_file_stays_404_whatever_its_summed_size(world):
+    base, store = world
+    # a report artifact's size_bytes is the sum of its output sizes; it has no stored file of its own to be too large
+    store.records["rep"] = {"artifact_id": "rep", "original_filename": "Report", "mime_type": "text/html",
+                            "artifact_type": "report", "status": "available",
+                            "size_bytes": share_render.MAX_RENDER_INPUT * 3}
+    store.acl.grant("rep", f"api-key:{OWNER}:operator", {"read"})
+    assert get(base, "/api/v1/artifacts/rep/render")[0] == 404
