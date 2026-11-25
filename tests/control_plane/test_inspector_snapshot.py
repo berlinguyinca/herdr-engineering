@@ -169,28 +169,74 @@ def db_row(ev):
             "event_type": ev["event_type"], "payload": json.dumps(ev["payload"])}
 
 
-class FakeConn:
-    """Just enough of asyncpg for SnapshotWriter, backed by a list of fabric_events rows."""
+INSERT_ROW = ("INSERT INTO fabric_events (event_id, sequence, event_type, entity_type, entity_id, session_id, payload,"
+              " source_timestamp, ingest_timestamp) VALUES ($1,$2,$3,'inspector',$4,$4,$5::jsonb,$6,$7)")
+_LOOP: asyncio.AbstractEventLoop | None = None      # the running test's loop: an asyncpg connection belongs to the loop that opened it
 
-    def __init__(self, rows):
-        self.rows, self.saved = list(rows), None
 
-    async def fetch(self, sql, last, settle, limit):
-        return sorted((r for r in self.rows if r["sequence"] > last), key=lambda r: r["sequence"])[:limit]
+class RealLog:
+    """A real throwaway Postgres holding ``fabric_events`` and ``inspector_snapshots``, as the writer sees them."""
 
-    async def fetchval(self, sql, *args):
-        if "inspector_snapshots" in sql:
-            return 1 if self.saved else None
-        if "to_regclass" in sql:
-            return False  # no archive table in this fake
-        return sum(1 for r in self.rows if r["sequence"] <= args[0])
+    def __init__(self, conn):
+        self.conn = conn
+        self.sequences: set = set()
 
-    async def fetchrow(self, sql):
-        return dict(self.saved) if self.saved else None
+    def __getattr__(self, name):                # fetch, fetchval, fetchrow, execute: straight to asyncpg
+        return getattr(self.conn, name)
 
-    async def execute(self, sql, version, fingerprint, watermark, count, body):
-        self.saved = {"schema_version": version, "fingerprint": fingerprint, "watermark": watermark,
-                      "event_count": count, "body": body}
+    def add(self, rows) -> None:
+        """Store the rows the log does not hold yet (the journal only ever grows)."""
+        async def go():
+            for r in rows:
+                if r["event_id"] not in self.sequences:
+                    self.sequences.add(r["event_id"])
+                    await self.conn.execute(INSERT_ROW, r["event_id"], r["sequence"], r["event_type"], r["entity_id"], r["payload"],
+                                            r["source_timestamp"], r["ingest_timestamp"])
+        _LOOP.run_until_complete(go())
+
+    @property
+    def saved(self):
+        row = _LOOP.run_until_complete(self.conn.fetchrow("SELECT * FROM inspector_snapshots WHERE id = 1"))
+        return dict(row) if row else None
+
+    @saved.setter
+    def saved(self, row: dict) -> None:
+        _LOOP.run_until_complete(self.conn.execute(
+            "UPDATE inspector_snapshots SET watermark = $1, event_count = $2, body = $3 WHERE id = 1",
+            row["watermark"], row["event_count"], row["body"]))
+
+
+@pytest.fixture(scope="module")
+def pg_dsn(tmp_path_factory):
+    pytest.importorskip("asyncpg")
+    from tests.control_plane._private_pg import private_postgres
+    from tests.control_plane.test_inspector_snapshot_postgres import FABRIC, MIGRATION
+    fabric = tmp_path_factory.mktemp("pg") / "fabric.sql"
+    fabric.write_text(FABRIC)
+    with private_postgres(fabric, MIGRATION) as dsn:
+        if dsn is None:
+            pytest.skip("no postgres binaries")
+        yield dsn
+
+
+@pytest.fixture
+def pg(pg_dsn):
+    import asyncpg
+    global _LOOP
+    _LOOP = loop = asyncio.new_event_loop()
+    conn = loop.run_until_complete(asyncpg.connect(pg_dsn))
+    loop.run_until_complete(conn.execute("TRUNCATE fabric_events, inspector_snapshots"))
+    try:
+        yield RealLog(conn)
+    finally:
+        loop.run_until_complete(conn.close())
+        loop.close()
+        _LOOP = None
+
+
+def writer_of(**kw):
+    """A writer for which every stored row has settled (the rows' timestamps lie in the future)."""
+    return snap.SnapshotWriter(store, interval=0, settle=-10**9, **kw)
 
 
 def boot_events(rows):
@@ -211,15 +257,16 @@ def booted(conn, rows):
 
 
 def run(coro):
-    return asyncio.run(coro)
+    return _LOOP.run_until_complete(coro)
 
 
-def test_writer_snapshot_then_boot_equals_full_replay_and_advances():
+def test_writer_snapshot_then_boot_equals_full_replay_and_advances(pg):
     rows = [db_row(e) for e in stream(500, seed=11)]
-    conn = FakeConn(rows[:400])
-    writer = snap.SnapshotWriter(store, interval=0)
+    conn = pg
+    conn.add(rows[:400])
+    writer = writer_of()
     assert run(writer.tick(conn)).startswith("written")
-    conn.rows = rows                      # 100 more events arrive after the snapshot
+    conn.add(rows)                       # 100 more events arrive after the snapshot
     outcome, state = booted(conn, rows)
     assert outcome == "snapshot" and state == full_state(rows)
     assert run(writer.tick(conn)).startswith("written")
@@ -228,19 +275,21 @@ def test_writer_snapshot_then_boot_equals_full_replay_and_advances():
     assert run(writer.tick(conn)) == "unchanged"
 
 
-def test_a_new_writer_resumes_from_the_stored_snapshot():
+def test_a_new_writer_resumes_from_the_stored_snapshot(pg):
     rows = [db_row(e) for e in stream(300, seed=2)]
-    conn = FakeConn(rows[:200])
-    run(snap.SnapshotWriter(store, interval=0).tick(conn))
-    conn.rows = rows
-    run(snap.SnapshotWriter(store, interval=0).tick(conn))
+    conn = pg
+    conn.add(rows[:200])
+    run(writer_of().tick(conn))
+    conn.add(rows)
+    run(writer_of().tick(conn))
     assert booted(conn, rows) == ("snapshot", full_state(rows))
 
 
-def test_boot_replays_everything_when_the_log_below_the_watermark_changed():
+def test_boot_replays_everything_when_the_log_below_the_watermark_changed(pg):
     rows = [db_row(e) for e in stream(300, seed=4)]
-    conn = FakeConn(rows)
-    run(snap.SnapshotWriter(store, interval=0).tick(conn))
+    conn = pg
+    conn.add(rows)
+    run(writer_of().tick(conn))
     late = {**rows[10], "sequence": rows[10]["sequence"] + 0, "event_id": "late"}
     late["sequence"] = rows[-1]["sequence"] - 1                      # lands UNDER the watermark after the snapshot
     late["payload"] = json.dumps({"kind": "message", "role": "user", "text": "late", "_received_at": T0 + 5, "_sequence": 99})
@@ -249,10 +298,11 @@ def test_boot_replays_everything_when_the_log_below_the_watermark_changed():
     assert outcome.startswith("full:") and state == full_state(all_rows)
 
 
-def test_boot_replays_everything_when_the_snapshot_is_unusable(monkeypatch):
+def test_boot_replays_everything_when_the_snapshot_is_unusable(monkeypatch, pg):
     rows = [db_row(e) for e in stream(200, seed=6)]
-    conn = FakeConn(rows)
-    run(snap.SnapshotWriter(store, interval=0).tick(conn))
+    conn = pg
+    conn.add(rows)
+    run(writer_of().tick(conn))
     good = dict(conn.saved)
     for broken in ({**good, "body": b"not gzip"}, {**good, "watermark": good["watermark"] - 1},
                    {**good, "body": snap.encode({"version": 1})}):
@@ -265,41 +315,48 @@ def test_boot_replays_everything_when_the_snapshot_is_unusable(monkeypatch):
     assert outcome.startswith("full:") and state == full_state(rows)     # a changed redaction rule re-sanitises everything
 
 
-def test_no_snapshot_is_a_plain_full_replay():
+def test_no_snapshot_is_a_plain_full_replay(pg):
     rows = [db_row(e) for e in stream(120, seed=8)]
-    assert booted(FakeConn(rows), rows) == ("full:no snapshot", full_state(rows))
+    pg.add(rows)
+    assert booted(pg, rows) == ("full:no snapshot", full_state(rows))
 
 
-def test_writer_rebuilds_when_it_finds_it_missed_an_event():
+def test_writer_rebuilds_when_it_finds_it_missed_an_event(pg):
     rows = [db_row(e) for e in stream(250, seed=9)]
-    conn = FakeConn(rows[:200])
-    writer = snap.SnapshotWriter(store, interval=0)
+    conn = pg
+    conn.add(rows[:200])
+    writer = writer_of()
     run(writer.tick(conn))
-    missed = {**rows[220], "sequence": conn.rows[-1]["sequence"] - 1, "event_id": "missed"}   # committed under the watermark
-    conn.rows = rows[:200] + [missed]
+    missed = {**rows[220], "sequence": rows[199]["sequence"] - 1, "event_id": "missed"}   # committed under the watermark
+    conn.add([missed])
     assert run(writer.tick(conn)).startswith("written")
-    assert booted(conn, conn.rows) == ("snapshot", full_state(conn.rows))
+    logged = rows[:200] + [missed]
+    assert booted(conn, logged) == ("snapshot", full_state(logged))
 
 
-def test_writer_never_raises_into_the_worker():
-    class Broken(FakeConn):
-        async def fetchrow(self, sql):
-            raise RuntimeError("table does not exist")
-    assert run(snap.SnapshotWriter(store, interval=0).tick(Broken([]))).startswith("failed")
+def test_writer_never_raises_into_the_worker(pg):
+    run(pg.execute("ALTER TABLE inspector_snapshots RENAME TO inspector_snapshots_away"))     # the table does not exist
+    try:
+        assert run(writer_of().tick(pg)).startswith("failed")
+    finally:
+        run(pg.execute("ALTER TABLE inspector_snapshots_away RENAME TO inspector_snapshots"))
 
 
-def test_writer_waits_between_runs():
-    conn = FakeConn([db_row(e) for e in stream(40, seed=1)])
-    writer = snap.SnapshotWriter(store, interval=600, clock=lambda: 100.0)
+def test_writer_waits_between_runs(pg):
+    conn = pg
+    conn.add([db_row(e) for e in stream(40, seed=1)])
+    writer = writer_of(clock=lambda: 100.0)
+    writer.interval = 600
     assert run(writer.tick(conn)).startswith("written")
     assert run(writer.tick(conn)) == "waiting"
 
 
-def test_repo_boot_uses_the_snapshot_and_matches_a_full_boot():
+def test_repo_boot_uses_the_snapshot_and_matches_a_full_boot(pg):
     from herdr_engineering.control_plane.repo import ControlPlaneRepo
     rows = [db_row(e) for e in stream(300, seed=12)]
-    conn = FakeConn(rows[:250])
-    run(snap.SnapshotWriter(store, interval=0).tick(conn))
+    conn = pg
+    conn.add(rows[:250])
+    run(writer_of().tick(conn))
 
     def boot(snapshot):
         repo = ControlPlaneRepo(inspector_limits={"max_events_per_session": 25, "max_bytes_per_session": 6000})
@@ -336,26 +393,29 @@ def skipped_boot(rows, saved, *, backfill=True):
     return outcome, canon(s.export_state())
 
 
-def test_boot_without_the_covered_rows_equals_a_full_replay():
+def test_boot_without_the_covered_rows_equals_a_full_replay(pg):
     rows = [db_row(e) for e in stream(400, seed=31)]
-    conn = FakeConn(rows[:300])
-    run(snap.SnapshotWriter(store, interval=0).tick(conn))
+    conn = pg
+    conn.add(rows[:300])
+    run(writer_of().tick(conn))
     assert skipped_boot(rows, conn.saved) == ("snapshot", full_state(rows))
 
 
-def test_a_refused_snapshot_loads_the_skipped_rows_and_still_equals_a_full_replay(monkeypatch):
+def test_a_refused_snapshot_loads_the_skipped_rows_and_still_equals_a_full_replay(monkeypatch, pg):
     rows = [db_row(e) for e in stream(300, seed=32)]
-    conn = FakeConn(rows[:250])
-    run(snap.SnapshotWriter(store, interval=0).tick(conn))
+    conn = pg
+    conn.add(rows[:250])
+    run(writer_of().tick(conn))
     monkeypatch.setattr(insp, "rules_fingerprint", lambda: "other rules")
     outcome, state = skipped_boot(rows, conn.saved)
     assert outcome.startswith("full:") and state == full_state(rows)
 
 
-def test_a_refused_snapshot_without_a_way_to_load_the_skipped_rows_refuses_to_start(monkeypatch):
+def test_a_refused_snapshot_without_a_way_to_load_the_skipped_rows_refuses_to_start(monkeypatch, pg):
     rows = [db_row(e) for e in stream(200, seed=33)]
-    conn = FakeConn(rows[:150])
-    run(snap.SnapshotWriter(store, interval=0).tick(conn))
+    conn = pg
+    conn.add(rows[:150])
+    run(writer_of().tick(conn))
     monkeypatch.setattr(insp, "rules_fingerprint", lambda: "other rules")
     with pytest.raises(RuntimeError, match="incomplete inspector"):
         skipped_boot(rows, conn.saved, backfill=False)

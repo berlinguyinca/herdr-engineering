@@ -16,6 +16,7 @@ from tests.control_plane.test_inspector_snapshot_postgres import FABRIC
 
 MIGRATIONS = Path(__file__).parents[2] / "deploy/control-plane/migrations"
 INDEX_MIGRATION = MIGRATIONS / "0054_fabric_events_inspector_sequence_index.sql"
+ARCHIVE_INDEX_MIGRATION = MIGRATIONS / "0056_fabric_events_archive_inspector_sequence_index.sql"
 INSERT = ("INSERT INTO fabric_events (event_id, sequence, event_type, entity_type, entity_id, session_id, payload,"
           " source_timestamp, ingest_timestamp) VALUES ($1,$2,$3,'inspector',$4,$4,$5::jsonb,$6,$7)")
 
@@ -45,15 +46,32 @@ def ingest_of(rows, skew=None):
 
 async def insert(conn, rows, ingest):
     for e in rows:
-        await conn.execute(INSERT, f"id-{e['sequence']}", e["sequence"], e["event_type"], e["entity_id"],
+        await conn.execute(INSERT, e.get("event_id", f"id-{e['sequence']}"), e["sequence"], e["event_type"], e["entity_id"],
                            json.dumps(e["payload"]), datetime.fromisoformat(e["source_timestamp"]), ingest(e))
 
 
-def run_rebuild(tmp_path, rows, page, ingest):
+ARCHIVE_SQL = "CREATE TABLE fabric_events_archive (LIKE fabric_events INCLUDING DEFAULTS, archived_at timestamptz NOT NULL DEFAULT now());"
+
+
+def tied(rows, width=2):
+    """The rows with ``width`` consecutive rows sharing one fabric sequence (the journal stamps it in milliseconds, so
+    rows written in the same millisecond tie) and a distinct event_id each."""
+    out = []
+    for i, e in enumerate(rows):
+        out.append({**e, "sequence": i // width + 1, "event_id": f"ev-{i}"})
+    return out
+
+
+def run_rebuild(tmp_path, rows, page, ingest, *, archived=0, copied=0):
+    """Rebuild into a real Postgres. The first ``archived`` rows (by sequence) are moved to ``fabric_events_archive``;
+    ``copied`` more rows are copied there and left in ``fabric_events`` (what the archive job's copy-then-delete leaves
+    behind when it is interrupted)."""
     asyncpg = pytest.importorskip("asyncpg")
-    fabric = tmp_path / "fabric.sql"
+    fabric, archive = tmp_path / "fabric.sql", tmp_path / "archive.sql"
     fabric.write_text(FABRIC)
-    with private_postgres(fabric, MIGRATIONS / "0030_inspector_snapshots.sql", INDEX_MIGRATION) as dsn:
+    archive.write_text(ARCHIVE_SQL)
+    with private_postgres(fabric, archive, MIGRATIONS / "0030_inspector_snapshots.sql", INDEX_MIGRATION,
+                          ARCHIVE_INDEX_MIGRATION) as dsn:
         if dsn is None:
             pytest.skip("no postgres binaries")
 
@@ -61,6 +79,10 @@ def run_rebuild(tmp_path, rows, page, ingest):
             conn = await asyncpg.connect(dsn)
             try:
                 await insert(conn, rows, ingest)
+                if archived or copied:
+                    await conn.execute("INSERT INTO fabric_events_archive SELECT *, now() FROM fabric_events "
+                                       "WHERE sequence <= $1", archived + copied)
+                    await conn.execute("DELETE FROM fabric_events WHERE sequence <= $1", archived)
                 old = snap._PAGE
                 snap._PAGE = page
                 try:
@@ -83,33 +105,86 @@ def full_replay(rows, ingest):
     return reference
 
 
-@pytest.mark.integration
-def test_index_migration_is_idempotent_serves_the_page_query_and_tolerates_a_hand_built_index(tmp_path):
+def explain_writer_queries(tmp_path, migrations):
+    """EXPLAIN the writer's own page, key-pass and lookup SQL over fabric_events UNION ALL fabric_events_archive."""
     asyncpg = pytest.importorskip("asyncpg")
-    fabric, manual = tmp_path / "fabric.sql", tmp_path / "manual.sql"
+    fabric, archive = tmp_path / "fabric.sql", tmp_path / "archive.sql"
     fabric.write_text(FABRIC)
-    manual.write_text("CREATE INDEX idx_fabric_events_inspector_sequence ON fabric_events (sequence) "
-                      "WHERE entity_type = 'inspector';")
-    with private_postgres(fabric, manual, INDEX_MIGRATION, INDEX_MIGRATION) as dsn:
+    archive.write_text(ARCHIVE_SQL)
+    with private_postgres(fabric, archive, *migrations) as dsn:
         if dsn is None:
             pytest.skip("no postgres binaries")
 
-        async def plan():
+        async def plans():
             conn = await asyncpg.connect(dsn)
             try:
-                await insert(conn, stream(200, seed=3), ingest_of(None))
-                await conn.execute("ANALYZE fabric_events")
-                await conn.execute("SET enable_seqscan = off")
-                lines = await conn.fetch(
-                    f"EXPLAIN SELECT {snap._COLUMNS} FROM fabric_events WHERE {snap._VALID} AND sequence > $1 "
-                    "AND ingest_timestamp < now() - make_interval(secs => $2) ORDER BY sequence LIMIT $3",
-                    -1, 60.0, 50)
-                return "\n".join(r[0] for r in lines)
+                await insert(conn, stream(400, seed=3), ingest_of(None))
+                await conn.execute("INSERT INTO fabric_events_archive SELECT *, now() FROM fabric_events WHERE sequence % 2 = 0")
+                await conn.execute("DELETE FROM fabric_events WHERE sequence % 2 = 0")
+                await conn.execute("ANALYZE fabric_events; ANALYZE fabric_events_archive; SET enable_seqscan = off")
+                cutoff = await conn.fetchval("SELECT now() - make_interval(secs => 60.0)")
+                out = {}
+                for name, sql, args in (
+                        ("live page", snap._page_sql(snap._COLUMNS, snap._LIVE, snap._SETTLED_BY_AGE), (-1, "", 60.0, 50)),
+                        ("merged page", snap._page_sql(snap._COLUMNS, snap._WITH_ARCHIVE, snap._SETTLED_BY_AGE), (-1, "", 60.0, 50)),
+                        ("key pass", snap._page_sql(snap._KEY_COLUMNS, snap._WITH_ARCHIVE, snap._SETTLED_AT), (0, "", cutoff, 50)),
+                        ("lookup", snap._lookup_sql(snap._WITH_ARCHIVE), ([2, 4, 6], cutoff))):
+                    lines = await conn.fetch("EXPLAIN " + sql, *args)
+                    out[name] = "\n".join(r[0] for r in lines)
+                return out
             finally:
                 await conn.close()
 
-        text = asyncio.run(plan())
-    assert "idx_fabric_events_inspector_sequence" in text and "Seq Scan on fabric_events" not in text
+        return asyncio.run(plans())
+
+
+@pytest.mark.integration
+def test_index_migrations_serve_the_writers_own_queries_on_both_tables(tmp_path):
+    plans = explain_writer_queries(tmp_path, [INDEX_MIGRATION, ARCHIVE_INDEX_MIGRATION])
+    for name, text in plans.items():
+        assert "Seq Scan" not in text, f"{name}:\n{text}"
+    for name in ("merged page", "key pass", "lookup"):
+        assert "idx_fabric_events_archive_inspector_sequence" in plans[name], plans[name]
+        assert "idx_fabric_events_inspector_sequence" in plans[name], plans[name]
+    assert "idx_fabric_events_inspector_sequence" in plans["live page"]
+
+
+@pytest.mark.integration
+def test_without_the_archive_index_the_writers_queries_scan_the_archive(tmp_path):
+    """Control for the test above: the plan check does notice a missing archive index."""
+    plans = explain_writer_queries(tmp_path, [INDEX_MIGRATION])
+    assert all("Seq Scan on fabric_events_archive" in plans[n] for n in ("merged page", "key pass", "lookup"))
+
+
+@pytest.mark.integration
+def test_index_migrations_are_idempotent_and_tolerate_a_hand_built_index(tmp_path):
+    asyncpg = pytest.importorskip("asyncpg")
+    fabric, manual = tmp_path / "fabric.sql", tmp_path / "manual.sql"
+    fabric.write_text(FABRIC)
+    manual.write_text(ARCHIVE_SQL + "CREATE INDEX idx_fabric_events_archive_inspector_sequence ON fabric_events_archive "
+                      "(sequence, event_id) WHERE entity_type = 'inspector' AND entity_id IS NOT NULL AND entity_id <> '';")
+    with private_postgres(fabric, manual, INDEX_MIGRATION, INDEX_MIGRATION,
+                          ARCHIVE_INDEX_MIGRATION, ARCHIVE_INDEX_MIGRATION) as dsn:
+        if dsn is None:
+            pytest.skip("no postgres binaries")
+
+        async def names():
+            conn = await asyncpg.connect(dsn)
+            try:
+                return {r[0] for r in await conn.fetch("SELECT indexname FROM pg_indexes WHERE indexname LIKE '%inspector_sequence'")}
+            finally:
+                await conn.close()
+
+        assert asyncio.run(names()) == {"idx_fabric_events_inspector_sequence", "idx_fabric_events_archive_inspector_sequence"}
+
+
+@pytest.mark.integration
+def test_the_archive_index_migration_is_a_no_op_without_an_archive_table(tmp_path):
+    fabric = tmp_path / "fabric.sql"
+    fabric.write_text(FABRIC)
+    with private_postgres(fabric, ARCHIVE_INDEX_MIGRATION) as dsn:      # must not raise
+        if dsn is None:
+            pytest.skip("no postgres binaries")
 
 
 @pytest.mark.integration
@@ -212,3 +287,259 @@ def test_a_deferred_tool_update_written_after_the_cursor_does_not_force_a_rebuil
     full = make_store()
     full.hydrate([{**e, "sequence": i + 1, "ingest_timestamp": None} for i, e in enumerate(journal)])
     assert canon(writer._shadow.export_state()) == canon(full.export_state())
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("page", [17, 1_000])
+def test_rebuild_keeps_rows_that_share_a_sequence_across_page_boundaries(tmp_path, page):
+    rows = tied(stream(300, seed=2))
+    ingest = ingest_of(rows)
+    writer, outcome, _ = run_rebuild(tmp_path, rows, page, ingest)
+    assert outcome.startswith("written")
+    assert canon(writer._shadow.export_state()) == canon(full_replay(rows, ingest).export_state())
+
+
+@pytest.mark.integration
+def test_in_order_replay_feeds_every_row_that_shares_a_sequence_exactly_once(tmp_path):
+    rows = tied(stream(300, seed=5), width=3)
+    for e in rows:
+        e["payload"].pop("_received_at", None)
+    rnd = random.Random(1)
+    skew = {i: rnd.randint(0, 3000) for i in range(len(rows))}
+    ingest_by_id = {e["event_id"]: datetime.fromtimestamp(T0 + skew[i], UTC) for i, e in enumerate(rows)}
+    ingest = lambda e: ingest_by_id[e["event_id"]]      # noqa: E731
+    writer, outcome, _ = run_rebuild(tmp_path, rows, 40, ingest)
+    assert outcome.startswith("written")
+    assert canon(writer._shadow.export_state()) == canon(full_replay(rows, ingest).export_state())
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("archived", [60, 400])
+def test_rebuild_with_archived_inspector_rows_replays_them_and_writes_the_snapshot(tmp_path, archived):
+    """The archive job moves inspector rows out of fabric_events but the snapshot's event_count still counts them, so a
+    rebuild that replays only the live rows can never match and the snapshot stays unwritten for good."""
+    asyncpg = pytest.importorskip("asyncpg")
+    rows = stream(400, seed=9)
+    ingest = ingest_of(rows)
+    fabric, archive = tmp_path / "fabric.sql", tmp_path / "archive.sql"
+    fabric.write_text(FABRIC)
+    archive.write_text(ARCHIVE_SQL)
+    with private_postgres(fabric, archive, MIGRATIONS / "0030_inspector_snapshots.sql", INDEX_MIGRATION) as dsn:
+        if dsn is None:
+            pytest.skip("no postgres binaries")
+
+        async def scenario():
+            conn = await asyncpg.connect(dsn)
+            try:
+                await insert(conn, rows, ingest)
+                await conn.execute("INSERT INTO fabric_events_archive SELECT *, now() FROM fabric_events "
+                                   "WHERE sequence <= $1", archived)
+                await conn.execute("DELETE FROM fabric_events WHERE sequence <= $1", archived)
+                writer = snap.SnapshotWriter(make_store, interval=0, settle=-10**9)
+                outcome = await writer.tick(conn)
+                row = await conn.fetchrow("SELECT watermark, event_count FROM inspector_snapshots WHERE id = 1")
+                return writer, outcome, dict(row) if row else None
+            finally:
+                await conn.close()
+
+        writer, outcome, written = asyncio.run(scenario())
+    assert outcome.startswith("written"), outcome
+    reference = full_replay(rows, ingest)
+    assert canon(writer._shadow.export_state()) == canon(reference.export_state())
+    assert written == {"watermark": reference.replay_watermark, "event_count": reference.replay_count}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("page", [17, 1_000])
+def test_rebuild_with_archived_rows_pages_correctly(tmp_path, page):
+    rows = stream(400, seed=9)
+    ingest = ingest_of(rows)
+    writer, outcome, written = run_rebuild(tmp_path, rows, page, ingest, archived=150)
+    assert outcome.startswith("written"), outcome
+    reference = full_replay(rows, ingest)
+    assert canon(writer._shadow.export_state()) == canon(reference.export_state())
+    assert written == {"watermark": reference.replay_watermark, "event_count": reference.replay_count}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("width", [1, 3])
+def test_in_order_replay_reads_archived_rows_with_skewed_timestamps_and_tied_sequences(tmp_path, width):
+    rows = tied(stream(300, seed=5), width=width)
+    for e in rows:
+        e["payload"].pop("_received_at", None)
+    rnd = random.Random(7)
+    ingest_by_id = {e["event_id"]: datetime.fromtimestamp(T0 + rnd.randint(0, 3000), UTC) for e in rows}
+    ingest = lambda e: ingest_by_id[e["event_id"]]      # noqa: E731
+    writer, outcome, written = run_rebuild(tmp_path, rows, 23, ingest, archived=100)
+    assert outcome.startswith("written"), outcome
+    assert max(writer._shadow.batches) <= 23 and len(writer._shadow.batches) > 1
+    reference = full_replay(rows, ingest)
+    assert canon(writer._shadow.export_state()) == canon(reference.export_state())
+    assert written == {"watermark": reference.replay_watermark, "event_count": reference.replay_count}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("skewed", [False, True], ids=["streamed", "in-order"])
+def test_rows_present_in_both_tables_are_replayed_and_counted_once(tmp_path, skewed):
+    """The archive job copies a row before it deletes it, so an interrupted run leaves it in both tables."""
+    rows = tied(stream(300, seed=5), width=2)
+    ingest = ingest_of(rows)
+    if skewed:
+        for e in rows:
+            e["payload"].pop("_received_at", None)
+        rnd = random.Random(3)
+        ingest_by_id = {e["event_id"]: datetime.fromtimestamp(T0 + rnd.randint(0, 3000), UTC) for e in rows}
+        ingest = lambda e: ingest_by_id[e["event_id"]]      # noqa: E731
+    writer, outcome, written = run_rebuild(tmp_path, rows, 31, ingest, archived=60, copied=40)
+    assert outcome.startswith("written"), outcome
+    reference = full_replay(rows, ingest)
+    assert canon(writer._shadow.export_state()) == canon(reference.export_state())
+    assert written == {"watermark": reference.replay_watermark, "event_count": reference.replay_count}
+
+
+def test_order_keys_are_held_compactly_and_come_back_in_key_order():
+    rnd = random.Random(4)
+    keys = [(rnd.choice([1.5, 2.5, 3.5]), float(rnd.randint(0, 9)), i // 3, i % 3) for i in range(5_000)]
+    held = snap._OrderKeys(run_size=700)
+    for k in rnd.sample(keys, len(keys)):
+        held.add(*k)
+    assert list(held.merged()) == sorted(keys)
+    assert held.nbytes <= 32 * len(keys)        # the previous tuple + event_id string per row was about 200 bytes
+
+
+def _late_row(after, event_id, text):
+    """A row that ties ``after`` on the fabric sequence (the journal's millisecond clock) and sorts after it on event_id."""
+    return {"event_type": "inspector.message", "entity_id": "s1", "sequence": after, "event_id": event_id,
+            "source_timestamp": datetime.fromtimestamp(T0 + 9_000, UTC).isoformat(),
+            "payload": {"kind": "message", "role": "user", "text": text, "_received_at": T0 + 9_000, "_sequence": 9_999}}
+
+
+def _with_real_log(tmp_path, scenario):
+    """Run ``scenario(conn)`` on a real Postgres that has the archive table, the snapshot table and both indexes."""
+    asyncpg = pytest.importorskip("asyncpg")
+    fabric, archive = tmp_path / "fabric.sql", tmp_path / "archive.sql"
+    fabric.write_text(FABRIC)
+    archive.write_text(ARCHIVE_SQL)
+    with private_postgres(fabric, archive, MIGRATIONS / "0030_inspector_snapshots.sql", INDEX_MIGRATION,
+                          ARCHIVE_INDEX_MIGRATION) as dsn:
+        if dsn is None:
+            pytest.skip("no postgres binaries")
+
+        async def go():
+            conn = await asyncpg.connect(dsn)
+            try:
+                return await scenario(conn)
+            finally:
+                await conn.close()
+
+        return asyncio.run(go())
+
+
+@pytest.mark.integration
+def test_an_incremental_tick_takes_a_row_that_ties_the_watermark_on_sequence(tmp_path, caplog):
+    """The row shares the last consumed sequence and sorts later on event_id. Resuming from (watermark + 1, "") skips it
+    and only the count check notices; resuming from the consumed (sequence, event_id) pair takes it incrementally."""
+    rows = tied(stream(120, seed=4), width=1)
+    ingest = ingest_of(rows)
+    last = rows[-1]["sequence"]
+    late = _late_row(last, "zz-late", "arrived in the same millisecond")
+
+    async def scenario(conn):
+        await insert(conn, rows, ingest)
+        writer = snap.SnapshotWriter(make_store, interval=0, settle=-10**9)
+        assert (await writer.tick(conn)).startswith("written")
+        assert writer._cursor == (last, rows[-1]["event_id"])
+        await insert(conn, [late], ingest_of([late]))
+        first = writer._shadow
+        with caplog.at_level("WARNING"):
+            outcome = await writer.tick(conn)
+        return writer, first, outcome
+
+    writer, first, outcome = _with_real_log(tmp_path, scenario)
+    assert outcome.startswith("written"), outcome
+    reference = full_replay([*rows, late], lambda e: ingest_of(rows)(e) if e is not late else ingest_of([late])(e))
+    assert canon(writer._shadow.export_state()) == canon(reference.export_state())
+    assert "missed or lost events" not in caplog.text and writer._shadow is first
+
+
+@pytest.mark.integration
+def test_a_snapshot_without_a_cursor_is_replaced_by_one_full_rebuild(tmp_path, caplog):
+    """Main's in-order replay keyed rows by sequence alone: with two rows in one millisecond it fed one twice and dropped
+    the other, and the count still matched. Such a snapshot has no cursor, and must not stay trusted."""
+    rows = tied(stream(120, seed=4), width=2)
+    ingest = ingest_of(rows)
+    correct = full_replay(rows, ingest)
+    streams, _ = _rebuild_events([{**r, "entity_type": "inspector", "ingest_timestamp": ingest(r)} for r in rows])
+    events = [e for s in streams.values() for e in s]
+    ordered = sorted(events, key=make_store()._replay_order)
+    k = next(i for i in range(1, len(ordered)) if ordered[i]["sequence"] == ordered[i - 1]["sequence"]
+             and ordered[i]["payload"] != ordered[i - 1]["payload"])
+    buggy_events = [*ordered[:k], {**ordered[k - 1]}, *ordered[k + 1:]]      # one fed twice, its tie partner dropped
+    buggy = make_store()
+    buggy.hydrate(buggy_events)
+    assert (buggy.replay_count, buggy.replay_watermark) == (correct.replay_count, correct.replay_watermark)
+    assert canon(buggy.export_state()) != canon(correct.export_state())
+    state = buggy.export_state()
+    assert "cursor" not in state
+
+    async def scenario(conn):
+        await insert(conn, rows, ingest)
+        await conn.execute("INSERT INTO inspector_snapshots (id, schema_version, fingerprint, watermark, event_count, body)"
+                           " VALUES (1, $1, $2, $3, $4, $5)", state["version"], state["fingerprint"], state["watermark"],
+                           state["count"], snap.encode(state))
+        writer = snap.SnapshotWriter(make_store, interval=0, settle=-10**9)
+        with caplog.at_level("WARNING"):
+            outcome = await writer.tick(conn)
+        stored = snap.decode(await conn.fetchval("SELECT body FROM inspector_snapshots WHERE id = 1"))
+        return writer, outcome, stored
+
+    writer, outcome, stored = _with_real_log(tmp_path, scenario)
+    assert outcome.startswith("written"), outcome
+    assert "has no cursor" in caplog.text and "cursor" in stored
+    assert canon(writer._shadow.export_state()) == canon(correct.export_state())
+
+
+@pytest.mark.integration
+def test_the_in_order_replay_hands_back_the_cutoff_it_read_with_and_the_count_uses_it(tmp_path):
+    """A row that settles after the replay's cutoff is counted by a query at now() but was not replayed: counting with the
+    replay's cutoff is what keeps a correct in-order rebuild from reporting a mismatch."""
+    rows = tied(stream(80, seed=5), width=2)
+    base = datetime.now(UTC)
+    ingest = lambda e: base.replace(year=base.year - 1)      # noqa: E731
+
+    async def scenario(conn):
+        await insert(conn, rows, ingest)
+        writer = snap.SnapshotWriter(make_store, interval=0, settle=0)
+        shadow = make_store()
+        replayed, cutoff = await writer._replay_in_order(conn, shadow)
+        await conn.execute(INSERT, "settled-late", 1, "inspector.message", "s1",
+                           json.dumps({"kind": "message", "role": "user", "text": "late"}), datetime.now(UTC), datetime.now(UTC))
+        return (replayed, shadow.replay_count, await writer._covered(conn, shadow.replay_watermark, cutoff, distinct=True),
+                await writer._covered(conn, shadow.replay_watermark))
+
+    replayed, count, at_cutoff, by_age = _with_real_log(tmp_path, scenario)
+    assert replayed == count == at_cutoff
+    assert by_age == at_cutoff + 1
+
+
+@pytest.mark.integration
+def test_an_unusable_stored_snapshot_with_archived_rows_rebuilds_once_without_a_failed_incremental_pass(tmp_path, caplog):
+    rows = stream(300, seed=9)
+    ingest = ingest_of(rows)
+
+    async def scenario(conn):
+        await insert(conn, rows, ingest)
+        await conn.execute("INSERT INTO fabric_events_archive SELECT *, now() FROM fabric_events WHERE sequence <= 150")
+        await conn.execute("DELETE FROM fabric_events WHERE sequence <= 150")
+        await conn.execute("INSERT INTO inspector_snapshots (id, schema_version, fingerprint, watermark, event_count, body)"
+                           " VALUES (1, 1, 'x', 10, 10, $1)", b"not a snapshot")
+        writer = snap.SnapshotWriter(make_store, interval=0, settle=-10**9)
+        with caplog.at_level("WARNING"):
+            outcome = await writer.tick(conn)
+        return writer, outcome
+
+    writer, outcome = _with_real_log(tmp_path, scenario)
+    assert outcome.startswith("written"), outcome
+    assert "stored inspector snapshot ignored" in caplog.text
+    assert "missed or lost events" not in caplog.text          # the unpaged live-only pass that used to run first
+    assert canon(writer._shadow.export_state()) == canon(full_replay(rows, ingest).export_state())

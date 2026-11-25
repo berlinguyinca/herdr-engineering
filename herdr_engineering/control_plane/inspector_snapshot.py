@@ -12,9 +12,12 @@ from __future__ import annotations
 
 import asyncio
 import gzip
+import heapq
+import itertools
 import json
 import logging
 import time
+from array import array
 
 from .bridge import _rebuild_events
 from .inspector import InspectorStore, SnapshotStale
@@ -28,6 +31,94 @@ DEFAULT_INTERVAL_SECONDS = 600.0
 _COLUMNS = ("event_id, schema_version, source_timestamp, ingest_timestamp, entity_type, entity_id, mission_id, "
             "session_id, sequence, event_type, payload")
 _VALID = "entity_type = 'inspector' AND entity_id IS NOT NULL AND entity_id <> ''"
+_LIVE = "fabric_events"
+# Rows the archive job moved out of fabric_events still count toward a snapshot's event_count, so a full rebuild reads both.
+_WITH_ARCHIVE = f"(SELECT {_COLUMNS} FROM fabric_events UNION ALL SELECT {_COLUMNS} FROM fabric_events_archive) AS fe"
+# No writer leaves a row in both tables: the archive job and fabric_compaction each move rows in one statement (DELETE ...
+# RETURNING feeding the INSERT). A hand-made copy (an operator's restore) still must not be replayed twice, so the page queries
+# stay a plain ordered merge of the two tables (both indexes serve them) and the reader drops the adjacent copy (see
+# _first_of_each); the rebuild's own covered count anti-joins against the live table, the per-tick and boot counts do not.
+_NOT_LIVE = ("NOT EXISTS (SELECT 1 FROM fabric_events f WHERE f.entity_type = 'inspector' "
+             "AND f.sequence = a.sequence AND f.event_id = a.event_id)")
+
+
+async def _source(conn, archived: bool) -> str:
+    """The FROM expression a full rebuild reads: the live journal, plus the archive when it exists."""
+    if archived and await conn.fetchval("SELECT to_regclass('fabric_events_archive') IS NOT NULL"):
+        return _WITH_ARCHIVE
+    return _LIVE
+
+
+# Which rows count as settled (older than the settle window): by age at the time of the query, or against a cutoff taken
+# once so two passes over the log see the same rows.
+_SETTLED_BY_AGE = "ingest_timestamp < now() - make_interval(secs => $3)"
+_SETTLED_AT = "ingest_timestamp < $3"
+# What the order-key pass reads of a row: the fields ``InspectorStore._replay_order`` looks at, not the payload.
+_KEY_COLUMNS = ("sequence, event_id, source_timestamp, ingest_timestamp, "
+                "CASE WHEN jsonb_typeof(payload->'_received_at') = 'number' THEN payload->>'_received_at' END AS ra, "
+                "CASE WHEN jsonb_typeof(payload->'_sequence') = 'number' THEN payload->>'_sequence' END AS sq")
+
+
+# Keyset condition on (sequence, event_id) with ``$1``/``$2``: the sequence is a millisecond clock, so rows tie on it and
+# paging on it alone would skip the rest of a tie that straddles a page boundary. ``sequence >= $1`` keeps the partial
+# sequence index usable.
+_AFTER = "sequence >= $1 AND (sequence, event_id) > ($1, $2)"
+
+
+def _page_sql(columns: str, source: str, settled: str) -> str:
+    """One keyset page (``$1``/``$2`` = the last (sequence, event_id) seen, ``$3`` for ``settled``, ``$4`` = page size)."""
+    return (f"SELECT {columns} FROM {source} WHERE {_VALID} AND {_AFTER} AND {settled} "
+            "ORDER BY sequence, event_id LIMIT $4")
+
+
+def _lookup_sql(source: str) -> str:
+    """The rows of a set of fabric sequences (``$1``), settled before the cutoff ``$2``, in (sequence, event_id) order."""
+    return (f"SELECT {_COLUMNS} FROM {source} WHERE {_VALID} AND sequence = ANY($1::bigint[]) AND ingest_timestamp < $2 "
+            "ORDER BY sequence, event_id")
+
+
+def _first_of_each(rows):
+    """``rows`` in (sequence, event_id) order without the repeats: a row the archive job copied but has not yet deleted is in
+    both tables and the two copies are adjacent."""
+    previous = None
+    for r in rows:
+        key = (r["sequence"], r["event_id"])
+        if key != previous:
+            yield r
+        previous = key
+
+
+class _OrderKeys:
+    """The replay-order keys of the whole log, held as packed arrays (8 + 8 + 8 + 4 bytes a row, not a Python tuple, floats
+    and an event_id string: about 200 bytes), in sorted runs of ``run_size`` rows that :meth:`merged` merges lazily.
+
+    A key is (receive time, per-session sequence, fabric sequence, tie): ``tie`` is the row's rank among the rows that share
+    its fabric sequence, in event_id order, which identifies a row without keeping its event_id."""
+
+    def __init__(self, run_size: int):
+        self._run_size = run_size
+        self._pending: list[tuple] = []
+        self._runs: list[tuple] = []
+
+    def add(self, recv: float, seq: float, sequence: int, tie: int) -> None:
+        self._pending.append((recv, seq, sequence, tie))
+        if len(self._pending) >= self._run_size:
+            self._flush()
+
+    def _flush(self) -> None:
+        if self._pending:
+            self._pending.sort()
+            cols = list(zip(*self._pending))
+            self._runs.append((array("d", cols[0]), array("d", cols[1]), array("q", cols[2]), array("I", cols[3])))
+            self._pending = []
+
+    def merged(self):
+        self._flush()
+        return heapq.merge(*(zip(*run) for run in self._runs))
+
+    @property
+    def nbytes(self) -> int:
+        return sum(a.itemsize * len(a) for run in self._runs for a in run) + 100 * len(self._pending)
 
 
 def parse_inspector_snapshots(raw) -> dict:
@@ -51,13 +142,23 @@ def parse_inspector_snapshots(raw) -> dict:
     return {"enabled": enabled, "interval_seconds": float(interval)}
 
 
-async def archived_inspector_count(conn, watermark: int) -> int:
-    """Inspector rows the archive job moved out of ``fabric_events`` at or below ``watermark``. The snapshot consumed them,
-    so they count toward its ``event_count``; 0 when the archive table does not exist."""
+async def archived_inspector_count(conn, watermark: int, *, distinct: bool = False) -> int:
+    """Inspector rows moved out of ``fabric_events`` into the archive at or below ``watermark``. The snapshot consumed them,
+    so they count toward its ``event_count``; 0 when the archive table does not exist. ``distinct`` leaves out the rows that
+    are also still in ``fabric_events`` (a copy no job makes; a rebuild, which replays such a row once, counts that way)."""
     if not await conn.fetchval("SELECT to_regclass('fabric_events_archive') IS NOT NULL"):
         return 0
-    return int(await conn.fetchval(f"SELECT count(*) FROM fabric_events_archive WHERE {_VALID} AND sequence <= $1",
+    anti = f"AND {_NOT_LIVE}" if distinct else ""
+    return int(await conn.fetchval(f"SELECT count(*) FROM fabric_events_archive a WHERE {_VALID} AND a.sequence <= $1 {anti}",
                                    int(watermark)))
+
+
+def _cursor_of(state: dict) -> tuple[int, str] | None:
+    """The (sequence, event_id) a stored snapshot says it consumed up to; None for one written without it."""
+    cursor = state.get("cursor")
+    if isinstance(cursor, list) and len(cursor) == 2 and type(cursor[0]) is int and isinstance(cursor[1], str):
+        return cursor[0], cursor[1]
+    return None
 
 
 def encode(state: dict) -> bytes:
@@ -118,6 +219,9 @@ class SnapshotWriter:
         self._clock = clock
         self._last: float | None = None
         self._shadow: InspectorStore | None = None
+        # (sequence, event_id) of the last row the shadow consumed: the sequence is a millisecond clock, so a row can tie with
+        # the watermark on sequence and come later on event_id, and an incremental fetch must resume from the pair.
+        self._cursor: tuple[int, str] | None = None
         self.last_outcome = "not run"
 
     async def tick(self, conn) -> str:
@@ -130,24 +234,23 @@ class SnapshotWriter:
             log.info("inspector snapshot %s", self.last_outcome)
         except Exception as exc:        # never take the worker down; the boot falls back to a full replay
             log.exception("inspector snapshot failed: %s", exc)
-            self._shadow = None
+            self._shadow, self._cursor = None, None
             self.last_outcome = f"failed: {type(exc).__name__}"
         return self.last_outcome
 
     async def _advance(self, conn) -> str:
         if self._shadow is None:
             self._shadow = await self._seed(conn)
+            if self._shadow.replay_count == 0 and self._shadow.replay_watermark < 0:
+                return await self._rebuild(conn)       # nothing seeded: a live-only fetch would mismatch, then rebuild anyway
         shadow = self._shadow
-        events = await self._fetch(conn, shadow.replay_watermark)
+        events = await self._fetch(conn, shadow.replay_watermark, self._cursor)
         try:
             await asyncio.to_thread(shadow.hydrate_delta, events)
         except SnapshotStale as exc:
             log.warning("inspector snapshot restarts from the full log: %s", exc)
             return await self._rebuild(conn)
-        covered = await conn.fetchval(f"SELECT count(*) FROM fabric_events WHERE {_VALID} AND sequence <= $1 "
-                                      "AND ingest_timestamp < now() - make_interval(secs => $2)",
-                                      shadow.replay_watermark, self.settle)
-        covered = int(covered) + await archived_inspector_count(conn, shadow.replay_watermark)
+        covered = await self._covered(conn, shadow.replay_watermark)
         if int(covered) != shadow.replay_count:
             log.warning("inspector snapshot missed or lost events (%s stored, %s consumed); rebuilding", covered, shadow.replay_count)
             return await self._rebuild(conn)
@@ -158,10 +261,19 @@ class SnapshotWriter:
         row = await conn.fetchrow("SELECT watermark, event_count, body FROM inspector_snapshots WHERE id = 1")
         if row is not None:
             try:
-                shadow.load_state(decode(row["body"]))
+                state = decode(row["body"])
+                cursor = _cursor_of(state)
+                if cursor is None:
+                    # Written before the cursor existed. The in-order replay of that code keyed rows by sequence alone, so a
+                    # snapshot it wrote can have fed one of two same-millisecond rows twice and dropped the other with the
+                    # count still right; the only way to tell is to replay once and write one that carries the cursor.
+                    raise SnapshotStale("stored snapshot has no cursor; rebuilding once")
+                shadow.load_state(state)
+                self._cursor = cursor
                 return shadow
             except (SnapshotStale, OSError, EOFError, ValueError, TypeError, KeyError) as exc:
                 log.warning("stored inspector snapshot ignored: %s", exc)
+        self._cursor = None
         return self._make_store()
 
     async def _rebuild(self, conn) -> str:
@@ -172,86 +284,109 @@ class SnapshotWriter:
         page's order keys do not precede what earlier pages consumed. The first page that does (``SnapshotStale``)
         abandons the streaming pass for :meth:`_replay_in_order`."""
         self._shadow = shadow = self._make_store()
-        fetched = 0
+        self._cursor = None
+        fetched, cutoff = 0, None
         try:
-            async for page in self._pages(conn, -1):
+            async for page in self._pages(conn, -1, archived=True):
                 await asyncio.to_thread(shadow.hydrate_delta, page)
                 fetched += len(page)
         except SnapshotStale as exc:
             log.warning("inspector snapshot rebuild is out of replay order across pages (%s); replaying the log in one pass", exc)
             self._shadow = shadow = self._make_store()
-            fetched = await self._replay_in_order(conn, shadow)
-        covered = await conn.fetchval(f"SELECT count(*) FROM fabric_events WHERE {_VALID} AND sequence <= $1 "
-                                      "AND ingest_timestamp < now() - make_interval(secs => $2)",
-                                      shadow.replay_watermark, self.settle)
-        covered = int(covered) + await archived_inspector_count(conn, shadow.replay_watermark)
+            self._cursor = None
+            fetched, cutoff = await self._replay_in_order(conn, shadow)
+        covered = await self._covered(conn, shadow.replay_watermark, cutoff, distinct=True)
         if int(covered) != shadow.replay_count:
-            self._shadow = None
+            self._shadow, self._cursor = None, None
             return "rebuild did not match the stored log; nothing written"
         return await self._write(conn, shadow, fetched)
 
-    async def _replay_in_order(self, conn, shadow: InspectorStore) -> int:
-        """Replay the whole log in exact replay order with bounded memory: one pass that reads only each row's order key
-        (about 80 bytes a row, instead of the row), a sort of those keys, then the rows fetched ``_PAGE`` at a time in
-        key order. Ties on the key keep fabric-sequence order, as in the one-shot hydrate. Returns the rows replayed."""
-        keys: list[tuple] = []
-        last = -1
+    async def _covered(self, conn, watermark: int, cutoff=None, *, distinct: bool = False) -> int:
+        """Settled inspector rows at or below ``watermark``, archived ones included. ``cutoff`` is the fixed time a replay read
+        with; without it, rows settle by age at the time of the query."""
+        if cutoff is None:
+            live = await conn.fetchval(f"SELECT count(*) FROM fabric_events WHERE {_VALID} AND sequence <= $1 "
+                                       "AND ingest_timestamp < now() - make_interval(secs => $2)", watermark, self.settle)
+        else:
+            live = await conn.fetchval(f"SELECT count(*) FROM fabric_events WHERE {_VALID} AND sequence <= $1 "
+                                       "AND ingest_timestamp < $2", watermark, cutoff)
+        return int(live) + await archived_inspector_count(conn, watermark, distinct=distinct)
+
+    async def _replay_in_order(self, conn, shadow: InspectorStore) -> tuple[int, object]:
+        """Replay the whole log in exact replay order with bounded memory per row held.
+
+        The order is the store's own Python key (``_replay_order``: a clamped receive time with a timestamp fallback), which
+        SQL cannot reproduce exactly, so the sort stays in Python. One pass reads only each row's key fields and keeps a
+        packed key (:class:`_OrderKeys`, about 28 bytes a row: a 10M-row log is roughly 280 MB, where a tuple with the event_id
+        was 2-3 GB), then the rows are fetched ``_PAGE`` at a time in key order by fabric sequence and hydrated. Both passes
+        read the rows settled before one cutoff, so they see the same log. Ties on the key keep (sequence, event_id) order.
+        Returns the rows replayed and that cutoff, which the caller counts the log with."""
+        keys = _OrderKeys(_PAGE)
+        source = await _source(conn, True)
+        cutoff = await conn.fetchval("SELECT now() - make_interval(secs => $1)", self.settle)
+        last, last_id, previous, tie = 0, "", None, 0
         while True:
-            page = await conn.fetch(
-                "SELECT sequence, source_timestamp, ingest_timestamp, "
-                "CASE WHEN jsonb_typeof(payload->'_received_at') = 'number' THEN payload->>'_received_at' END AS ra, "
-                "CASE WHEN jsonb_typeof(payload->'_sequence') = 'number' THEN payload->>'_sequence' END AS sq "
-                f"FROM fabric_events WHERE {_VALID} AND sequence > $1 "
-                "AND ingest_timestamp < now() - make_interval(secs => $2) ORDER BY sequence LIMIT $3",
-                last, self.settle, _PAGE)
-            for r in page:
+            page = await conn.fetch(_page_sql(_KEY_COLUMNS, source, _SETTLED_AT), last, last_id, cutoff, _PAGE)
+            for r in _first_of_each(page):
                 probe = {"sequence": int(r["sequence"]), "source_timestamp": r["source_timestamp"],
                          "ingest_timestamp": r["ingest_timestamp"],
                          "payload": {"_received_at": float(r["ra"]) if r["ra"] is not None else None,
                                      "_sequence": float(r["sq"]) if r["sq"] is not None else None}}
                 recv, seq = shadow._replay_order(probe)
-                keys.append((recv, seq, probe["sequence"]))
+                tie = tie + 1 if probe["sequence"] == previous else 0
+                previous = probe["sequence"]
+                keys.add(recv, float(seq), probe["sequence"], tie)
+            if page:
+                last, last_id = int(page[-1]["sequence"]), page[-1]["event_id"]
+                self._cursor = (last, last_id)
             if len(page) < _PAGE:
                 break
-            last = int(page[-1]["sequence"])
-        keys.sort()
         replayed = 0
-        for lo in range(0, len(keys), _PAGE):
-            wanted = [k[2] for k in keys[lo:lo + _PAGE]]
-            rows = await conn.fetch(f"SELECT {_COLUMNS} FROM fabric_events WHERE {_VALID} AND sequence = ANY($1::bigint[])",
-                                    wanted)
-            streams, _ = _rebuild_events([dict(r) for r in rows])
-            by_seq = {e["sequence"]: e for stream in streams.values() for e in stream}
-            batch = [by_seq[q] for q in wanted if q in by_seq]
+        ordered = keys.merged()
+        while wanted := [(k[2], k[3]) for k in itertools.islice(ordered, _PAGE)]:
+            rows = await conn.fetch(_lookup_sql(source), sorted({w[0] for w in wanted}), cutoff)
+            ties: dict = {}
+            previous, tie = None, 0
+            distinct = []
+            for r in _first_of_each(rows):
+                tie = tie + 1 if r["sequence"] == previous else 0
+                previous = r["sequence"]
+                ties[(r["sequence"], r["event_id"])] = tie
+                distinct.append(dict(r))
+            streams, _ = _rebuild_events(distinct)
+            by_key = {(e["sequence"], ties[(e["sequence"], e["event_id"])]): e
+                      for stream in streams.values() for e in stream}
+            batch = [by_key[w] for w in wanted if w in by_key]
             await asyncio.to_thread(shadow.hydrate, batch)
             replayed += len(batch)
-        return replayed
+        return replayed, cutoff
 
-    async def _row_pages(self, conn, after: int):
-        """Raw inspector rows newer than ``after``, ``_PAGE`` rows at a time, in fabric-sequence order."""
-        last = after
+    async def _row_pages(self, conn, after: int, archived: bool = False, cursor: tuple[int, str] | None = None):
+        """Raw inspector rows newer than ``after`` (or than the ``cursor`` pair, which also takes the rest of a sequence tie),
+        ``_PAGE`` rows at a time, in (fabric-sequence, event_id) order. ``archived`` also reads the archive table (a full
+        rebuild; an incremental fetch is above every archived row). ``self._cursor`` follows the last row yielded."""
+        last, last_id = cursor or (after + 1, "")         # (after + 1, "") sorts before every real row above ``after``
+        source = await _source(conn, archived)
         while True:
-            page = await conn.fetch(
-                f"SELECT {_COLUMNS} FROM fabric_events WHERE {_VALID} AND sequence > $1 "
-                "AND ingest_timestamp < now() - make_interval(secs => $2) ORDER BY sequence LIMIT $3",
-                last, self.settle, _PAGE)
+            page = await conn.fetch(_page_sql(_COLUMNS, source, _SETTLED_BY_AGE), last, last_id, self.settle, _PAGE)
             if not page:
                 return
-            last = int(page[-1]["sequence"])
-            yield [dict(r) for r in page]
+            last, last_id = int(page[-1]["sequence"]), page[-1]["event_id"]
+            self._cursor = (last, last_id)
+            yield [dict(r) for r in _first_of_each(page)]
             if len(page) < _PAGE:
                 return
 
-    async def _pages(self, conn, after: int):
+    async def _pages(self, conn, after: int, archived: bool = False, cursor: tuple[int, str] | None = None):
         """Like :meth:`_row_pages`, each page folded into the shape a boot sees (via ``_rebuild_events``)."""
-        async for rows in self._row_pages(conn, after):
+        async for rows in self._row_pages(conn, after, archived, cursor):
             streams, _ = _rebuild_events(rows)
             yield [e for stream in streams.values() for e in stream]
 
-    async def _fetch(self, conn, after: int) -> list[dict]:
-        """Inspector events newer than ``after`` (all pages), in the same shape a boot sees (via ``_rebuild_events``)."""
+    async def _fetch(self, conn, after: int, cursor: tuple[int, str] | None = None) -> list[dict]:
+        """Inspector events newer than ``after`` / ``cursor`` (all pages), in the same shape a boot sees (via ``_rebuild_events``)."""
         rows: list[dict] = []
-        async for page in self._row_pages(conn, after):
+        async for page in self._row_pages(conn, after, cursor=cursor):
             rows.extend(page)
         streams, _ = _rebuild_events(rows)
         return [e for stream in streams.values() for e in stream]
@@ -260,6 +395,8 @@ class SnapshotWriter:
         if fetched == 0 and await conn.fetchval("SELECT 1 FROM inspector_snapshots WHERE id = 1") == 1:
             return "unchanged"
         state = await asyncio.to_thread(shadow.export_state)
+        if self._cursor is not None:
+            state["cursor"] = list(self._cursor)       # an extra key: a snapshot without it (older code) still loads
         body = await asyncio.to_thread(encode, state)
         await conn.execute(
             "INSERT INTO inspector_snapshots (id, schema_version, fingerprint, watermark, event_count, body, created_at) "
