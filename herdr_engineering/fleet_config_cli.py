@@ -31,6 +31,7 @@ from typing import Any
 
 import yaml
 
+from .cognito_values import cognito_problem
 from .fleet_config import (
     CONTROL_PLANE_SECTION,
     SCHEMA_VERSION,
@@ -628,6 +629,15 @@ def _check_member_host(
         )
 
 
+_COGNITO_COLLAB_KEY = {
+    "pool_id": "cognito_pool",
+    "client_ids": "cognito_clients",
+    "web_client_id": "cognito_web_client",
+    "domain": "cognito_domain",
+    "group": "cognito_group",
+}
+
+
 def artifact_host_slices(cfg: FleetConfig) -> dict[str, dict] | None:
     """The host's per-role configuration slices (herdr_artifact_host.host_config schema), or None when it is disabled.
 
@@ -742,6 +752,19 @@ def artifact_host_slices(cfg: FleetConfig) -> dict[str, dict] | None:
             + ", ".join(missing)
         )
     del clients
+    if problem := cognito_problem(
+        {
+            "pool_id": cognito["pool_id"],
+            "client_ids": cognito["client_ids"],
+            "web_client_id": cognito["web_client_id"],
+            "domain": cognito["domain"],
+            "group": cognito["group"],
+        }
+    ):
+        raise FleetConfigError(
+            f"control_plane.collab.{_COGNITO_COLLAB_KEY[problem[0]]} {problem[1]} "
+            "(control_plane.artifact_host: the host refuses to start on it)"
+        )
     library = cfg.section(CONTROL_PLANE_SECTION).get("artifact_library")
     key = library.get("host_key") if isinstance(library, dict) else None
     if not isinstance(key, str) or not key:

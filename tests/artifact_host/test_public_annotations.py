@@ -15,7 +15,9 @@ class Session:
         self, host: Host, share: Seeded, user: str = "alice", email: str = "Alice@Lab.example"
     ) -> None:
         self.host, self.share = host, share
-        self.sess = landing_session(sign_in(host, share, access(user), ident(user, email=email)))
+        self.sess = landing_session(
+            sign_in(host, share, access(user), ident(user, email=email, nonce="n-0"))
+        )
         self.base = f"/s/{share.token}/k/{self.sess}/annotations"
         self.cookie = f"{write_cookie_name(share.share_id, self.sess)}={write_cookie_value(SECRET, share.share_id, self.sess)}"
 
