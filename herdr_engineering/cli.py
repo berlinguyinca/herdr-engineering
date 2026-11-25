@@ -2837,7 +2837,7 @@ def _parse_routes(specs):
 
 def _cmd_dev_register(args) -> int:
     from .devfabric import DevServiceRegistry
-    from .errors import InvalidError
+    from .fabric import GatewayRejected
     host = _resolve_target_host(args.host, args.port)
     try:
         routes = _parse_routes(args.route)
@@ -2856,8 +2856,8 @@ def _cmd_dev_register(args) -> int:
                 preferred_port=args.preferred_port)
             _print_json(result)
             return 0
-        except InvalidError as exc:
-            _print_json({"ok": False, "error": f"gateway rejected the registration: {exc.message}"})
+        except GatewayRejected as exc:
+            _print_json({"ok": False, "error": f"gateway rejected the registration: {exc.reason or exc.message}"})
             return 1
         except Exception as exc:
             _print_json({"ok": False, "gateway": str(exc),

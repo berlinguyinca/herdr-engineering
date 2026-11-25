@@ -36,8 +36,16 @@ from pathlib import Path
 from typing import Any
 
 from .devfabric import DevServiceRegistry, enable_keepalive, proxy_pair, route_and_pipe
-from .errors import ConflictError, InvalidError, UnreachableError
+from .errors import ConflictError, UnreachableError
 from .fabric_named import AcceptBackoff
+
+
+class GatewayRejected(UnreachableError):
+    """The gateway answered 400: it is up and refused this request. Still an UnreachableError for existing callers."""
+
+    def __init__(self, message: str, *, reason: str = "", **kw: Any) -> None:
+        super().__init__(message, **kw)
+        self.reason = reason
 
 
 class TokenNotAccepted(UnreachableError):
@@ -1246,8 +1254,8 @@ class FabricClient:
                     reason = str(json.loads(exc.read()).get("error", ""))
                 except Exception:  # noqa: BLE001 - an unreadable body still means "rejected"
                     reason = ""
-                raise InvalidError(f"fabric gateway rejected the request (400): {reason}".rstrip(": "),
-                                   target=url) from exc
+                raise GatewayRejected(f"fabric gateway error 400 for {url}" + (f": {reason}" if reason else ""),
+                                      target=url, reason=reason) from exc
             raise UnreachableError(f"fabric gateway error {exc.code} for {url}",
                                    target=url) from exc
         except Exception as exc:
