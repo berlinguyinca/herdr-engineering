@@ -364,9 +364,10 @@ def test_create_publish_content_history(host: Host) -> None:
     assert r2.status == 200 and r2.json()["version_number"] == 2
     hist = call(host, s, "GET", f"/artifacts/{aid}/history").json()["versions"]
     assert [v["version_number"] for v in hist] == [2, 1]
+    # the superseded version stays stored, so it stays counted
     assert host.rows("SELECT bytes_used FROM member_usage WHERE member_id='alice'")[0][
         "bytes_used"
-    ] == len(b"<html>v2</html>")
+    ] == len(b"<html>v1</html>") + len(b"hello") + len(b"<html>v2</html>")
 
 
 def test_stale_base_leaves_no_rows(host: Host) -> None:
@@ -495,6 +496,25 @@ def test_quota_is_enforced_and_settled_on_delete(host: Host) -> None:
     [u] = host.rows("SELECT bytes_used, bytes_retracted FROM member_usage WHERE member_id='alice'")
     assert u["bytes_used"] == 0 and u["bytes_retracted"] == 11
     assert call(host, s, "GET", f"/artifacts/{aid}").status == 404
+
+
+def test_old_versions_count_toward_the_quota_and_settle_on_delete(host: Host) -> None:
+    s = sign_in(host)
+    host.execute(
+        "INSERT INTO member_usage (member_id, max_member_bytes) VALUES ('alice', 25) ON CONFLICT (member_id) DO UPDATE SET max_member_bytes=25"
+    )
+    aid = create(host, s)
+    first = publish_files(host, s, aid, {"index.html": b"x" * 10})
+    assert first.status == 200
+    second = publish_files(host, s, aid, {"index.html": b"y" * 10}, base=first.json()["version_id"])
+    assert second.status == 200  # 10 kept + 10 current
+    third = publish_files(host, s, aid, {"index.html": b"z" * 10}, base=second.json()["version_id"])
+    assert third.status == 413 and third.json()["error"] == "quota"  # 10 + 10 + 10 > 25
+    [u] = host.rows("SELECT bytes_used FROM member_usage WHERE member_id='alice'")
+    assert u["bytes_used"] == 20
+    assert call(host, s, "POST", f"/artifacts/{aid}/delete", {"confirm": True}).status == 200
+    [u] = host.rows("SELECT bytes_used, bytes_retracted FROM member_usage WHERE member_id='alice'")
+    assert u["bytes_used"] == 0 and u["bytes_retracted"] == 20
 
 
 def test_create_is_idempotent(host: Host) -> None:
