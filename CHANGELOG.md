@@ -5,6 +5,10 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Fix: artifact host storage is reclaimed, and disabled Cognito accounts are refused per request
+
+- `herdr_artifact_host` housekeeping gains a `versions` duty that collects blobs only for a *tombstoned* artifact whose `purge_after` hold has passed: its versions are marked `purged` and the blobs only they used are deleted (row and file) under publish's per-sha lock, with the artifact row locked as `share_create` does. A tombstone with no `purge_after` (an imported one) gets the standard 30-day hold counted from the first pass that sees it, written back, and is not purged on that pass; `legal_hold` artifacts, versions a pending or live share points at, and blobs a kept version still names are never touched. Old versions of a live (or retracted) artifact are kept, and now count toward the member's quota: publish adds the superseded version to `bytes_used` instead of replacing it, delete/discard settle the whole held size, and the usage reconciliation sums current plus kept old versions. The orphan-blob sweep (one-hour `blob_grace`, for upload blobs no record references) is unchanged and ignores purged versions' manifests. `SweepReport` gains `versions_purged`.
+- `SyncedDirectory.groups` returns no groups for an account listed under `disabled` in `members.json` (the sync still lists it under its group), so a disabled account's member session and agent tokens are refused on the next recheck instead of waiting for housekeeping's revocation pass.
 ### Fix: gateway lease and pipe bug-hunt findings
 
 - `FabricGateway.op_register` validates every lease `routes[].host` with `validate_target_host` (same SSRF rule as `target_host`), including re-registration of an existing lease id.
