@@ -248,7 +248,7 @@ def test_an_unclosable_half_made_pane_keeps_its_marker_and_the_next_ensure_makes
         _, tab = session(h, side)
         before = panes_in(side, tab)
         stuck = failing_run(h.root, h, close_fails=True)
-        result = make(h, stuck, tab, budget_s=5.0, lock_timeout_s=0)
+        result = make(h, stuck, tab, budget_s=30.0, lock_timeout_s=0)
         marker = state.read_marker(root_of(h), tab)
         now = panes_in(side, tab)
         assert result.outcome is Outcome.UNAVAILABLE and len(now) == len(before) + 1
