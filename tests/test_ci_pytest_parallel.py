@@ -12,6 +12,7 @@ import ast
 import importlib.util
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -36,13 +37,55 @@ def calm_host(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.Monk
     monkeypatch.setenv("HERDR_LOADAVG_FILE", str(calm))
 
 
+def visible_cpus() -> int:
+    """The CPUs this process may really use, which is the basis the worker quotas are chosen against.
+
+    Linux reports an affinity mask (`os.sched_getaffinity`); elsewhere there is no such call, so the CPU count stands in. The
+    tests that need a real mask say so themselves (`allowed_cpus`), because pinning also needs `taskset`, which is Linux-only.
+    Reading this at module scope is deliberate - `Q` and the skip markers below are computed from it - so it must not raise
+    (#936: it did, and the collection error took the whole local run down with it).
+    """
+    try:
+        return len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        return os.cpu_count() or 1
+
+
+def allowed_cpus() -> list[int] | None:
+    """The CPUs this process may pin to, or None where pinning is impossible (no affinity call, or no `taskset`)."""
+    if shutil.which("taskset") is None:
+        return None
+    try:
+        return sorted(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        return None
+
+
+def watchdog_runs_here() -> bool:
+    """Whether `scripts/ci/run-watched.py` can work at all here: it measures progress by reading `/proc`, so it cannot on macOS.
+
+    This is a capability, not a platform guess - a Linux box with `/proc` unmounted is as unable to run it as a Mac is.
+    """
+    return Path("/proc").is_dir()
+
+
+#: Tests that drive the watchdog, or the cgroup quota reader the worker count comes from, need `/proc`.
+needs_proc = pytest.mark.skipif(not watchdog_runs_here(), reason="run-watched.py and the cgroup quota reader need /proc")
+#: Tests that start a real pytest-xdist run need the plugin installed (it is a pinned dev dependency; the unit gate installs it).
+needs_xdist = pytest.mark.skipif(
+    importlib.util.find_spec("xdist") is None, reason="pytest-xdist is not installed in this environment"
+)
+
+
 def args_with(cpus: int | None = None, **env: str) -> list[str]:
     """The helper's arguments; `cpus` restricts the real CPU affinity (taskset) so a 4/8/16-CPU host is simulated without a fake."""
     exports = "".join(f"export {k}={v}; " for k, v in env.items())
     pin: list[str] = []
     if cpus:
+        allowed = allowed_cpus()
+        if allowed is None:
+            pytest.skip(f"needs {cpus} pinnable CPUs to simulate a {cpus}-CPU host; this host ({sys.platform}) has no affinity mask or no taskset")
         # Pin to the first `cpus` of the CPUs this process may really use: a Slurm cpuset need not contain CPUs 0..N-1.
-        allowed = sorted(os.sched_getaffinity(0))
         if len(allowed) < cpus:
             pytest.skip(f"needs {cpus} allowed CPUs to simulate a {cpus}-CPU host; this process may use only {len(allowed)}")
         pin = ["taskset", "-c", ",".join(str(c) for c in allowed[:cpus])]
@@ -137,6 +180,7 @@ def test_xdist_dependencies_are_pinned_exactly() -> None:
     assert any(re.fullmatch(r"execnet==\d+\.\d+\.\d+", d) for d in dev), dev
 
 
+@needs_xdist
 def test_loadfile_spreads_files_over_workers_but_keeps_each_file_on_one(tmp_path: Path) -> None:
     """A real two-worker run on four small files: more than one worker is used, and every file stays on exactly one."""
     names = ("test_a", "test_b", "test_c", "test_d")
@@ -211,6 +255,7 @@ def test_neither_ci_expression_collects_the_herdr_live_tests() -> None:
         assert done.returncode == 5, f"{name} collected live tests:\n{done.stdout}"  # 5 = nothing collected
 
 
+@needs_xdist
 def test_a_real_run_deselects_slow_tests_from_the_parallel_pass_and_runs_them_in_the_tail(tmp_path: Path) -> None:
     (tmp_path / "test_x.py").write_text(
         "import os, pytest\n"
@@ -246,6 +291,8 @@ def test_the_gate_runs_the_parallel_pass_and_a_serial_tail_both_under_the_watchd
 
 
 def watch(soft: str, hard: str, script: str, **env: str) -> subprocess.CompletedProcess[str]:
+    if not watchdog_runs_here():
+        pytest.skip("run-watched.py measures progress through /proc, which this platform does not have")
     return subprocess.run([sys.executable, str(WATCHER), soft, hard, "--", sys.executable, "-u", "-c", script],
                           capture_output=True, text=True, timeout=60, env={**os.environ, **env})
 
@@ -286,6 +333,7 @@ def wait_gone(pid: int, seconds: float = 15) -> bool:
     return False
 
 
+@needs_proc
 def test_sigterm_to_the_watchdog_stops_the_command_and_exits_128_plus_signal(pidfiles) -> None:
     pidfile = pidfiles()
     script = f"import os, time; open({str(pidfile)!r}, 'w').write(str(os.getpid())); time.sleep(1234)"
@@ -368,6 +416,7 @@ def test_a_hang_kill_stops_an_orphaned_daemon_too(pidfiles) -> None:
     assert wait_gone(wait_file(pidfile)), "a hang kill leaked the orphaned daemon"
 
 
+@needs_proc
 def test_sigterm_to_the_watchdog_stops_an_orphaned_daemon_too(pidfiles) -> None:
     pidfile = pidfiles()
     spawn = daemonize_cmd(pidfile, "time.sleep(1234)")
@@ -390,6 +439,7 @@ def test_a_leaked_busy_survivor_does_not_keep_the_watchdog_alive_and_is_stopped(
     assert wait_gone(wait_file(pidfile)), "the leaked busy process was left running"
 
 
+@needs_proc
 def test_a_closed_reader_does_not_kill_or_hang_the_run() -> None:
     done = subprocess.run(
         f'{sys.executable} {WATCHER} 100 100 -- {sys.executable} -u -c '
@@ -399,7 +449,7 @@ def test_a_closed_reader_does_not_kill_or_hang_the_run() -> None:
     assert done.stdout == "0\n" and "Traceback" not in done.stderr and "BrokenPipe" not in done.stderr, done.stderr
 
 
-VISIBLE = len(os.sched_getaffinity(0))
+VISIBLE = visible_cpus()
 CAP = 8
 # Quotas are chosen relative to the CPUs this test process may use, so the tests hold on any host (and under `taskset -c 0-1`).
 Q = min(VISIBLE, CAP) - 1          # the largest quota that must shrink the worker count
@@ -428,6 +478,7 @@ def workers_for(env: dict[str, str], **more: str) -> list[str]:
 
 
 @needs_two_cpus
+@needs_proc
 def test_auto_is_capped_by_a_cgroup_cpu_quota_smaller_than_the_visible_cores(tmp_path: Path) -> None:
     """xdist's `auto` counts the cores in the affinity mask, not the CPU quota of the cgroup: a job granted fewer CPUs than it can see
     starts workers that starve each other (3 s socket reads timing out, `pg_ctl stop` past its wait)."""
@@ -437,6 +488,7 @@ def test_auto_is_capped_by_a_cgroup_cpu_quota_smaller_than_the_visible_cores(tmp
 
 
 @needs_two_cpus
+@needs_proc
 def test_the_smallest_quota_up_the_cgroup_path_wins(tmp_path: Path) -> None:
     """Slurm and containers often put the limit on a parent: the job's own cgroup says `max` or something larger."""
     env = cg(tmp_path, v2={"a": f"{Q * 100000} 100000", "a/b": "max 100000", "a/b/c": f"{(Q + 5) * 100000} 100000"}, proc="0::/a/b/c")
@@ -447,6 +499,7 @@ def test_the_smallest_quota_up_the_cgroup_path_wins(tmp_path: Path) -> None:
 
 
 @needs_two_cpus
+@needs_proc
 def test_a_fractional_quota_rounds_down_but_never_to_zero(tmp_path: Path) -> None:
     assert workers_for(cg(tmp_path, v2={"j": "150000 100000"}, proc="0::/j")) == ["-n", "1"]
     (tmp_path / "x").mkdir()
@@ -461,6 +514,7 @@ def test_an_unlimited_or_generous_quota_keeps_auto(tmp_path: Path) -> None:
 
 
 @needs_two_cpus
+@needs_proc
 def test_cgroup_v1_reads_the_cpu_controller_path_from_proc_self_cgroup_and_its_parents(tmp_path: Path) -> None:
     env = cg(tmp_path, v1={"": (Q * 100000, 100000), "job": (-1, 100000)}, proc="4:cpu,cpuacct:/job")
     assert workers_for(env) == ["-n", str(Q)]
@@ -476,6 +530,7 @@ def test_no_cgroup_files_means_auto(tmp_path: Path) -> None:
 
 
 @needs_two_cpus
+@needs_proc
 def test_the_scaling_really_reaches_pytest_as_a_worker_count(tmp_path: Path) -> None:
     """End to end for one case: the exact words the gate passes are `-n <Q>`, and xdist accepts them."""
     env = cg(tmp_path, v2={"job": f"{Q * 100000} 100000"}, proc="0::/job")
@@ -545,6 +600,7 @@ def pidfiles(tmp_path: Path):
     reap_pidfiles(made)
 
 
+@needs_proc
 def test_the_pidfile_fixture_kills_a_leaked_process_and_removes_the_file(tmp_path: Path) -> None:
     pidfile = tmp_path / "leak"
     sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(1234)"])
@@ -598,6 +654,7 @@ def test_out_write_survives_a_full_nonblocking_stdout_pipe() -> None:
     assert done.returncode == 0 and "survived" in done.stderr, done.stderr
 
 
+@needs_proc
 def test_out_write_waits_for_a_late_reader_of_a_nonblocking_stdout_and_loses_nothing() -> None:
     total = 1_000_000
     for via in ("out", "watchdog"):
@@ -630,6 +687,7 @@ def test_out_write_survives_a_closed_or_missing_stdout() -> None:
     assert missing.returncode == 0 and "survived" in missing.stderr, missing.stderr
 
 
+@needs_proc
 def test_the_group_is_not_signalled_once_the_root_is_reaped_unless_a_member_proves_it_is_ours(monkeypatch) -> None:
     mod = load_watcher()
     proc = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
@@ -650,6 +708,7 @@ def test_the_group_is_not_signalled_once_the_root_is_reaped_unless_a_member_prov
         live.wait()
 
 
+@needs_proc
 def test_a_reaped_root_whose_pid_was_reused_by_an_unrelated_group_leader_is_never_group_signalled(monkeypatch) -> None:
     mod = load_watcher()
     gone = subprocess.Popen([sys.executable, "-c", "pass"])
@@ -666,6 +725,7 @@ def test_a_reaped_root_whose_pid_was_reused_by_an_unrelated_group_leader_is_neve
         stranger.wait()
 
 
+@needs_proc
 def test_a_reaped_root_whose_group_still_holds_a_known_member_is_group_signalled(monkeypatch) -> None:
     mod = load_watcher()
     root = subprocess.Popen(["sh", "-c", "sleep 60 & echo $!"], stdout=subprocess.PIPE, text=True, start_new_session=True)
@@ -685,6 +745,7 @@ def test_a_reaped_root_whose_group_still_holds_a_known_member_is_group_signalled
         os.kill(member, signal.SIGKILL)
 
 
+@needs_proc
 def test_a_token_that_appears_in_the_environ_after_the_first_look_is_found(tmp_path: Path) -> None:
     mod = load_watcher()
     token = "late-token-1"
@@ -729,6 +790,7 @@ def test_signal_handlers_are_installed_before_the_command_is_spawned() -> None:
     assert lines["popen"] and lines["handler"] and max(lines["handler"]) < min(lines["popen"])
 
 
+@needs_proc
 def test_a_signal_sent_by_the_command_the_instant_it_starts_still_stops_it_cleanly(pidfiles) -> None:
     pidfile = pidfiles()
     script = f"import os, signal, time; open({str(pidfile)!r}, 'w').write(str(os.getpid())); os.kill(os.getppid(), signal.SIGTERM); time.sleep(1234)"
