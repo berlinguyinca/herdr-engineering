@@ -1,6 +1,7 @@
 """Real processes and kernel locks; Docker/health stay in disposable fixtures."""
 import fcntl
 import json
+import re
 import os
 import shutil
 import signal
@@ -261,6 +262,22 @@ def test_wrong_owner_cannot_clear_or_change_metadata(env):
         subprocess.run(["python3", str(helper), action, str(state(env)), "b" * 32, *extra],
                        check=True)
         assert owner.read_bytes() == before
+
+
+def test_every_lock_phase_deploy_sh_enters_is_one_deploy_state_accepts(env):
+    # deploy_lock_phase goes through deploy-state.py whenever the collab lock is held; a phase name the helper does not
+    # know aborts the deploy with "invalid phase" (predeploy-backup did exactly that on the artifact-host tests)
+    helper = DEPLOY.parent / "deploy-state.py"
+    phases = sorted(set(re.findall(r"^\s*deploy_lock_phase\s+([a-z-]+)", DEPLOY.read_text(), re.M)))
+    assert "predeploy-backup" in phases and "checkpoint-prewarm" in phases
+    state(env).mkdir(parents=True)
+    owner = state(env) / "rollout-owner.json"
+    subprocess.run(["python3", str(helper), "lock-start", str(state(env)), "a" * 32, "123"], check=True)
+    for phase in phases:
+        result = subprocess.run(["python3", str(helper), "lock-phase", str(state(env)), "a" * 32, phase],
+                                capture_output=True, text=True)
+        assert result.returncode == 0, f"{phase}: {result.stderr}"
+        assert json.loads(owner.read_text())["phase"] == phase
 
 
 @pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
@@ -527,6 +544,13 @@ exec '{original}' "$@"
         result = subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
     log = env["log"].read_text()
     assert "prewarm-before-host-changes" in log
+    # the database is dumped (and verified) BEFORE the migration the prewarm applies, into the private backup directory
+    dump = next(env["home"].glob(".local/share/herdr-engineering/backups/control-plane/predeploy-controlplane-*.dump"))
+    assert dump.read_bytes() == b"PGDMP-synthetic" and stat.S_IMODE(dump.stat().st_mode) == 0o600
+    # the wrapper above logs this marker for every prewarm run, also the failing one (which exits before the stub's own
+    # "docker run" line would be written)
+    assert log.index("pg_dump -U cpadmin -d herdr") < log.index("prewarm-before-host-changes")
+    assert "herdr-cp-rustfs" not in log           # a migration does not touch the object store
     assert "PREWARM-SECRET" not in result.stdout + result.stderr
     metadata_path = next(state(env).glob("attempt-*/metadata.json"))
     metadata = json.loads(metadata_path.read_text())
@@ -536,6 +560,9 @@ exec '{original}' "$@"
     if fail:
         assert "PREWARM-SECRET-MUST-NOT-LEAK" in prewarm_log.read_text()
         assert result.returncode == 1, result.stdout + result.stderr
+        # the migration may have moved the schema: the message says so and names the dump instead of claiming nothing changed
+        assert "no host files or services changed" not in result.stderr
+        assert "schema may have changed" in result.stderr and str(dump) in result.stderr
         assert metadata["outcome"] == "prewarm_failed"
         assert " up " not in log
         assert not (env["home"] / ".config").exists()
@@ -554,6 +581,28 @@ exec '{original}' "$@"
         assert f"src={metadata_path.parent}/candidate,dst=/etc/herdr/fleet,readonly" in run
         assert log.index("docker run ") < log.index(" up ")
     assert not (state(env) / "rollout-owner.json").exists()
+
+
+def test_a_failed_pre_migration_dump_stops_the_deploy_before_the_migration(env):
+    _seed_previous(env, _layout_commit())
+    env["env"]["STUB_FAIL_CP_DUMP"] = "1"
+    result = deploy(env)
+    log = env["log"].read_text()
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "before the migration failed; nothing was migrated" in result.stderr
+    assert "docker run " not in log and " up " not in log
+    assert list(env["home"].glob(".local/share/herdr-engineering/backups/control-plane/.partial-*")) == []
+    metadata = json.loads(next(state(env).glob("attempt-*/metadata.json")).read_text())
+    assert metadata["outcome"] == "backup_failed"        # nothing ran in the prewarm: not recorded as a prewarm failure
+
+
+def test_a_real_deploy_installs_the_control_plane_backup_timer_and_a_first_deploy_dumps_nothing(env):
+    result = deploy(env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    log = env["log"].read_text()
+    assert "pg_dump" not in log                    # nothing to dump before the first database exists
+    assert "systemctl --user enable --now herdr-controlplane-backup.timer" in log
+    assert (env["home"] / ".config/systemd/user/herdr-controlplane-backup.timer").is_file()
 
 
 def test_initially_absent_web_skips_prewarm_network_and_is_recreated(env):

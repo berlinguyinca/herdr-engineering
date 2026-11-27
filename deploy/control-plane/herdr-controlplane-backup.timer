@@ -1,0 +1,13 @@
+# Daily; Persistent so a run missed while the host was off happens at the next boot. Installed by `deploy.sh` /
+# `memory-backup.sh install --target control-plane`.
+[Unit]
+Description=Daily Herdr control-plane backup
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=15m
+Persistent=true
+Unit=herdr-controlplane-backup.service
+
+[Install]
+WantedBy=timers.target

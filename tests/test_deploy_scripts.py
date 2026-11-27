@@ -77,6 +77,16 @@ def env(tmp_path, candidate_ref, monkeypatch):
     # the tag as "running" (what the stub curl's health answer reports).
     stub.write_text(f"""#!/usr/bin/env bash
 echo "docker $*" >> {log}
+# the control-plane database backup (memory-backup.sh): the user comes from the container's environment, pg_dump
+# prints a synthetic archive and pg_restore --list accepts it; STUB_FAIL_CP_DUMP=1 makes the dump fail
+if [ "$1 $2" = "exec herdr-cp-postgres" ] || [ "$1 $2 $3" = "exec -i herdr-cp-postgres" ]; then
+  case "$*" in
+    *printenv*) echo cpadmin ;;
+    *pg_dump*) [ -z "${{STUB_FAIL_CP_DUMP:-}}" ] || exit 1; printf PGDMP-synthetic ;;
+    *pg_restore*) cat >/dev/null ;;
+  esac
+  exit 0
+fi
 # deploy-state.py asks for `inspect --type container NAME`: answer it like `inspect NAME`
 if [ "$1 ${{2:-}} ${{3:-}}" = "inspect --type container" ] && [ "$#" = 4 ]; then set -- inspect "$4"; fi
 is_missing() {{ case " $(cat {missing} 2>/dev/null) " in *" $1 "*) return 0 ;; esac; return 1; }}
