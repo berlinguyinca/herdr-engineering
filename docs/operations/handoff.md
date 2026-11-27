@@ -482,6 +482,14 @@ when it would otherwise have started a drain, and once per session. It then leav
 changes or its switch is turned off and on. A session that would have succeeded on a fourth try is therefore left to the
 harness's own compaction. The waits count credited time (see below), so a laptop asleep for hours does not use them up.
 
+### What an event reason quotes
+
+A reason is a short stable code with at most one plain detail line (`git commit -q exit 1: lint failed`,
+`herdr-handoff exit 1: no such file`): colour codes and control characters removed, newlines collapsed to the first
+meaningful line, at most 120 characters. The full stderr of the failing git or `herdr-handoff` call goes to the
+controller's own stderr, where the process supervisor logs it; it is never written to the event log or shown in the
+side pane.
+
 ### Last resort: compaction
 
 Compaction is used only in the fallback path: over the ceiling once the 30-minute bound passed without the order typed (or

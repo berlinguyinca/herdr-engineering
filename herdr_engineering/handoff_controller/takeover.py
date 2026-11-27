@@ -27,6 +27,7 @@ from .config import ControllerConfig
 from .events import ATTEMPT, COMPACTING, Colour, EventLog, HandoffEvent, StuckReason, now_iso
 from .handoff_cli import HandoffCli, HandoffCliResult
 from .herdr_cli import HerdrCli
+from .proc import detail_line, log_output
 
 _CLOSED_PHASES = frozenset({"source_closed", "already_closed"})
 _CONFIRMED_PHASES = frozenset({"confirmed", "source_exit_failed"})  # the child is proven live; the source stays open
@@ -112,14 +113,15 @@ def classify(done: HandoffCliResult) -> TakeoverResult:
     except ValueError:
         reply = None
     if not isinstance(reply, dict) or not isinstance(reply.get("status"), str):
-        first = (done.stderr.strip().splitlines() or ["no output"])[0][:200]
-        return TakeoverResult(Outcome.FAILED, f"herdr-handoff exit {done.returncode}: {first}")
+        what = f"herdr-handoff exit {done.returncode}"
+        log_output(what, done.stderr)
+        return TakeoverResult(Outcome.FAILED, f"{what}: {detail_line(done.stderr)}")
     status = reply["status"]
     pane = reply.get("pane_id") if isinstance(reply.get("pane_id"), str) else None
     if status == "source_closed" and reply.get("source_closed") is True and done.returncode == 0:
         return TakeoverResult(Outcome.CLOSED, "", pane, status)
     detail = reply.get("reason")
-    return TakeoverResult(Outcome.REFUSED, f"{status}: {detail}" if isinstance(detail, str) and detail else status, pane,
+    return TakeoverResult(Outcome.REFUSED, f"{status}: {detail_line(detail)}" if isinstance(detail, str) and detail.strip() else status, pane,
                           status)
 
 

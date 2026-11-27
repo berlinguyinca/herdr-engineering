@@ -173,6 +173,23 @@ def test_classify_reads_the_status_of_the_json_reply() -> None:
     assert classify(_result(1, {"status": "subagents_running"})).reason == "subagents_running"
 
 
+def test_a_failing_programs_multiline_coloured_stderr_is_one_plain_short_line_in_the_reason_and_whole_in_the_log(
+        caplog: pytest.LogCaptureFixture) -> None:
+    script = "printf '\\033[31mboom\\033[0m %0300d\\nsecond line\\n\\033[1;32mthird\\033[0m\\n' 0 >&2; exit 3"
+    ran = subprocess.run(["sh", "-c", script], capture_output=True, text=True)  # a real process, not a canned string
+    with caplog.at_level("WARNING", logger="herdr_engineering.handoff_controller"):
+        result = classify(HandoffCliResult(ran.returncode, ran.stdout, ran.stderr))
+    assert result.outcome is Outcome.FAILED and result.reason.startswith("herdr-handoff exit 3: boom 000")
+    assert "\n" not in result.reason and "\x1b" not in result.reason and len(result.reason) <= 160
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "second line" in logged and "third" in logged
+
+
+def test_a_refusal_detail_is_one_plain_short_line() -> None:
+    refused = classify(_result(1, {"status": "source_dirty", "reason": "\x1b[31mdirty\x1b[0m\nsecond line " + "x" * 300}))
+    assert refused.reason.startswith("source_dirty: dirty") and "\n" not in refused.reason and len(refused.reason) <= 160
+
+
 @pytest.mark.parametrize("done", [_result(124, ""), _result(127, "", "no such file"), _result(1, "", "boom\nmore"),
                                   _result(0, "[]"), _result(0, {"no": "status"})])
 def test_classify_never_reads_silence_or_noise_as_success(done: HandoffCliResult) -> None:

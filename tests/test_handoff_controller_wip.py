@@ -7,6 +7,8 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 from herdr_engineering.handoff_controller.wip import WipReason, WipResult, _push, wip_commit
 
 
@@ -332,3 +334,21 @@ def test_main_without_a_remote_reports_no_unpushed_commits(tmp_path: Path) -> No
     work = _no_remote_repo(tmp_path, "main")
     result = wip_commit(work, push_allowed=True)
     assert result.reason is WipReason.ON_MAIN and result.unpushed == ()
+
+
+def test_a_hooks_multiline_coloured_stderr_is_one_plain_short_line_in_the_error_and_whole_in_the_log(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    work = make_repo(tmp_path)
+    hook = work / ".git" / "hooks" / "pre-commit"
+    hook.parent.mkdir(exist_ok=True)
+    hook.write_text("#!/bin/sh\nprintf '\\033[31mlint failed\\033[0m %0300d\\nsecond line\\n\\033[1;32mthird\\033[0m\\n' 0 >&2\nexit 1\n")
+    hook.chmod(0o755)
+    (work / "a.txt").write_text("two\n")
+    with caplog.at_level("WARNING", logger="herdr_engineering.handoff_controller"):
+        result = wip_commit(work, push_allowed=True)
+    assert result.reason is WipReason.COMMIT_REJECTED and result.error
+    assert result.error.startswith("git commit -q exit 1: lint failed 000")
+    assert "\n" not in result.error and "\x1b" not in result.error and len(result.error) <= 160
+    assert "second line" not in result.error
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "second line" in logged and "third" in logged  # the whole stderr is in the log
