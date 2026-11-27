@@ -236,8 +236,8 @@ def test_resume_body_is_consumed_so_one_response_only(gate_server, pr, escalated
         escalate(gate_server)
     elif pr == 7:
         gate_server.gate_store.on_push(PrKey(REPO, 7), "sha1")
-    smuggled = b"GET /api/v1/review-gate/prs HTTP/1.1\r\nHost: x\r\nX-API-Key: read\r\n\r\n"
-    req = (f"POST /api/v1/review-gate/prs/{REPO}/{pr}/resume HTTP/1.1\r\nHost: x\r\n"
+    smuggled = b"GET /api/v1/review-gate/prs HTTP/1.1\r\nHost: 127.0.0.1\r\nX-API-Key: read\r\n\r\n"
+    req = (f"POST /api/v1/review-gate/prs/{REPO}/{pr}/resume HTTP/1.1\r\nHost: 127.0.0.1\r\n"
            f"X-API-Key: write\r\nContent-Type: application/json\r\n"
            f"Content-Length: {len(smuggled)}\r\n\r\n").encode() + smuggled
     data = raw_exchange(gate_server, req)
@@ -271,7 +271,7 @@ def test_trailing_slash_routes(gate_server):
     assert request(gate_server, "review-gate/queue/x")[0] == 404
 
 
-SMUGGLED = b"GET /api/v1/review-gate/prs HTTP/1.1\r\nHost: x\r\nX-API-Key: read\r\n\r\n"
+SMUGGLED = b"GET /api/v1/review-gate/prs HTTP/1.1\r\nHost: 127.0.0.1\r\nX-API-Key: read\r\n\r\n"
 
 
 def _responses(data):
@@ -279,7 +279,7 @@ def _responses(data):
 
 
 def _post_head(extra):
-    return (f"POST /api/v1/review-gate/prs/{REPO}/7/resume HTTP/1.1\r\nHost: x\r\n"
+    return (f"POST /api/v1/review-gate/prs/{REPO}/7/resume HTTP/1.1\r\nHost: 127.0.0.1\r\n"
             f"X-API-Key: write\r\nContent-Type: application/json\r\n{extra}\r\n").encode()
 
 

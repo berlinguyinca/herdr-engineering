@@ -70,12 +70,14 @@ from .library import (
     LibraryStore,
     Source,
     Viewer,
+    held_bytes,
     settle_quota,
+    version_bytes,
 )
 from .media_type import safe_media_type
 from .member_session import check_session, mint_session
 from .share_bundle import ShareBundleError, choose_entry, content_type_for, normalise_name
-from .share_http import RateLimiter
+from .share_http import MODE_SWITCH_MAX_BYTES, RateLimiter, labelled_html, shared_by_bar
 from .share_store import token_digest
 
 log = logging.getLogger("herdr_artifact_host.member")
@@ -666,7 +668,7 @@ class MemberService:
         self._throttle_write(member)
         async with self.pool.acquire() as conn, conn.transaction():
             await self._lock_usage(conn, member)
-            row = await self._owned(conn, member, artifact_id, lock=True, agent=self._agent(actor))
+            await self._owned(conn, member, artifact_id, lock=True, agent=self._agent(actor))
             await conn.execute(
                 "UPDATE artifacts SET lifecycle='retracted', updated_at=now() WHERE artifact_id=$1",
                 artifact_id,
@@ -678,7 +680,7 @@ class MemberService:
                 artifact_id,
                 self._who(actor, member),
             )
-            await settle_quota(conn, member, int(row["size_bytes"]))
+            await settle_quota(conn, member, await held_bytes(conn, artifact_id))
         await self._drop_staging(member, artifact_id)
         await self._audit(member, "delete", "ok")
         return {"artifact_id": artifact_id, "deleted": True}
@@ -1011,15 +1013,18 @@ class MemberService:
 
     # -- publish
 
-    def _check_quota(self, usage: asyncpg.Record | None, current_size: int, total: int) -> int:
-        """The member's projected bytes if this artifact became ``total`` bytes; raises 413 ``quota`` when over."""
+    def _check_quota(
+        self, usage: asyncpg.Record | None, current_size: int, total: int, keep: int = 0
+    ) -> int:
+        """The member's projected bytes if this artifact became ``total`` bytes; raises 413 ``quota`` when over.
+        ``keep`` is what the superseded version still holds: old versions stay stored, so they stay counted."""
 
         def limit(column: str, default: int) -> int:
             return int((usage and usage[column]) or default)
 
         if total > limit("max_artifact_bytes", self.limits.max_artifact_bytes):
             raise MemberError(413, "quota", "artifact is over its size limit")
-        projected = int(usage["bytes_used"] if usage else 0) - current_size + total
+        projected = int(usage["bytes_used"] if usage else 0) - current_size + total + keep
         if projected > limit("max_member_bytes", self.limits.max_member_bytes):
             raise MemberError(413, "quota", "storage quota exceeded")
         return projected
@@ -1173,7 +1178,12 @@ class MemberService:
             member,
         )
         current_row = await self._owned(self.pool, member, artifact_id, agent=self._agent(actor))
-        self._check_quota(early, int(current_row["size_bytes"]), total)
+        self._check_quota(
+            early,
+            int(current_row["size_bytes"]),
+            total,
+            await version_bytes(self.pool, current_row["current_version_id"]),
+        )
         # Each publish holds one pooled connection from its first blob lock until the commit (the session-level locks
         # must outlive the blob write), so a global cap keeps publishes from draining the pool.
         if self._publishing >= self.limits.concurrent_publishes:
@@ -1245,7 +1255,12 @@ class MemberService:
                     current = row["current_version_id"]
                     if (base_version_id or None) != current:
                         raise MemberError(409, "stale_base", "the artifact has a newer version")
-                    projected = self._check_quota(usage, int(row["size_bytes"]), total)
+                    projected = self._check_quota(
+                        usage,
+                        int(row["size_bytes"]),
+                        total,
+                        await version_bytes(conn, current),
+                    )
                     for item in manifest:
                         await conn.execute(
                             "INSERT INTO artifact_blobs (sha256, size_bytes, media_type) VALUES ($1,$2,$3) "
@@ -1360,6 +1375,7 @@ class MemberService:
         token = secrets.token_urlsafe(32)
         share_id = "shr_" + secrets.token_hex(12)
         expires = now_dt(self.now) + timedelta(days=days)
+        checked = await self._precheck_create(member, artifact_id, version_id, entry_arg, agent)
         async with self.pool.acquire() as conn, conn.transaction():
             usage = await self._lock_usage(conn, member)
             if usage["sharing_disabled"]:
@@ -1383,6 +1399,8 @@ class MemberService:
                 entry = choose_entry(entry_arg, sorted(f["name"] for f in files))
             except ShareBundleError:
                 raise _bad("entry is not in the version") from None
+            if ver["manifest"] != checked:  # only the version can have moved since the check above
+                raise MemberError(409, "version_changed", "the version changed, retry")
             recent = await conn.fetchval(
                 "SELECT count(*) FROM shares WHERE created_by=$1 AND created_at > $2",
                 member,
@@ -1438,6 +1456,91 @@ class MemberService:
             "url": f"{base}/s/{token}/",
             "expires_at": iso(expires),
         }
+
+    async def _precheck_create(
+        self, member: str, artifact_id: str, version_id: str, entry_arg: str | None, agent: bool
+    ) -> str | None:
+        """Before the locking transaction (blob reads and HTML parsing must not hold row locks while the pool is shared
+        with public serving): the label check of the entry page of the member's own ready version.  Returns the manifest
+        text it checked, or None when there is nothing to check (the transaction then gives the uniform error)."""
+        row = await self.pool.fetchrow(
+            "SELECT v.output_manifest::text AS manifest FROM artifact_versions v JOIN artifacts a "
+            "ON a.artifact_id=v.artifact_id WHERE v.version_id=$1 AND v.artifact_id=$2 AND v.state='ready' "
+            "AND a.owner=$3 AND a.intake='accepted' AND a.lifecycle='active'"
+            + (" AND a.created_via='agent'" if agent else ""),
+            version_id,
+            artifact_id,
+            member,
+        )
+        if row is None:
+            return None
+        files = json.loads(row["manifest"])
+        try:
+            entry = choose_entry(entry_arg, sorted(f["name"] for f in files))
+        except ShareBundleError:
+            return None
+        await self._require_labelable(files, entry)
+        return row["manifest"]
+
+    async def _precheck_approve(
+        self, member: str, artifact_id: str, share_id: str, agent: bool
+    ) -> str | None:
+        """The same check for a pending share, before its locking transaction; returns the manifest text checked."""
+        row = await self.pool.fetchrow(
+            "SELECT s.entry, s.state, v.output_manifest::text AS manifest FROM shares s JOIN artifacts a "
+            "ON a.artifact_id=s.artifact_id JOIN artifact_versions v ON v.version_id=s.version_id "
+            "WHERE s.share_id=$1 AND s.artifact_id=$2 AND a.owner=$3 "
+            "AND a.lifecycle NOT IN ('retracted','tombstoned')"
+            + (" AND s.created_via='agent' AND a.created_via='agent'" if agent else ""),
+            share_id,
+            artifact_id,
+            member,
+        )
+        if row is None or row["state"] != "pending":
+            return None
+        await self._require_labelable(json.loads(row["manifest"] or "[]"), row["entry"])
+        return row["manifest"]
+
+    async def _require_labelable(self, files: list[dict[str, Any]], entry: str) -> None:
+        """A member link labels every HTML page it serves ("shared by ... not reviewed") and the serve path fails closed
+        with the uniform 404 for a page it cannot label.  Refuse a share whose ENTRY page is such a page, with the reason,
+        rather than hand out a link that never opens; other pages of the version are checked (and 404) when served."""
+        item = next((f for f in files if f["name"] == entry), None)
+        if item is None:
+            return
+        ctype = content_type_for(entry)
+        if ctype.split(";")[0].strip() != "text/html":
+            return
+        if int(item["size_bytes"]) > MODE_SWITCH_MAX_BYTES:
+            raise MemberError(
+                400,
+                "html_too_large",
+                f"{entry} is over {MODE_SWITCH_MAX_BYTES} bytes, the most a member link can label",
+            )
+        bar = shared_by_bar("a lab member")
+
+        def label() -> bool:
+            with self.blobs.open(item["sha256"]) as handle:
+                return labelled_html(handle.read(), ctype, bar) is not None
+
+        try:
+            labelled = await asyncio.to_thread(label)
+        except (BlobCorrupt, BlobMissing) as err:
+            log.warning("share label check: blob %s is %s", item["sha256"], type(err).__name__)
+            raise _not_found() from None
+        except OSError:
+            log.exception("share label check: blob %s unreadable", item["sha256"])
+            raise MemberError(
+                503, "storage_unavailable", "storage is unavailable, retry shortly"
+            ) from None
+        if not labelled:
+            raise MemberError(
+                400,
+                "unsupported_html",
+                f"{entry} cannot carry the 'shared by' label (unsupported encoding such as UTF-16, or "
+                "ambiguous markup: CDATA, <?...>, odd comments, an unclosed template/textarea/svg/script "
+                "before <body>); save it as plain UTF-8 HTML",
+            )
 
     @staticmethod
     def _allow_list(value: object, pattern: re.Pattern[str], *, lower: bool = False) -> list[str]:
@@ -1501,6 +1604,7 @@ class MemberService:
         ):
             raise _bad("idempotency_key is invalid")
         self._throttle_write(member)
+        checked = await self._precheck_approve(member, artifact_id, share_id, self._agent(actor))
         async with self.pool.acquire() as conn, conn.transaction():
             usage = await self._lock_usage(conn, member)
             if usage["sharing_disabled"]:  # revoke and the event log stay open
@@ -1526,6 +1630,13 @@ class MemberService:
                 raise MemberError(409, "not_pending", "the share link is not pending")
             if row["expires_at"] is not None and row["expires_at"] <= now_dt(self.now):
                 raise MemberError(409, "expired", "the share link has expired")
+            manifest = await conn.fetchval(
+                "SELECT v.output_manifest::text FROM shares s JOIN artifact_versions v "
+                "ON v.version_id=s.version_id WHERE s.share_id=$1",
+                share_id,
+            )
+            if manifest != checked:  # only the version can have moved since the check above
+                raise MemberError(409, "version_changed", "the version changed, retry")
             # an agent's link has no token yet: it is made here and shown to the owner once (only its digest is kept)
             token = secrets.token_urlsafe(32) if row["created_via"] == "agent" else None
             await conn.execute(
@@ -2378,6 +2489,7 @@ def build_member_settings(
         ),
     }
     assets = {url: (path.read_bytes(), ctype) for url, (path, ctype) in files.items()}
+
     # Exact files, never 'self': the same origin serves member-uploaded bundles (/s/<token>/f/x.js), which a bare
     # 'self' would let an HTML-injection bug load as a script and drive this API.
     def page_csp(origin: str) -> str:

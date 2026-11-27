@@ -17,9 +17,12 @@ def _token_ok(token) -> bool:
     return isinstance(token, str) and 0 < len(token) <= MAX_TOKEN_CHARS and token.isascii()
 
 
-def authorise(state, access_token, id_token, authenticator) -> tuple[dict | None, str, str | None]:
+def authorise(
+    state, access_token, id_token, authenticator, nonce: str | None = None
+) -> tuple[dict | None, str, str | None]:
     """``(grant, reason, identity)``: grant is ``{identity, email, exp, basis}`` or None with a fixed reason code; identity is
-    the verified Cognito user once the access token checked out (for the audit actor), else None."""
+    the verified Cognito user once the access token checked out (for the audit actor), else None. ``nonce`` (the page's
+    own sign-in attempt, ``X-Nonce``) must equal the id token's nonce when given."""
     try:
         if not isinstance(state, dict) or state.get("audience") != "lab" or authenticator is None:
             return None, "audience", None
@@ -40,7 +43,7 @@ def authorise(state, access_token, id_token, authenticator) -> tuple[dict | None
         user, exp, token_groups = claims.get("user"), claims.get("exp"), claims.get("groups") or []
         if not isinstance(user, str) or not user or not isinstance(exp, float):
             return None, "bad_access_token", None
-        email = authenticator.verify_id_token(id_token, user=user)
+        email = authenticator.verify_id_token(id_token, user=user, nonce=nonce)
         if not isinstance(email, str) or not email:
             return None, "bad_id_token", user
         if email in allow_emails or any(

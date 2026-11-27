@@ -36,10 +36,11 @@ path-prefix override. Longest prefix wins.
 
 ```bash
 # Augur: origin 3011 -> UI (frontend:3000) by default, /api -> api:8300
+# (route hosts must be IP literals or localhost; the gateway refuses names)
 herdr-eng devfabric register \
   --machine <machine> --host <tailnet-ip-or-name> --port 3000 \
   --preferred-port 3011 \
-  --route /api=<tailnet-ip-or-name>:8300 \
+  --route /api=<tailnet-ip>:8300 \
   --repo augur --label "augur console"
 
 # then forward it (per-host mode) — or the central gateway does it automatically

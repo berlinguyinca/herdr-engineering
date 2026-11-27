@@ -13,6 +13,7 @@ import math
 import os
 import re
 import shlex
+import stat
 import subprocess
 import tempfile
 import time
@@ -111,11 +112,23 @@ class RolloutStore:
     def __init__(self, root: Path | None = None):
         self.root = root or _default_rollout_root()
 
-    def _directory(self):
+    def _directory(self, *, tighten=False):
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         info = self.root.lstat()
-        if self.root.is_symlink() or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        if (
+            self.root.is_symlink()
+            or not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_mode & 0o022
+        ):
+            # Group/world WRITE is never repaired: another user may already have planted a
+            # plan whose inventory ansible-inventory would execute.
             raise ValueError("rollout state must be a private, owned directory")
+        if tighten and info.st_mode & 0o077:
+            # Ours, not a link, not writable by others: only read bits remain (an older
+            # release or a umask may have left it 0755), so tighten rather than refuse.
+            # Only write paths do; status/latest only look.
+            self.root.chmod(0o700)
 
     def _path(self, rollout_id):
         if not re.fullmatch(r"[0-9a-f]{32}", rollout_id):
@@ -124,7 +137,7 @@ class RolloutStore:
 
     @contextmanager
     def lock(self, *, runner_id=None):
-        self._directory()
+        self._directory(tighten=True)
         name = ".lock" if runner_id is None else ".run-" + self._path(runner_id).stem + ".lock"
         fd = os.open(self.root / name, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         try:
@@ -137,6 +150,8 @@ class RolloutStore:
         path = self._path(rollout_id)
         if path.is_symlink():
             raise ValueError("rollout state must not be a symlink")
+        if path.stat().st_uid != os.getuid():
+            raise ValueError("rollout state file is not owned by this user")
         data = json.loads(path.read_text())
         if data.get("id") != rollout_id or not SHA.fullmatch(data.get("revision", "")):
             raise ValueError("invalid rollout state")
@@ -149,7 +164,7 @@ class RolloutStore:
         return data
 
     def write(self, data):
-        self._directory()
+        self._directory(tighten=True)
         path = self._path(data["id"])
         if path.exists():
             old = self.read(data["id"])
@@ -267,6 +282,24 @@ def resolve_plan_revision(explicit: str | None = None, pin: Path | None = None) 
     return pinned
 
 
+def delta_targets(store, revision, targets, *, abandoned_covers=False) -> list:
+    """Targets not covered by any settled plan for `revision`.
+
+    A host added to the inventory after a plan settled is in none of that plan's hosts, so
+    the settled plan alone would never roll the new host out. By default an abandoned plan
+    covers nothing; with `abandoned_covers` the operator's decision to stop rolling its hosts
+    is respected, so only hosts no settled plan ever named count as uncovered.
+    """
+    settled = ("complete", "abandoned") if abandoned_covers else ("complete",)
+    covered = {
+        host
+        for plan in list_rollouts(store)
+        if plan["revision"] == revision and plan.get("status") in settled
+        for host in plan["hosts"]
+    }
+    return [t for t in targets if t["host"] not in covered]
+
+
 def list_rollouts(store) -> list:
     """Every stored plan, validated. A corrupt record fails closed: the directory is the record."""
     store._directory()  # the same privacy/ownership check the write paths demand
@@ -284,9 +317,7 @@ def latest_unfinished(store):
     durable state, so the next attempt must continue it rather than start a parallel one (#844).
     """
     unfinished = [
-        plan
-        for plan in list_rollouts(store)
-        if plan.get("status") not in ("complete", "abandoned")
+        plan for plan in list_rollouts(store) if plan.get("status") not in ("complete", "abandoned")
     ]
     if not unfinished:
         return None
@@ -308,12 +339,42 @@ def abandon_rollout(store, rollout_id, *, reason: str = "abandoned by operator")
     return plan
 
 
-def prune_settled(store, *, older_than_days: int = 30, now=None) -> list:
+def _coverage_keepers(plans, revisions) -> set:
+    """IDs of the fewest newest-first settled plans whose hosts cover everything the settled
+    plans of `revisions` cover: the record `delta_targets` infers coverage from."""
+    keep = set()
+    for revision in revisions:
+        ordered = sorted(
+            (
+                p
+                for p in plans
+                if p["revision"] == revision and p.get("status") in ("complete", "abandoned")
+            ),
+            key=lambda p: (p.get("createdAt", ""), p["id"]),
+            reverse=True,
+        )
+        chosen, covered = [], set()
+        for plan in ordered:  # newest first: prefer the freshest record that adds a host
+            if not set(plan["hosts"]) <= covered:
+                chosen.append(plan)
+                covered |= set(plan["hosts"])
+        for plan in list(chosen):  # drop what later picks made redundant
+            others = set().union(*(set(o["hosts"]) for o in chosen if o is not plan))
+            if set(plan["hosts"]) <= others:
+                chosen.remove(plan)
+        keep |= {plan["id"] for plan in chosen}
+    return keep
+
+
+def prune_settled(store, *, older_than_days: int = 30, now=None, keep_revisions=()) -> list:
     """Delete settled (complete/abandoned) plans older than the horizon; return what left.
 
     Unsettled plans are never touched: a blocked rollout may be the operator's next action,
     and only a deliberate abandon marks it done. A settled record whose settle time is
-    unreadable is kept, never guessed. The horizon is bounded: a negative one would delete
+    unreadable is kept, never guessed. For each revision in `keep_revisions` (the pin), the
+    settled plans that together record which hosts were covered are kept however old: pruning
+    them would make a later small delta plan look like the whole fleet and re-roll it. The
+    horizon is bounded: a negative one would delete
     every settled record (losing the abandon audit trail), and an absurd one overflows.
     """
     if not 0 <= older_than_days <= 3650:
@@ -322,8 +383,10 @@ def prune_settled(store, *, older_than_days: int = 30, now=None) -> list:
     cutoff = now - timedelta(days=older_than_days)
     pruned = []
     with store.lock():
-        for plan in list_rollouts(store):
-            if plan.get("status") not in ("complete", "abandoned"):
+        plans = list_rollouts(store)
+        protected = _coverage_keepers(plans, set(keep_revisions))
+        for plan in plans:
+            if plan.get("status") not in ("complete", "abandoned") or plan["id"] in protected:
                 continue
             # An abandoned plan's audit window starts when it was abandoned, not when it
             # was created: judging it by createdAt would delete a freshly-abandoned old
@@ -582,9 +645,12 @@ def inventory_targets(inventory, host=None):
 
     expected = sorted(hosts_in("herdr_fleet"))
     if host is not None:
-        if host not in expected:
+        wanted = [host] if isinstance(host, str) else list(host)
+        if len(set(wanted)) != len(wanted):
+            raise ValueError("duplicate --host: each host may be named once")
+        if not wanted or any(name not in expected for name in wanted):
             raise ValueError("host is not in expected inventory")
-        expected = [host]
+        expected = wanted
     variables = resolved.get("_meta", {}).get("hostvars", {})
     targets = []
     for name in expected:
@@ -626,12 +692,21 @@ def _conversation(agent):
     raise ValueError("native Pi session lacks an exact conversation reference; bootstrap required")
 
 
+def _has_reachable_row(rows, session_id):
+    return any(
+        r.get("reachable") is True and r["descriptor"].get("sessionId") == session_id for r in rows
+    )
+
+
 def _foreground_identity(transport, target, agent, rows):
-    pane = _identifier(agent.get("pane_id"))
-    terminal = _identifier(agent.get("terminal_id"))
+    try:
+        pane = _identifier(agent.get("pane_id"))
+        terminal = _identifier(agent.get("terminal_id"))
+    except ValueError as exc:
+        raise NoForegroundProof(str(exc)) from exc
     tokens = ("revision", "state_change_seq")
     if not any(type(agent.get(key)) is int and agent[key] >= 0 for key in tokens):
-        raise ValueError("native pane has no revision token for identity verification")
+        raise NoForegroundProof("native pane has no revision token for identity verification")
     info = transport.process_info(target, pane)
     pids = {
         process["pid"]
@@ -641,6 +716,12 @@ def _foreground_identity(transport, target, agent, rows):
     candidates = [
         row for row in rows if row.get("reachable") is True and row["descriptor"].get("pid") in pids
     ]
+    if not candidates:
+        if any(row["descriptor"].get("pid") in pids for row in rows):
+            # A Pi control row owns the foreground process but did not answer: a live Pi we
+            # could not attribute, which is not the same as nothing running there.
+            raise NoForegroundProof("foreground Pi control instance did not answer the list")
+        raise NoProcessInPane("no Pi process runs in the pane")
     if len(candidates) != 1:
         raise ValueError("foreground PID does not identify exactly one live Pi control instance")
     descriptor = candidates[0]["descriptor"]
@@ -663,7 +744,13 @@ def _foreground_identity(transport, target, agent, rows):
         # Stable custom transcript references carry no parseable conversation ID.
         # Only the already-verified process/control identity establishes the target.
         native_session_id = None
-    if native_session_id is not None and native_session_id != session_id:
+    if (
+        native_session_id is not None
+        and native_session_id != session_id
+        and _has_reachable_row(rows, native_session_id)
+    ):
+        # A native reference naming a dead predecessor is the stale registration the foreground
+        # proof exists to see past; one naming another live conversation is a real conflict.
         raise ValueError("fresh native conversation disagrees with foreground identity")
     return session_id, {
         "source": "verified_foreground_pid",
@@ -674,6 +761,14 @@ def _foreground_identity(transport, target, agent, rows):
         "revision": agent.get("revision"),
         "stateChangeSeq": agent.get("state_change_seq"),
     }
+
+
+class NoForegroundProof(ValueError):
+    """The foreground process could not be attributed: unproven, so never grounds for "ended"."""
+
+
+class NoProcessInPane(ValueError):
+    """The pane runs no Pi process at all (empty, or only a shell): a registration for it is a husk."""
 
 
 class TransientlyUnreachable(ValueError):
@@ -882,11 +977,14 @@ def _session(plan, state, transport, target, root, save):
     )
     if activation_needed and not state.get("prepared"):
         receipt = _operation(plan, state, "prepare", "prepare", {}, transport, target, root, save)
-        if receipt["status"] == "skipped" and receipt.get("result", {}).get("status") == "busy":
+        if receipt["status"] == "skipped" and (receipt.get("result") or {}).get("status") == "busy":
             state["status"] = "pending"
             state.setdefault("busyReceipts", []).append(state["operations"].pop("prepare"))
             return
-        if receipt["status"] != "succeeded" or receipt.get("result", {}).get("status") != "ready":
+        if (
+            receipt["status"] != "succeeded"
+            or (receipt.get("result") or {}).get("status") != "ready"
+        ):
             state["status"] = "pending" if receipt["status"] == "running" else "blocked"
             return
         state["prepared"] = True
@@ -1050,6 +1148,9 @@ def _session(plan, state, transport, target, root, save):
         )
 
 
+_printable = fleet.printable_text
+
+
 def _note_unreachable(state, note):
     state["lastUnreachableAt"] = datetime.now(UTC).isoformat()
     state["note"] = note[:500]
@@ -1083,6 +1184,8 @@ def apply_rollout(store, rollout_id, *, transport=None, stage=None):
             target = host_state["target"]
             host_state.pop("error", None)
             host_state.pop("hostLevelError", None)
+            host_state.pop("nextStep", None)
+            host_state.pop("blockCode", None)
             try:
                 if not host_state.get("sourceRoot"):
                     if inventory_targets(Path(plan["inventory"]), host) != [target]:
@@ -1092,6 +1195,18 @@ def apply_rollout(store, rollout_id, *, transport=None, stage=None):
                     report = stage(plan["revision"], host=host, inventory=Path(plan["inventory"]))
                     host_state["staging"] = report
                     save()
+                    if report.get("ok") is not True and report.get("code") == DIRTY_RELEASE:
+                        host_state.update(
+                            status="blocked",
+                            blockCode=DIRTY_RELEASE,
+                            error=_printable(report.get("error") or "managed release is dirty")[:500],
+                            nextStep=(
+                                "inspect and commit or move the local changes in "
+                                f"~/.local/share/herdr-engineering/pi/releases/{plan['revision']} "
+                                "on the host, then re-run `herdr-eng fleet rollout apply`"
+                            ),
+                        )
+                        continue
                     if report.get("ok") is not True:
                         host_state.update(
                             status="pending", error=report.get("error", "staging unavailable")
@@ -1119,12 +1234,40 @@ def apply_rollout(store, rollout_id, *, transport=None, stage=None):
                 rows = _rows(transport, target, root)
                 identified = []
                 coverage_errors = []
+                unproven = {}
                 for agent in agents:
                     try:
                         try:
                             session_id, proof = _conversation(agent), None
                         except ValueError:
                             session_id, proof = _foreground_identity(transport, target, agent, rows)
+                        else:
+                            if (
+                                not _has_reachable_row(rows, session_id)
+                                and _unreachable_kind(rows, session_id) != "transient"
+                            ):
+                                # The native reference may name a dead predecessor while a live
+                                # Pi runs in this pane; settling it as ended would skip the reload.
+                                # A transient miss keeps its previous status instead, so the
+                                # remote proof is not even attempted for it. The proof is best
+                                # effort here: only "no Pi process in the pane" lets the
+                                # registration be treated as a husk; anything else leaves it
+                                # unproven, so it is retried and never settles as ended.
+                                try:
+                                    session_id, proof = _foreground_identity(
+                                        transport, target, agent, rows
+                                    )
+                                except NoProcessInPane:
+                                    pass
+                                except (
+                                    ValueError,
+                                    KeyError,
+                                    TypeError,
+                                    ConnectionError,
+                                    OSError,
+                                    subprocess.SubprocessError,
+                                ) as exc:
+                                    unproven[session_id] = _printable(str(exc))[:500]
                         identified.append((agent, session_id, proof))
                     except (
                         ValueError,
@@ -1143,8 +1286,6 @@ def apply_rollout(store, rollout_id, *, transport=None, stage=None):
                 identities = [session_id for _, session_id, _ in identified]
                 if len(identities) != len(set(identities)):
                     raise ValueError("ambiguous native conversation identity")
-                if not agents:
-                    raise ValueError("no native Pi sessions; expected coverage unverified")
                 # A retired husk is expected to leave the native inventory; its absence is the
                 # settled end state, not a fresh blocker no later pass could ever clear (#798 review).
                 # An ended session (process exited) is likewise settled.
@@ -1180,6 +1321,18 @@ def apply_rollout(store, rollout_id, *, transport=None, stage=None):
                         session_id,
                         {"sessionId": session_id, "native": agent, "status": "discovered"},
                     )
+                    if session_id in unproven:
+                        # A dead registration whose pane we could not inspect: keep the status,
+                        # note why, and retry next pass. Never end it, never complete the host.
+                        _note_unreachable(
+                            state,
+                            "native registration has no live row and the pane's foreground "
+                            "could not be proved: " + unproven[session_id],
+                        )
+                        if state.get("status") == "discovered":
+                            state["status"] = "pending"
+                        save()
+                        continue
                     previous_error = state.get("error")
                     if state.get("status") != "retired":
                         # A retired session keeps the refusal that justified retiring it.
@@ -1280,12 +1433,28 @@ def apply_rollout(store, rollout_id, *, transport=None, stage=None):
                     for s in host_state["sessions"].values()
                     if s.get("status") == "retired"
                 ]
+                nothing_to_do = not agents and not host_state["sessions"] and not session_errors
+                if nothing_to_do and any(
+                    r.get("reachable") is True or r.get("error") != _PROCESS_GONE for r in rows
+                ):
+                    # A Pi outside a herdr pane, or one herdr never tagged 'pi', answers on its
+                    # control socket yet is absent from the native inventory: it may still be
+                    # on the old revision, so "nothing to reload" cannot be claimed. A row counts as absent
+                    # only when its process is provably gone; an unresponsive one may be alive.
+                    raise ValueError("no native Pi sessions; expected coverage unverified")
+                if nothing_to_do:
+                    host_state["statusReason"] = (
+                        "no Pi sessions on host; release staged, nothing to reload"
+                    )
+                else:
+                    host_state.pop("statusReason", None)
                 host_state["status"] = (
                     "blocked"
                     if session_errors
                     or any(s["status"] == "blocked" for s in host_state["sessions"].values())
                     else "complete"
-                    if host_state["sessions"]
+                    if nothing_to_do
+                    or host_state["sessions"]
                     and all(
                         s["status"] in ("complete", "retired", "ended")
                         for s in host_state["sessions"].values()
@@ -1430,25 +1599,35 @@ def retire_identityless(store, rollout_id, *, settled_by="operator"):
         }
 
 
+#: Typed staging error code for a modified managed release (see ansible/files/stage-release.py).
+DIRTY_RELEASE = "managed_release_dirty"
+
+
 def _offline_failure(state):
+    """Offline is decided from the return code and error text the controller itself recorded.
+
+    Playbook stdout/stderr is never searched: every Ansible recap contains `unreachable=0`,
+    so a substring match made every Ansible-staged host look offline. The phrases below are
+    whole ssh transport messages, none of which is a substring of that recap. A dirty-release
+    block is excluded outright: its text carries remote file names.
+    """
+    if state.get("blockCode") == DIRTY_RELEASE:
+        # Its error text embeds file names from the remote host: untrusted, never evidence.
+        return False
     staging = state.get("staging") or {}
     evidence = " ".join(
-        str(value)
-        for value in (
-            state.get("error", ""),
-            staging.get("error", ""),
-            staging.get("stdout", ""),
-            staging.get("stderr", ""),
-        )
+        str(value) for value in (state.get("error", ""), staging.get("error", ""))
     ).lower()
     return staging.get("rc") in (4, 124, 255) or any(
         marker in evidence
         for marker in (
             "offline",
-            "unreachable",
             "timed out",
             "connection refused",
             "no route to host",
+            "network is unreachable",
+            "host is unreachable",
+            "connection timed out",
             "could not resolve hostname",
             "control transport failed (exit 255)",
         )

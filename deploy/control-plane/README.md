@@ -196,6 +196,19 @@ same-origin reverse proxy for browser traffic that adds the key server-side:
   write actions; `*` = one path segment, trailing `**` = the rest). Anything else is 403
   at the proxy. No `operator_key_file` = read-only dashboard.
 - A client-supplied `X-API-Key` / `X-Forwarded-*` is dropped; the browser never sees a key.
+- A browser write (a mutation carrying `Origin`) must be same-origin with the proxy: the `Origin` must equal the
+  `Host` the proxy receives (or name a `public_hosts` entry), and `Sec-Fetch-Site`, when sent, must not be
+  cross-site; otherwise 403 before the operator key is attached. `X-Forwarded-Host` is not trusted. The operator key
+  is also only attached with a proxy-made upstream `Origin`. A browser write with a body must say
+  `application/json` (415 otherwise). Every request (read or write) whose `Host` is not an IP literal, `localhost` or
+  listed in `public_hosts` is 403 (DNS rebinding), so **reaching the dashboard by a DNS name needs `public_hosts`**;
+  by IP literal or `localhost` nothing needs configuring.
+- `public_hosts` lists the names the browser uses as `host[:port]`. An entry without a port matches any port; `:80` /
+  `:443` are the same as no port for an `http` / `https` Origin. An `Origin` naming a listed entry is accepted even if a front rewrote `Host`. A front that
+  rewrites `Host` (nginx without `proxy_set_header Host $http_host`, an ingress) sends its own upstream name
+  (e.g. `dashboard-proxy:8081`): list that too, or the whole dashboard is 403. `public_scheme: https` additionally
+  requires the scheme of an `Origin` that names a listed entry to match (set it when TLS is terminated in front of the
+  proxy); a direct `http` access by an IP or `localhost` that is not itself listed is not affected. An `Origin` on another port than the listed entry (or than the `Host`) is refused. An entry that does not parse (for example `dash.example:99999`) stops the proxy at start (exit 2).
 
 ```yaml
 control_plane:

@@ -388,3 +388,22 @@ def test_the_default_side_pane_check_is_false_for_a_pane_without_a_marker(tmp_pa
     w_pane = AgentPane("p1", "t1", "claude", "idle", None, None)
     assert ctlrun.default_is_side_pane(w_pane) is False
     assert ctlrun.Controller.__dataclass_fields__["is_side_pane"].default is ctlrun.default_is_side_pane
+
+
+def test_a_refused_checkpoint_push_takes_over_with_the_dirty_source_allowed_and_keeps_the_error(tmp_path: Path) -> None:
+    w = Wave(tmp_path, cfg=replace(CFG, push_default=True))
+    calls = _briefed(w, tmp_path)
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+    _git(w.repo, "remote", "add", "origin", str(remote))
+    _git(w.repo, "push", "-q", "-u", "origin", "feat/x")
+    hook = remote / "hooks" / "pre-receive"
+    hook.write_text("#!/bin/sh\necho refused-by-hook >&2\nexit 1\n")
+    hook.chmod(0o755)
+    (w.repo / "a.txt").write_text("changed after the last push\n")
+    _git(w.repo, "add", "-u")  # a tracked change for the checkpoint to commit
+    w.tick(w.pane("p1", "idle"))
+    assert w.names()[-1] == "handoff.succeeded"
+    (done,) = [e for e in w.events() if e.event == "handoff.wip_committed"]
+    assert done.reason == "push_failed" and done.error and "refused-by-hook" in done.error
+    assert "--allow-dirty-source" in calls.read_text()  # the unpushed commit must not make the close refuse

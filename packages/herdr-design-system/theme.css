@@ -12,16 +12,16 @@
  */
 :root {
   /* surfaces */
-  --background: #f7f7f8;
+  --background: #f5f6f8;
   --surface: #ffffff;
-  --surface-2: #ececf1;
-  --surface-hover: #f2f2f5;
-  --border: #d9d9e3;
-  --border-subtle: #ececf1;
+  --surface-2: #eceef3;
+  --surface-hover: #f0f1f5;
+  --border: #d3d6df;
+  --border-subtle: #e4e6ed;
 
   /* text */
-  --text: #353740;
-  --text-secondary: #5a5a6e;
+  --text: #24252d;
+  --text-secondary: #565869;
   --text-muted: #666678;
   --text-on-accent: #ffffff;
 
@@ -39,7 +39,7 @@
   /* semantic status colors (Spec §9) */
   --status-ok: #08794f;        /* healthy / complete */
   --status-active: #2563eb;    /* active / running */
-  --status-waiting: #9ca3af;   /* waiting */
+  --status-waiting: #5b6270;   /* waiting (4.5:1 on white, so it is safe as text) */
   --status-attention: #b45309; /* needs attention */
   --status-blocked: #ea580c;   /* blocked */
   --status-failed: #b91c1c;    /* failed / critical */
@@ -58,13 +58,13 @@
     Consolas, "Liberation Mono", monospace;
 
   /* layout / elevation */
-  --radius: 8px;
+  --radius: 10px;
   --radius-sm: 4px;
   /* Controls (buttons, tabs, chips): one height scale and one radius everywhere. */
   --control-h: 32px;
   --control-h-sm: 28px;
   --control-radius: var(--radius-sm);
-  --shadow: 0 1px 2px rgba(16, 24, 40, 0.05);
+  --shadow: 0 1px 2px rgba(16, 24, 40, 0.06), 0 1px 3px rgba(16, 24, 40, 0.04);
   --shadow-lg: 0 8px 24px rgba(16, 24, 40, 0.1);
   --sidebar-width: 232px;
   --content-max: 1080px;
@@ -86,6 +86,7 @@
   --hd-border: var(--border);
   --text-primary: var(--text);
   --text-sm: 0.8125rem;
+  --status-warn: var(--status-attention); /* warnings and stale data: amber, never the failure red */
   --status-danger: var(--status-failed);
   --status-error: var(--status-failed);
   --status-success: var(--status-ok);
@@ -126,14 +127,14 @@
 /* Dark palette: follows the OS unless the user forces light; data-theme="dark" forces it. */
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --background: #17181c;
-    --surface: #1f2026;
+    --background: #131418;
+    --surface: #1c1d23;
     --surface-2: #2a2b33;
     --surface-hover: #2a2b33;
     --border: #3a3b45;
-    --border-subtle: #2c2d36;
+    --border-subtle: #2a2b34;
     --text: #e6e6ea;
-    --text-secondary: #a4a4b3;
+    --text-secondary: #b0b0bf;
     --text-muted: #8a8a9a;
     --text-on-accent: #07211a;
     --accent: #2fc59c;
@@ -190,14 +191,14 @@
   }
 }
 :root[data-theme="dark"] {
-  --background: #17181c;
-  --surface: #1f2026;
+  --background: #131418;
+  --surface: #1c1d23;
   --surface-2: #2a2b33;
   --surface-hover: #2a2b33;
   --border: #3a3b45;
-  --border-subtle: #2c2d36;
+  --border-subtle: #2a2b34;
   --text: #e6e6ea;
-  --text-secondary: #a4a4b3;
+  --text-secondary: #b0b0bf;
   --text-muted: #8a8a9a;
   --text-on-accent: #07211a;
   --accent: #2fc59c;

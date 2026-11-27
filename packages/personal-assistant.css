@@ -134,6 +134,30 @@ a.hd-btn { text-decoration: none; display: inline-flex; align-items: center; }
 .pa-adot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; opacity: .35; }
 .pa-adot--ready { background: var(--status-ok); opacity: 1; }
 .pa-adot--setup { background: var(--status-attention); opacity: 1; }
+
+/* ---- look and feel: assistant surfaces (presentation only) ---- */
+.pa-item { transition: border-color var(--motion-fast), box-shadow var(--motion-fast); }
+.pa-tabs { gap: 2px; margin-bottom: 16px; }
+.pa-tab { padding: 8px 14px; font-weight: 500; }
+.pa-tab--active { border-bottom: 2px solid var(--accent); border-radius: var(--radius-sm) var(--radius-sm) 0 0; border-color: var(--border-subtle); border-bottom-color: var(--accent); }
+.pa-badge { padding: 1px 9px; background: var(--surface-2); border-color: var(--border-subtle); color: var(--text-secondary); font-weight: 500; line-height: 1.5; }
+.pa-badge--granted { background: transparent; }
+.pa-msg { padding: 14px 16px; border: 1px solid var(--border-subtle); border-radius: var(--radius); background: var(--surface); display: flex; flex-direction: column; gap: 6px; }
+.pa-msg + .pa-msg { margin-top: 10px; }
+.pa-msg [data-preview]:empty { display: none; }
+.pa-msg .pa-row { margin-top: 4px; }
+.pa-approval { border-left: 3px solid var(--status-attention); }
+.pa-h3 { margin: 20px 0 8px; font-size: 13px; letter-spacing: .04em; text-transform: uppercase; font-weight: 600; }
+.pa-strip { border-radius: var(--radius); box-shadow: var(--shadow); padding: 12px 16px; gap: 8px; }
+.pa-app { padding: 16px; box-shadow: var(--shadow); }
+.pa-setup { padding: 16px; }
+@media (max-width: 480px) {
+  .pa-msg { padding: 12px; }
+  .pa-msg .pa-row { flex-direction: row; flex-wrap: wrap; }
+  .pa-msg .pa-row .hd-btn { width: auto; flex: 1 1 auto; min-height: 44px; }
+  .pa-tabs { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; }
+  .pa-tab { flex: none; white-space: nowrap; min-height: 44px; }
+}
 /* The loaded page is 372px with no assistants and 574px with two (871px once the shell stacks under 900px). The desktop placeholder sits between the two so neither case jumps by more than the tolerance in the tests. */
 .pa-skeleton .hd-skeleton-group { min-height: 452px; }
 @media (max-width: 900px) { .pa-skeleton .hd-skeleton-group { min-height: 820px; } }

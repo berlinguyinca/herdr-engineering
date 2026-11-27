@@ -704,3 +704,253 @@ def test_a_failed_blob_pass_is_retried_on_the_next_sweep(migrated_dsn, tmp_path)
         assert retry.blobs_removed == 1 and not env.blobs.exists(orphan)
 
     run(migrated_dsn, tmp_path, body)
+
+
+# -- version purge: only a tombstone past its purge_after hold loses blobs; old versions of live artifacts are kept
+
+DAY = timedelta(days=1)
+
+
+async def _seed_versions(
+    env: Env,
+    artifact: str,
+    versions: list[tuple[str, bytes, timedelta]],
+    *,
+    lifecycle: str = "active",
+    updated_ago: timedelta = 2 * DAY,
+    legal_hold: bool = False,
+    purge_after: timedelta | None = None,
+) -> dict[str, str]:
+    """An artifact with versions ``(id, content, age)`` oldest first (the last is current); returns id -> blob sha.
+    ``purge_after`` is an offset from now (negative: already past); None leaves the column NULL."""
+    now = utc()
+    await env.pool.execute(
+        "INSERT INTO artifacts (artifact_id, owner, lifecycle, legal_hold, updated_at, size_bytes, purge_after) "
+        "VALUES ($1,'alice',$2,$3,$4,$5,$6)",
+        artifact,
+        lifecycle,
+        legal_hold,
+        now - updated_ago,
+        len(versions[-1][1]),
+        None if purge_after is None else now + purge_after,
+    )
+    shas: dict[str, str] = {}
+    for number, (vid, data, age) in enumerate(versions, start=1):
+        sha = env.blob(data, age=2 * HOUR)
+        shas[vid] = sha
+        await env.pool.execute(
+            "INSERT INTO artifact_blobs (sha256, size_bytes) VALUES ($1,$2) ON CONFLICT DO NOTHING",
+            sha,
+            len(data),
+        )
+        await env.pool.execute(
+            "INSERT INTO artifact_versions (version_id, artifact_id, version_number, output_manifest, created_at) "
+            "VALUES ($1,$2,$3,$4::jsonb,$5)",
+            vid,
+            artifact,
+            number,
+            json.dumps([{"name": "i.html", "sha256": sha, "size_bytes": len(data)}]),
+            now - age,
+        )
+    await env.pool.execute(
+        "UPDATE artifacts SET current_version_id=$2 WHERE artifact_id=$1", artifact, versions[-1][0]
+    )
+    return shas
+
+
+async def _version_state(env: Env, vid: str) -> str:
+    return str(
+        await env.pool.fetchval("SELECT state FROM artifact_versions WHERE version_id=$1", vid)
+    )
+
+
+async def _has_row(env: Env, sha: str) -> bool:
+    return bool(await env.pool.fetchval("SELECT 1 FROM artifact_blobs WHERE sha256=$1", sha))
+
+
+def test_a_tombstone_inside_its_hold_keeps_its_blobs(migrated_dsn, tmp_path) -> None:
+    async def body(env: Env) -> None:
+        shas = await _seed_versions(
+            env,
+            "t1",
+            [("t1a", b"one", 40 * DAY), ("t1b", b"two", 40 * DAY)],
+            lifecycle="tombstoned",
+            updated_ago=40 * DAY,  # long past any one-hour grace
+            purge_after=10 * DAY,
+        )
+        for _ in range(2):
+            assert (await env.keeper.run_once(utc())).versions_purged == 0
+        for vid, sha in shas.items():
+            assert await _version_state(env, vid) == "ready"
+            assert env.blobs.exists(sha) and await _has_row(env, sha)
+
+    run(migrated_dsn, tmp_path, body)
+
+
+def test_a_tombstone_past_purge_after_loses_every_version_and_blob(migrated_dsn, tmp_path) -> None:
+    async def body(env: Env) -> None:
+        shas = await _seed_versions(
+            env,
+            "t1",
+            [("t1a", b"one", 40 * DAY), ("t1b", b"two", 40 * DAY)],
+            lifecycle="tombstoned",
+            purge_after=-DAY,
+        )
+        report = await env.keeper.run_once(utc())
+        assert report.versions_purged == 2
+        for vid, sha in shas.items():
+            assert await _version_state(env, vid) == "purged"
+            assert not env.blobs.exists(sha) and not await _has_row(env, sha)
+
+    run(migrated_dsn, tmp_path, body)
+
+
+def test_an_imported_tombstone_without_purge_after_gets_a_hold_and_survives_the_first_pass(
+    migrated_dsn, tmp_path
+) -> None:
+    async def body(env: Env) -> None:
+        shas = await _seed_versions(
+            env,
+            "imp",
+            [("i1", b"imported", 90 * DAY)],
+            lifecycle="tombstoned",
+            updated_ago=90 * DAY,  # the importer copies the source created_at here
+            purge_after=None,
+        )
+        now = utc()
+        assert (await env.keeper.run_once(now)).versions_purged == 0
+        assert await _version_state(env, "i1") == "ready" and env.blobs.exists(shas["i1"])
+        hold = await env.pool.fetchval("SELECT purge_after FROM artifacts WHERE artifact_id='imp'")
+        assert hold is not None and timedelta(days=29) < hold - now < timedelta(days=31)
+        # the hold is real: it ends 30 days on, and only then do the bytes go
+        assert (await env.keeper.run_once(now + 29 * DAY)).versions_purged == 0
+        assert (await env.keeper.run_once(now + 31 * DAY)).versions_purged == 1
+        assert not env.blobs.exists(shas["i1"])
+
+    run(migrated_dsn, tmp_path, body)
+
+
+def test_a_legal_hold_tombstone_is_never_purged_or_given_a_date(migrated_dsn, tmp_path) -> None:
+    async def body(env: Env) -> None:
+        shas = await _seed_versions(
+            env, "lh", [("h1", b"held", 3 * DAY)], lifecycle="tombstoned", legal_hold=True
+        )
+        assert (await env.keeper.run_once(utc() + 400 * DAY)).versions_purged == 0
+        assert env.blobs.exists(shas["h1"])
+        assert (
+            await env.pool.fetchval("SELECT purge_after FROM artifacts WHERE artifact_id='lh'")
+            is None
+        )
+
+    run(migrated_dsn, tmp_path, body)
+
+
+def test_old_versions_of_a_live_artifact_survive_and_count_toward_the_quota(
+    migrated_dsn, tmp_path
+) -> None:
+    async def body(env: Env) -> None:
+        revisions = [(f"v{i}", f"revision {i}".encode() * 100, (90 - i) * DAY) for i in range(1, 6)]
+        shas = await _seed_versions(env, "a1", revisions, updated_ago=80 * DAY)
+        await env.pool.execute(
+            "INSERT INTO member_usage (member_id, bytes_used) VALUES ('alice', 0)"
+        )
+        report = await env.keeper.run_once(utc() + 400 * DAY)
+        assert report.versions_purged == 0
+        for vid, sha in shas.items():
+            assert await _version_state(env, vid) == "ready"
+            assert env.blobs.exists(sha) and await _has_row(env, sha)
+        assert report.usage_corrected == 1
+        assert await env.pool.fetchval(
+            "SELECT bytes_used FROM member_usage WHERE member_id='alice'"
+        ) == sum(len(data) for _, data, _ in revisions)
+
+    run(migrated_dsn, tmp_path, body)
+
+
+def test_a_retracted_artifact_keeps_its_blobs(migrated_dsn, tmp_path) -> None:
+    async def body(env: Env) -> None:
+        shas = await _seed_versions(
+            env, "gone", [("g1", b"one", 3 * DAY)], lifecycle="retracted", updated_ago=40 * DAY
+        )
+        assert (await env.keeper.run_once(utc())).versions_purged == 0
+        assert env.blobs.exists(shas["g1"]) and await _has_row(env, shas["g1"])
+
+    run(migrated_dsn, tmp_path, body)
+
+
+def test_a_purge_spares_held_and_shared_versions(migrated_dsn, tmp_path) -> None:
+    async def body(env: Env) -> None:
+        held = await _seed_versions(
+            env, "held", [("h1", b"h-one", 3 * DAY)], lifecycle="tombstoned",
+            legal_hold=True, purge_after=-DAY,
+        )  # fmt: skip
+        shared = await _seed_versions(
+            env, "shared", [("s1", b"s-one", 3 * DAY)], lifecycle="tombstoned", purge_after=-DAY
+        )
+        await env.pool.execute(
+            "INSERT INTO shares (share_id, artifact_id, version_id, audience, token_hash, state, entry, created_by) "
+            "VALUES ('sh1','shared','s1','public',$1,'live','index.html','alice')",
+            os.urandom(32).hex(),
+        )
+        assert (await env.keeper.run_once(utc())).versions_purged == 0
+        for vid in ("h1", "s1"):
+            assert await _version_state(env, vid) == "ready"
+        for sha in (*held.values(), *shared.values()):
+            assert env.blobs.exists(sha) and await _has_row(env, sha)
+        await env.pool.execute("UPDATE shares SET state='revoked' WHERE share_id='sh1'")
+        assert (await env.keeper.run_once(utc())).versions_purged == 1
+        assert await _version_state(env, "s1") == "purged" and not env.blobs.exists(shared["s1"])
+
+    run(migrated_dsn, tmp_path, body)
+
+
+def test_a_blob_still_used_by_a_kept_version_survives_the_purge(migrated_dsn, tmp_path) -> None:
+    async def body(env: Env) -> None:
+        shas = await _seed_versions(
+            env, "gone", [("g1", b"same", 3 * DAY)], lifecycle="tombstoned", purge_after=-DAY
+        )
+        kept = await _seed_versions(env, "live", [("k1", b"same", 3 * DAY)])
+        assert shas["g1"] == kept["k1"]
+        report = await env.keeper.run_once(utc())
+        assert report.versions_purged == 1 and await _version_state(env, "g1") == "purged"
+        assert env.blobs.exists(kept["k1"]) and await _has_row(env, kept["k1"])
+
+    run(migrated_dsn, tmp_path, body)
+
+
+def test_a_busy_blob_defers_its_version_to_the_next_pass(migrated_dsn, tmp_path) -> None:
+    async def body(env: Env) -> None:
+        shas = await _seed_versions(
+            env, "a1", [("v1", b"busy old", 3 * DAY)], lifecycle="tombstoned", purge_after=-DAY
+        )
+        async with env.pool.acquire() as holder:
+            await holder.execute(
+                "SELECT pg_advisory_lock($1, hashtext($2))", LOCK_NS_BLOB, shas["v1"]
+            )
+            try:
+                assert (await env.keeper.run_once(utc())).versions_purged == 0
+                assert await _version_state(env, "v1") == "ready" and env.blobs.exists(shas["v1"])
+            finally:
+                await holder.execute(
+                    "SELECT pg_advisory_unlock($1, hashtext($2))", LOCK_NS_BLOB, shas["v1"]
+                )
+        assert (await env.keeper.run_once(utc())).versions_purged == 1
+        assert not env.blobs.exists(shas["v1"])
+
+    run(migrated_dsn, tmp_path, body)
+
+
+def test_a_purged_versions_blob_is_not_protected_by_its_manifest(migrated_dsn, tmp_path) -> None:
+    """The orphan sweep must treat a purged version's manifest as history, or a blob whose row went would leak."""
+
+    async def body(env: Env) -> None:
+        sha = env.blob(b"purged manifest", age=2 * HOUR)
+        await env.pool.execute("INSERT INTO artifacts (artifact_id, owner) VALUES ('a1','alice')")
+        await env.pool.execute(
+            "INSERT INTO artifact_versions (version_id, artifact_id, version_number, state, output_manifest) "
+            "VALUES ('v1','a1',1,'purged',$1::jsonb)",
+            json.dumps([{"name": "i.html", "sha256": sha, "size_bytes": 1}]),
+        )
+        assert (await env.keeper.run_once(utc())).blobs_removed == 1 and not env.blobs.exists(sha)
+
+    run(migrated_dsn, tmp_path, body)

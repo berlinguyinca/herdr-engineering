@@ -15,6 +15,7 @@ import asyncio
 import copy
 import datetime as _dt
 import json
+import os
 import threading
 import time
 from collections.abc import Callable
@@ -146,6 +147,17 @@ class DurableSource:
         raise NotImplementedError
 
 
+def env_seconds(name: str, default: float | None, *, allow_zero: bool = False) -> float | None:
+    """Seconds from the environment; the default when unset, unreadable or not positive (zero only if ``allow_zero``)."""
+    try:
+        value = float(os.environ.get(name, ""))
+    except ValueError:
+        return default
+    return value if value > 0 or (allow_zero and value == 0) else default
+
+
+
+
 class _LoopRunner:
     """Runs coroutines on a single dedicated event loop (daemon thread).
 
@@ -160,8 +172,18 @@ class _LoopRunner:
             target=self._loop.run_forever, name="herdr-cp-pg-loop", daemon=True)
         self._thread.start()
 
-    def run(self, coro: Any):
-        return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
+    def run(self, coro: Any, timeout: float | None = None):
+        """Run ``coro`` on the loop and wait at most ``timeout`` seconds (forever when None, unless the opt-in
+        HERDR_CP_BRIDGE_WAIT_TIMEOUT_S is set; projection recovery reads must not be cut short).
+
+        On timeout the coroutine is cancelled and ``TimeoutError`` is raised, so a hung database never holds the caller."""
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        try:
+            return future.result(timeout if timeout is not None
+                                 else env_seconds("HERDR_CP_BRIDGE_WAIT_TIMEOUT_S", None))
+        except TimeoutError:
+            future.cancel()
+            raise
 
 
 class PostgresSource(DurableSource):
@@ -297,6 +319,13 @@ class PostgresSource(DurableSource):
         snapshot["inspector_snapshot"] = inspector_row
         return snapshot
 
+    @staticmethod
+    def _savepoint(conn):
+        """A nested transaction (savepoint) when the connection has one, so a failed lookup rolls back to it instead of
+        aborting the boot's repeatable-read transaction; a no-op context for the lightweight fetch-only connections."""
+        import contextlib
+        return conn.transaction() if callable(getattr(conn, "transaction", None)) else contextlib.nullcontext()
+
     async def _inspector_snapshot_row(self, conn) -> tuple[dict | None, int | None]:
         """The stored inspector snapshot and, when the event log below its watermark is verifiably the one it
         consumed, that watermark (the boot then does not load those rows). An optimisation only: a missing table
@@ -304,24 +333,25 @@ class PostgresSource(DurableSource):
         if not self._inspector_snapshots:
             return None, None
         try:
-            row = await conn.fetchrow("SELECT schema_version, fingerprint, watermark, event_count, body "
-                                      "FROM inspector_snapshots WHERE id = 1")
-            if row is None:
-                return None, None
-            row = dict(row)
-            covered = await conn.fetchval(
-                f"SELECT count(*) FROM {self._events_table} WHERE entity_type = 'inspector' AND entity_id IS NOT NULL "
-                "AND entity_id <> '' AND sequence <= $1", int(row["watermark"]))
-            row["covered_count"] = int(covered)
-            archived = 0
-            if self._events_table == "fabric_events":
-                from .inspector_snapshot import archived_inspector_count
-                archived = await archived_inspector_count(conn, int(row["watermark"]))
-            row["archived_count"] = archived      # rows the archive job moved out; the snapshot consumed them
-            if int(covered) + archived != int(row["event_count"]):
-                return row, None
-            row["skipped_upto"] = int(row["watermark"])
-            return row, int(row["watermark"])
+            async with self._savepoint(conn):
+                row = await conn.fetchrow("SELECT schema_version, fingerprint, watermark, event_count, body "
+                                          "FROM inspector_snapshots WHERE id = 1")
+                if row is None:
+                    return None, None
+                row = dict(row)
+                covered = await conn.fetchval(
+                    f"SELECT count(*) FROM {self._events_table} WHERE entity_type = 'inspector' AND entity_id IS NOT NULL "
+                    "AND entity_id <> '' AND sequence <= $1", int(row["watermark"]))
+                row["covered_count"] = int(covered)
+                archived = 0
+                if self._events_table == "fabric_events":
+                    from .inspector_snapshot import archived_inspector_count
+                    archived = await archived_inspector_count(conn, int(row["watermark"]))
+                row["archived_count"] = archived      # rows the archive job moved out; the snapshot consumed them
+                if int(covered) + archived != int(row["event_count"]):
+                    return row, None
+                row["skipped_upto"] = int(row["watermark"])
+                return row, int(row["watermark"])
         except Exception:  # noqa: BLE001
             return None, None
 

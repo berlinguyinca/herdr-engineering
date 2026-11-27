@@ -104,7 +104,9 @@ dig @127.0.0.1 dev.lan A                 # -> 100.64.8.6
 dig @100.64.8.6 foo.dev.lan A          # -> 100.64.8.6
 
 # Gateway control plane is up and advertises dev.lan
-curl -s http://127.0.0.1:29999/healthz     # -> {"url_base":"dev.lan", ...}
+curl -s http://127.0.0.1:29999/healthz     # -> {"ok":true} (liveness only; no token needed)
+# the full payload ({"url_base":"dev.lan", "role":..., ...}) needs the control-API token:
+curl -s -H "Authorization: Bearer $(cat ~/.config/herdr-engineering/fabric-gateway/token)" http://127.0.0.1:29999/healthz
 
 # From any device on the tailnet, once split-DNS is configured:
 curl http://dev.lan:18052                # reaches the leased service

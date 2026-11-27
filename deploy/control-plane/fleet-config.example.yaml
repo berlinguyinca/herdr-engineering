@@ -33,6 +33,10 @@ sections:
       #   upstream: "http://control-plane-web:8080"
       #   # operator_post_allowlist: ["POST /api/v1/attention/ack"]   # "METHOD /path"; * = one segment, trailing ** = rest
       #   #   default = the dashboard's own write actions (see control_plane/dashboard_proxy.py)
+      #   # public_hosts: ["dash.example.ts.net"]   # names the browser uses, "host[:port]" (no port = any port). Needed to
+      #   #   reach the dashboard by DNS name (Origin-guarded writes are 403 otherwise). Set: other Host values are 403
+      #   #   (DNS rebinding); behind a Host-rewriting front also list its upstream name, e.g. "dashboard-proxy".
+      #   # public_scheme: https                    # Origin scheme required for a listed name (TLS ends before the proxy)
       rustfs_endpoint: "http://rustfs:9000"
       minio_user: "REDACTED"        # the object store's access key (what the web reads)
       minio_password: "REDACTED"
@@ -113,6 +117,10 @@ sections:
         operator_user: "REDACTED"                    # Cognito username the dashboard's no-sign-in
                                                      # collaboration acts as (required)
         # operator_email: "owner@example.test"       # optional, shown for the operator
+        # Extra DNS names the web API and dashboard answer to (DNS-rebinding guard; IP literals, localhost,
+        # dev.lan and control-plane-web already pass in the shipped compose). List every other name people or
+        # agents reach the control plane by, e.g. the public fabric name:
+        # dashboard_hosts: ["cp.example.test"]
         # Share links do NOT live here: they use control_plane.share.public_url (a different host); this URL stays
         # the MCP host (see COLLAB.md, "Share links").
         # T15 attention inbox, evidence-based progress, analytics (everything off unless enabled):

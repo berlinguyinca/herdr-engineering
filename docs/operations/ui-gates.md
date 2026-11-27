@@ -149,7 +149,7 @@ a pause control (the flow view has a "Pause motion" button with `aria-pressed`);
 | Viewports | desktop 1280x800, tablet 768x1024, mobile 375x667, reflow 320x568 |
 | Visual diff, page | 0.01% of pixels (autospec allows 0.1%; a whole-page percentage hid edges-gone at 0.05%, invisible inspector at 0.09%), per-channel tolerance 2 |
 | Visual diff, component | 0.05% of the component's own area (graph, node, inspector, logo, sub-tabs, log, Gantt, attention item, review pane) |
-| Baseline size | at most 6144 KB in total, 300 KB per file (3439 KB, biggest 101 KB now) |
+| Baseline size | at most 16000 KB in total, 600 KB per file (3833 KB, biggest 191 KB now) |
 | First render of a large graph | 6000 ms |
 | Filter key to next frame, p95 | 500 ms |
 | Redraws for six quick keystrokes in the filter above the draw cap | at most 2 (counted through CDP coverage, not timed; measured 1) |

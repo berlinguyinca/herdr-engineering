@@ -143,6 +143,7 @@ def run_takeover(ref: SessionRef, adapter: HarnessAdapter, handoff_id: str, cfg:
     event, `handoff.succeeded`, `handoff.failed_compacted` or `handoff.stuck`, is appended to `log` exactly once, after
     `handoff.takeover_started`. `--allow-dirty-source` is passed only when `push_allowed` is False: there unpushed
     commits are recorded by herdr-handoff and do not stop the close; where pushing is allowed they must be pushed.
+    The controller also passes False after a refused push (`push_failed`) or `NOTHING_STAGEABLE`.
     `started`: the chain's `handoff.takeover_started` is already in the log.
     `ready` is asked right before every call to herdr-handoff, after the look at the record; when it says no, nothing is
     called and None is returned with no terminal event: the chain goes on waiting, and the next call starts over.

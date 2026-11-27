@@ -67,6 +67,7 @@ TERMINAL = {
     "handoff.stuck": Colour.RED,
 }
 ATTEMPT = "attempt"  # the `reason` of a `handoff.takeover_started` written before each call to herdr-handoff: attempts are counted per chain
+PUSH_FAILED = "push_failed"  # the `reason` of a `handoff.wip_committed` whose push was refused: the local commit stays unpushed
 NOTHING_STAGEABLE = "nothing_stageable"  # the `reason` of a `handoff.wip_committed` for tracked changes that cannot be staged
 SESSION_WORKING = "session_working"  # the `reason` of a `handoff.wip_committed` for a last resort that left the worktree uncommitted
 COMPACTING = "compacting"  # the `reason` of the second `handoff.takeover_started`: the attempts are over, compaction begins
@@ -93,6 +94,7 @@ class HandoffEvent:
     successor_session_id: str | None = None  # the successor agent's session id, when Herdr reports one
     subagents_live: int | None = None  # `handoff.waiting`: the subagents the registry counts as running
     commit: str | None = None  # `handoff.wip_committed`: the checkpoint commit
+    error: str | None = None  # `handoff.wip_committed`: why a push failed (git's own text)
 
     def __post_init__(self) -> None:
         if self.event not in EVENT_NAMES:
@@ -220,7 +222,7 @@ class Chain:
     triggered_wall: float = 0.0  # `triggered_at` as the log has it, before any credit mapping (the store's clock)
     compacting: bool = False  # the takeover attempts are over and compaction began: a restart must not replay them
     attempts: int = 0  # calls to herdr-handoff takeover made so far for this chain
-    unstageable: bool = False  # the checkpoint found tracked changes it cannot stage (a dirty submodule): take over regardless
+    unstageable: bool = False  # the checkpoint could not stage (a dirty submodule) or push: take over regardless
 
 
 def epoch(iso: str) -> float:
@@ -274,7 +276,7 @@ def _chain_of(mine: Sequence[HandoffEvent]) -> Chain:
                  epoch(next(e.at for e in mine if e.event == "handoff.triggered")),
                  any(e.event == "handoff.takeover_started" and e.reason == COMPACTING for e in mine),
                  sum(e.event == "handoff.takeover_started" and e.reason == ATTEMPT for e in mine),
-                 any(e.event == "handoff.wip_committed" and e.reason == NOTHING_STAGEABLE for e in mine))
+                 any(e.event == "handoff.wip_committed" and e.reason in (NOTHING_STAGEABLE, PUSH_FAILED) for e in mine))
 
 
 def open_chain(events: Sequence[HandoffEvent]) -> Chain | None:

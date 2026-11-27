@@ -24,6 +24,7 @@ import time
 from contextlib import contextmanager
 from uuid import uuid4
 
+from ..endpoint_guard import validate_model_endpoint
 from ..host_policy import HostPolicy, HostSnapshot, PolicyMode, normalize_aliases
 from ..llm_session_id import dashboard_form
 from . import llm_stats, review_refs, usage_spend
@@ -3574,8 +3575,14 @@ class ControlPlaneRepo:
                 raise ValueError("fallback_models must be one to eight gateway model patterns without whitespace")
         if not name or not (base_url or fallback_models):
             raise ValueError("name and a base_url or fallback_models are required")
-        if base_url and not str(base_url).startswith(("http://", "https://")):
-            raise ValueError("base_url must be http(s)")
+        if base_url:
+            validate_model_endpoint(base_url, resolve=True)
+        existing = self.list_custom_models().get(name)
+        if existing and existing.get("project") != project:
+            # A name is how traffic finds its route: taking over one (a project's, or a shared one) would capture
+            # its prompts. Ownership never changes through this call; there is no operator identity here, so an
+            # operator deletes the model first and registers it again.
+            raise ValueError(f"custom model {name!r} is owned by another project; ownership cannot change")
         payload = {"name": name, "upstream_model": upstream_model or name, "project": project, "deleted": False}
         if base_url:
             payload["base_url"] = base_url.rstrip("/")
@@ -4111,13 +4118,21 @@ class ControlPlaneRepo:
         return out
 
     # --------------------------------------------------------------- health
+    def durable_sink_health(self) -> dict | None:
+        """The durable sink's write counters, or None when there is no sink (or it keeps none)."""
+        sink_health = getattr(self._sink, "write_health", None)
+        return sink_health() if callable(sink_health) else None
+
     def health(self):
         # Repo-level stats only. Deployment context (whether this repo is
         # hydrated from durable Postgres, image version/commit) is overlaid by
         # the HTTP server in api.ControlPlaneServer._health(), because the repo
         # itself cannot know about its source.
+        durable = self.durable_sink_health()
         return {
             "status": "ok",
+            **({"durable_sink": durable} if durable else {}),
+            **({"durable_sink_degraded": True} if durable and durable["degraded"] else {}),
             "events": ({"ingested": self._durable_public_count,
                         "cached": len(self._event_order), "durable_total": self._durable_row_count}
                        if callable(getattr(self._durable_history, 'export_events', None))

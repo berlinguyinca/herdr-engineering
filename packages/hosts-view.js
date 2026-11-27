@@ -2,7 +2,7 @@
 // config notice and the fleet version matrix are morphed, so a live refresh writes only what
 // changed (identical data: zero writes). The ?drift=1 filter is a navigation, so it is fixed per mount.
 import { patchList, morph, patchText } from './patch.js';
-import { snapshotText, animateChanges } from './motion.js';
+import { snapshotText, animateChanges, skeleton } from './motion.js';
 import { liveRefresher, pollWhileVisible } from './refresh-bus.js';
 import { renderFleetMatrix } from './fleet-view.js';
 import { renderHostCard, HOST_CARD_STYLE, staleFor } from './host-view.js';
@@ -24,22 +24,42 @@ const STALE_TICK_MS = 15000;
 // so on a quiet fleet only the poll moves telemetry forward and turns a dead host stale.
 export const HOST_POLL_MS = 15000;
 
+const failureText = (err) => String(err?.message || 'request failed');
+
+// Each secondary read reports its own failure: a failed inventory or config-status fetch must never
+// read as "no data". Only the host list itself throws (the route shows a page-level error with Retry).
 export async function loadHosts(client) {
-  const [{ hosts }, matrix, configStatus] = await Promise.all([
+  const [{ hosts }, inventory, config] = await Promise.all([
     client.listHosts(),
-    client.request('/api/v1/fleet/inventory').catch(() => ({ hosts: [], components: [] })),
-    client.getFleetConfigStatus().catch(() => null),
+    client.request('/api/v1/fleet/inventory').then((matrix) => ({ matrix }), (error) => ({ error })),
+    client.getFleetConfigStatus().then((status) => ({ status }), (error) => ({ error })),
   ]);
-  return { hosts: hosts || [], matrix, configStatus };
+  return {
+    hosts: hosts || [],
+    matrix: inventory.error ? null : inventory.matrix,
+    matrixError: inventory.error ? failureText(inventory.error) : null,
+    configStatus: config.error ? null : config.status,
+    configError: config.error ? failureText(config.error) : null,
+  };
+}
+
+// An error with a Retry button; `attr` names the button so a view can delegate its click.
+export function retryError(message, attr = 'data-hosts-retry') {
+  return `<herdr-error message="${escapeHtml(String(message))}"></herdr-error><p><button type="button" ${attr}>Retry</button></p>`;
+}
+
+export function renderMatrixRegion({ matrix, matrixError }, opts) {
+  if (matrixError) return retryError(`Fleet versions could not be loaded: ${matrixError}`);
+  return renderFleetMatrix(matrix, opts);
 }
 
 export function mountHosts(container, client, { data = null, driftedOnly = false } = {}) {
   container.innerHTML = `${HOST_CARD_STYLE}<div class="hd-live-head" style="display:flex;flex-wrap:wrap;align-items:baseline;gap:12px"><h1>Hosts</h1><herdr-freshness interval="5000"></herdr-freshness></div>
-    <div data-hosts-notice></div><div data-hosts-empty></div><div class="hd-grid" data-hosts-grid></div>
+    <div data-hosts-notice></div><div data-hosts-empty>${data ? '' : skeleton('hosts', { rows: 3 })}</div><div class="hd-grid" data-hosts-grid></div>
     <details class="hd-silent-hosts" data-hosts-silent-wrap hidden><summary data-hosts-silent-label></summary><div class="hd-grid" data-hosts-silent style="margin-top:12px"></div></details>
     <h2 style="margin-top:24px">Fleet versions</h2>
     <p class="hd-card__sub"><a href="#/hosts${driftedOnly ? '' : '?drift=1'}">${driftedOnly ? 'Show all components' : 'Show only components that differ'}</a></p>
-    <div data-hosts-matrix></div>`;
+    <div data-hosts-matrix>${data ? '' : skeleton('fleet versions', { rows: 2, inStatus: false })}</div>`;
   const notice = container.querySelector('[data-hosts-notice]');
   const empty = container.querySelector('[data-hosts-empty]');
   const grid = container.querySelector('[data-hosts-grid]');
@@ -48,10 +68,10 @@ export function mountHosts(container, client, { data = null, driftedOnly = false
   const matrixEl = container.querySelector('[data-hosts-matrix]');
   let first = true;
 
-  function apply({ hosts, matrix, configStatus }) {
+  function apply({ hosts, matrix, matrixError = null, configStatus, configError = null }) {
     const cfg = indexConfigStatus(configStatus);
     const now = Date.now();
-    morph(notice, configNotice(cfg));
+    morph(notice, configNotice(cfg, configError));
     morph(empty, hosts.length ? '' : '<herdr-empty message="No hosts reporting"></herdr-empty>');
     // The rendered card is the snapshot: identical markup skips the card entirely.
     const meters = first ? null : snapshotText(grid, '[data-meter]', meterKey);
@@ -71,7 +91,7 @@ export function mountHosts(container, client, { data = null, driftedOnly = false
     if (silentWrap.hidden === !silent.length) { /* unchanged: writing the same value would still count as a mutation */ } else silentWrap.hidden = !silent.length;
     patchText(container.querySelector('[data-hosts-silent-label]'), `${silent.length} host${silent.length === 1 ? '' : 's'} registered but never reported`);
     if (first) { for (const el of container.querySelectorAll('[data-entering]')) el.removeAttribute('data-entering'); }
-    morph(matrixEl, renderFleetMatrix(matrix, { driftedOnly }));
+    morph(matrixEl, renderMatrixRegion({ matrix, matrixError }, { driftedOnly }));
     // Meters ease through their width transition; the changed row and a changed fleet cell flash.
     animateChanges(grid, '[data-meter]', meters, meterKey, { count: false });
     animateChanges(matrixEl, 'td.hd-fleet__cell', cells, cellKey, { count: false });
@@ -84,10 +104,21 @@ export function mountHosts(container, client, { data = null, driftedOnly = false
     for (const el of container.querySelectorAll('[data-stale-since]')) patchText(el, staleFor(Number(el.getAttribute('data-stale-since')), now));
   }, STALE_TICK_MS);
 
-  const live = liveRefresher(() => loadHosts(client), apply, () => container.querySelector('herdr-freshness'));
+  // A failed first load (no page yet) says so with Retry; later failures keep the last page and turn the chip red.
+  const load = () => loadHosts(client).catch((err) => {
+    if (first) { morph(empty, retryError(`Hosts could not be loaded: ${failureText(err)}`)); matrixEl.innerHTML = ''; }
+    throw err;
+  });
+  const live = liveRefresher(load, apply, () => container.querySelector('herdr-freshness'));
+  const onClick = (event) => {
+    if (!event.target.closest?.('[data-hosts-retry]')) return;
+    event.preventDefault();
+    live.refresh();
+  };
+  container.addEventListener('click', onClick);
   if (data) live.applied(data); else live.refresh();
   const stopPoll = pollWhileVisible(() => live.refresh(), HOST_POLL_MS);
-  return { refresh: (hint) => live.refresh(hint), dispose: () => { stopPoll(); live.dispose(); clearInterval(tick); } };
+  return { refresh: (hint) => live.refresh(hint), dispose: () => { stopPoll(); live.dispose(); clearInterval(tick); container.removeEventListener('click', onClick); } };
 }
 
 // Host diagnostics is the one page here that is NOT live: H03 reads each feed once and the plan forbids polling it, so this mount starts no

@@ -2200,6 +2200,9 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
             if user and self._ok(user):
                 if self._member(room, user):
                     return reply   # same answer as a pending invite: no signed-in-or-not oracle
+                if len(room["members"]) >= self.max_members_per_room:
+                    user = None    # a full room takes no direct add: fall back to a pending invite, same reply
+            if user and self._ok(user):
                 self._commit("member_added", self._actor(
                     pr, project_id=room["project_id"], room_id=room_id, subject_user_id=user,
                     role=role, expires_at=self._now() + self.guest_ttl if role == "guest" else None, action="member.add", outcome="allowed",
@@ -5991,9 +5994,11 @@ class CollabService(WorkbenchMixin, ContextMixin, AttentionMixin, FederationMixi
     def get_task(self, pr: Principal, room_id: str, task_id: str) -> dict:
         with self._lock:
             _, first = self._authorize(pr, room_id, "read", "task.get")
+            self._no_external(pr)
             task = self._tasks.get(task_id) if isinstance(task_id, str) else None
             if (not task or task["room_id"] != room_id or task["seq"] < first
-                    or self._tc_blind_get(pr, self._rooms[room_id], task)):
+                    or self._tc_blind_get(pr, self._rooms[room_id], task)
+                    or self._tr2_task_hidden(pr, self._rooms[room_id], task)):
                 raise CollabError(404, "not found")
             out = dict(self._task_json(task_id, task), untrusted=True)
         return {"task": out}

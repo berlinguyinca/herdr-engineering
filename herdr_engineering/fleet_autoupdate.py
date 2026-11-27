@@ -302,20 +302,24 @@ def _drain_pinned_rollout(root: Path, store, pin: str) -> dict:
         # fleet forever and write a fresh record every night (#844).
         settled_for_pin = [p for p in fleet_rollout.list_rollouts(store)
                            if p["revision"] == pin]
-        if settled_for_pin:
-            newest = max(settled_for_pin, key=lambda p: (p.get("createdAt", ""), p["id"]))
-            return {
-                "status": "skipped",
-                "id": newest["id"],
-                "reason": (
-                    f"pinned revision {pin[:12]} is already {newest['status']} "
-                    f"(rollout {newest['id']}) - plan a new revision to roll out again"
-                ),
-            }
         inventory = root / "ansible" / "inventory" / "hosts.yml"
-        plan = fleet_rollout.create_rollout(
-            store, pin, fleet_rollout.inventory_targets(inventory, None), inventory=inventory
-        )
+        targets = fleet_rollout.inventory_targets(inventory, None)
+        if settled_for_pin:
+            # A host no settled plan for the pin ever named (added to the inventory later) gets
+            # a delta plan for just those hosts, whatever the newest plan's status: hosts of an
+            # abandoned plan stay retired, hosts of a complete one are converged.
+            targets = fleet_rollout.delta_targets(store, pin, targets, abandoned_covers=True)
+            if not targets:
+                newest = max(settled_for_pin, key=lambda p: (p.get("createdAt", ""), p["id"]))
+                return {
+                    "status": "skipped",
+                    "id": newest["id"],
+                    "reason": (
+                        f"pinned revision {pin[:12]} is already {newest['status']} "
+                        f"(rollout {newest['id']}) - plan a new revision to roll out again"
+                    ),
+                }
+        plan = fleet_rollout.create_rollout(store, pin, targets, inventory=inventory)
     report = fleet_rollout.run_rollout(
         store, plan["id"], interval_seconds=30, max_passes=PI_ROLLOUT_MAX_PASSES
     )
@@ -325,7 +329,7 @@ def _drain_pinned_rollout(root: Path, store, pin: str) -> dict:
         "id": plan["id"],
     }
     try:
-        result["pruned"] = [entry["id"] for entry in fleet_rollout.prune_settled(store)]
+        result["pruned"] = [entry["id"] for entry in fleet_rollout.prune_settled(store, keep_revisions={pin})]
     except BlockingIOError:
         # The drain already happened; a busy store lock must not discard its report.
         result["prunedError"] = "another rollout driver holds the lock; prune deferred"

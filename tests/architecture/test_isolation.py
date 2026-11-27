@@ -157,6 +157,15 @@ def test_runner_output_cap(repo, tmp_path, monkeypatch):
         runner.run_isolated(str(repo), "HEAD", "h", REPO_ID)
 
 
+def test_runner_stops_a_worker_that_floods_its_output_long_before_the_wall_clock(repo, tmp_path, monkeypatch):
+    monkeypatch.setattr(runner, "MAX_OUTPUT", 1000)
+    monkeypatch.setattr(runner, "_WORKER", _fake_worker(tmp_path, "import sys\nwhile True:\n    sys.stdout.write('x' * 65536)\n    sys.stdout.flush()\n"))
+    started = time.monotonic()
+    with pytest.raises(runner.AnalysisError, match="size limit"):
+        runner.run_isolated(str(repo), "HEAD", "h", REPO_ID, limits=runner.Limits(wall_seconds=60))
+    assert time.monotonic() - started < 20  # without the early check the blocked worker runs to the 60 s limit
+
+
 # ------------------------------------------------------------------ the sandbox really cuts the network
 needs_sandbox = pytest.mark.skipif(runner._mechanism() is None, reason="no unprivileged network sandbox on this host")
 

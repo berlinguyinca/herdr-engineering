@@ -343,10 +343,10 @@ def _warn(message: str) -> None:
 
 def _emit(ctl: Controller, ref: SessionRef, name: str, chain_id: str, *, reason: str | None = None,
           colour: Colour | None = None, pct: float | None = None, handoff_id: str | None = None,
-          subagents_live: int | None = None, commit: str | None = None) -> None:
+          subagents_live: int | None = None, commit: str | None = None, error: str | None = None) -> None:
     ctl.log.append(HandoffEvent(name, iso(ctl.clock()), chain_id, ref.pane_id, ref.session_id, ref.harness,
                                 handoff_id, None, None, colour, reason, pct, subagents_live=subagents_live,
-                                commit=commit))
+                                commit=commit, error=error))
 
 
 def _skip_once(ctl: Controller, events: Sequence[HandoffEvent], pane: AgentPane, harness: Harness, reason: str,
@@ -442,7 +442,7 @@ def _checkpoint(ctl: Controller, ref: SessionRef, chain_id: str, worktree: Path,
                 pct: float | None) -> WipResult | None:
     """Commit the worktree's tracked changes; None when the chain ended stuck instead."""
     result: WipResult = wip_commit(worktree, push_allowed=allowed)
-    if result.error:
+    if result.error and result.reason is not WipReason.PUSH_FAILED:  # a refused push left a good local commit: recorded below
         _stuck(ctl, ref, chain_id, stuck_reason(StuckReason.GIT_STATE_UNKNOWN, result.reason.value if result.reason else None,
                                                 result.error), pct)
         return None
@@ -460,7 +460,8 @@ def _checkpoint(ctl: Controller, ref: SessionRef, chain_id: str, worktree: Path,
     pushing = result.reason in (WipReason.PUSH_FAILED, WipReason.PUSH_NOT_ALLOWED)
     if result.committed or pushing or result.reason is WipReason.NOTHING_STAGEABLE:  # unpushed commits are recorded the same way
         why = result.reason.value if (pushing or result.reason is WipReason.NOTHING_STAGEABLE) and result.reason else "committed"
-        _emit(ctl, ref, "handoff.wip_committed", chain_id, reason=why, pct=pct, commit=result.sha)
+        _emit(ctl, ref, "handoff.wip_committed", chain_id, reason=why, pct=pct, commit=result.sha,
+              error=result.error if result.reason is WipReason.PUSH_FAILED else None)
     return result
 
 
@@ -486,7 +487,7 @@ def _finish(ctl: Controller, ref: SessionRef, chain: Chain, rt: PaneRuntime, pct
             if wip is None:
                 return
     unstageable = chain.unstageable or (not chain.takeover_started and wip is not None
-                                        and wip.reason is WipReason.NOTHING_STAGEABLE)  # the log remembers it across a restart
+                                        and wip.reason in (WipReason.NOTHING_STAGEABLE, WipReason.PUSH_FAILED))  # the log remembers it across a restart
     cfg = replace(ctl.cfg, max_attempts=0) if last_resort else ctl.cfg  # no attempts: straight to compaction
 
     def ready() -> bool:  # a fresh read before every call to herdr-handoff; the user may have started typing since the last one

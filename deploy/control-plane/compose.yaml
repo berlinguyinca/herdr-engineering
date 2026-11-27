@@ -54,7 +54,7 @@ x-herdr-deploy-layout: 2
 services:
   # ---- control plane (bridge network) -------------------------------------
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
     container_name: herdr-cp-postgres
     restart: unless-stopped
     # Tuned for the 503 GiB NVMe master host (stock defaults were 128MB
@@ -145,6 +145,19 @@ services:
     image: herdr-engineering:${HERDR_CP_IMAGE_TAG:?run deploy.sh}
     container_name: herdr-cp-web
     restart: unless-stopped
+    # init reaps children and forwards signals; the web command also handles SIGTERM itself (clean shutdown of
+    # the stores and the assistant hub), so `docker stop` ends it well inside the grace period.
+    init: true
+    stop_grace_period: 30s
+    # Passes while the process answers /api/v1/health at all: curl without -f, so a degraded (non-2xx) answer
+    # still counts as alive and only a refused connection or a timeout fails. deploy.sh already waits for every
+    # recreated service to leave "starting" and not be "unhealthy" (services_settled).
+    healthcheck:
+      test: ["CMD", "curl", "-sS", "-o", "/dev/null", "-m", "5", "http://127.0.0.1:8080/api/v1/health?probe=1"]
+      interval: 15s
+      timeout: 6s
+      retries: 3
+      start_period: 120s
     depends_on:
       postgres:
         condition: service_healthy
@@ -189,6 +202,14 @@ services:
       - "--web-root"
       - "/app/packages"
       - "--allow-open"
+      # Host names the API answers to (DNS-rebinding guard; IP literals and localhost always pass).
+      # dev.lan is the shipped front door, control-plane-web the compose-internal name the LLM proxy and
+      # dashboard proxy call. Add any other name (e.g. the public fabric name) under
+      # control_plane.collab.dashboard_hosts in the central fleet file: it is merged with these.
+      - "--collab-dashboard-host"
+      - "dev.lan"
+      - "--collab-dashboard-host"
+      - "control-plane-web"
       - "--fleet-config"
       - "/etc/herdr/fleet/fleet-config.yaml"
 
@@ -227,6 +248,25 @@ services:
     image: herdr-engineering:${HERDR_CP_IMAGE_TAG:?run deploy.sh}
     container_name: herdr-cp-worker
     restart: unless-stopped
+    init: true
+    # Shutdown budget after SIGTERM: a running pass may finish for 20 s (PASS_GRACE_SECONDS) + 5 s for an abandoned pass
+    # to unwind + 5 s for the collab bridge teardown + 2 s to close the connection = 32 s, plus the projection
+    # refresh thread's join; 45 s leaves a margin so docker never SIGKILLs the worker mid-teardown.
+    # (tests/test_cp_compose_lifecycle.py derives the sum from control_plane/worker.py.)
+    stop_grace_period: 45s
+    # Heartbeat: the worker touches this file once its connection probes healthy, at the start of every pass and after
+    # every step of a pass, so a long single step (a large artifact render) does not look like a wedged loop. The
+    # check is the file's age: unhealthy once 300 s pass with no step finishing (keep it above the longest expected
+    # single step) or, with Postgres down, no probe succeeding. While Postgres is unreachable the worker retries with
+    # a backoff of 30 s growing to 120 s and exits 1 after 10 consecutive connection failures (about 8 minutes, up to
+    # 10 with connect timeouts); restart: unless-stopped brings it back. Unhealthy therefore shows after 5 minutes,
+    # before the restart.
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.stat('/tmp/herdr-worker-heartbeat').st_mtime < 300 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
     depends_on:
       postgres:
         condition: service_healthy
@@ -253,6 +293,9 @@ services:
       - ${HERDR_COLLAB_SPOOL_DIR:?run deploy.sh}:/collab-spool
     environment:
       HERDR_ENGINEERING_CONFIG: /app/control-plane/config.yaml
+      HERDR_WORKER_HEARTBEAT: /tmp/herdr-worker-heartbeat
+      # Overrides (optional): HERDR_WORKER_MAX_FAILED_PASSES (10; 0 = never exit), HERDR_WORKER_CONNECT_TIMEOUT (10 s),
+      # HERDR_WORKER_STATEMENT_TIMEOUT (120 s).
       # The group of collab-public (compose.collab.yaml runs it as this uid:uid): the worker hands member share URLs to
       # it through group-readable files. Same default as collab-public; members refuse to start without a group.
       HERDR_COLLAB_CERT_UID: ${HERDR_COLLAB_CERT_UID:-1000}
@@ -544,11 +587,12 @@ services:
       retries: 18
 
   # ---- dev.lan front door (host network; was deploy/fabric-stack) -------------
-  # The worker mounts ./config.yaml (control plane); the fabric services mount
-  # the fabric config from ../fabric-stack. Same project, same rendered substitution file.
+  # The worker's config (control plane) and the fabric config (deploy/fabric-stack/config.yaml, read by
+  # fabric-gateway and herdr-web as /app/config.yaml) are both baked into the image: no relative bind mounts. Per-host gateway routes come from an absolute host path (below).
+  # Same project, same rendered substitution file.
 
   coredns:
-    image: coredns/coredns:1.11.4
+    image: coredns/coredns:1.11.4@sha256:4190b960ea90e017631e3e1a38eea28e98e057ab60d57d47b3db6e5cf77436f7
     container_name: herdr-coredns
     restart: unless-stopped
     network_mode: host
@@ -574,19 +618,31 @@ services:
         hard: 524288
     network_mode: host
     volumes:
-      - ../fabric-stack/config.yaml:/app/config.yaml:ro
       - herdr-state:/state
       # Certificates are issued and renewed ON THE HOST (the image has no certbot or tailscale CLI; see
       # deploy/fabric-stack/README.md "HTTPS on 443"). The gateway only reads them and reloads when the files change.
       - ${HOME}/.config/herdr-engineering/acme:/acme:ro
       - ${HOME}/.config/herdr-engineering/ca:/ca:ro
       - ${HOME}/.config/herdr-engineering/tailnet-cert:/tailnet-cert:ro
+      # Host-local route overrides (scripts/fabric-stack.sh memory-route writes memory-route.yaml here). Absolute and outside
+      # any checkout, so it survives deploys; it is read after the baked /app/config.yaml and a missing file is skipped. deploy.sh creates the directory.
+      - ${HOME}/.config/herdr-engineering/fabric:/fabric-local:ro
+      # Control-API bearer token: a DIRECTORY mount (a rename-replace is followed; a missing file bind would be
+      # created as a directory by docker). Put the token in ~/.config/herdr-engineering/fabric-gateway/token (0600).
+      # The gateway re-reads it on every request, so rotating needs no restart: replace the file ATOMICALLY
+      # (write a temp file in the same directory, then rename it over token).
+      - ${HOME}/.config/herdr-engineering/fabric-gateway:/run/fabric:ro
     environment:
       HERDR_ENGINEERING_STATE: /state
-      HERDR_ENGINEERING_CONFIG: /app/config.yaml
+      HERDR_ENGINEERING_CONFIG: /app/config.yaml:/fabric-local/memory-route.yaml
+      HERDR_ENGINEERING_FABRIC_TOKEN_FILE: /run/fabric/token
     command:
       - "devfabric"
       - "gateway"
+      # ROLLOUT: the gateway refuses to start with no token unless --allow-open is given. It is kept here so
+      # deploying the code does not take the gateway down; a token in /run/fabric/token is enforced the moment it
+      # exists even with this flag. Remove the flag (follow-up PR) once the token is provisioned everywhere.
+      - "--allow-open"
       - "--control-port"
       - "29999"
       - "--bind"
@@ -618,14 +674,16 @@ services:
     restart: unless-stopped
     network_mode: host
     volumes:
-      - ../fabric-stack/config.yaml:/app/config.yaml:ro
       # Agent Mine fleet store: the private web UI's /api/agent-mine reads
       # $HOME/.cache/agent-mine/fleet/ (the container runs as root, HOME=/root).
       # Bind the controller's fleet store read-only so the dashboard can serve the
       # per-site summaries written by playbooks/agent-mine.yml.
       - ~/.cache/agent-mine:/root/.cache/agent-mine:ro
+      # The web UI calls the gateway control API (leases, /healthz): same read-only token directory as fabric-gateway.
+      - ${HOME}/.config/herdr-engineering/fabric-gateway:/run/fabric:ro
     environment:
       HERDR_ENGINEERING_CONFIG: /app/config.yaml
+      HERDR_ENGINEERING_FABRIC_TOKEN_FILE: /run/fabric/token
     command: ["web", "--host", "127.0.0.1", "--port", "8787"]
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8787/"]

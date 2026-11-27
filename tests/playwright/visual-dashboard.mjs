@@ -12,6 +12,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { CFG, REPO } from './ui-gates-lib.mjs';
+import { routeFixture } from './dashboard-fixtures.mjs';
 
 const PACKAGES = path.join(REPO, 'packages');
 const TYPES = { '.js': 'text/javascript', '.mjs': 'text/javascript', '.css': 'text/css', '.html': 'text/html', '.json': 'application/json', '.svg': 'image/svg+xml', '.md': 'text/markdown', '.woff2': 'font/woff2' };
@@ -100,6 +101,12 @@ const APPS = { ready: true, redirect_uri: 'https://cp.example/api/v1/assistant-a
   { id: 'calendar', name: 'Google Calendar', kind: 'oauth', provider: 'google', connected: true, account: 'ann@example.com', status: 'connected', scopes: [], client_configured: true },
   { id: 'github', name: 'GitHub', kind: 'status', provider: 'github', connected: true, account: 'berlinguyinca', status: 'connected', scopes: [], client_configured: false }] };
 
+/** The Missions and assistant answers above first, then the fixtures of every other dashboard route (dashboard-fixtures.mjs). */
+export const fixtureAnswer = (pathname, method, params = new URLSearchParams()) => apiAnswer(pathname, method) ?? routeFixture(pathname, method, params, { now: NOW, ago });
+
+/** Every API request the pages made, "METHOD path -> fixture|MISS": the capture entry point reports misses, never hides them. */
+export const API_LOG = new Set();
+
 /** The /api/v1 answers. Reads only: a surface never mutates anything. Unknown routes answer {} like the live-view tests do. */
 export function apiAnswer(pathname, method = 'GET') {
   const db = assistantDb();
@@ -125,7 +132,8 @@ export function apiAnswer(pathname, method = 'GET') {
     default:
       // the view opens a thread when the assistant has none: answer that one write with a fixed thread
       if (method === 'POST' && /\/threads$/.test(pathname)) return { thread_id: 'thr_1', title: 'New thread', created_at: created };
-      return /\/threads$/.test(pathname) ? { threads: [] } : {};
+      if (/\/threads$/.test(pathname)) return { threads: [] };
+      return undefined;   // not an assistant/missions answer: dashboard-fixtures.mjs has the rest, and an unknown route is a MISS, never {}
   }
 }
 
@@ -134,13 +142,20 @@ export function apiAnswer(pathname, method = 'GET') {
  * what only this app needs: the stubbed API, a silent event stream, and no calm/theme state from storage.
  * Returns { ctx, page } like openReal.
  */
-export async function openDashboard(browser, hash, ctxOpts = {}) {
+/** `log` given (the capture matrix): strict, an unanswered route is a logged 404 MISS. Omitted (the pinned baselines and the a11y gate): the original behaviour, unknown routes answer {}. */
+export async function openDashboard(browser, hash, ctxOpts = {}, log) {
   const origin = await dashboardOrigin();
   const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 }, ...ctxOpts });
   const page = await ctx.newPage();
   // no network beyond the loopback static server: any other request is refused
   await ctx.route('**/*', (route) => (route.request().url().startsWith(origin) || route.request().url().startsWith('data:') ? route.fallback() : route.abort()));
-  await page.route('**/api/v1/**', (route) => route.fulfill({ json: apiAnswer(new URL(route.request().url()).pathname, route.request().method()) }));
+  await page.route('**/api/v1/**', (route) => {
+    const u = new URL(route.request().url());
+    const answer = fixtureAnswer(u.pathname, route.request().method(), u.searchParams);
+    if (!log) return route.fulfill({ json: apiAnswer(u.pathname, route.request().method()) ?? {} });
+    log.add(`${route.request().method()} ${u.pathname} -> ${answer === undefined ? 'MISS' : 'fixture'}`);
+    return answer === undefined ? route.fulfill({ status: 404, json: { error: 'no fixture for ' + u.pathname } }) : route.fulfill({ json: answer });
+  });
   await page.addInitScript(() => {
     window.EventSource = class { constructor(url) { this.url = String(url); } close() {} };
   });
@@ -155,7 +170,9 @@ export async function openDashboard(browser, hash, ctxOpts = {}) {
 // Size cap (6144 KB for all baselines): the pages are tall (Missions 961px, assistant tabs 1600-2400px) and 100 baselines already take 4.5 MB,
 // so the matrix is desktop light, desktop dark and mobile light. Left out: tablet (768px uses the same collapsed layout as mobile, 375px, so
 // the mobile baseline covers the layout) and mobile dark (the colours are pinned by desktop dark). Listed in the test matrix as a known limit.
-const SKIP = ['tablet-light', 'tablet-dark', 'mobile-dark'];
+// Desktop only (2026-11-11): the dashboard is used on desktops, so phone and tablet pixel baselines are not kept; phone reflow stays gated by
+// ui-gates-dashboard-a11y and assistant-connectors.test.mjs.
+const SKIP = ['tablet-light', 'tablet-dark', 'mobile-light', 'mobile-dark'];
 export const DASHBOARD_SURFACES = [
   { slug: 'dashboard-missions', app: 'dashboard', fullPage: true, skip: SKIP, hash: '/missions', proof: '[data-mission-key]',
     steps: async (page) => { await page.locator('[data-mission-key="pi:M-203"]').waitFor(); await page.locator('#mc-result').filter({ hasText: 'matching current missions' }).waitFor(); await page.evaluate(() => document.activeElement?.blur()); },
@@ -166,21 +183,22 @@ export const DASHBOARD_SURFACES = [
     regions: [{ name: 'panel', selector: '#pa-notifications' }] },
   { slug: 'dashboard-assistant-approvals', app: 'dashboard', fullPage: true, skip: SKIP, hash: '/personal-assistant', proof: '[data-config]', steps: assistantTab('Approvals', 'Approving allows'),
     regions: [{ name: 'panel', selector: '#pa-approvals' }] },
-  { slug: 'dashboard-assistant-connectors', app: 'dashboard', fullPage: true, skip: [...SKIP, 'mobile-light'],   // no mobile baseline: the 6144 KB cap; phone reflow is gated by ui-gates-dashboard-a11y and assistant-connectors.test.mjs
+  { slug: 'dashboard-assistant-connectors', app: 'dashboard', fullPage: true, skip: SKIP,   // no mobile baseline: the 6144 KB cap; phone reflow is gated by ui-gates-dashboard-a11y and assistant-connectors.test.mjs
      hash: '/personal-assistant', proof: '[data-config]', steps: connectorsTab },
 ];
 
-async function connectorsTab(page) {
+export async function connectorsTab(page) {
   await assistantTab('Connectors', 'Apps your assistant can use')(page);
   for (const sel of ['[data-app="gmail"]', '[data-blocked-form]', '[data-draft="r-1"]', '[data-reminder="rem_1"]', '[data-cstatus]']) await page.locator(sel).first().waitFor({ state: 'attached' });
   await page.waitForTimeout(100);
 }
 
-function assistantTab(name, text) {
+export function assistantTab(name, text) {
   return async (page) => {
     await page.locator('[data-config]').click();
     await page.getByRole('tab', { name, exact: true }).click();
-    await page.locator('#pa-panel').getByText(text).first().waitFor();
+    if (text) await page.locator('#pa-panel').getByText(text).first().waitFor();
+    else await page.waitForFunction(() => (document.querySelector('#pa-panel')?.textContent || '').trim().length > 20);   // tabs without a known heading: wait for any content
     // The voice buttons are colour emoji (U+1F3A4, U+1F50A). No bundled font has them, so each host would paint them with its own
     // emoji font (or a box): the one thing in these pages that is not reproducible. They are swapped for ASCII stand-ins here, and
     // kept swapped across redraws; docs/specs/.../test-matrix.md lists this as a known limit of the baselines.

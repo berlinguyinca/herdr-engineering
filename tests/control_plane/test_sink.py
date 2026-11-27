@@ -125,7 +125,7 @@ def test_sink_reconnects_a_closed_database_connection(monkeypatch):
     replacement = FakeConn()
     connects = []
 
-    async def connect(dsn):
+    async def connect(dsn, **options):
         connects.append(dsn)
         return replacement
 
@@ -148,7 +148,7 @@ def test_sink_serializes_connection_recovery_and_concurrent_writes(monkeypatch):
     replacement = FakeConn()
     connects = []
 
-    async def connect(dsn):
+    async def connect(dsn, **options):
         connects.append(dsn)
         await asyncio.sleep(0.02)
         return replacement

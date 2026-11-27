@@ -23,10 +23,13 @@ import sys
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .handoff_adapters.base import Harness
 from .version import __version__
+
+if TYPE_CHECKING:
+    from .devfabric import DevServiceForwarder, DevServiceLease, DevServiceRegistry
 
 # The central fleet file, alone in its own directory (deploy.sh mounts the directory).
 # Same value as fleet_config_cli.DEFAULT_CONFIG_PATH (not imported: keeps startup light).
@@ -455,7 +458,8 @@ def _build_parser() -> argparse.ArgumentParser:
             rp.add_argument("--pi-revision", default=None,
                             help="full immutable Pi commit SHA; defaults to the pinned "
                                  "revision (~/.config/herdr-engineering/pi-rollout-revision)")
-            rp.add_argument("--host", default=None)
+            rp.add_argument("--host", action="append", default=None,
+                            help="plan only this host; repeat to plan several hosts in one rollout")
             rp.add_argument("--inventory", default=None)
         elif action != "latest":
             rp.add_argument("--id", required=True, help="rollout ID printed by plan")
@@ -795,7 +799,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--process"); p2.add_argument("--label")
     p2.add_argument("--route", action="append", default=None, metavar="PREFIX=HOST:PORT",
                     help="same-origin route (repeatable): a path prefix -> backend, "
-                         "e.g. /api=api:8300. The --host/--port is the catch-all. "
+                         "e.g. /api=127.0.0.1:8300. HOST must be an IP literal or localhost "
+                         "(the gateway refuses named hosts). The --host/--port is the catch-all. "
                          "Makes this a multi-backend same-origin app edge.")
     p2.add_argument("--preferred-port", type=int, default=None,
                     help="pin the origin's external dev port (default: match --port, "
@@ -850,6 +855,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--reset-lock", action="store_true",
                     help="take over a stale gateway.lock (e.g. after a crash/SIGKILL; "
                          "safe when no other gateway is running)")
+    p2.add_argument("--allow-open", action="store_true",
+                    help="serve the control API without a bearer token when none is configured "
+                         "(HERDR_ENGINEERING_FABRIC_TOKEN, host config fabric.token or the fabric-token "
+                         "file); without this flag the gateway refuses to start with no token. A token that "
+                         "appears later is enforced immediately")
     p2.add_argument("--rewrite-headers", action="store_true",
                     help="opt-in: rewrite loopback URLs in Location / CORS / cookie-domain "
                          "headers of HTTP leases to the fabric address (forces "
@@ -1120,8 +1130,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--yes", action="store_true", help="install-hooks: apply without the confirmation prompt")
     p2.set_defaults(func=_cmd_cp_assistant_worker)
     p2 = csub.add_parser("assistant-action", help="list, approve or deny hub workers' action requests (owner API)")
-    p2.add_argument("action", choices=["list", "approve", "deny"])
-    p2.add_argument("request_id", nargs="?", default=None, help="the request to decide (approve|deny)")
+    p2.add_argument("action", choices=["list", "show", "approve", "deny"])
+    p2.add_argument("request_id", nargs="?", default=None, help="the request to show or decide (show|approve|deny)")
+    p2.add_argument("--display-sha256", default=None,
+                    help="approve: the hash `show` printed, to approve a cut command without a prompt (not on a terminal)")
     p2.add_argument("--status", default=None, choices=["pending", "approved", "denied", "vetoed"], help="list filter")
     p2.add_argument("--control-plane", default=None, help="control-plane base URL (default: host.json)")
     p2.add_argument("--api-key-file", default=None, help="PATH to a file holding an operator API key (never the key itself)")
@@ -1288,6 +1300,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p2.add_argument("--fleet-config", default=FLEET_CONFIG_DEFAULT,
                     help="central fleet config file; control_plane.pg_dsn names the database")
     p2.add_argument("--host-id", default=None, help="worker host identity for artifact job placement")
+    p2.add_argument("--heartbeat-file", default=os.environ.get("HERDR_WORKER_HEARTBEAT"),
+                    help="touch this file after every successful pass (the container health check reads its age; "
+                         "env HERDR_WORKER_HEARTBEAT)")
+    p2.add_argument("--max-failed-passes", type=int, default=_env_int("HERDR_WORKER_MAX_FAILED_PASSES", 10),
+                    help="exit 1 after this many consecutive failed passes so the supervisor restarts the worker; "
+                         "0 never gives up (default 10, env HERDR_WORKER_MAX_FAILED_PASSES)")
+    p2.add_argument("--connect-timeout", type=float, default=_env_float("HERDR_WORKER_CONNECT_TIMEOUT", 10.0),
+                    help="seconds allowed to open a Postgres connection (default 10, env HERDR_WORKER_CONNECT_TIMEOUT)")
+    p2.add_argument("--statement-timeout", type=float, default=_env_float("HERDR_WORKER_STATEMENT_TIMEOUT", 120.0),
+                    help="seconds allowed per Postgres statement (default 120, env HERDR_WORKER_STATEMENT_TIMEOUT)")
     p2.set_defaults(func=_cmd_cp_worker)
     p2 = csub.add_parser("feed-pi", help="publish a read-only Pi orchestration snapshot",
                          description="Post a Pi snapshot using HERDR_CP_INGEST_KEY (ingest-role API key).")
@@ -2443,6 +2465,7 @@ def _cmd_fleet_rollout(args) -> int:
         inventory_targets,
         latest_unfinished,
         prune_settled,
+        read_pin,
         resolve_plan_revision,
         retire_identityless,
         run_rollout,
@@ -2466,7 +2489,15 @@ def _cmd_fleet_rollout(args) -> int:
         elif args.rollout_command == "abandon":
             report = abandon_rollout(store, args.id, reason=args.reason)
         elif args.rollout_command == "prune":
-            report = {"pruned": prune_settled(store, older_than_days=args.older_than_days)}
+            try:
+                pinned = {read_pin()} - {None}
+            except ValueError:
+                pinned = set()  # an invalid pin protects nothing; prune is not the place to fail
+            report = {
+                "pruned": prune_settled(
+                    store, older_than_days=args.older_than_days, keep_revisions=pinned
+                )
+            }
         else:
             report = store.read(args.id)
     except (OSError, ValueError, RuntimeError, FleetError) as exc:
@@ -2709,9 +2740,15 @@ def _local_fabric_client():
         return None
     if not url:
         return None
+    from .fabric import TokenNotAccepted, TokenUnreadable
     try:
         FabricClient(url).healthz()
         return FabricClient(url)
+    except (TokenNotAccepted, TokenUnreadable) as exc:
+        # The gateway is there but this host's token does not work: say so instead of degrading silently.
+        print(f"herdr-eng: fabric gateway {url} NOT used, falling back to the local registry: {exc}",
+              file=sys.stderr, flush=True)
+        return None
     except Exception:
         return None  # gateway down: degrade to local mode, never break registration
 
@@ -2730,8 +2767,13 @@ def _gateway_configured_or_reachable() -> bool:
     if url:
         return True  # configured (even if currently unreachable)
     # Not configured: check if one is somehow reachable (e.g. via env override)
+    from .fabric import TokenNotAccepted, TokenUnreadable
     try:
         FabricClient("http://127.0.0.1:29999").healthz()
+        return True
+    except (TokenNotAccepted, TokenUnreadable) as exc:
+        print(f"herdr-eng: a fabric gateway is reachable but this host's token does not work with it: {exc}",
+              file=sys.stderr, flush=True)
         return True
     except Exception:
         return False
@@ -2797,6 +2839,7 @@ def _parse_routes(specs):
 
 def _cmd_dev_register(args) -> int:
     from .devfabric import DevServiceRegistry
+    from .fabric import GatewayRejected
     host = _resolve_target_host(args.host, args.port)
     try:
         routes = _parse_routes(args.route)
@@ -2815,16 +2858,23 @@ def _cmd_dev_register(args) -> int:
                 preferred_port=args.preferred_port)
             _print_json(result)
             return 0
+        except GatewayRejected as exc:
+            _print_json({"ok": False, "error": f"gateway rejected the registration: {exc.reason or exc.message}"})
+            return 1
         except Exception as exc:
             _print_json({"ok": False, "gateway": str(exc),
                          "note": "gateway unreachable — fell back to local registry",
                          "warning": "lease is NOT reachable via dev:<port> until the gateway is up"})
-    lease = DevServiceRegistry().register(
-        target_machine_id=args.machine, target_host=host, target_port=args.port,
-        protocol=args.protocol, owner_herdr_session_id=args.session,
-        owner_repository=args.repo, owner_worktree_id=args.worktree,
-        owner_process_id=args.process, label=args.label, routes=routes,
-        preferred_port=args.preferred_port)
+    try:
+        lease = DevServiceRegistry().register(
+            target_machine_id=args.machine, target_host=host, target_port=args.port,
+            protocol=args.protocol, owner_herdr_session_id=args.session,
+            owner_repository=args.repo, owner_worktree_id=args.worktree,
+            owner_process_id=args.process, label=args.label, routes=routes,
+            preferred_port=args.preferred_port)
+    except ValueError as exc:
+        _print_json({"ok": False, "error": str(exc)})
+        return 1
     _print_json(lease.to_dict())
     return 0
 
@@ -2892,7 +2942,44 @@ def _spec_from_manifest(m: dict) -> dict:
     }
 
 
-def heartbeat_local_leases(reg, state: dict) -> None:
+def _renew_local(reg: DevServiceRegistry, lease_id: str) -> DevServiceLease | None:
+    """Heartbeat a local lease; if its port went to another lease while it
+    lapsed (heartbeat returns None) re-register it onto a fresh port. A lease
+    missing from the registry stays None (the next sync re-enrolls it)."""
+    renewed = reg.heartbeat(lease_id)
+    if renewed is None:
+        old = reg.get(lease_id)
+        if old is not None:
+            renewed = reg.register(
+                target_machine_id=old.target_machine_id, target_host=old.target_host,
+                target_port=old.target_port, lease_id=lease_id)
+    return renewed
+
+
+def _renew_serving_origin(reg: DevServiceRegistry, lease_id: str, bound_port: int,
+                          forwarder: DevServiceForwarder, bind: str) -> tuple[int, DevServiceForwarder]:
+    """One renewal cycle of ``enroll --serve``. Returns (bound_port, forwarder).
+
+    The port is tracked by the caller, not read off a lease object captured at
+    enroll time: the registry reloads fresh lease objects, so a stale copy would
+    keep reporting the old port and restart the forwarder every cycle.
+    """
+    from .devfabric import forwarder_for
+    renewed = _renew_local(reg, lease_id)
+    if renewed is None or renewed.external_port == bound_port:
+        return bound_port, forwarder
+    logging.getLogger("herdr.cli").warning(
+        "lease %s moved from port %s to %s on renewal",
+        lease_id, bound_port, renewed.external_port)
+    forwarder.stop()
+    forwarder = forwarder_for(renewed, bind_host=bind).start()
+    _print_json({"ok": True, "serving": f"http://{bind}:{renewed.external_port}",
+                 "note": "lease moved to a new port"})
+    return renewed.external_port, forwarder
+
+
+def heartbeat_local_leases(reg, state: dict, fwd: dict | None = None,
+                           bind: str = "127.0.0.1") -> None:
     """Renew every locally-held lease (the --serve renewal loop, #89).
 
     Loud about the two ways a renewal can silently lose the origin: the
@@ -2900,23 +2987,53 @@ def heartbeat_local_leases(reg, state: dict) -> None:
     process — the next sync re-enrolls it), and the lease LAPSED between
     cycles (expired while the forwarder still held the port — fleet-wide
     unreachable until this renewal). The lapsed lease is still renewed.
+    A renewal can move the lease to a new port (its old one went to another
+    lease); with ``fwd`` the forwarder is restarted on the new port.
     """
     from .devfabric import _now_iso, _parse_time
     now = _parse_time(_now_iso())
     for key, st in state.items():
-        lid = st["lease_id"]
-        lease = reg.get(lid)
-        lapsed = lease is not None and _parse_time(lease.expires_at) < now
-        renewed = reg.heartbeat(lid)
-        if renewed is None:
+        try:
+            _heartbeat_one_local(reg, key, st, now, fwd, bind)
+        except Exception as exc:  # noqa: BLE001 - one lease must not stop the others renewing
             logging.getLogger("herdr.cli").warning(
-                "lease %s missing from the registry while the forwarder "
-                "still serves it (clobbered or pruned); the next sync will "
-                "re-enroll it", lid)
-        elif lapsed:
-            logging.getLogger("herdr.cli").warning(
-                "lease %s lapsed (expired while the forwarder held the "
-                "port); renewed now", lid)
+                "renewing lease %s failed: %s", st.get("lease_id"), exc)
+
+
+def _heartbeat_one_local(reg, key: str, st: dict, now, fwd: dict | None, bind: str) -> None:
+    from .devfabric import _parse_time
+    log = logging.getLogger("herdr.cli")
+    lid = st["lease_id"]
+    lease = reg.get(lid)
+    lapsed = lease is not None and _parse_time(lease.expires_at) < now
+    old_port = st.get("port")
+    renewed = _renew_local(reg, lid)
+    if renewed is None:
+        log.warning(
+            "lease %s missing from the registry while the forwarder "
+            "still serves it (clobbered or pruned); the next sync will "
+            "re-enroll it", lid)
+    elif lapsed:
+        log.warning(
+            "lease %s lapsed (expired while the forwarder held the "
+            "port); renewed now", lid)
+    if renewed is None or old_port is None or renewed.external_port == old_port:
+        return
+    log.warning("lease %s moved from port %s to %s on renewal", lid, old_port, renewed.external_port)
+    if fwd is not None and key in fwd:  # a failed earlier start leaves None: retry it too
+        if fwd[key] is not None:
+            try:
+                fwd[key].stop()
+            except Exception:
+                pass
+        fwd.pop(key, None)
+        err = _ensure_origin_forwarder(fwd, key, renewed, bind)
+        if err is not None:
+            # Keep the old port recorded so the next cycle sees the move again and retries.
+            log.warning("forwarder for lease %s could not bind port %s: %s; retrying next cycle",
+                        lid, renewed.external_port, err)
+            return
+    st["port"] = renewed.external_port
 
 
 def _ensure_origin_forwarder(fwd: dict, key: str, lease, bind: str):
@@ -2995,7 +3112,7 @@ def _enroll_origin(spec: dict, client, reg, bind: str = "127.0.0.1"):
     elif existing is not None:
         lease = reg.update_routes(stable_id, routes)
         if lease.state != "active":
-            lease = reg.heartbeat(stable_id) or lease
+            lease = _renew_local(reg, stable_id) or lease
         changed = True
     else:
         lease = reg.register(
@@ -3110,7 +3227,7 @@ def _cmd_dev_enroll_sync(args) -> int:
     def _heartbeat_local():
         if client is None:
             try:
-                heartbeat_local_leases(reg, state)
+                heartbeat_local_leases(reg, state, fwd=fwd, bind=args.bind)
             except Exception:
                 pass
 
@@ -3204,7 +3321,7 @@ def _cmd_dev_enroll(args) -> int:
     --serve runs the forwarder locally.
     """
     from .contracts import Route
-    from .devfabric import DevServiceRegistry, forwarder_for
+    from .devfabric import DevServiceRegistry, _normalize_routes, forwarder_for
     from .errors import ConflictError
 
     m = {}
@@ -3235,8 +3352,13 @@ def _cmd_dev_enroll(args) -> int:
         _print_json({"ok": False, "error": "missing catch-all backend (--catchall HOST:PORT or manifest.catchall)"})
         return 1
     c_host, c_port = catchall["host"], int(catchall["port"])
-    routes = [Route(r.get("prefix", "/"), r.get("host"), int(r.get("port")))
-              if isinstance(r, dict) else r for r in routes_in]
+    try:
+        routes = [Route(r.get("prefix", "/"), r.get("host"), int(r.get("port")))
+                  if isinstance(r, dict) else r for r in routes_in]
+        _normalize_routes(routes)
+    except (ValueError, TypeError) as exc:
+        _print_json({"ok": False, "error": f"bad route table: {exc}"})
+        return 1
     routes_wire = [{"prefix": r.prefix, "host": r.host, "port": r.port} for r in routes] or None
 
     client = _local_fabric_client()
@@ -3289,10 +3411,14 @@ def _cmd_dev_enroll(args) -> int:
                   and cand.target_port == c_port), None)
     if stale is not None:
         reg.close(stale.id)
-    lease = reg.register(
-        target_machine_id=machine, target_host=c_host, target_port=c_port,
-        protocol=protocol, owner_repository=repo, label=label,
-        routes=routes, preferred_port=origin_port)
+    try:
+        lease = reg.register(
+            target_machine_id=machine, target_host=c_host, target_port=c_port,
+            protocol=protocol, owner_repository=repo, label=label,
+            routes=routes, preferred_port=origin_port)
+    except ValueError as exc:
+        _print_json({"ok": False, "error": f"bad route table: {exc}"})
+        return 1
     origin = f"http://dev:{lease.external_port}"
     out = {
         "ok": True, "via": "local", "lease_id": lease.id, "origin": origin,
@@ -3310,7 +3436,7 @@ def _cmd_dev_enroll(args) -> int:
         return 0
 
     try:
-        forwarder_for(lease, bind_host=args.bind).start()
+        forwarder = forwarder_for(lease, bind_host=args.bind).start()
     except ConflictError as exc:
         _print_json({"ok": False, "error": str(exc)})
         return 1
@@ -3321,13 +3447,15 @@ def _cmd_dev_enroll(args) -> int:
     stop = {"flag": False}
     signal.signal(signal.SIGINT, lambda *_: stop.__setitem__("flag", True))
     next_hb = time.monotonic()
+    bound_port = lease.external_port
     while not stop["flag"]:
         time.sleep(0.2)
         # Keep the lease active (default TTL ~90s) so the origin stays a live
         # fabric member (visible in `devfabric list`, kept by a central gateway).
         if time.monotonic() >= next_hb:
             try:
-                reg.heartbeat(lease.id)
+                bound_port, forwarder = _renew_serving_origin(
+                    reg, lease.id, bound_port, forwarder, args.bind)
             except Exception:
                 pass
             next_hb = time.monotonic() + 30
@@ -3340,7 +3468,7 @@ def _cmd_dev_heartbeat(args) -> int:
     if client is not None:
         _print_json(client.heartbeat(args.lease_id))
         return 0
-    lease = DevServiceRegistry().heartbeat(args.lease_id)
+    lease = _renew_local(DevServiceRegistry(), args.lease_id)
     _print_json({"ok": lease is not None,
                  "lease": lease.to_dict() if lease else None})
     return 0
@@ -3507,7 +3635,7 @@ def _cmd_dev_gateway(args) -> int:
 
     from .config import InvalidError, load_config
     from .devfabric import DevServiceRegistry
-    from .fabric import FabricGateway, GatewayRouter, tailnet_ipv4
+    from .fabric import FabricGateway, GatewayRouter, read_fabric_token, tailnet_ipv4
     try:
         cfg = load_config().get("fabric") or {}
     except InvalidError:
@@ -3524,6 +3652,18 @@ def _cmd_dev_gateway(args) -> int:
     # through it): prefer the tailnet IP; loopback-only when no tailnet.
     control_host = next((h for h in bind_hosts if h != "127.0.0.1"), "127.0.0.1")
     acme_domain = getattr(args, "acme_domain", None) or cfg.get("acme_domain") or None
+    allow_open = bool(getattr(args, "allow_open", False))
+    try:
+        have_token = allow_open or bool(read_fabric_token())
+    except OSError as exc:
+        raise SystemExit(f"fabric gateway: the control-API token is unreadable ({exc}); "
+                         "fix it (token file: a regular 0600 file; host config: reachable control plane); "
+                         "refusing to start")
+    if not have_token:
+        raise SystemExit("fabric gateway: no control-API token configured. Set HERDR_ENGINEERING_FABRIC_TOKEN, "
+                         "fabric.token, or write ~/.config/herdr-engineering/fabric-token "
+                         "(or HERDR_ENGINEERING_FABRIC_TOKEN_FILE); pass --allow-open to serve the control "
+                         "API unauthenticated")
     registry = DevServiceRegistry()
     router = GatewayRouter(bind_hosts)
     gateway = FabricGateway(
@@ -3531,13 +3671,14 @@ def _cmd_dev_gateway(args) -> int:
         url_base=args.url_base or (cfg.get("url_base") or None) or acme_domain,
         probe_interval=float(cfg.get("probe_interval_seconds", 15)),
         reset_lock=bool(getattr(args, "reset_lock", False)),
+        allow_open=allow_open,
         rewrite_headers=bool(getattr(args, "rewrite_headers", False)),
         peer_url=getattr(args, "peer", None) or cfg.get("peer_url") or None,
         node_id=getattr(args, "node_id", None) or cfg.get("node_id") or None,
         promote_after=int(getattr(args, "promote_after", 3)),
         named_domain=None if getattr(args, "no_named_urls", False) else acme_domain,
         named_port=int(getattr(args, "named_port", None) or cfg.get("named_port") or 443),
-        host_routes=dict(_route(r) for r in [*getattr(args, "route", []), *(cfg.get("routes") or [])]),
+        host_routes=dict(_route(r) for r in [*getattr(args, "route", []), *(cfg.get("routes") or []), *(cfg.get("local_routes") or [])]),
         apex_upstream=_host_port(getattr(args, "apex_upstream", None) or cfg.get("apex_upstream")),
         url_aliases=tuple(dict.fromkeys([*getattr(args, "url_alias", []), *(cfg.get("url_aliases") or []),
                                          *_private_ca_domains(cfg)])))
@@ -3584,6 +3725,7 @@ def _cmd_dev_gateway(args) -> int:
     gateway.start()
     _print_json({
         "ok": True, "gateway": True, "https": bool(tls_cert), "role": gateway.role, "peer": gateway.peer_url, "access_enforced": bool(users or tags),
+        "control_auth": gateway.control_auth,
         "control_url": f"http://{gateway.control_host}:{control_port}",
         "url_base": gateway.url_base,
         "named_urls": (f"https://<service>.{gateway.named_domain}" + ("" if gateway.named_port == 443 else f":{gateway.named_port}"))
@@ -3824,7 +3966,15 @@ def _cmd_dev_agent(args) -> int:
 
     from .config import InvalidError, load_config
     from .fabric import FabricClient, gateway_url_from_config, tailnet_ipv4
-    from .fabric_agent import AgentConfig, FabricAgent, parse_agent_binaries, parse_deny_processes
+    from .fabric_agent import (
+        AgentConfig,
+        FabricAgent,
+        parse_adopt_mode,
+        parse_agent_binaries,
+        parse_allow_processes,
+        parse_deny_processes,
+        parse_ports,
+    )
     from .host_config import ConfigRefresher, HostConfigUnavailable, exit_unavailable, host_config
 
     logging.basicConfig(level=logging.INFO,
@@ -3861,11 +4011,13 @@ def _cmd_dev_agent(args) -> int:
         str(Path.home() / ".local/share/herdr-engineering/state")))
     # Noise filter knobs (all optional, sensible defaults in AgentConfig):
     # extra excluded ports + the dev-port window the agent will register.
-    extra_exclude = frozenset(int(p) for p in fabric_cfg.get(
-        "agent_exclude_ports", []))
     try:
+        extra_exclude = parse_ports(fabric_cfg.get("agent_exclude_ports"), "agent_exclude_ports")
         agent_binaries = parse_agent_binaries(fabric_cfg.get("agent_binaries"))
         deny_processes = parse_deny_processes(fabric_cfg.get("agent_deny_processes"))
+        adopt_mode = parse_adopt_mode(fabric_cfg.get("agent_adopt_mode"))
+        allow_ports = parse_ports(fabric_cfg.get("agent_allow_ports"), "agent_allow_ports")
+        allow_processes = parse_allow_processes(fabric_cfg.get("agent_allow_processes"))
     except ValueError as exc:
         _print_json({"code": "config", "message": str(exc)})
         return 1
@@ -3890,6 +4042,9 @@ def _cmd_dev_agent(args) -> int:
             host_slow_interval=float(fabric_cfg.get("host_slow_interval", 3600.0)),
             agent_binaries=agent_binaries,
             deny_processes=deny_processes,
+            adopt_mode=adopt_mode,
+            allow_ports=allow_ports,
+            allow_processes=allow_processes,
             orphan_grace=float(fabric_cfg.get("agent_orphan_grace_seconds", 60.0)),
             lease_max_age=float(fabric_cfg.get("agent_lease_max_age_seconds", 86400.0)),
         ))
@@ -3911,7 +4066,7 @@ def _cmd_dev_agent(args) -> int:
         if fab == seen["fabric"] and cp == seen["cp"] and key == seen["key"]:
             return
         new_base = gateway_url_from_config(cfg, fabric_url=fab[0] or "") or base
-        agent.retarget(FabricClient(new_base, fab[1] or None), cp, key)
+        agent.retarget(FabricClient(new_base), cp, key)
         seen["fabric"], seen["cp"], seen["key"] = fab, cp, key
 
     try:
@@ -3949,7 +4104,7 @@ def _cmd_dev_serve(args) -> int:
     import signal
     import time
 
-    from .devfabric import DevServiceRegistry, forwarder_for
+    from .devfabric import DevServiceRegistry, _normalize_routes, forwarder_for
     from .errors import ConflictError
     lease = DevServiceRegistry().get(args.lease_id)
     if lease is None:
@@ -4314,9 +4469,72 @@ def _cp_config(fleet_config_path=None) -> dict:
     return out
 
 
-async def _cp_connect(dsn: str):
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ[name])
+    except (KeyError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ[name])
+    except (KeyError, ValueError):
+        return default
+
+
+async def _cp_connect(dsn: str, *, timeout: float | None = None, command_timeout: float | None = None):
     import asyncpg
-    return await asyncpg.connect(dsn)
+    return await asyncpg.connect(dsn, timeout=60 if timeout is None else timeout, command_timeout=command_timeout)
+
+
+class _StopSignals:
+    """SIGTERM and SIGINT set a stop event instead of killing the process mid-cleanup. SIGINT also records that the exit
+    status must be 130, and puts the default handler back at once, so a second Ctrl-C kills a teardown that is stuck."""
+
+    def __init__(self) -> None:
+        self.interrupted = False
+
+    def install(self, loop, stop: asyncio.Event) -> None:
+        def on_interrupt() -> None:
+            self.interrupted = True
+            stop.set()
+            loop.remove_signal_handler(signal.SIGINT)
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+        try:
+            loop.add_signal_handler(signal.SIGTERM, stop.set)
+            loop.add_signal_handler(signal.SIGINT, on_interrupt)
+        except (NotImplementedError, RuntimeError, ValueError):
+            pass
+
+
+_STOPPED = object()
+
+
+async def _until_stopped(coro, stop: asyncio.Event):
+    """Await ``coro`` unless ``stop`` is set first; then cancel it (its finally blocks run) and return _STOPPED."""
+    import asyncio
+    task = asyncio.ensure_future(coro)
+    waiter = asyncio.ensure_future(stop.wait())
+    try:
+        await asyncio.wait({task, waiter}, return_when=asyncio.FIRST_COMPLETED)
+        if task.done():
+            return task.result()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        return _STOPPED
+    finally:
+        waiter.cancel()
+
+
+def _sigterm_as_interrupt() -> None:
+    """Make SIGTERM (docker stop) take the same cleanup path as Ctrl-C. Main thread only; a no-op elsewhere."""
+    def _raise(_signum, _frame):
+        raise KeyboardInterrupt
+    try:
+        signal.signal(signal.SIGTERM, _raise)
+    except ValueError:
+        pass
 
 
 def _cmd_cp_migrate(args) -> int:
@@ -4508,6 +4726,11 @@ def _cmd_cp_assistant_worker(args) -> int:
     except (OSError, ValueError, KeyError) as exc:
         print(f"assistant-worker {args.action} failed: {type(exc).__name__}", file=sys.stderr)
     return 1
+
+
+def _full_text_sha256(full: str) -> str:
+    from .control_plane.assistant_hub.policy import full_text_sha256
+    return full_text_sha256(full)
 
 
 def _tty_safe(value) -> str:
@@ -4728,12 +4951,52 @@ def _cmd_cp_assistant_hub_owner(args) -> int:
                 rows = call("GET", f"/api/v1/assistant-action-requests{query}")["requests"]
                 print(f"{'REQUEST_ID':<20} {'STATUS':<9} {'VERB':<14} {'WORKER':<22} DISPLAY")
                 for r in rows:
-                    display = _tty_safe(r["display"])[:120]
+                    display = _tty_safe(r["display"])
                     print(_tty_safe(f"{r['request_id']:<20} {r['status']:<9} {r['verb']:<14} {r['worker_id']:<22} ")
                           + display)
+                    if not r.get("display_complete", True):
+                        print("  (cut: read it with `assistant-action show ID`)")
+            elif args.action == "show":
+                row = call("GET", f"/api/v1/assistant-action-requests/{quoted}")
+                print(_tty_safe(f"{row['request_id']}: {row['status']}"))
+                print(_tty_safe(row.get("display_full") or row["display"]))
+                if row.get("display_complete", True):
+                    print("shown in full: approve needs no hash")
+                elif row.get("approvable"):
+                    print("display_sha256: " + _full_text_sha256(row["display_full"]))
+                else:
+                    print("deny only: this command is too long to show in full")
             else:
-                out = call("POST", f"/api/v1/assistant-action-requests/{quoted}/decision",
-                           {"approve": args.action == "approve"})
+                body = {"approve": args.action == "approve"}
+                try:
+                    out = call("POST", f"/api/v1/assistant-action-requests/{quoted}/decision", body)
+                except urllib.error.HTTPError as exc:
+                    if not (body["approve"] and exc.code == 409
+                            and _http_error_payload(exc).get("code") == "truncated_display"):
+                        raise
+                    row = call("GET", f"/api/v1/assistant-action-requests/{quoted}")
+                    if not row.get("approvable"):
+                        print("this request can only be denied: it is too long to show in full",
+                              file=sys.stderr)
+                        return 1
+                    full = row["display_full"]
+                    if args.display_sha256:
+                        body["display_sha256"] = args.display_sha256
+                    elif sys.stdin.isatty():
+                        print(_tty_safe(full))
+                        try:
+                            answer = input("Approve exactly this command? [y/N] ").strip().lower()
+                        except (EOFError, KeyboardInterrupt):
+                            answer = ""
+                        if answer not in ("y", "yes"):
+                            print("not approved")
+                            return 1
+                        body["display_sha256"] = _full_text_sha256(full)
+                    else:
+                        print("this command is cut in the list; read it with `assistant-action show ID` and "
+                              "pass the hash it prints as --display-sha256", file=sys.stderr)
+                        return 2
+                    out = call("POST", f"/api/v1/assistant-action-requests/{quoted}/decision", body)
                 print(_tty_safe(f"{out['request_id']}: {out['status']}"))
         elif args.action == "list":
             rows = call("GET", "/api/v1/assistant-grants")["grants"]
@@ -4749,16 +5012,28 @@ def _cmd_cp_assistant_hub_owner(args) -> int:
             print(_tty_safe(f"{out['grant_id']}: {out['state']}"))
         return 0
     except urllib.error.HTTPError as exc:
-        code = ""
-        try:
-            code = str(json.loads(exc.read(65536)).get("code") or "")
-        except (OSError, ValueError, AttributeError):
-            pass
+        payload = _http_error_payload(exc)
+        code = str(payload.get("code") or "")
+        message = payload.get("error") if kind == "assistant-action" else ""
         suffix = f" ({code})" if code and code.replace("_", "").isalnum() else ""
-        print(f"{kind} {args.action} failed: HTTP {exc.code}{suffix}", file=sys.stderr)
+        detail = f": {_tty_safe(message)[:300]}" if isinstance(message, str) and message else ""
+        print(f"{kind} {args.action} failed: HTTP {exc.code}{suffix}{detail}", file=sys.stderr)
     except (OSError, ValueError, KeyError) as exc:
         print(f"{kind} {args.action} failed: {type(exc).__name__}", file=sys.stderr)
     return 1
+
+
+def _http_error_payload(exc) -> dict:
+    """The JSON object in an HTTP error body, read once (a second ``read`` returns nothing) and cached on ``exc``."""
+    cached = getattr(exc, "_herdr_payload", None)
+    if cached is None:
+        try:
+            parsed = json.loads(exc.read(65536))
+            cached = parsed if isinstance(parsed, dict) else {}
+        except (OSError, ValueError):
+            cached = {}
+        exc._herdr_payload = cached  # type: ignore[attr-defined]
+    return cached
 
 
 _REDEEM_SAFE = re.compile(r"[A-Za-z0-9._~:/\-]+")
@@ -5478,12 +5753,13 @@ def _cmd_cp_web(args) -> int:
     hub_server = _wire_assistant_hub(svr)
     if hub_server is not None:
         logging.info("assistant hub listening on %s:%s", hub_server.host, hub_server.port)
-    _print_json({"ok": True, "serving": "control plane UI + /api/v1 + SSE",
-                 "host": args.host, "port": args.port,
-                 "url": f"http://{args.host}:{svr.port if not args.port else args.port}"})
     watch = stall_watch.install()
     stall_watch.tune_gc(gc_tuning)
+    _sigterm_as_interrupt()      # before the ready line, so a SIGTERM sent on seeing it is never lost
     try:
+        _print_json({"ok": True, "serving": "control plane UI + /api/v1 + SSE",
+                     "host": args.host, "port": args.port,
+                     "url": f"http://{args.host}:{svr.port if not args.port else args.port}"})
         svr.serve()
     except KeyboardInterrupt:
         pass
@@ -6558,7 +6834,8 @@ def _cmd_cp_worker(args) -> int:
     from .control_plane.artifact_renderers import RendererRegistry
     from .control_plane.artifacts import ArtifactStore
     from .control_plane.db import Migrator
-    from .control_plane.worker import run_one_pass, run_worker
+    from .control_plane.worker import (BRIDGE_TEARDOWN_SECONDS, CONNECTION_CLOSE_SECONDS, WorkerGaveUp,
+                                       run_one_pass, run_worker)
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     # validated before anything connects: an invalid collab_artifacts section refuses the start (also with --once)
@@ -6566,12 +6843,29 @@ def _cmd_cp_worker(args) -> int:
     collab_settings = _collab_artifacts_settings(worker_cp)
     member_runtime = _members_runtime(worker_cp, collab_settings) if collab_settings.enabled else None
 
+    signals = _StopSignals()
+
     async def _run():
+        stop = asyncio.Event()
+        signals.install(asyncio.get_running_loop(), stop)     # before anything connects: a stop during startup is clean
         cp = _cp_config(getattr(args, "fleet_config", None))
-        conn = await _cp_connect(cp["postgres_dsn"])
+        dsn = cp["postgres_dsn"]
+
+        def connect():
+            return _cp_connect(dsn, timeout=args.connect_timeout, command_timeout=args.statement_timeout or None)
+
+        async def startup():
+            migration_conn = await _cp_connect(dsn, timeout=args.connect_timeout)   # no statement timeout: a migration may be long
+            try:
+                await Migrator(migration_conn).apply(args.migrations or _cp_migrations_dir())
+            finally:
+                await migration_conn.close()
+            return await connect()
+
+        conn = await _until_stopped(startup(), stop)
+        if conn is _STOPPED:
+            return None
         try:
-            migrations = args.migrations or _cp_migrations_dir()
-            await Migrator(conn).apply(migrations)
             rustfs = _maybe_rustfs_client(cp)
             from .config import load_config
             from .control_plane.artifact_lineage import lineage_poster_from_section
@@ -6584,6 +6878,13 @@ def _cmd_cp_worker(args) -> int:
                                                    lineage=lineage_poster_from_section(worker_cfg.get("lineage")))
                              if rustfs is not None else None)
             runner = render_runner if render_runner is not None else None
+
+            def rebind(new_conn):       # the render runner's ArtifactStore holds the connection; rebuild it on the new one
+                if rustfs is None:
+                    return {}
+                return {"artifact_job_runner": ArtifactRenderRunner(
+                    ArtifactStore(new_conn, rustfs), RendererRegistry(),
+                    lineage=lineage_poster_from_section(worker_cfg.get("lineage")))}
             worker_id = args.host_id or socket.gethostname()
             snapshotter = _worker_snapshot_writer(getattr(args, "fleet_config", None))
             compactor = _worker_fabric_compactor(getattr(args, "fleet_config", None))
@@ -6591,19 +6892,18 @@ def _cmd_cp_worker(args) -> int:
             share_hk = _worker_share_housekeeper(getattr(args, "fleet_config", None), member_runtime)
             reconciler = _worker_artifact_reconciler(getattr(args, "fleet_config", None), rustfs)
             if args.once:
-                return await run_one_pass(conn, worker_id=worker_id,
-                                          artifact_job_runner=runner, inspector_snapshotter=snapshotter,
-                                          fabric_compactor=compactor, inspector_archiver=archiver, share_housekeeper=share_hk,
-                                          annotation_housekeeper=_worker_annotation_housekeeper(
-                                              getattr(args, "fleet_config", None)),
-                                          artifact_reconciler=reconciler)
-            stop = asyncio.Event()
+                once = await _until_stopped(run_one_pass(
+                    conn, worker_id=worker_id,
+                    artifact_job_runner=runner, inspector_snapshotter=snapshotter,
+                    fabric_compactor=compactor, inspector_archiver=archiver, share_housekeeper=share_hk,
+                    annotation_housekeeper=_worker_annotation_housekeeper(getattr(args, "fleet_config", None)),
+                    artifact_reconciler=reconciler), stop)
+                return None if once is _STOPPED else once
             bridge_task = None
             mirror = None
             if collab_settings.enabled:     # a long-running loop on its own connections; --once never starts it
                 if rustfs is None:
                     raise SystemExit("control_plane.collab_artifacts needs RustFS (control_plane.rustfs_endpoint)")
-                dsn = cp["postgres_dsn"]
                 mirror = _build_collab_mirror(collab_settings, rustfs=rustfs)
             try:       # everything is validated and built before any task starts
                 annotation_hk = _worker_annotation_housekeeper(getattr(args, "fleet_config", None), mirror)
@@ -6633,6 +6933,9 @@ def _cmd_cp_worker(args) -> int:
                         heap_release=_heap_release_enabled(fleet_cp))
                     refresh.start()
                 await run_worker(conn, interval=args.interval, stop=stop, worker_id=worker_id,
+                                 connect=connect, rebind=rebind,
+                                 max_failed_passes=args.max_failed_passes or None,
+                                 heartbeat=Path(args.heartbeat_file) if args.heartbeat_file else None,
                                  artifact_job_runner=runner, inspector_snapshotter=snapshotter,
                                  fabric_compactor=compactor, inspector_archiver=archiver, share_housekeeper=share_hk,
                                  annotation_housekeeper=annotation_hk,
@@ -6642,17 +6945,27 @@ def _cmd_cp_worker(args) -> int:
                 if refresh is not None:
                     await asyncio.to_thread(refresh.stop)
                 if bridge_task is not None:
-                    try:
-                        await asyncio.wait_for(bridge_task, 60)    # applier.aclose / mirror.close run in its teardown
-                    except Exception as exc:  # noqa: BLE001 - never mask the exception run_worker is raising
-                        logging.getLogger(__name__).warning("collab bridge teardown failed (%s)", type(exc).__name__)
+                    # applier.aclose / mirror.close run in its teardown; bounded so the whole stop fits stop_grace_period
+                    done, _ = await asyncio.wait({bridge_task}, timeout=BRIDGE_TEARDOWN_SECONDS)
+                    if not done:
+                        bridge_task.cancel()
+                        logging.getLogger(__name__).warning(
+                            "collab bridge teardown still running after %.0fs; abandoned", BRIDGE_TEARDOWN_SECONDS)
+                    elif not bridge_task.cancelled() and bridge_task.exception() is not None:
+                        logging.getLogger(__name__).warning(      # never mask the exception run_worker is raising
+                            "collab bridge teardown failed (%s)", type(bridge_task.exception()).__name__)
             return None
         finally:
-            await conn.close()
+            await conn.close(timeout=CONNECTION_CLOSE_SECONDS)
 
     try:
         result = asyncio.run(_run())
     except KeyboardInterrupt:
+        return 130
+    except WorkerGaveUp as exc:
+        print(f"herdr-eng control-plane worker: {exc}; exiting so the supervisor restarts it", file=sys.stderr)
+        return 1
+    if signals.interrupted:
         return 130
     if result is not None:
         _print_json({"ok": True, "pass": result})

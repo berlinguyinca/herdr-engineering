@@ -18,6 +18,7 @@ import logging
 import os
 import queue
 import re
+import socket
 import stat
 import threading
 import time
@@ -28,12 +29,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from .endpoint_guard import resolve_model_endpoint
+
 log = logging.getLogger("herdr.llm_proxy")
 
 FORWARDED_PATHS = ("/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/v1/models")
 MISS_RELOAD_SECONDS = 2.0
 MAX_BODY = 16 * 1024 * 1024
 CATALOG_TTL_SECONDS = 10.0
+PINNED_TTL_SECONDS = 30.0
 CATALOG_TIMEOUT_SECONDS = 3.0
 MAX_CATALOG_BODY = 1024 * 1024
 REGISTERED_MODEL_HEADER = "x-herdr-require-registered-model"
@@ -217,6 +221,11 @@ class ProxyState:
         self._catalog_lock = threading.Lock()
         self._catalog_last = float("-inf")
         self._catalog: list[dict] = []
+        # Every id and alias the gateway has ever advertised. A failed or contended catalog read empties
+        # ``_catalog`` (no stale success), but must not let a registered name capture a gateway model.
+        self._upstream_names: frozenset[str] = frozenset()
+        self._catalog_read = False       # a catalog has been read at least once, so _upstream_names is meaningful
+        self._pinned: dict[str, tuple[float, tuple[str, ...]]] = {}   # base_url -> (when, validated address)
         self.reports: ReportQueue | None = None      # set by serve(); None = report inline (tests)
 
     def refresh(self, force: bool = False) -> None:
@@ -286,6 +295,29 @@ class ProxyState:
             custom = self._models.get(model or "")
             return dict(custom) if custom else None
 
+    def catalog_read(self) -> bool:
+        """False until the gateway catalog has been read once: before that no name can be called a shadow or not."""
+        return self._catalog_read
+
+    def pinned_addresses(self, base: str) -> tuple[str, ...]:
+        """The validated addresses to connect ``base`` to (none for an IP literal). Resolved at most once per
+        PINNED_TTL_SECONDS, never while holding the lock, and raises ValueError/OSError like the resolver."""
+        now = time.monotonic()
+        with self._lock:
+            hit = self._pinned.get(base)
+        if hit and now - hit[0] < PINNED_TTL_SECONDS:
+            return hit[1]
+        address = resolve_model_endpoint(base)
+        with self._lock:
+            self._pinned = {k: v for k, v in self._pinned.items() if now - v[0] < PINNED_TTL_SECONDS}
+            self._pinned[base] = (now, address)
+        return address
+
+    def serves_upstream(self, model: str | None) -> bool:
+        """True when the normal upstream serves ``model``: a registered model of that name must not shadow it."""
+        self._fabric_catalog()
+        return bool(model) and model in self._upstream_names
+
     def _fabric_catalog(self) -> list[dict]:
         # Catalog I/O never holds the key/routing/admission lock. Concurrent
         # refresh contenders use CPU while the first request refreshes evidence.
@@ -312,6 +344,12 @@ class ProxyState:
             if not isinstance(data, list) or any(not isinstance(item, dict) for item in data):
                 raise ValueError("invalid catalog")
             self._catalog = data
+            names = {item["id"] for item in data if isinstance(item.get("id"), str)}
+            for item in data:
+                if isinstance(item.get("aliases"), list):
+                    names.update(a for a in item["aliases"] if isinstance(a, str))
+            self._upstream_names = frozenset(names)
+            self._catalog_read = True
         except Exception:
             # No stale success on failure, redirects, or malformed metadata.
             self._catalog = []
@@ -447,6 +485,17 @@ def _upstream_error_class(status: int) -> str | None:
 
 def _ms(start: float | None, end: float | None) -> int | None:
     return None if start is None or end is None else max(0, int((end - start) * 1000))
+
+
+def _connect_pinned(addresses, port, timeout, source):
+    """socket.create_connection over already-validated addresses: the first that answers wins."""
+    last: OSError | None = None
+    for address in addresses:
+        try:
+            return socket.create_connection((address, port), timeout, source)
+        except OSError as exc:
+            last = exc
+    raise last or OSError("no address to connect to")
 
 
 def make_handler(state: ProxyState):
@@ -613,15 +662,26 @@ def make_handler(state: ProxyState):
         def _forward_slotted(self, key: dict, raw: bytes, body: dict | None, meta: dict):
             model = body.get("model") if body else None
             custom = state.custom_model(model)
+            leaves_upstream = bool(custom and custom.get("base_url") and not custom.get("fabric_model"))
+            if leaves_upstream and state.serves_upstream(model):
+                # A registered name never captures a model the upstream serves. Only a route that would leave the
+                # upstream (a private base_url without a gateway model) is neutralised: a fabric_model registration
+                # stays on the gateway and keeps its fallback and egress policy.
+                custom = None
+            elif leaves_upstream and custom.get("project") and not state.catalog_read():
+                # Whether this plain registration shadows a gateway model is unknown until a catalog has been read
+                # once. (A policy model has its own gateway fallback and is built around the catalog.)
+                meta.update(status=503, error_class="model_catalog_unavailable")
+                return self._json(503, {"error": {"code": "model_catalog_unavailable",
+                                                 "message": "the model catalog has not been read yet"}})
+            if custom and custom.get("project") and custom["project"] != key["project"]:
+                meta.update(status=403, error_class="model_project_mismatch")
+                return self._json(403, {"error": {"code": "model_project_mismatch"}})
             guarded = self.headers.get(REGISTERED_MODEL_HEADER, "").lower() == "true"
             if guarded and custom is None:
                 meta.update(status=503, error_class="model_not_registered")
                 return self._json(503, {"error": {"code": "model_not_registered",
                                                  "message": "required model is not registered"}})
-            if (custom and (guarded or custom.get("fabric_model")) and custom.get("project")
-                    and custom["project"] != key["project"]):
-                meta.update(status=403, error_class="model_project_mismatch")
-                return self._json(403, {"error": {"code": "model_project_mismatch"}})
             base, bearer, upstream_model, route_kind = (state.resolve_route(custom, model) if custom
                                                         else (state.upstream, state.upstream_key, model, "cpu"))
             policy = bool(custom and custom.get("fabric_model"))
@@ -645,6 +705,13 @@ def make_handler(state: ProxyState):
                         meta.update(status=503, error_class="model_unavailable")
                         return self._json(503, {"error": {"code": "model_unavailable",
                                                          "message": "no route is available for this model"}})
+                    pin: tuple[str, ...] = ()
+                    if custom and base != state.upstream:
+                        try:        # the stored URL is checked again here: it may predate the registration check
+                            pin = state.pinned_addresses(base)
+                        except ValueError:
+                            meta.update(status=403, error_class="model_endpoint_refused")
+                            return self._json(403, {"error": {"code": "model_endpoint_refused"}})
                     parts = urlsplit(base + self.path)
                     conn_cls = (http.client.HTTPSConnection if parts.scheme == "https"
                                 else http.client.HTTPConnection)
@@ -657,6 +724,10 @@ def make_handler(state: ProxyState):
                         headers["Authorization"] = f"Bearer {bearer}"
                     try:
                         conn = conn_cls(parts.hostname, parts.port, timeout=FALLBACK_ATTEMPT_TIMEOUT_SECONDS if may_fall_back else UPSTREAM_TIMEOUT_SECONDS)
+                        if pin:
+                            # Connect to an address that was validated; Host and TLS server name stay the hostname.
+                            conn._create_connection = (lambda _addr, timeout, source, _pin=pin, _port=conn.port:
+                                                       _connect_pinned(_pin, _port, timeout, source))
                         sent = time.monotonic()
                         conn.request(self.command, parts.path + (f"?{parts.query}" if parts.query else ""),
                                      body=raw or None, headers=headers)
