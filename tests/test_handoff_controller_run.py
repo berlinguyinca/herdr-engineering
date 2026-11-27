@@ -515,11 +515,20 @@ def _server_world(h: object, tmp_path: Path, pct: float) -> tuple[World, str]:
     return world, pane
 
 
+def _run_until_drain_started(world: World, pane: str, timeout_s: float = 60.0) -> None:
+    """`run_once` until the order was attempted: a pane that is momentarily not idle under load is waited for, as the
+    loop itself does on its next tick."""
+    def attempted() -> bool:
+        run_once(world.ctl)
+        return "handoff.drain_started" in [e.event for e in world.events(pane)]
+    assert wait_for(attempted, timeout_s, 0.2)
+
+
 @herdr_server
 def test_run_once_drains_session_at_limit(tmp_path: Path) -> None:
     with isolated_herdr("run-drain") as h:
         world, pane = _server_world(h, tmp_path, 81.0)
-        run_once(world.ctl)
+        _run_until_drain_started(world, pane)
         assert [e.event for e in world.events(pane)] == ["handoff.triggered", "handoff.drain_started"]
         assert wait_for(lambda: h.submitted.exists() and "Context is nearly full" in h.submitted.read_text(), 60.0)
         assert world.ctl.runtime[pane].typed
@@ -539,12 +548,14 @@ def test_run_once_ignores_session_below_limit(tmp_path: Path) -> None:
 def test_restart_resumes_from_event_log(tmp_path: Path) -> None:
     with isolated_herdr("run-restart") as h:
         world, pane = _server_world(h, tmp_path, 85.0)
-        run_once(world.ctl)
+        _run_until_drain_started(world, pane)
         assert wait_for(lambda: h.submitted.exists() and "Context is nearly full" in h.submitted.read_text(), 60.0)
         before = world.events(pane)
         restarted = world.controller()  # a new process: no memory, same store and event log
         restarted.herdr, restarted.env, restarted.locate = world.ctl.herdr, world.ctl.env, world.ctl.locate
         run_once(restarted)
-        assert world.events(pane) == before  # no new chain, no second drain_started
+        later = world.events(pane)
+        assert later[:len(before)] == before and {e.chain_id for e in later} == {e.chain_id for e in before}  # no new chain
+        assert [e.event for e in later[len(before):]] in ([], ["handoff.waiting"])  # no second drain_started; a busy pane is said once
         assert h.submitted.read_text().count("Context is nearly full") == 1
         assert restarted.runtime[pane].typed

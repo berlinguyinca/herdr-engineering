@@ -329,6 +329,7 @@ def test_the_side_pane_protocols_live_in_events_and_run_re_exports_them() -> Non
 def test_commits_that_were_already_unpushed_are_recorded_when_pushing_is_not_allowed(tmp_path: Path) -> None:
     w = World(tmp_path)
     _repo_on("feature", w.repo, dirty=False)  # a clean tree whose only commit is not on any remote
+    _git(w.repo, "remote", "add", "origin", str(w.repo))  # a repository with no remote has nothing to push
     ref = SessionRef(Harness.CLAUDE, "p1", w.repo, "s-p1", None)
     assert ctlrun._checkpoint(w.ctl, ref, "c1", w.repo, False, 85.0)
     done = [e for e in w.events() if e.event == "handoff.wip_committed"]

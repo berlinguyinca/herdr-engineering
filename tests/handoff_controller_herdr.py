@@ -72,9 +72,9 @@ def _our_program_pids(program: Path, env: Mapping[str, str] | None = None) -> li
 
 
 def _teardown(herdr: str, env: Mapping[str, str], root: Path, server: subprocess.Popen[bytes], program: Path) -> None:
-    subprocess.run([herdr, "server", "stop"], env=env, cwd=root, capture_output=True, timeout=10, check=False)
+    subprocess.run([herdr, "server", "stop"], env=env, cwd=root, capture_output=True, timeout=60, check=False)
     try:
-        server.wait(timeout=10)
+        server.wait(timeout=30)
     except subprocess.TimeoutExpired:
         pass
     if server.poll() is None:  # a dead server's group id may already belong to someone else

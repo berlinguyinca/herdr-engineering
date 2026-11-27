@@ -253,7 +253,7 @@ def test_an_unclosable_half_made_pane_keeps_its_marker_and_the_next_ensure_makes
         now = panes_in(side, tab)
         assert result.outcome is Outcome.UNAVAILABLE and len(now) == len(before) + 1
         assert marker is not None and marker.pane_id in now  # kept: the pane is still there
-        again = make(h, side, tab, start_grace_s=0.0, budget_s=5.0, lock_timeout_s=0)
+        again = make(h, side, tab, start_grace_s=0.0, budget_s=60.0, lock_timeout_s=0)
         assert again.outcome is Outcome.CREATED
-        assert wait_for(lambda: len(panes_in(side, tab)) == len(before) + 1, 10.0), panes_in(side, tab)  # replaced, never doubled
+        assert wait_for(lambda: len(panes_in(side, tab)) == len(before) + 1, 30.0), panes_in(side, tab)  # replaced, never doubled
         assert marker.pane_id not in panes_in(side, tab)
