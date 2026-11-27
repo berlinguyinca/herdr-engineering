@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -17,10 +18,10 @@ TEST_ROOT = Path(__file__).resolve().parents[1] / ".herdr-test" / "subagent-gate
 
 @pytest.fixture
 def env():
-    shutil.rmtree(TEST_ROOT, ignore_errors=True)
-    TEST_ROOT.mkdir(parents=True)
-    yield {"HERDR_ENGINEERING_STATE": str(TEST_ROOT), "HERDR_PANE_ID": "%7"}
-    shutil.rmtree(TEST_ROOT, ignore_errors=True)
+    TEST_ROOT.mkdir(parents=True, exist_ok=True)  # one directory per test: pytest-xdist workers share this file's tests
+    root = Path(tempfile.mkdtemp(dir=TEST_ROOT))
+    yield {"HERDR_ENGINEERING_STATE": str(root), "HERDR_PANE_ID": "%7"}
+    shutil.rmtree(root, ignore_errors=True)
 
 
 def _start(env: dict[str, str], agent_id: str) -> None:

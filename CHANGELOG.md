@@ -1749,6 +1749,12 @@ Key files must be mode 0600 and are refused otherwise; the key is never printed.
 - Every state-changing route on the main listener refuses cross-origin or cross-site browser requests and browser bodies that are not `application/json` (the per-route copies are gone; `browser_write_refusal` in `browser_guard.py` is the one rule). A disabled Rakazo bridge answers 404 on its routes before the guard, so a disabled feature is still indistinguishable from an absent one.
 - LLM proxy: a registered custom model whose name the upstream catalog serves no longer captures that name (the registration is ignored for routing, for every project; a project-owned registration that leaves the upstream gets `503 model_catalog_unavailable` until a catalog has been read once, policy-only registrations with `fabric_model` are unaffected); a custom model's `base_url` is refused when it names a loopback, link-local or metadata address, resolved once and the connection pinned to the validated addresses (no second lookup, no DNS rebinding); the project check applies with or without the guard header; changing a model's ownership (shared to project, project to project or back) is refused, delete and re-register instead.
 
+### Fix: automatic handoff controller follow-ups
+
+- A repository with no remote no longer ends the chain red `on_main_with_changes`: with no remote there is nothing to push, so no commit counts as unpushed. A feature branch gets its checkpoint commit and the chain goes on; only uncommitted changes on main, master or a detached head stop it, and the controller still never commits there.
+- Event reasons no longer quote git or `herdr-handoff` stderr verbatim: a reason is the command and exit code plus one plain line (colour codes and control characters removed, at most 120 characters). The full stderr goes to the controller's log.
+- Tests: the controller, subagent registry and subagent CLI tests no longer depend on short fixed timeouts, so they hold under `pytest -n 6`.
+
 ## [0.1.0] - 2026-09-24
 
 First public-quality release of the HerdR Engineering integration layer.

@@ -507,11 +507,11 @@ def _server_world(h: object, tmp_path: Path, pct: float) -> tuple[World, str]:
     world.env = {**h.env, "HERDR_ENGINEERING_STATE": str(h.root / "state")}
     world.ctl.env = world.env
     pane = h.start()
-    assert wait_for(lambda: any(p.pane_id == pane and p.name == "claude" and p.status == "idle" for p in h.cli.agents() or []), 20.0)
+    assert wait_for(lambda: any(p.pane_id == pane and p.name == "claude" and p.status == "idle" for p in h.cli.agents() or []), 60.0)
     transcript = tmp_path / "session.jsonl"
     transcript.write_text(_usage_line(int(WINDOW * pct / 100)))
     world.ctl.locate = lambda adapter, p: SessionRef(Harness.CLAUDE, p.pane_id, h.root, "sess-1", transcript)
-    world.ctl.drain_attempt_s = 10.0
+    world.ctl.drain_attempt_s = 60.0  # a ceiling for the drain to be typed, not a pace
     return world, pane
 
 
@@ -521,7 +521,7 @@ def test_run_once_drains_session_at_limit(tmp_path: Path) -> None:
         world, pane = _server_world(h, tmp_path, 81.0)
         run_once(world.ctl)
         assert [e.event for e in world.events(pane)] == ["handoff.triggered", "handoff.drain_started"]
-        assert wait_for(lambda: h.submitted.exists() and "Context is nearly full" in h.submitted.read_text(), 10.0)
+        assert wait_for(lambda: h.submitted.exists() and "Context is nearly full" in h.submitted.read_text(), 60.0)
         assert world.ctl.runtime[pane].typed
         run_once(world.ctl)  # waiting for the briefing: nothing more is typed
         assert h.submitted.read_text().count("Context is nearly full") == 1
@@ -540,7 +540,7 @@ def test_restart_resumes_from_event_log(tmp_path: Path) -> None:
     with isolated_herdr("run-restart") as h:
         world, pane = _server_world(h, tmp_path, 85.0)
         run_once(world.ctl)
-        assert wait_for(lambda: h.submitted.exists() and "Context is nearly full" in h.submitted.read_text(), 10.0)
+        assert wait_for(lambda: h.submitted.exists() and "Context is nearly full" in h.submitted.read_text(), 60.0)
         before = world.events(pane)
         restarted = world.controller()  # a new process: no memory, same store and event log
         restarted.herdr, restarted.env, restarted.locate = world.ctl.herdr, world.ctl.env, world.ctl.locate
