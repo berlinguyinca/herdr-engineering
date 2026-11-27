@@ -463,7 +463,7 @@ red or orange outcome the source session keeps running.
 | `no_longer_managed` | the pane is still listed but the switch went off, or it became a side pane, while the chain was open | none; turn the switch on to start over. It does not count towards `gave_up` |
 | `compaction_state_unknown` | a controller restarted while a compaction had begun and no end was recorded | look at the pane; the controller never types `/compact` a second time |
 | `merge_in_progress` | a merge, cherry-pick, revert or rebase is unfinished, so nothing was committed | finish or abort it. Where pushing is not allowed the controller goes on without committing (`--allow-dirty-source`); where it is allowed the chain stops |
-| `on_main_with_changes` | the session is on main, master or a detached head with uncommitted or unpushed work | move the work to a feature branch; the controller will not commit on main |
+| `on_main_with_changes` | the session is on main, master or a detached head with uncommitted or unpushed work (a repository with no remote has nothing it could push, so only uncommitted changes count there) | move the work to a feature branch; the controller will not commit on main |
 | `launch_state_unknown` | a takeover died while placing the successor, a child may or may not exist | look for a pane below the source before doing anything; the controller will not retry |
 | `successor_without_takeover` | the record names a successor but no launched child | inspect the record with `herdr-handoff inspect`; do not launch another |
 | `source_not_closed_successor_live` | the successor is live; only closing the source failed | close the source pane yourself; the controller marks it handed off and never drains it again |
@@ -481,6 +481,14 @@ third non-green end is final: `gave_up`. The controller writes one `handoff.skip
 when it would otherwise have started a drain, and once per session. It then leaves the session alone until its session id
 changes or its switch is turned off and on. A session that would have succeeded on a fourth try is therefore left to the
 harness's own compaction. The waits count credited time (see below), so a laptop asleep for hours does not use them up.
+
+### What an event reason quotes
+
+A reason is a short stable code with at most one plain detail line (`git commit -q exit 1: lint failed`,
+`herdr-handoff exit 1: no such file`): colour codes and control characters removed, newlines collapsed to the first
+meaningful line, at most 120 characters. The full stderr of the failing git or `herdr-handoff` call goes to the
+controller's own stderr, where the process supervisor logs it; it is never written to the event log or shown in the
+side pane.
 
 ### Last resort: compaction
 

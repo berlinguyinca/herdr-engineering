@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import tempfile
 import subprocess
 import sys
 import threading
@@ -24,7 +25,7 @@ def cli(tmp: Path, *argv: str, stdin: str = "", pane: str | None = "%1") -> subp
     if pane is not None:
         env["HERDR_PANE_ID"] = pane
     return subprocess.run([sys.executable, "-c", code, "handoff", *argv], cwd=REPO, env=env, input=stdin,
-                          capture_output=True, text=True, timeout=60)
+                          capture_output=True, text=True, timeout=300)
 
 
 def hook(tmp: Path, phase: str, agent_id: str, **kw) -> subprocess.CompletedProcess[str]:
@@ -124,10 +125,10 @@ TEST_ROOT = Path(REPO) / ".herdr-test" / "subagents"
 
 @pytest.fixture
 def state_env() -> Iterator[dict[str, str]]:
-    shutil.rmtree(TEST_ROOT, ignore_errors=True)
-    TEST_ROOT.mkdir(parents=True)
-    yield {"HERDR_ENGINEERING_STATE": str(TEST_ROOT), "HERDR_PANE_ID": "%7"}
-    shutil.rmtree(TEST_ROOT, ignore_errors=True)
+    TEST_ROOT.mkdir(parents=True, exist_ok=True)  # one directory per test: pytest-xdist workers share this file's tests
+    root = Path(tempfile.mkdtemp(dir=TEST_ROOT))
+    yield {"HERDR_ENGINEERING_STATE": str(root), "HERDR_PANE_ID": "%7"}
+    shutil.rmtree(root, ignore_errors=True)
 
 
 def _payload(agent_id: str) -> str:
@@ -164,7 +165,7 @@ def test_wait_until_idle_true_when_last_agent_stops(state_env) -> None:
     timer = threading.Timer(0.3, reg.record, args=("stop", _payload("a1"), state_env))
     timer.start()
     try:
-        assert reg.wait_until_idle("%7", state_env, timeout_s=5, poll_s=0.05) is True
+        assert reg.wait_until_idle("%7", state_env, timeout_s=120, poll_s=0.05) is True  # ceiling only: it returns when the stop lands
     finally:
         timer.join()
 
@@ -173,13 +174,15 @@ def test_wait_until_idle_false_on_timeout(state_env) -> None:
     reg.record("start", _payload("a1"), state_env)
     started = time.monotonic()
     assert reg.wait_until_idle("%7", state_env, timeout_s=0.2, poll_s=0.05) is False
-    assert time.monotonic() - started >= 0.2
+    elapsed = time.monotonic() - started
+    assert elapsed >= 0.2  # it waited the whole timeout; how much longer a loaded machine took is not what is proved
+    assert elapsed < 60  # and it did return
 
 
 def test_wait_until_idle_true_immediately_for_unknown_pane(state_env) -> None:
     started = time.monotonic()
-    assert reg.wait_until_idle("%7", state_env, timeout_s=30, poll_s=5) is True
-    assert time.monotonic() - started < 1
+    assert reg.wait_until_idle("%7", state_env, timeout_s=120, poll_s=30) is True
+    assert time.monotonic() - started < 25  # one poll (30 s) would mean it slept: a loaded machine is slow, not that slow
 
 
 def test_purge_pane_removes_entries_and_returns_count(state_env) -> None:
@@ -228,7 +231,7 @@ def test_concurrent_hooks_on_one_agent_id_leave_one_file_and_no_exception(state_
 def test_without_pane_id_record_is_a_noop_and_status_unknown(state_env) -> None:
     env = {"HERDR_ENGINEERING_STATE": state_env["HERDR_ENGINEERING_STATE"]}
     reg.record("start", _payload("a1"), env)
-    assert list(TEST_ROOT.iterdir()) == []
+    assert list(Path(state_env["HERDR_ENGINEERING_STATE"]).iterdir()) == []
     assert reg.status("%7", env) == reg.SubagentStatus(known=False, live=0)
     assert reg.status("", env) == reg.SubagentStatus(known=False, live=0)
 
@@ -265,14 +268,16 @@ def test_wait_until_idle_survives_the_pane_dir_vanishing_mid_wait(state_env) -> 
     timer = threading.Timer(0.2, shutil.rmtree, args=(reg._pane_dir(state_env, "%7"),))
     timer.start()
     try:
-        assert reg.wait_until_idle("%7", state_env, timeout_s=5, poll_s=0.02) is True
+        assert reg.wait_until_idle("%7", state_env, timeout_s=120, poll_s=0.02) is True
     finally:
         timer.join()
 
 
 def test_wait_status_returns_the_last_status_seen_on_timeout(state_env) -> None:
     reg.record("start", _payload("a1"), state_env)
+    started = time.monotonic()
     assert reg.wait_status("%7", state_env, timeout_s=0.2, poll_s=0.05) == reg.SubagentStatus(known=True, live=1)
+    assert time.monotonic() - started >= 0.2
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")

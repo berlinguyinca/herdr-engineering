@@ -63,7 +63,7 @@ from .store import shared_store_root
 from .switch import is_enabled, toggled_at
 from .takeover import run_takeover, stuck_reason
 from .trigger import Decision, decide
-from .wip import WipReason, WipResult, wip_commit
+from .wip import WipReason, WipResult, unpushed_commits, wip_commit
 
 __all__ = ["EnsureSidePane", "IsSidePane"]  # re-exported: they live in events.py
 
@@ -428,10 +428,10 @@ def _common_dir(worktree: Path) -> Path | None:
 def _has_changes(worktree: Path) -> bool | None:
     """Tracked changes or unpushed commits; None when git cannot say."""
     status = run_group(["git", "-C", str(worktree), "status", "--porcelain", "--untracked-files=no"], 60.0)
-    unpushed = run_group(["git", "-C", str(worktree), "rev-list", "--abbrev-commit", "HEAD", "--not", "--remotes"], 60.0)
-    if status.returncode != 0 or unpushed.returncode != 0:
+    commits, err = unpushed_commits(worktree, 60.0)
+    if status.returncode != 0 or err:
         return None
-    return bool(status.stdout.strip() or unpushed.stdout.strip())
+    return bool(status.stdout.strip() or commits)
 
 
 def _stuck(ctl: Controller, ref: SessionRef, chain_id: str, why: str, pct: float | None) -> None:

@@ -20,6 +20,7 @@ from tests.test_handoff_controller_wave2 import _fake, _run_takeover
 def _checkpoint_events(tmp_path: Path, *, allowed: bool) -> tuple[list[HandoffEvent], str]:
     w = World(tmp_path)
     _repo_on("feature", w.repo, dirty=True)
+    _git(w.repo, "remote", "add", "origin", str(w.repo))  # a repository with no remote has nothing to push
     ref = SessionRef(Harness.CLAUDE, "p1", w.repo, "s-p1", None)
     assert ctlrun._checkpoint(w.ctl, ref, "c1", w.repo, allowed, 85.0)
     return [e for e in w.events() if e.event == "handoff.wip_committed"], subprocess.run(["git", "-C", str(w.repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()

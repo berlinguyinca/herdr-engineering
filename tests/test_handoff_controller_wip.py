@@ -7,6 +7,8 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 from herdr_engineering.handoff_controller.wip import WipReason, WipResult, _push, wip_commit
 
 
@@ -311,3 +313,42 @@ def test_rejected_push_error_names_the_reason_not_the_remote_url(tmp_path: Path)
     assert result.reason is WipReason.PUSH_FAILED and result.error
     assert "exit 1: To " not in result.error  # git's first stderr line is "To <remote url>"
     assert "rejected" in result.error or "failed to push" in result.error
+
+
+def _no_remote_repo(tmp_path: Path, branch: str) -> Path:
+    work = make_repo(tmp_path, branch)
+    git(work, "remote", "remove", "origin")
+    return work
+
+
+def test_a_repository_without_a_remote_has_nothing_to_push(tmp_path: Path) -> None:
+    work = _no_remote_repo(tmp_path, "feat/x")
+    (work / "a.txt").write_text("two\n")
+    result = wip_commit(work, push_allowed=True)
+    assert result.committed and result.sha and not result.pushed
+    assert result.unpushed == () and result.reason is None and result.error is None
+    assert git(work, "log", "-1", "--format=%s") == "wip: auto-handoff checkpoint"
+
+
+def test_main_without_a_remote_reports_no_unpushed_commits(tmp_path: Path) -> None:
+    work = _no_remote_repo(tmp_path, "main")
+    result = wip_commit(work, push_allowed=True)
+    assert result.reason is WipReason.ON_MAIN and result.unpushed == ()
+
+
+def test_a_hooks_multiline_coloured_stderr_is_one_plain_short_line_in_the_error_and_whole_in_the_log(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    work = make_repo(tmp_path)
+    hook = work / ".git" / "hooks" / "pre-commit"
+    hook.parent.mkdir(exist_ok=True)
+    hook.write_text("#!/bin/sh\nprintf '\\033[31mlint failed\\033[0m %0300d\\nsecond line\\n\\033[1;32mthird\\033[0m\\n' 0 >&2\nexit 1\n")
+    hook.chmod(0o755)
+    (work / "a.txt").write_text("two\n")
+    with caplog.at_level("WARNING", logger="herdr_engineering.handoff_controller"):
+        result = wip_commit(work, push_allowed=True)
+    assert result.reason is WipReason.COMMIT_REJECTED and result.error
+    assert result.error.startswith("git commit -q exit 1: lint failed 000")
+    assert "\n" not in result.error and "\x1b" not in result.error and len(result.error) <= 160
+    assert "second line" not in result.error
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "second line" in logged and "third" in logged  # the whole stderr is in the log

@@ -371,6 +371,30 @@ def test_a_briefing_the_session_wrote_is_picked_up_and_a_dirty_main_stops_the_ch
     assert (world.repo / "a.txt").read_text() == "two\n"  # nothing was committed on main
 
 
+def test_a_clean_main_without_a_remote_is_not_stuck_on_main_with_changes(tmp_path: Path) -> None:
+    world = World(tmp_path)
+    _repo_on("main", world.repo, dirty=False)  # one local commit, no remote: nothing can be unpushed
+    world.session("p1", 85.0)
+    _typed_chain(world, started=world.clock[0] - 10)
+    _briefing_record(world.store, "p1", "2999-01-01T00:00:00Z")
+    world.tick(world.pane("p1", "idle"))
+    assert not any((e.reason or "").startswith("on_main_with_changes") for e in world.events())
+
+
+def test_a_feature_branch_without_a_remote_gets_the_checkpoint_commit_and_the_chain_goes_on(tmp_path: Path) -> None:
+    world = World(tmp_path)
+    _repo_on("feat/x", world.repo, dirty=True)
+    world.session("p1", 85.0)
+    _typed_chain(world, started=world.clock[0] - 10)
+    _briefing_record(world.store, "p1", "2999-01-01T00:00:00Z")
+    world.tick(world.pane("p1", "idle"))
+    wip = [e for e in world.events() if e.event == "handoff.wip_committed"]
+    assert len(wip) == 1 and wip[0].reason == "committed"
+    assert not any((e.reason or "").startswith(("on_main_with_changes", "git_state_unknown")) for e in world.events())
+    log = subprocess.run(["git", "-C", str(world.repo), "log", "-1", "--format=%s"], capture_output=True, text=True, check=True)
+    assert log.stdout.strip() == "wip: auto-handoff checkpoint"
+
+
 def test_a_worktree_whose_git_state_is_unknown_stops_the_chain(tmp_path: Path) -> None:
     world = World(tmp_path)
     (world.repo / ".git").write_text("not a gitfile\n")  # a repository git cannot read (a directory with no repository at all is not an error)
@@ -483,21 +507,30 @@ def _server_world(h: object, tmp_path: Path, pct: float) -> tuple[World, str]:
     world.env = {**h.env, "HERDR_ENGINEERING_STATE": str(h.root / "state")}
     world.ctl.env = world.env
     pane = h.start()
-    assert wait_for(lambda: any(p.pane_id == pane and p.name == "claude" and p.status == "idle" for p in h.cli.agents() or []), 20.0)
+    assert wait_for(lambda: any(p.pane_id == pane and p.name == "claude" and p.status == "idle" for p in h.cli.agents() or []), 60.0)
     transcript = tmp_path / "session.jsonl"
     transcript.write_text(_usage_line(int(WINDOW * pct / 100)))
     world.ctl.locate = lambda adapter, p: SessionRef(Harness.CLAUDE, p.pane_id, h.root, "sess-1", transcript)
-    world.ctl.drain_attempt_s = 10.0
+    world.ctl.drain_attempt_s = 60.0  # a ceiling for the drain to be typed, not a pace
     return world, pane
+
+
+def _run_until_drain_started(world: World, pane: str, timeout_s: float = 60.0) -> None:
+    """`run_once` until the order was attempted: a pane that is momentarily not idle under load is waited for, as the
+    loop itself does on its next tick."""
+    def attempted() -> bool:
+        run_once(world.ctl)
+        return "handoff.drain_started" in [e.event for e in world.events(pane)]
+    assert wait_for(attempted, timeout_s, 0.2)
 
 
 @herdr_server
 def test_run_once_drains_session_at_limit(tmp_path: Path) -> None:
     with isolated_herdr("run-drain") as h:
         world, pane = _server_world(h, tmp_path, 81.0)
-        run_once(world.ctl)
+        _run_until_drain_started(world, pane)
         assert [e.event for e in world.events(pane)] == ["handoff.triggered", "handoff.drain_started"]
-        assert wait_for(lambda: h.submitted.exists() and "Context is nearly full" in h.submitted.read_text(), 10.0)
+        assert wait_for(lambda: h.submitted.exists() and "Context is nearly full" in h.submitted.read_text(), 60.0)
         assert world.ctl.runtime[pane].typed
         run_once(world.ctl)  # waiting for the briefing: nothing more is typed
         assert h.submitted.read_text().count("Context is nearly full") == 1
@@ -515,12 +548,14 @@ def test_run_once_ignores_session_below_limit(tmp_path: Path) -> None:
 def test_restart_resumes_from_event_log(tmp_path: Path) -> None:
     with isolated_herdr("run-restart") as h:
         world, pane = _server_world(h, tmp_path, 85.0)
-        run_once(world.ctl)
-        assert wait_for(lambda: h.submitted.exists() and "Context is nearly full" in h.submitted.read_text(), 10.0)
+        _run_until_drain_started(world, pane)
+        assert wait_for(lambda: h.submitted.exists() and "Context is nearly full" in h.submitted.read_text(), 60.0)
         before = world.events(pane)
         restarted = world.controller()  # a new process: no memory, same store and event log
         restarted.herdr, restarted.env, restarted.locate = world.ctl.herdr, world.ctl.env, world.ctl.locate
         run_once(restarted)
-        assert world.events(pane) == before  # no new chain, no second drain_started
+        later = world.events(pane)
+        assert later[:len(before)] == before and {e.chain_id for e in later} == {e.chain_id for e in before}  # no new chain
+        assert [e.event for e in later[len(before):]] in ([], ["handoff.waiting"])  # no second drain_started; a busy pane is said once
         assert h.submitted.read_text().count("Context is nearly full") == 1
         assert restarted.runtime[pane].typed

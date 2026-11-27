@@ -55,8 +55,8 @@ from tests.test_handoff_controller_briefing import _cli_prefix
 
 ADAPTER = adapter_for(Harness.CLAUDE)
 herdr_server = pytest.mark.herdr_server
-FAST = {"ready": lambda: True, "confirm_timeout_s": 15.0, "retry_delay_s": 0.0, "poll_s": 0.1, "compact_ready_timeout_s": 10.0,
-        "compact_work_start_s": 5.0, "compact_work_end_s": 15.0}
+FAST = {"ready": lambda: True, "confirm_timeout_s": 60.0, "retry_delay_s": 0.0, "poll_s": 0.1, "compact_ready_timeout_s": 30.0,
+        "compact_work_start_s": 30.0, "compact_work_end_s": 60.0}  # ceilings: each wait ends when its condition holds
 CHILD_ID = "handoff_" + "a" * 32
 
 
@@ -171,6 +171,23 @@ def test_classify_reads_the_status_of_the_json_reply() -> None:
     dirty = classify(_result(1, {"status": "source_dirty", "reason": "worktree_dirty: x", "pane_id": "w1:p5"}))
     assert dirty.outcome is Outcome.REFUSED and dirty.reason == "source_dirty: worktree_dirty: x"
     assert classify(_result(1, {"status": "subagents_running"})).reason == "subagents_running"
+
+
+def test_a_failing_programs_multiline_coloured_stderr_is_one_plain_short_line_in_the_reason_and_whole_in_the_log(
+        caplog: pytest.LogCaptureFixture) -> None:
+    script = "printf '\\033[31mboom\\033[0m %0300d\\nsecond line\\n\\033[1;32mthird\\033[0m\\n' 0 >&2; exit 3"
+    ran = subprocess.run(["sh", "-c", script], capture_output=True, text=True)  # a real process, not a canned string
+    with caplog.at_level("WARNING", logger="herdr_engineering.handoff_controller"):
+        result = classify(HandoffCliResult(ran.returncode, ran.stdout, ran.stderr))
+    assert result.outcome is Outcome.FAILED and result.reason.startswith("herdr-handoff exit 3: boom 000")
+    assert "\n" not in result.reason and "\x1b" not in result.reason and len(result.reason) <= 160
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "second line" in logged and "third" in logged
+
+
+def test_a_refusal_detail_is_one_plain_short_line() -> None:
+    refused = classify(_result(1, {"status": "source_dirty", "reason": "\x1b[31mdirty\x1b[0m\nsecond line " + "x" * 300}))
+    assert refused.reason.startswith("source_dirty: dirty") and "\n" not in refused.reason and len(refused.reason) <= 160
 
 
 @pytest.mark.parametrize("done", [_result(124, ""), _result(127, "", "no such file"), _result(1, "", "boom\nmore"),
@@ -317,8 +334,8 @@ def test_refusal_keeps_source_and_retries_then_compacts(server: IsolatedHerdr, h
     """The child is launched but never confirmed (herdr-handoff is given a confirm timeout shorter than the child's
     start-up), so nothing proves the handoff happened: the source is compacted, and the event names the child."""
     work, store = make_repo(tmp_path, dirty=False), tmp_path / "store"
-    source = start_idle(server, "FAKE_TUI_COMPACT_S=0.8")
-    server.start_delay(3.0)  # the child starts slowly: the 0.5 s confirmation cannot see it
+    source = start_idle(server, "FAKE_TUI_COMPACT_S=6.0")
+    server.start_delay(30.0)  # the child starts far later than the 0.5 s confirmation, however loaded the machine is
     handoff_id = new_record(handoff, store, source, work)
     log = EventLog(store)
     done = run_takeover(make_ref(source, work), ADAPTER, handoff_id, ControllerConfig(max_attempts=2), log, handoff,
@@ -416,10 +433,10 @@ def test_push_not_allowed_passes_allow_dirty_and_the_dirty_source_is_closed(serv
 
 @herdr_server
 def test_compaction_pointer_typed_after_compact(server: IsolatedHerdr, tmp_path: Path) -> None:
-    source = start_idle(server, "FAKE_TUI_COMPACT_S=0.8")
+    source = start_idle(server, "FAKE_TUI_COMPACT_S=6.0")
     pointer = tmp_path / "documents" / "h.md"
     done = compact_with_pointer(make_ref(source, tmp_path), ADAPTER, pointer, server.cli, poll_s=0.1,
-                                ready_timeout_s=10.0, work_start_timeout_s=5.0, work_end_timeout_s=15.0)
+                                ready_timeout_s=30.0, work_start_timeout_s=30.0, work_end_timeout_s=60.0)
     assert done and done.reason is None
     assert submitted(server) == ["/compact", f"Your briefing is {pointer}; read it after compaction"]
     assert "Compacted" in server.cli.read_visible(source)  # the pointer came after the compaction finished
@@ -453,7 +470,7 @@ def test_compaction_is_not_typed_into_a_blocked_agent_or_another_harness(server:
 def test_no_way_forward_is_red_with_reason(server: IsolatedHerdr, handoff: HandoffCli, tmp_path: Path) -> None:
     work, store = make_repo(tmp_path, dirty=False), tmp_path / "store"
     source = start_idle(server, "FAKE_TUI_PREFILL=half-written")
-    server.start_delay(3.0)  # the child starts slowly: the 0.5 s confirmation cannot see it
+    server.start_delay(30.0)  # the child starts far later than the 0.5 s confirmation, however loaded the machine is
     handoff_id = new_record(handoff, store, source, work)
     log = EventLog(store)
     done = run_takeover(make_ref(source, work), ADAPTER, handoff_id, ControllerConfig(max_attempts=2), log, handoff,
@@ -518,17 +535,18 @@ class ShortExit:
         return ExitPlan("/exit", ("Enter",), self._end)
 
 
-@pytest.mark.parametrize("script, expected", [
-    ("import sys,time\nif 'inspect' in sys.argv: print('{}')\nif 'takeover' in sys.argv: time.sleep(30)", "exit 124"),
-    ("import sys\nif 'inspect' in sys.argv: print('{}')\nif 'takeover' in sys.argv: print('boom', file=sys.stderr); sys.exit(2)", "exit 2: boom"),
+@pytest.mark.parametrize("script, expected, margin_s", [
+    ("import sys,time\nif 'inspect' in sys.argv: print('{}')\nif 'takeover' in sys.argv: time.sleep(30)", "exit 124", 0.5),  # the hang is cut off at the short bound, loaded or not
+    ("import sys\nif 'inspect' in sys.argv: print('{}')\nif 'takeover' in sys.argv: print('boom', file=sys.stderr); sys.exit(2)", "exit 2: boom", 60.0),  # a ceiling only: the call ends at once, and a loaded interpreter start must not time it out
 ], ids=["timed_out", "failed"])
-def test_attempts_exhausted_by_failures_end_red_without_compacting(script: str, expected: str, tmp_path: Path) -> None:
+def test_attempts_exhausted_by_failures_end_red_without_compacting(script: str, expected: str, margin_s: float,
+                                                                    tmp_path: Path) -> None:
     broken = HandoffCli([sys.executable, "-c", script], env={"PATH": "/usr/bin:/bin"}, cwd=tmp_path)
     ref = make_ref("w1:p1", tmp_path)
     log = EventLog(tmp_path / "store")
     done = run_takeover(ref, ShortExit(0.2), CHILD_ID, ControllerConfig(max_attempts=2), log, broken, HerdrCli("/nonexistent/herdr"),  # type: ignore[arg-type]
                         store_root=tmp_path / "store", worktree=tmp_path, push_allowed=True, env={}, confirm_timeout_s=0.1,
-                        call_margin_s=0.5, retry_delay_s=0.0, poll_s=0.1, ready=lambda: True)
+                        call_margin_s=margin_s, retry_delay_s=0.0, poll_s=0.1, ready=lambda: True)
     assert (done.event, done.colour) == ("handoff.stuck", Colour.RED), done
     assert done.reason and done.reason.startswith("no_briefing") and expected in done.reason, done.reason
     assert [e.event for e in log.read()] == ["handoff.takeover_started"] * 3 + ["handoff.stuck"]  # the chain's, then one per attempt

@@ -1,11 +1,18 @@
 """Run an external command in its own process group, with a timeout and a cleaned environment. Never raises."""
 from __future__ import annotations
 
+import logging
 import os
+import re
 import signal
 import subprocess
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+
+LOG = logging.getLogger("herdr_engineering.handoff_controller")
+DETAIL_MAX = 120
+_ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[@-Z\\-_])")
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 TIMED_OUT = 124
 NOT_RUNNABLE = 127
@@ -62,3 +69,18 @@ def run_group(cmd: Sequence[str], timeout_s: float, *, env: Mapping[str, str] | 
         proc.wait()
         return subprocess.CompletedProcess(argv, NOT_RUNNABLE, "", str(exc))
     return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+
+
+def detail_line(text: str, *, skip_prefix: str | None = None) -> str:
+    """One short, plain line of a command's output for an event reason: no colour codes, control characters or
+    newlines, at most DETAIL_MAX characters. The first non-empty line, or the first not starting with `skip_prefix`."""
+    lines = [_CONTROL.sub(" ", _ANSI.sub("", raw)).strip() for raw in text.splitlines()]
+    lines = [line for line in lines if line]
+    line = next((x for x in lines if skip_prefix is None or not x.startswith(skip_prefix)), lines[-1] if lines else "no output")
+    return line if len(line) <= DETAIL_MAX else line[:DETAIL_MAX - 3] + "..."
+
+
+def log_output(what: str, text: str) -> None:
+    """The full output goes to the controller's log (stderr), never into an event."""
+    if text.strip():
+        LOG.warning("%s: %s", what, text.rstrip())
