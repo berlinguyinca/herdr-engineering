@@ -334,7 +334,7 @@ def test_refusal_keeps_source_and_retries_then_compacts(server: IsolatedHerdr, h
     """The child is launched but never confirmed (herdr-handoff is given a confirm timeout shorter than the child's
     start-up), so nothing proves the handoff happened: the source is compacted, and the event names the child."""
     work, store = make_repo(tmp_path, dirty=False), tmp_path / "store"
-    source = start_idle(server, "FAKE_TUI_COMPACT_S=0.8")
+    source = start_idle(server, "FAKE_TUI_COMPACT_S=6.0")
     server.start_delay(30.0)  # the child starts far later than the 0.5 s confirmation, however loaded the machine is
     handoff_id = new_record(handoff, store, source, work)
     log = EventLog(store)
@@ -433,7 +433,7 @@ def test_push_not_allowed_passes_allow_dirty_and_the_dirty_source_is_closed(serv
 
 @herdr_server
 def test_compaction_pointer_typed_after_compact(server: IsolatedHerdr, tmp_path: Path) -> None:
-    source = start_idle(server, "FAKE_TUI_COMPACT_S=0.8")
+    source = start_idle(server, "FAKE_TUI_COMPACT_S=6.0")
     pointer = tmp_path / "documents" / "h.md"
     done = compact_with_pointer(make_ref(source, tmp_path), ADAPTER, pointer, server.cli, poll_s=0.1,
                                 ready_timeout_s=30.0, work_start_timeout_s=30.0, work_end_timeout_s=60.0)
