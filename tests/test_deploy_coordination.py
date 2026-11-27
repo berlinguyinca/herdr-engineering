@@ -547,7 +547,9 @@ exec '{original}' "$@"
     # the database is dumped (and verified) BEFORE the migration the prewarm applies, into the private backup directory
     dump = next(env["home"].glob(".local/share/herdr-engineering/backups/control-plane/predeploy-controlplane-*.dump"))
     assert dump.read_bytes() == b"PGDMP-synthetic" and stat.S_IMODE(dump.stat().st_mode) == 0o600
-    assert log.index("pg_dump -U cpadmin -d herdr") < log.index("docker run ")
+    # the wrapper above logs this marker for every prewarm run, also the failing one (which exits before the stub's own
+    # "docker run" line would be written)
+    assert log.index("pg_dump -U cpadmin -d herdr") < log.index("prewarm-before-host-changes")
     assert "herdr-cp-rustfs" not in log           # a migration does not touch the object store
     assert "PREWARM-SECRET" not in result.stdout + result.stderr
     metadata_path = next(state(env).glob("attempt-*/metadata.json"))
