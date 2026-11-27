@@ -371,6 +371,30 @@ def test_a_briefing_the_session_wrote_is_picked_up_and_a_dirty_main_stops_the_ch
     assert (world.repo / "a.txt").read_text() == "two\n"  # nothing was committed on main
 
 
+def test_a_clean_main_without_a_remote_is_not_stuck_on_main_with_changes(tmp_path: Path) -> None:
+    world = World(tmp_path)
+    _repo_on("main", world.repo, dirty=False)  # one local commit, no remote: nothing can be unpushed
+    world.session("p1", 85.0)
+    _typed_chain(world, started=world.clock[0] - 10)
+    _briefing_record(world.store, "p1", "2999-01-01T00:00:00Z")
+    world.tick(world.pane("p1", "idle"))
+    assert not any((e.reason or "").startswith("on_main_with_changes") for e in world.events())
+
+
+def test_a_feature_branch_without_a_remote_gets_the_checkpoint_commit_and_the_chain_goes_on(tmp_path: Path) -> None:
+    world = World(tmp_path)
+    _repo_on("feat/x", world.repo, dirty=True)
+    world.session("p1", 85.0)
+    _typed_chain(world, started=world.clock[0] - 10)
+    _briefing_record(world.store, "p1", "2999-01-01T00:00:00Z")
+    world.tick(world.pane("p1", "idle"))
+    wip = [e for e in world.events() if e.event == "handoff.wip_committed"]
+    assert len(wip) == 1 and wip[0].reason == "committed"
+    assert not any((e.reason or "").startswith(("on_main_with_changes", "git_state_unknown")) for e in world.events())
+    log = subprocess.run(["git", "-C", str(world.repo), "log", "-1", "--format=%s"], capture_output=True, text=True, check=True)
+    assert log.stdout.strip() == "wip: auto-handoff checkpoint"
+
+
 def test_a_worktree_whose_git_state_is_unknown_stops_the_chain(tmp_path: Path) -> None:
     world = World(tmp_path)
     (world.repo / ".git").write_text("not a gitfile\n")  # a repository git cannot read (a directory with no repository at all is not an error)

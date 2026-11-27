@@ -311,3 +311,24 @@ def test_rejected_push_error_names_the_reason_not_the_remote_url(tmp_path: Path)
     assert result.reason is WipReason.PUSH_FAILED and result.error
     assert "exit 1: To " not in result.error  # git's first stderr line is "To <remote url>"
     assert "rejected" in result.error or "failed to push" in result.error
+
+
+def _no_remote_repo(tmp_path: Path, branch: str) -> Path:
+    work = make_repo(tmp_path, branch)
+    git(work, "remote", "remove", "origin")
+    return work
+
+
+def test_a_repository_without_a_remote_has_nothing_to_push(tmp_path: Path) -> None:
+    work = _no_remote_repo(tmp_path, "feat/x")
+    (work / "a.txt").write_text("two\n")
+    result = wip_commit(work, push_allowed=True)
+    assert result.committed and result.sha and not result.pushed
+    assert result.unpushed == () and result.reason is None and result.error is None
+    assert git(work, "log", "-1", "--format=%s") == "wip: auto-handoff checkpoint"
+
+
+def test_main_without_a_remote_reports_no_unpushed_commits(tmp_path: Path) -> None:
+    work = _no_remote_repo(tmp_path, "main")
+    result = wip_commit(work, push_allowed=True)
+    assert result.reason is WipReason.ON_MAIN and result.unpushed == ()

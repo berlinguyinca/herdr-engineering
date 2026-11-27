@@ -463,7 +463,7 @@ red or orange outcome the source session keeps running.
 | `no_longer_managed` | the pane is still listed but the switch went off, or it became a side pane, while the chain was open | none; turn the switch on to start over. It does not count towards `gave_up` |
 | `compaction_state_unknown` | a controller restarted while a compaction had begun and no end was recorded | look at the pane; the controller never types `/compact` a second time |
 | `merge_in_progress` | a merge, cherry-pick, revert or rebase is unfinished, so nothing was committed | finish or abort it. Where pushing is not allowed the controller goes on without committing (`--allow-dirty-source`); where it is allowed the chain stops |
-| `on_main_with_changes` | the session is on main, master or a detached head with uncommitted or unpushed work | move the work to a feature branch; the controller will not commit on main |
+| `on_main_with_changes` | the session is on main, master or a detached head with uncommitted or unpushed work (a repository with no remote has nothing it could push, so only uncommitted changes count there) | move the work to a feature branch; the controller will not commit on main |
 | `launch_state_unknown` | a takeover died while placing the successor, a child may or may not exist | look for a pane below the source before doing anything; the controller will not retry |
 | `successor_without_takeover` | the record names a successor but no launched child | inspect the record with `herdr-handoff inspect`; do not launch another |
 | `source_not_closed_successor_live` | the successor is live; only closing the source failed | close the source pane yourself; the controller marks it handed off and never drains it again |

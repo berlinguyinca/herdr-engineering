@@ -55,7 +55,13 @@ def _describe(proc: subprocess.CompletedProcess[str]) -> str:
     return f"git {' '.join(proc.args[3:5])} exit {proc.returncode}: {why}"
 
 
-def _unpushed(worktree: Path, timeout_s: float) -> tuple[tuple[str, ...], str | None]:
+def unpushed_commits(worktree: Path, timeout_s: float) -> tuple[tuple[str, ...], str | None]:
+    """(commits no remote has, error). A repository with no remote has nothing it could push: ((), None)."""
+    remotes = _git(worktree, timeout_s, "remote")
+    if remotes.returncode != 0:
+        return (), _describe(remotes)
+    if not remotes.stdout.strip():
+        return (), None
     proc = _git(worktree, timeout_s, "rev-list", "--abbrev-commit", "HEAD", "--not", "--remotes")
     if proc.returncode != 0:
         return (), _describe(proc)
@@ -130,7 +136,7 @@ def wip_commit(worktree: Path, *, push_allowed: bool, timeout_s: float = 120.0) 
     if others.returncode != 0:
         return failure(others)
     untracked = tuple(name for name in others.stdout.split("\0") if name)
-    unpushed, err = _unpushed(worktree, timeout_s)
+    unpushed, err = unpushed_commits(worktree, timeout_s)
     if err:
         return WipResult(False, None, False, (), untracked, WipReason.GIT_ERROR, err)
     if not branch or branch in PROTECTED_BRANCHES:
@@ -168,7 +174,7 @@ def wip_commit(worktree: Path, *, push_allowed: bool, timeout_s: float = 120.0) 
         if rev.returncode != 0:
             return WipResult(True, None, False, unpushed, untracked, WipReason.GIT_ERROR, _describe(rev))
         sha = rev.stdout.strip()
-        unpushed, err = _unpushed(worktree, timeout_s)
+        unpushed, err = unpushed_commits(worktree, timeout_s)
         if err:
             return WipResult(True, sha, False, (), untracked, WipReason.GIT_ERROR, err)
     if not unpushed:
@@ -177,11 +183,11 @@ def wip_commit(worktree: Path, *, push_allowed: bool, timeout_s: float = 120.0) 
         return WipResult(committed, sha, False, unpushed, untracked, WipReason.PUSH_NOT_ALLOWED)
     reason, push_error = _push(worktree, branch, timeout_s)
     if reason is not None:
-        remaining, err = _unpushed(worktree, timeout_s)
+        remaining, err = unpushed_commits(worktree, timeout_s)
         if err:  # the state after the refused push is unknown: not a good local commit
             return WipResult(committed, sha, False, unpushed, untracked, WipReason.GIT_ERROR, f"{push_error}; {err}")
         return WipResult(committed, sha, False, remaining, untracked, reason, push_error)
-    after_push, err = _unpushed(worktree, timeout_s)
+    after_push, err = unpushed_commits(worktree, timeout_s)
     if err:
         return WipResult(committed, sha, True, (), untracked, WipReason.GIT_ERROR, err)
     return WipResult(committed, sha, True, after_push, untracked)
