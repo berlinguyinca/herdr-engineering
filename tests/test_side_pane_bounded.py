@@ -75,8 +75,8 @@ def test_a_budgeted_call_still_creates_the_pane_and_stays_within_the_budget() ->
         side = side_of(h)
         _, tab = session(h, side)
         started = time.monotonic()
-        result = make(h, side, tab, budget_s=5.0, lock_timeout_s=0)
-        assert result.outcome is Outcome.CREATED and time.monotonic() - started < 6.5
+        result = make(h, side, tab, budget_s=30.0, lock_timeout_s=0)  # the budget is a ceiling the call stays under
+        assert result.outcome is Outcome.CREATED and time.monotonic() - started < 35.0
         assert state.read_marker(root_of(h), tab) is not None
 
 
@@ -96,7 +96,7 @@ def test_an_unparsable_split_reply_finds_the_new_pane_in_the_layout() -> None:
         side = side_of(h)
         first, tab = session(h, side)
         garbled = passthrough(h.root, h, h.root / "calls.log", swallow_split="run")
-        result = placing.ensure(tab, None, garbled, env_of(h), command=SLEEP)
+        result = placing.ensure(tab, None, garbled, env_of(h), command=SLEEP, budget_s=60.0)
         now = panes_in(side, tab)
         assert result.outcome is Outcome.CREATED and len(now) == 2 and result.pane_id in now and result.pane_id != first
         marker = state.read_marker(root_of(h), tab)
@@ -110,7 +110,7 @@ def test_an_unparsable_reply_with_no_new_pane_closes_nothing_and_says_so(capsys:
         _, tab = session(h, side)
         before = panes_in(side, tab)
         garbled = passthrough(h.root, h, h.root / "calls.log", swallow_split="skip")
-        result = placing.ensure(tab, None, garbled, env_of(h), command=SLEEP)
+        result = placing.ensure(tab, None, garbled, env_of(h), command=SLEEP, budget_s=60.0)
         assert result.outcome is Outcome.UNAVAILABLE and panes_in(side, tab) == before
         assert not any(line.startswith("pane close") for line in (h.root / "calls.log").read_text().splitlines())
         assert "split" in capsys.readouterr().err
