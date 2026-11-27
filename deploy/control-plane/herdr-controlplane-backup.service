@@ -1,0 +1,15 @@
+# User unit: back up the main control-plane database (container herdr-cp-postgres) and its object store
+# (container herdr-cp-rustfs). Same pattern as herdr-hindsight-backup.service: oneshot, UMask=0077, NoNewPrivileges,
+# calling memory-backup.sh (one script for both databases) with --target control-plane. Owner-only, archive-verified
+# dumps land in ~/.local/share/herdr-engineering/backups/control-plane (newest 14 kept).
+# Installed and enabled by every real `deploy.sh` (or `memory-backup.sh install --target control-plane`).
+# No Environment=: defaults live in the script; `herdr-eng doctor` reports the newest dump's age.
+[Unit]
+Description=Back up the Herdr control-plane database and object store
+
+[Service]
+Type=oneshot
+UMask=0077
+NoNewPrivileges=true
+TimeoutStartSec=60min
+ExecStart=%h/.local/share/herdr-engineering/memory-backup.sh backup --target control-plane

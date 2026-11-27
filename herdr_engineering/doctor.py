@@ -255,6 +255,14 @@ def run_doctor(config: dict[str, Any] | None = None,
     except Exception as exc:  # doctor must never crash on an optional section
         report.add("memory_hindsight", "warn", f"memory backend checks failed: {type(exc).__name__}")
 
+    # control-plane database backup age (a "not applicable" result on a host that does not run the control plane)
+    try:
+        from .control_plane_backup_status import check_control_plane_backup
+        for chk in check_control_plane_backup():
+            report.add(chk["name"], chk["status"], chk["detail"], chk["data"])
+    except Exception as exc:  # doctor must never crash on an optional section
+        report.add("control_plane_backup", "warn", f"control-plane backup check failed: {type(exc).__name__}")
+
     _add_build_cache_toolchain(report)
     _add_build_hygiene(report, config or {})
 

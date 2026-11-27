@@ -5,6 +5,13 @@ YYYY-MM-DD. The format follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Feature: control-plane database and object-store backup, pre-migration dump, migrator lock
+
+- `memory-backup.sh --target control-plane` dumps `herdr-cp-postgres` (`pg_dump -Fc`, verified, atomic rename, newest 14 kept) and copies the `herdr-cp-rustfs` object store into a verified tar; `herdr-controlplane-backup.{service,timer}` run it daily and every real `deploy.sh` installs them. Dumps stay on the host.
+- `deploy.sh` takes a verified `predeploy-controlplane-*.dump` before the checkpoint prewarm applies migrations and stops if it fails; a failed prewarm no longer says nothing changed, because the schema may have moved.
+- The migrator holds a Postgres advisory lock and a 60 s `lock_timeout` for a run, so two starters cannot migrate at once and a migration cannot hang behind a long transaction.
+- `herdr-eng doctor` gains `control_plane_backup` (age of the newest dump; "not applicable" on hosts without the control plane). Restore runbook: `docs/operations/control-plane-backup-restore.md`.
+
 ### Fix: collab room teardown, assistant store scans, dev route validation
 
 - Collaboration page: leaving a room before its helper handlers were wired no longer throws a `ReferenceError` (`unbindHelpers` was a `const` declared after the teardown that calls it), which skipped the rest of the teardown and left the room's listeners and controller running (#974).

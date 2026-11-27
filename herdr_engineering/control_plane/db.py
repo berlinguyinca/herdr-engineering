@@ -24,6 +24,14 @@ MIGRATION_ALIASES = {
 }
 
 
+# One migrator at a time per database: the session-level advisory lock key (any fixed bigint nothing else in the
+# control plane uses), and how long a migration may wait for a lock (this one or a table's) before failing loudly.
+MIGRATION_LOCK_KEY = 0x4845524452434D47    # "HERDRCMG"
+MIGRATION_LOCK_TIMEOUT_MS = 60_000
+# How long a starter waits for a sibling's migration (the advisory lock) before giving up: far longer than one DDL's lock wait.
+MIGRATION_WAIT_TIMEOUT_MS = 600_000
+
+
 def control_plane_config(cfg: dict[str, Any]) -> dict[str, str]:
     """Return normalized control-plane settings from a config dict.
 
@@ -45,8 +53,15 @@ class Migrator:
     ``fetch(sql, *args)`` (a real asyncpg connection or a test fake).
     """
 
-    def __init__(self, conn: Any):
+    def __init__(
+        self,
+        conn: Any,
+        lock_timeout_ms: int = MIGRATION_LOCK_TIMEOUT_MS,
+        wait_timeout_ms: int = MIGRATION_WAIT_TIMEOUT_MS,
+    ):
         self._conn = conn
+        self._lock_timeout_ms = lock_timeout_ms
+        self._wait_timeout_ms = wait_timeout_ms
 
     async def ensure_schema(self) -> None:
         await self._conn.execute(
@@ -63,6 +78,24 @@ class Migrator:
         return [r["version"] for r in rows]
 
     async def apply(self, migrations_dir: str) -> list[str]:
+        """Apply what is pending, holding one advisory lock so two starters never migrate at once.
+
+        The lock is per session (taken and released on this connection). Waiting for a sibling's migration to finish is
+        bounded by ``wait_timeout_ms`` (long, so a slow migration does not fail the second starter); every wait for a
+        table lock while applying (behind a long transaction) fails after ``lock_timeout_ms`` instead of hanging the start.
+        """
+        try:
+            await self._conn.execute(f"SET lock_timeout = {int(self._wait_timeout_ms)}")
+            await self._conn.execute("SELECT pg_advisory_lock($1)", MIGRATION_LOCK_KEY)
+            try:
+                await self._conn.execute(f"SET lock_timeout = {int(self._lock_timeout_ms)}")
+                return await self._apply_locked(migrations_dir)
+            finally:
+                await self._conn.execute("SELECT pg_advisory_unlock($1)", MIGRATION_LOCK_KEY)
+        finally:
+            await self._conn.execute("RESET lock_timeout")
+
+    async def _apply_locked(self, migrations_dir: str) -> list[str]:
         await self.ensure_schema()
         already = set(await self.applied())
         files = sorted(p.name for p in Path(migrations_dir).glob("*.sql"))
